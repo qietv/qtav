@@ -1,0 +1,28 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+find_dependency(
+    FFmpeg
+    COMPONENTS @QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS@
+)
+if(NOT DEFINED FFmpeg_avcodec_VERSION_MAJOR
+   OR FFmpeg_avcodec_VERSION_MAJOR STREQUAL "")
+    set(QtAVCore_FOUND FALSE)
+    set(QtAVCore_NOT_FOUND_MESSAGE
+        "QtAVCore could not determine the libavcodec major version")
+    return()
+endif()
+if(FFmpeg_avcodec_VERSION_MAJOR
+   LESS @QTAV_MINIMUM_FFMPEG_AVCODEC_MAJOR@)
+    set(QtAVCore_FOUND FALSE)
+    set(QtAVCore_NOT_FOUND_MESSAGE
+        "QtAVCore requires FFmpeg 8 or newer "
+        "(libavcodec major @QTAV_MINIMUM_FFMPEG_AVCODEC_MAJOR@+)")
+    return()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/QtAVCoreTargets.cmake")
+check_required_components(QtAVCore)

@@ -1,0 +1,534 @@
+add_executable(qtav_core_api_test api_test.cpp)
+target_link_libraries(qtav_core_api_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_api_test PRIVATE cxx_std_17)
+add_test(NAME qtav_core_api COMMAND qtav_core_api_test)
+
+add_executable(qtav_core_backend_api_test backend_api_test.cpp)
+target_link_libraries(qtav_core_backend_api_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_backend_api_test PRIVATE cxx_std_17)
+add_test(NAME qtav_core_backend_api COMMAND qtav_core_backend_api_test)
+
+find_package(FFmpeg REQUIRED COMPONENTS avutil)
+add_executable(
+    qtav_core_frame_color_metadata_test
+    frame_color_metadata_test.cpp
+    "${PROJECT_SOURCE_DIR}/core/src/backend.cpp"
+    "${PROJECT_SOURCE_DIR}/core/src/frame.cpp"
+)
+target_link_libraries(
+    qtav_core_frame_color_metadata_test
+    PRIVATE
+        FFmpeg::avutil
+)
+target_include_directories(
+    qtav_core_frame_color_metadata_test
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/core/include"
+        "${PROJECT_SOURCE_DIR}/core/src"
+)
+target_compile_definitions(
+    qtav_core_frame_color_metadata_test
+    PRIVATE QTAV_CORE_STATIC
+)
+target_compile_features(
+    qtav_core_frame_color_metadata_test
+    PRIVATE cxx_std_17
+)
+add_test(
+    NAME qtav_core_frame_color_metadata
+    COMMAND qtav_core_frame_color_metadata_test
+)
+
+add_library(
+    qtav_test_simulated_audio_sink
+    STATIC
+    simulated_audio_sink.cpp
+)
+target_link_libraries(qtav_test_simulated_audio_sink PUBLIC QtAV::Core)
+target_compile_features(
+    qtav_test_simulated_audio_sink
+    PUBLIC cxx_std_17
+)
+target_include_directories(
+    qtav_test_simulated_audio_sink
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+add_executable(
+    qtav_core_simulated_audio_sink_test
+    simulated_audio_sink_test.cpp
+)
+target_link_libraries(
+    qtav_core_simulated_audio_sink_test
+    PRIVATE qtav_test_simulated_audio_sink
+)
+target_compile_features(
+    qtav_core_simulated_audio_sink_test
+    PRIVATE cxx_std_17
+)
+add_test(
+    NAME qtav_core_simulated_audio_sink
+    COMMAND qtav_core_simulated_audio_sink_test
+)
+
+add_executable(qtav_core_playback_test playback_test.cpp)
+target_link_libraries(qtav_core_playback_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_playback_test PRIVATE cxx_std_17)
+
+add_executable(qtav_core_control_test control_test.cpp)
+target_link_libraries(qtav_core_control_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_control_test PRIVATE cxx_std_17)
+
+add_executable(qtav_core_audio_sink_player_test audio_sink_player_test.cpp)
+target_link_libraries(qtav_core_audio_sink_player_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_audio_sink_player_test PRIVATE cxx_std_17)
+
+if(TARGET qtav_audio_file)
+    add_executable(qtav_audio_file_test wav_audio_sink_test.cpp)
+    target_link_libraries(qtav_audio_file_test PRIVATE QtAV::AudioFile)
+    target_compile_features(qtav_audio_file_test PRIVATE cxx_std_17)
+    add_test(
+        NAME qtav_audio_file
+        COMMAND
+            qtav_audio_file_test
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-audio-file-test.wav"
+    )
+endif()
+
+if(TARGET qtav_audio_coreaudio)
+    add_executable(
+        qtav_audio_coreaudio_test
+        coreaudio_audio_sink_test.cpp
+    )
+    target_link_libraries(
+        qtav_audio_coreaudio_test
+        PRIVATE QtAV::AudioCoreAudio
+    )
+    target_compile_features(
+        qtav_audio_coreaudio_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_audio_coreaudio
+        COMMAND qtav_audio_coreaudio_test
+    )
+    set_tests_properties(
+        qtav_audio_coreaudio
+        PROPERTIES TIMEOUT 15
+    )
+endif()
+
+if(TARGET qtav_render_cpu)
+    add_executable(qtav_render_cpu_test cpu_video_renderer_test.cpp)
+    target_link_libraries(
+        qtav_render_cpu_test
+        PRIVATE QtAV::RenderCPU
+    )
+    target_compile_features(qtav_render_cpu_test PRIVATE cxx_std_17)
+endif()
+
+if(TARGET qtav_render_metal)
+    enable_language(OBJCXX)
+    add_executable(
+        qtav_render_metal_test
+        metal_video_renderer_test.mm
+    )
+    target_link_libraries(
+        qtav_render_metal_test
+        PRIVATE QtAV::RenderMetal
+    )
+    target_compile_features(qtav_render_metal_test PRIVATE cxx_std_17)
+    target_compile_options(qtav_render_metal_test PRIVATE -fobjc-arc)
+endif()
+
+if(TARGET qtav_interop_cvmetal)
+    enable_language(OBJCXX)
+    find_library(QTAV_TEST_CVMETAL_COREVIDEO_FRAMEWORK CoreVideo)
+    add_executable(
+        qtav_interop_cvmetal_test
+        cvmetal_frame_interop_test.mm
+    )
+    target_link_libraries(
+        qtav_interop_cvmetal_test
+        PRIVATE
+            QtAV::InteropCVMetal
+            "${QTAV_TEST_CVMETAL_COREVIDEO_FRAMEWORK}"
+    )
+    target_compile_features(
+        qtav_interop_cvmetal_test
+        PRIVATE cxx_std_17
+    )
+    target_compile_options(
+        qtav_interop_cvmetal_test
+        PRIVATE -fobjc-arc
+    )
+endif()
+
+if(TARGET qtav_hw_videotoolbox)
+    add_executable(
+        qtav_hw_videotoolbox_test
+        videotoolbox_hardware_decoder_test.cpp
+    )
+    target_link_libraries(
+        qtav_hw_videotoolbox_test
+        PRIVATE QtAV::HWVideoToolbox
+    )
+    target_compile_features(
+        qtav_hw_videotoolbox_test
+        PRIVATE cxx_std_17
+    )
+endif()
+
+if(TARGET qtav_audio_resample)
+    add_executable(
+        qtav_audio_resample_test
+        audio_resample_player_test.cpp
+    )
+    target_link_libraries(
+        qtav_audio_resample_test
+        PRIVATE QtAV::AudioResample
+    )
+    target_compile_features(qtav_audio_resample_test PRIVATE cxx_std_17)
+
+    add_executable(
+        qtav_simulated_audio_sink_player_test
+        simulated_audio_sink_player_test.cpp
+    )
+    target_link_libraries(
+        qtav_simulated_audio_sink_player_test
+        PRIVATE
+            qtav_test_simulated_audio_sink
+            QtAV::AudioResample
+    )
+    target_compile_features(
+        qtav_simulated_audio_sink_player_test
+        PRIVATE cxx_std_17
+    )
+
+    if(TARGET qtav_audio_file)
+        add_executable(
+            qtav_audio_file_player_test
+            wav_audio_sink_player_test.cpp
+        )
+        target_link_libraries(
+            qtav_audio_file_player_test
+            PRIVATE
+                QtAV::AudioFile
+                QtAV::AudioResample
+        )
+        target_compile_features(
+            qtav_audio_file_player_test
+            PRIVATE cxx_std_17
+        )
+    endif()
+endif()
+
+find_program(FFMPEG_EXECUTABLE ffmpeg)
+if(FFMPEG_EXECUTABLE)
+    set(QTAV_CORE_TEST_MEDIA "${CMAKE_CURRENT_BINARY_DIR}/qtav-core-test.mp4")
+    add_test(
+        NAME qtav_core_generate_media
+        COMMAND
+            "${FFMPEG_EXECUTABLE}"
+            -hide_banner
+            -loglevel error
+            -y
+            -f lavfi
+            -i testsrc2=size=160x90:rate=12
+            -f lavfi
+            -i sine=frequency=440:sample_rate=48000
+            -t 1
+            -c:v mpeg4
+            -c:a aac
+            "${QTAV_CORE_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_generate_media
+        PROPERTIES FIXTURES_SETUP qtav_core_media
+    )
+    add_test(
+        NAME qtav_core_playback
+        COMMAND qtav_core_playback_test "${QTAV_CORE_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_playback
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_media
+            TIMEOUT 15
+    )
+    add_test(
+        NAME qtav_core_control
+        COMMAND qtav_core_control_test "${QTAV_CORE_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_control
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_media
+            TIMEOUT 15
+    )
+    add_test(
+        NAME qtav_core_audio_sink_player
+        COMMAND qtav_core_audio_sink_player_test "${QTAV_CORE_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_audio_sink_player
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_media
+            TIMEOUT 15
+    )
+
+    if(TARGET qtav_simulated_audio_sink_player_test)
+        add_test(
+            NAME qtav_simulated_audio_sink_player
+            COMMAND
+                qtav_simulated_audio_sink_player_test
+                "${QTAV_CORE_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_simulated_audio_sink_player
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_core_media
+                TIMEOUT 15
+        )
+    endif()
+
+    if(TARGET qtav_render_cpu_test)
+        set(
+            QTAV_RENDER_CPU_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-render-cpu-test.nut"
+        )
+        add_test(
+            NAME qtav_render_cpu_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "nullsrc=size=4x2:rate=1,geq=r=17:g=34:b=51,format=rgb24"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt rgb24
+                "${QTAV_RENDER_CPU_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_cpu_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_render_cpu_media
+        )
+        add_test(
+            NAME qtav_render_cpu_conversion
+            COMMAND qtav_render_cpu_test "${QTAV_RENDER_CPU_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_cpu_conversion
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_render_cpu_media
+                TIMEOUT 15
+        )
+    endif()
+
+    if(TARGET qtav_render_metal_test)
+        set(
+            QTAV_RENDER_METAL_RGB_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-metal-rgb.nut"
+        )
+        set(
+            QTAV_RENDER_METAL_YUV_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-metal-yuv420p.nut"
+        )
+        set(
+            QTAV_RENDER_METAL_NV12_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-metal-nv12.nut"
+        )
+        add_test(
+            NAME qtav_render_metal_generate_rgb
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=rgb24"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt rgb24
+                "${QTAV_RENDER_METAL_RGB_MEDIA}"
+        )
+        add_test(
+            NAME qtav_render_metal_generate_yuv
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=yuv420p"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt yuv420p
+                "${QTAV_RENDER_METAL_YUV_MEDIA}"
+        )
+        add_test(
+            NAME qtav_render_metal_generate_nv12
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=nv12"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt nv12
+                "${QTAV_RENDER_METAL_NV12_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_metal_generate_rgb
+            qtav_render_metal_generate_yuv
+            qtav_render_metal_generate_nv12
+            PROPERTIES FIXTURES_SETUP qtav_render_metal_media
+        )
+        add_test(
+            NAME qtav_render_metal_software_frames
+            COMMAND
+                qtav_render_metal_test
+                "${QTAV_RENDER_METAL_RGB_MEDIA}"
+                "${QTAV_RENDER_METAL_YUV_MEDIA}"
+                "${QTAV_RENDER_METAL_NV12_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_metal_software_frames
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_render_metal_media
+                TIMEOUT 20
+        )
+    endif()
+
+    if(TARGET qtav_hw_videotoolbox_test)
+        set(
+            QTAV_HW_VIDEOTOOLBOX_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-videotoolbox-test.mp4"
+        )
+        add_test(
+            NAME qtav_hw_videotoolbox_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i testsrc2=size=160x90:rate=12
+                -t 2
+                -c:v libx264
+                -pix_fmt yuv420p
+                -g 12
+                "${QTAV_HW_VIDEOTOOLBOX_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_hw_videotoolbox_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_hw_videotoolbox_media
+        )
+        add_test(
+            NAME qtav_hw_videotoolbox_lifecycle
+            COMMAND
+                qtav_hw_videotoolbox_test
+                "${QTAV_HW_VIDEOTOOLBOX_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_hw_videotoolbox_lifecycle
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_hw_videotoolbox_media
+                TIMEOUT 15
+        )
+    endif()
+
+    if(TARGET qtav_interop_cvmetal_test)
+        set(
+            QTAV_INTEROP_CVMETAL_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-cvmetal-test.mp4"
+        )
+        add_test(
+            NAME qtav_interop_cvmetal_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=64x32:r=1:d=1,drawbox=x=32:y=0:w=32:h=32:color=blue:t=fill,format=yuv420p"
+                -frames:v 1
+                -c:v libx264
+                -pix_fmt yuv420p
+                "${QTAV_INTEROP_CVMETAL_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_interop_cvmetal_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_interop_cvmetal_media
+        )
+        add_test(
+            NAME qtav_interop_cvmetal_zero_copy
+            COMMAND
+                qtav_interop_cvmetal_test
+                "${QTAV_INTEROP_CVMETAL_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_interop_cvmetal_zero_copy
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_interop_cvmetal_media
+                TIMEOUT 20
+        )
+    endif()
+
+    if(TARGET qtav_audio_resample_test)
+        set(
+            QTAV_AUDIO_RESAMPLE_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-audio-resample-test.wav"
+        )
+        add_test(
+            NAME qtav_audio_resample_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i "aevalsrc=0.5:sample_rate=8000:duration=1"
+                -c:a pcm_s16le
+                "${QTAV_AUDIO_RESAMPLE_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_audio_resample_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_audio_resample_media
+        )
+        add_test(
+            NAME qtav_audio_resample_player
+            COMMAND
+                qtav_audio_resample_test
+                "${QTAV_AUDIO_RESAMPLE_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_audio_resample_player
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_audio_resample_media
+                TIMEOUT 15
+        )
+
+        if(TARGET qtav_audio_file_player_test)
+            add_test(
+                NAME qtav_audio_file_player
+                COMMAND
+                    qtav_audio_file_player_test
+                    "${QTAV_AUDIO_RESAMPLE_TEST_MEDIA}"
+                    "${CMAKE_CURRENT_BINARY_DIR}/qtav-audio-file-player.wav"
+            )
+            set_tests_properties(
+                qtav_audio_file_player
+                PROPERTIES
+                    FIXTURES_REQUIRED qtav_audio_resample_media
+                    TIMEOUT 15
+            )
+        endif()
+    endif()
+endif()
