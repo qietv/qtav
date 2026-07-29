@@ -148,6 +148,7 @@ Implemented under `modern/`:
   `setVideoRenderer()`, and `renderVideo()`;
 - libswscale CPU rendering into application-owned image buffers;
 - D3D11 software-frame rendering into borrowed Windows render-target views;
+- WASAPI shared-mode device output with playback clock and latency reporting;
 - Metal software-frame rendering into borrowed textures or drawables;
 - CoreAudio device output with playback clock and latency reporting;
 - VideoToolbox hardware decoding into retained `CVPixelBuffer` frames;
@@ -162,7 +163,7 @@ Implemented under `modern/`:
 
 Known intentional limitations:
 
-- no native audio-device sink outside macOS yet;
+- no native audio-device sink outside macOS and Windows yet;
 - no OpenGL or Vulkan renderer yet;
 - no non-Apple hardware decoder or GPU zero-copy interop yet;
 - no subtitles or post-load track switching;
@@ -231,10 +232,11 @@ Last verified baseline:
   system libraries only; no Qt dependency;
 - MPEG-4/AAC generated-media playback: passed;
 - AC-3, E-AC-3, and TrueHD audio-only decoding: passed.
-- Windows Visual Studio 2026 static/shared Release CTest: 19/19 passed,
-  including WARP D3D11 rendering; all-backends-disabled CTest: 8/8 passed;
-- Windows install plus external `QtAV::RenderD3D11` CMake consumption:
-  passed.
+- Windows Visual Studio 2026 static/shared Release CTest: 21/21 passed,
+  including WARP D3D11 rendering and WASAPI device/Player playback;
+  all-backends-disabled CTest: 8/8 passed;
+- Windows install plus external `QtAV::RenderD3D11` and
+  `QtAV::AudioWASAPI` CMake consumption: passed.
 
 Before finishing any implementation turn:
 

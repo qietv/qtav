@@ -30,6 +30,7 @@ code is used.
 - optional libswresample converter for negotiated interleaved PCM output;
 - optional RIFF/WAVE PCM diagnostic file sink;
 - optional macOS CoreAudio device sink with native playback timing;
+- optional Windows WASAPI shared-mode device sink with native playback timing;
 - optional VideoToolbox hardware decoding with reference-counted
   `CVPixelBuffer` frames and explicit software fallback;
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
@@ -38,7 +39,7 @@ code is used.
 
 The core does not open a platform audio device by default. Applications can
 keep consuming decoded frames through `onAudioFrame()` and can optionally bind
-an `AudioSink`; the macOS CoreAudio implementation and GPU render APIs remain
+an `AudioSink`; the macOS CoreAudio and Windows WASAPI implementations remain
 separate backend targets so the core acquires no Qt or platform dependency.
 
 Current backend integration boundary:
@@ -56,6 +57,9 @@ Current backend integration boundary:
 - `QtAV::AudioCoreAudio` negotiates Float32 mono/stereo PCM against the macOS
   output device, owns its AudioQueue buffers, and supplies a device-backed
   playback clock and latency;
+- `QtAV::AudioWASAPI` negotiates shared-mode Float32 mono/stereo PCM against a
+  Windows render endpoint, owns an event-driven queue on a dedicated COM
+  thread, and supplies an `IAudioClock`-backed playback clock and latency;
 - `HardwareDecodeConfig` selects an optional hardware device for video decode;
   `QtAV::HWVideoToolbox` supplies the Apple configuration helper and produces
   `HardwareFrame` values backed by retained `CVPixelBuffer` storage;
@@ -73,8 +77,8 @@ Current backend integration boundary:
 - `QtAV::InteropCVMetal` imports supported VideoToolbox `CVPixelBuffer` planes
   as retained Metal textures without mapping or copying through CPU memory,
   preserving whether the native pixel buffer is limited or full range;
-- no Windows audio-device or hardware-decoder backend, and no Linux or Android
-  native backend, has been implemented yet.
+- no Windows hardware-decoder backend, and no Linux or Android native backend,
+  has been implemented yet.
 
 ## Build
 
@@ -111,6 +115,7 @@ clear error. Current switches are:
 `QTAV_RENDER_METAL=AUTO` builds the native renderer on Apple hosts with Metal,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
+`QTAV_AUDIO_WASAPI=AUTO` builds the shared-mode device sink on Windows,
 `QTAV_AUDIO_COREAUDIO=AUTO` builds the macOS device sink when AudioToolbox
 and CoreAudio are available, and `QTAV_HW_VIDEOTOOLBOX=AUTO` builds the Apple
 hardware-decode selection and native-frame access target when VideoToolbox and
@@ -131,8 +136,9 @@ under `build/modern/bin/<Config>`, for example
 `build/modern/bin/Release/qtav_core_console.exe`.
 
 On macOS, when `QtAV::AudioCoreAudio` and `QtAV::AudioResample` are available,
-the console example sends decoded audio to the default output device. Other
-hosts retain callback-only audio inspection.
+the console example sends decoded audio to the default output device. On
+Windows it does the same through `QtAV::AudioWASAPI`. Other hosts retain
+callback-only audio inspection.
 
 ## API shape
 
@@ -206,6 +212,33 @@ decoded planar PCM, sample rate, or channel layout as needed. AudioQueue owns
 the native playback schedule while queued data is copied into backend-owned
 buffers. `clock()` maps AudioQueue sample time to the media timeline and
 reports queued plus device latency.
+
+### WASAPI device sink
+
+Link `QtAV::AudioWASAPI` and `QtAV::AudioResample`, then bind the Windows
+shared-mode device sink:
+
+```cpp
+#include <qtav/swresample_audio_converter.h>
+#include <qtav/wasapi_audio_sink.h>
+
+player
+    .setAudioFrameConverter(
+        std::make_shared<qtav::SwresampleAudioConverter>())
+    .setAudioSink(
+        std::make_shared<qtav::WasapiAudioSink>());
+```
+
+The default configuration resolves the current default multimedia render
+endpoint whenever the sink opens. `WasapiEndpointId` can select an explicit
+endpoint without passing an apartment-bound COM interface across threads.
+The initial implementation negotiates one or two interleaved Float32 channels
+at the endpoint mix rate and relies on `SwresampleAudioConverter` for decoded
+format conversion. A dedicated multimedia-class thread owns COM, the
+event-driven `IAudioClient`, copied PCM queue, pause/flush/drain lifecycle, and
+the `IAudioClock` media-timeline anchor. A device-clock underrun temporarily
+returns an invalid clock so `Player` can use its monotonic fallback until the
+next buffer establishes a new anchor.
 
 ### VideoToolbox hardware decode
 
@@ -458,6 +491,16 @@ copies accepted buffers into a bounded AudioQueue pool, implements
 pause/flush/drain, and reports a media-timeline device clock plus hardware and
 queued latency.
 
+`QtAV::AudioWASAPI` implements `WasapiAudioSink` on Windows. Its
+backend-specific public header uses an owning `WasapiEndpointId` value rather
+than exposing `IMMDevice` through the generic contract. The sink follows the
+default multimedia render endpoint unless an explicit endpoint is selected,
+negotiates shared-mode interleaved Float32 PCM at the engine mix rate, copies
+accepted buffers into a bounded backend queue, and implements event-driven
+pause/flush/drain. COM and native WASAPI interfaces stay on a dedicated
+multimedia-class thread; callers can query a cached media-timeline
+`IAudioClock` position and combined engine/stream latency from any thread.
+
 `QtAV::RenderD3D11` implements the Windows software-frame renderer. Its
 backend-specific public header exposes strong non-owning wrappers for
 `ID3D11Device` and `ID3D11DeviceContext`; no Windows SDK type reaches the core
@@ -531,6 +574,7 @@ Player facade
        ├─ libswresample interleaved PCM converter
        ├─ RIFF/WAVE diagnostic PCM file sink
        ├─ CoreAudio device sink with AudioQueue clocking
+       ├─ WASAPI shared-mode device sink with IAudioClock clocking
        ├─ Metal software/hardware-frame renderer with borrowed native resources
        ├─ VideoToolbox decoder producing retained CVPixelBuffer frames
        ├─ CVMetalTextureCache zero-copy frame interop

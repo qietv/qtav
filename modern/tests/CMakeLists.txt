@@ -118,6 +118,29 @@ if(TARGET qtav_audio_coreaudio)
     )
 endif()
 
+if(TARGET qtav_audio_wasapi)
+    add_executable(
+        qtav_audio_wasapi_test
+        wasapi_audio_sink_test.cpp
+    )
+    target_link_libraries(
+        qtav_audio_wasapi_test
+        PRIVATE QtAV::AudioWASAPI
+    )
+    target_compile_features(
+        qtav_audio_wasapi_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_audio_wasapi
+        COMMAND qtav_audio_wasapi_test
+    )
+    set_tests_properties(
+        qtav_audio_wasapi
+        PROPERTIES TIMEOUT 15
+    )
+endif()
+
 if(TARGET qtav_render_cpu)
     add_executable(qtav_render_cpu_test cpu_video_renderer_test.cpp)
     target_link_libraries(
@@ -296,6 +319,21 @@ if(FFMPEG_EXECUTABLE)
             FIXTURES_REQUIRED qtav_core_media
             TIMEOUT 15
     )
+
+    if(TARGET qtav_audio_wasapi
+       AND TARGET qtav_audio_resample
+       AND TARGET qtav_core_console)
+        add_test(
+            NAME qtav_audio_wasapi_player
+            COMMAND qtav_core_console "${QTAV_CORE_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_audio_wasapi_player
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_core_media
+                TIMEOUT 15
+        )
+    endif()
 
     if(TARGET qtav_simulated_audio_sink_player_test)
         add_test(

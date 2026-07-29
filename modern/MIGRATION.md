@@ -48,6 +48,8 @@ mdk-sdk:
 - optional `WavAudioSink` diagnostic output through `QtAV::AudioFile`;
 - optional macOS `CoreAudioAudioSink` device output through
   `QtAV::AudioCoreAudio`;
+- optional Windows `WasapiAudioSink` shared-mode device output through
+  `QtAV::AudioWASAPI`;
 - optional VideoToolbox hardware decode through `QtAV::HWVideoToolbox`, with
   reference-counted `CVPixelBuffer` frames and explicit software fallback;
 - optional `QtAV::InteropCVMetal` import of limited/full-range VideoToolbox
@@ -106,14 +108,22 @@ normally use the injected `SwresampleAudioConverter`. The sink copies PCM into
 its native AudioQueue pool, implements pause/flush/natural-end drain, and
 provides the device-master clock and latency consumed by `Player`.
 
+On Windows, `WasapiAudioSink` follows the default multimedia render endpoint
+or accepts an explicit owning `WasapiEndpointId`. It negotiates interleaved
+Float32 mono/stereo PCM at the endpoint mix rate, so decoded formats normally
+use `SwresampleAudioConverter`. A dedicated multimedia-class thread owns COM,
+the event-driven WASAPI client, and copied PCM queue. The sink implements
+pause/flush/natural-end drain and exposes a cached `IAudioClock`-based
+device-master position plus engine and stream latency.
+
 On Windows, `D3D11VideoRenderer` borrows an `ID3D11Device`, its immediate
 context, and the render-target view returned by an application callback. It
 uploads software RGB, YUV, NV12/NV21, P010, and gray frames, performs SDR YUV
 conversion in a pixel shader, and supports resize, custom viewports, aspect
 handling, right-angle rotation, and render-target recreation. The backend
 header contains the Windows SDK types and is never included by a core public
-header. WASAPI, D3D11VA decode, zero-copy decoder-texture interop, and HDR
-output remain separate follow-up work.
+header. D3D11VA decode, zero-copy decoder-texture interop, and HDR output
+remain separate follow-up work.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -122,8 +132,7 @@ or pace playback. Decoded planar audio therefore normally uses
 
 ## Deliberately deferred
 
-- remaining platform audio device implementations (WASAPI,
-  ALSA/PulseAudio, AAudio);
+- remaining platform audio device implementations (ALSA/PulseAudio, AAudio);
 - OpenGL and Vulkan renderer implementations;
 - remaining hardware decoders and non-Apple GPU zero-copy interop;
 - subtitle decoding and libass rendering;
@@ -179,8 +188,10 @@ are separate backend/product work.
 3. Complete the Apple production path by adding CoreAudio, then VideoToolbox
    and CVPixelBuffer/Metal interop.
 4. Add hardware decode and zero-copy frame handles for that path.
-5. Add subtitle and multi-track switching.
-6. Add live-stream buffering and recovery policies.
+5. Complete the Windows D3D11VA device/frame/interop design checkpoint, then
+   add hardware decode and zero-copy texture rendering.
+6. Add subtitle and multi-track switching.
+7. Add live-stream buffering and recovery policies.
 
 Each backend should remain optional so the core library never acquires a GUI
 toolkit dependency.

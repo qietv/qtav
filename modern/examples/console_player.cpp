@@ -5,6 +5,9 @@
 #if defined(QTAV_CORE_CONSOLE_HAS_COREAUDIO)
 #  include <qtav/coreaudio_audio_sink.h>
 #  include <qtav/swresample_audio_converter.h>
+#elif defined(QTAV_CORE_CONSOLE_HAS_WASAPI)
+#  include <qtav/swresample_audio_converter.h>
+#  include <qtav/wasapi_audio_sink.h>
 #endif
 
 #include <atomic>
@@ -63,6 +66,12 @@ int main(int argc, char** argv)
             std::make_shared<qtav::SwresampleAudioConverter>())
         .setAudioSink(
             std::make_shared<qtav::CoreAudioAudioSink>());
+#elif defined(QTAV_CORE_CONSOLE_HAS_WASAPI)
+    player
+        .setAudioFrameConverter(
+            std::make_shared<qtav::SwresampleAudioConverter>())
+        .setAudioSink(
+            std::make_shared<qtav::WasapiAudioSink>());
 #endif
 
     std::atomic<std::uint64_t> decodedVideoFrames { 0 };

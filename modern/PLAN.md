@@ -27,10 +27,12 @@ Continuation checkpoint:
   `CVPixelBuffer` hardware frames with explicit software fallback, then imports
   limited/full-range NV12/P010 pixel-buffer planes into Metal without a CPU
   copy and applies structured SDR/HDR color metadata, plus the Windows D3D11
-  software-frame renderer using borrowed native resources;
+  software-frame renderer using borrowed native resources and the Windows
+  WASAPI shared-mode device sink with event-driven playback and native
+  clocking;
 - the Apple reference path, including HDR and color-space metadata plumbing,
-  and the Windows D3D11 software-frame path are complete; the active next task
-  is the Windows WASAPI audio sink;
+  and the Windows D3D11 software-frame and WASAPI audio paths are complete;
+  the active next task is the D3D11VA device/frame/interop design checkpoint;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -51,6 +53,7 @@ Current public entry points:
 - `modern/core/include/qtav/hardware_frame.h`
 - `modern/backends/audio/file/include/qtav/wav_audio_sink.h`
 - `modern/backends/audio/coreaudio/include/qtav/coreaudio_audio_sink.h`
+- `modern/backends/audio/wasapi/include/qtav/wasapi_audio_sink.h`
 - `modern/backends/render/metal/include/qtav/metal_video_renderer.h`
 - `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
@@ -68,6 +71,7 @@ Current implementation:
 - `modern/backends/audio/file/include/qtav/wav_audio_sink.h`
 - `modern/backends/audio/file/src/wav_audio_sink.cpp`
 - `modern/backends/audio/coreaudio/src/coreaudio_audio_sink.cpp`
+- `modern/backends/audio/wasapi/src/wasapi_audio_sink.cpp`
 - `modern/backends/render/metal/src/metal_video_renderer.mm`
 - `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
@@ -82,6 +86,7 @@ Current implementation:
 - `modern/tests/wav_audio_sink_test.cpp`
 - `modern/tests/wav_audio_sink_player_test.cpp`
 - `modern/tests/coreaudio_audio_sink_test.cpp`
+- `modern/tests/wasapi_audio_sink_test.cpp`
 - `modern/tests/metal_video_renderer_test.mm`
 - `modern/tests/d3d11_video_renderer_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
@@ -104,13 +109,14 @@ Current verification:
 - core public-header scans contain no Qt, FFmpeg, or platform SDK types;
 - MPEG-4/AAC, AC-3, E-AC-3, and TrueHD decode tests pass.
 - on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, static and shared
-  Release builds pass 19/19 CTest tests, including deterministic WARP D3D11
-  rendering;
+  Release builds pass 21/21 CTest tests, including deterministic WARP D3D11
+  rendering, WASAPI device lifecycle, and Player-driven WASAPI playback;
 - Windows multi-config FFmpeg imports select matching Debug/Release libraries,
   and project DLLs, tests, and examples share a runnable `bin/<Config>`
   directory;
-- installation plus external CMake consumption of `QtAV::RenderD3D11`
-  together with the portable core, render, and audio targets passes.
+- installation plus external CMake consumption of `QtAV::RenderD3D11` and
+  `QtAV::AudioWASAPI` together with the portable core, render, and audio
+  targets passes.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -419,7 +425,7 @@ Next active implementation order:
 2. [x] Add `qtav_render_d3d11` and render software frames first.
 3. [x] Add resize, viewport, aspect-ratio, rotation, surface recreation, and
    device-loss tests.
-4. [ ] Add WASAPI.
+4. [x] Add WASAPI.
 5. [ ] Complete the D3D11VA device, frame-lifetime, and interop design
    checkpoint below.
 6. [ ] Add D3D11VA and D3D11 zero-copy interop.
@@ -444,6 +450,31 @@ Completed D3D11 software-frame checkpoint:
 - Windows multi-config discovery now maps vcpkg FFmpeg Debug and Release
   libraries correctly, and a common runtime directory makes shared-library
   tests and examples directly runnable.
+
+Completed WASAPI checkpoint:
+
+- `QtAV::AudioWASAPI` is Windows-only, optional under
+  `QTAV_AUDIO_WASAPI=AUTO/ON/OFF`, installable as an exported package target,
+  and keeps Windows SDK, COM, and WASAPI types out of core public headers;
+- `WasapiEndpointId` owns an optional endpoint identifier so the sink can
+  select a device without transferring an apartment-bound `IMMDevice`; an
+  empty identifier follows the current default multimedia render endpoint;
+- the sink negotiates shared-mode interleaved Float32 mono/stereo PCM at the
+  endpoint mix rate and uses the injected `QtAV::AudioResample` backend for
+  decoded planar, sample-rate, or channel-layout conversion;
+- a dedicated MMCSS thread owns COM and the event-driven audio client while a
+  bounded backend queue copies accepted PCM independently of decoded-frame
+  lifetime;
+- pause/resume, seek flush, natural-end drain, endpoint invalidation, bounded
+  backpressure, underrun recovery, and close are synchronized without calling
+  native interfaces from `Player::position()`;
+- cached `IAudioClock` position is anchored to media timestamps, reported
+  latency combines engine padding and stream latency, and an underrun
+  invalidates the device clock until the next accepted buffer re-anchors it;
+- device integration tests cover capabilities, invalid input, shared-mode
+  format negotiation, pause/resume, write, clock/latency, drain, flush,
+  re-anchor, and close; the Windows console example exercises
+  `Player`/libswresample/WASAPI playback with generated MPEG-4/AAC media.
 
 D3D11VA and zero-copy design checkpoint:
 
@@ -534,8 +565,8 @@ Acceptance:
 
 ### Audio and hardware decode
 
-- [ ] `qtav_audio_wasapi`.
-- [ ] Shared-mode PCM negotiation and audio clock.
+- [x] `qtav_audio_wasapi`.
+- [x] Shared-mode PCM negotiation and audio clock.
 - [ ] Complete the D3D11VA device/frame/interop design checkpoint.
 - [ ] `qtav_hw_d3d11va`.
 - [ ] `qtav_interop_d3d11` for zero-copy decoder textures.
