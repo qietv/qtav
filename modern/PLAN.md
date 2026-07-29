@@ -420,7 +420,9 @@ Next active implementation order:
 3. [x] Add resize, viewport, aspect-ratio, rotation, surface recreation, and
    device-loss tests.
 4. [ ] Add WASAPI.
-5. [ ] Add D3D11VA and D3D11 zero-copy interop.
+5. [ ] Complete the D3D11VA device, frame-lifetime, and interop design
+   checkpoint below.
+6. [ ] Add D3D11VA and D3D11 zero-copy interop.
 
 Completed D3D11 software-frame checkpoint:
 
@@ -442,6 +444,34 @@ Completed D3D11 software-frame checkpoint:
 - Windows multi-config discovery now maps vcpkg FFmpeg Debug and Release
   libraries correctly, and a common runtime directory makes shared-library
   tests and examples directly runnable.
+
+D3D11VA and zero-copy design checkpoint:
+
+Complete this checkpoint after WASAPI and before implementing
+`qtav_hw_d3d11va` or `qtav_interop_d3d11`.
+
+1. [ ] Decide how the hardware decoder receives the application-selected
+   D3D11 device. Prefer decoding on the same borrowed device used by the
+   renderer so the normal path does not require a cross-device copy.
+2. [ ] Define backend-specific retained-frame access to both the
+   `ID3D11Texture2D` and its array slice while keeping D3D11 and FFmpeg types
+   out of core public headers.
+3. [ ] Define device-context locking, playback-worker access, render-thread
+   access, and frame-pool lifetime using the FFmpeg 8 D3D11VA device and
+   frames-context contracts.
+4. [ ] Keep hardware decode, D3D11 texture interop, D3D11 Video Processor
+   operations, and final rendering as separate responsibilities and targets
+   where the existing module boundaries require them.
+5. [ ] Specify explicit software-map/copy fallback, foreign-device rejection,
+   seek and flush behavior, device removal, surface recreation, and retained
+   frame lifetime after player shutdown.
+6. [ ] Define deterministic WARP coverage for contracts and error paths plus
+   real-GPU integration coverage for hardware decode and zero-copy texture
+   rendering.
+7. [ ] Treat Aleksoid1978/VideoRenderer as an isolated GPL-3.0 behavioral
+   reference only. Do not vendor it, link it, or copy its C++, shaders, data
+   tables, or vendor-specific extensions; implement against FFmpeg and
+   Microsoft public APIs.
 
 Default platform order after the contracts are stable:
 
@@ -506,6 +536,7 @@ Acceptance:
 
 - [ ] `qtav_audio_wasapi`.
 - [ ] Shared-mode PCM negotiation and audio clock.
+- [ ] Complete the D3D11VA device/frame/interop design checkpoint.
 - [ ] `qtav_hw_d3d11va`.
 - [ ] `qtav_interop_d3d11` for zero-copy decoder textures.
 
