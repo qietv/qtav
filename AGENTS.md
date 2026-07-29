@@ -45,6 +45,14 @@ completed.
 - Keep Objective-C++ (`.mm`) inside Apple backends.
 - Keep Windows SDK, COM, WRL, D3D, DXGI, and WASAPI headers inside Windows
   backends.
+- Before starting implementation that depends on Windows platform features,
+  including the Windows SDK, COM, D3D, DXGI, WASAPI, or D3D11VA, determine
+  whether the current development host is Windows.
+- If the current development host is not Windows, warn the user and refuse to
+  proceed with the implementation or its next development step. Continue only
+  when the user explicitly states that cross-platform development for that
+  task is intended; when continuing, clearly identify any Windows-native build
+  or runtime validation that cannot be performed on the current host.
 - Prefer explicit, optional backend linkage first. Do not introduce runtime
   plugin loading until the backend API is stable.
 - If dynamic plugins are introduced later, use a versioned C ABI at the shared
