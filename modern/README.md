@@ -23,6 +23,8 @@ code is used.
 - compile-time `VideoRenderAPI`, `AudioSink`, and hardware-frame interop
   contracts;
 - optional libswscale CPU renderer for application-owned image buffers;
+- optional Windows D3D11 renderer for borrowed devices, immediate contexts,
+  and current render-target views;
 - optional Metal renderer for borrowed Apple devices, command queues, and
   current render targets;
 - optional libswresample converter for negotiated interleaved PCM output;
@@ -59,6 +61,10 @@ Current backend integration boundary:
   `HardwareFrame` values backed by retained `CVPixelBuffer` storage;
 - `QtAV::RenderCPU` converts and scales decoded software frames into packed
   RGB/BGR/RGBA/BGRA/ARGB or Gray8 buffers;
+- `QtAV::RenderD3D11` uploads software YUV420/422/444, NV12/NV21, P010,
+  RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders through an
+  application-owned D3D11 device, immediate context, and current render-target
+  view;
 - `QtAV::RenderMetal` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders into the application's
   current Metal texture or drawable, accepts an optional hardware-frame
@@ -67,8 +73,8 @@ Current backend integration boundary:
 - `QtAV::InteropCVMetal` imports supported VideoToolbox `CVPixelBuffer` planes
   as retained Metal textures without mapping or copying through CPU memory,
   preserving whether the native pixel buffer is limited or full range;
-- no Windows, Linux, or Android audio-device or hardware-decoder backend has
-  been implemented yet.
+- no Windows audio-device or hardware-decoder backend, and no Linux or Android
+  native backend, has been implemented yet.
 
 ## Build
 
@@ -101,6 +107,7 @@ clear error. Current switches are:
   `QTAV_INTEROP_VAAPI`.
 
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
+`QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
 `QTAV_RENDER_METAL=AUTO` builds the native renderer on Apple hosts with Metal,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
@@ -118,6 +125,10 @@ Run the headless example:
 ```sh
 build/modern/examples/qtav_core_console /path/to/media.mp4
 ```
+
+Visual Studio multi-config builds place executables and project DLLs together
+under `build/modern/bin/<Config>`, for example
+`build/modern/bin/Release/qtav_core_console.exe`.
 
 On macOS, when `QtAV::AudioCoreAudio` and `QtAV::AudioResample` are available,
 the console example sends decoded audio to the default output device. Other
@@ -308,6 +319,43 @@ formats. `setTarget()` and `render()` are synchronized internally, but the
 application remains responsible for coordinating its own reads of the pixel
 memory with rendering.
 
+### D3D11 renderer
+
+On Windows, link `QtAV::RenderD3D11`, include
+`<qtav/d3d11_video_renderer.h>`, and pass a borrowed device, its immediate
+context, and a callback that returns the current application-owned render
+target:
+
+```cpp
+auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
+    qtav::BorrowedD3D11Device(device),
+    qtav::BorrowedD3D11DeviceContext(immediateContext),
+    [&] {
+        return qtav::D3D11RenderTarget { currentRenderTargetView };
+    });
+
+qtav::VideoRenderConfig config;
+config.surfaceSize = { width, height };
+renderer->open(config);
+player.setVideoRenderAPI(renderer);
+```
+
+The device, immediate context, callback, and returned
+`ID3D11RenderTargetView` remain application-owned. The callback runs
+synchronously inside `render()` and is queried for every frame, so swap-chain
+resize or other surface recreation can replace the view before calling
+`configure()` with the new size. The renderer serializes its own use of the
+borrowed immediate context, but it does not preserve D3D11 pipeline state;
+applications sharing that context must restore their state after
+`renderVideo()`.
+
+The software path uploads YUV420P, YUV422P, YUV444P, NV12, NV21, P010,
+RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8 frames. It renders to single-sample
+BGRA8 or RGBA8 UNORM 2D targets, applies limited/full-range BT.601, BT.709, or
+BT.2020 YUV conversion, and supports custom viewports, Fit/Fill/Stretch, all
+right-angle rotations, resize, surface recreation, and surface/device-loss
+events. HDR transfer and D3D11VA zero-copy interop remain later Windows work.
+
 ### Metal renderer
 
 `QtAV::RenderMetal` is an Objective-C++ API. Include
@@ -410,6 +458,13 @@ copies accepted buffers into a bounded AudioQueue pool, implements
 pause/flush/drain, and reports a media-timeline device clock plus hardware and
 queued latency.
 
+`QtAV::RenderD3D11` implements the Windows software-frame renderer. Its
+backend-specific public header exposes strong non-owning wrappers for
+`ID3D11Device` and `ID3D11DeviceContext`; no Windows SDK type reaches the core
+headers. It compiles shaders for the borrowed device, uploads software-frame
+planes into per-frame shader resources, and obtains the current borrowed
+render target immediately before drawing.
+
 `AudioSinkClock` fields are measured in milliseconds on the media timeline.
 `positionMilliseconds` is the sample position currently presented by the
 device, while `latencyMilliseconds` is informational and must not already be
@@ -455,6 +510,10 @@ and verify channel data, drain timing, sample counts, and seek reset behavior.
 Audio-file tests verify RIFF/WAVE headers and little-endian samples, then run
 the player and converter to produce an exact 64,000-byte 16 kHz stereo S16
 payload from deterministic 8 kHz mono input.
+Windows D3D11 tests use the WARP device for deterministic offscreen rendering
+and cover RGB, YUV420P, and NV12 upload, viewport, aspect ratio, rotation,
+resize, target recreation, foreign-device rejection, and missing-surface
+events.
 
 ## Architecture
 
@@ -468,6 +527,7 @@ Player facade
   │    └─ keyed VideoRenderAPI instances on native render threads
   └─ optional backend contracts
        ├─ libswscale CPU image-buffer renderer
+       ├─ D3D11 software-frame renderer with borrowed Windows resources
        ├─ libswresample interleaved PCM converter
        ├─ RIFF/WAVE diagnostic PCM file sink
        ├─ CoreAudio device sink with AudioQueue clocking

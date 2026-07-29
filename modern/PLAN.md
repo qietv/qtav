@@ -26,10 +26,11 @@ Continuation checkpoint:
   and an optional VideoToolbox decode path that produces reference-counted
   `CVPixelBuffer` hardware frames with explicit software fallback, then imports
   limited/full-range NV12/P010 pixel-buffer planes into Metal without a CPU
-  copy and applies structured SDR/HDR color metadata;
+  copy and applies structured SDR/HDR color metadata, plus the Windows D3D11
+  software-frame renderer using borrowed native resources;
 - the Apple reference path, including HDR and color-space metadata plumbing,
-  is complete; the active next task is the Windows D3D11 software-frame
-  renderer on a Windows host;
+  and the Windows D3D11 software-frame path are complete; the active next task
+  is the Windows WASAPI audio sink;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -51,6 +52,7 @@ Current public entry points:
 - `modern/backends/audio/file/include/qtav/wav_audio_sink.h`
 - `modern/backends/audio/coreaudio/include/qtav/coreaudio_audio_sink.h`
 - `modern/backends/render/metal/include/qtav/metal_video_renderer.h`
+- `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
 
@@ -67,6 +69,7 @@ Current implementation:
 - `modern/backends/audio/file/src/wav_audio_sink.cpp`
 - `modern/backends/audio/coreaudio/src/coreaudio_audio_sink.cpp`
 - `modern/backends/render/metal/src/metal_video_renderer.mm`
+- `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
 - `modern/tests/audio_sink_player_test.cpp`
@@ -80,6 +83,7 @@ Current implementation:
 - `modern/tests/wav_audio_sink_player_test.cpp`
 - `modern/tests/coreaudio_audio_sink_test.cpp`
 - `modern/tests/metal_video_renderer_test.mm`
+- `modern/tests/d3d11_video_renderer_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
 - `modern/tests/cvmetal_frame_interop_test.mm`
 
@@ -99,6 +103,14 @@ Current verification:
 - runtime linkage contains no Qt;
 - core public-header scans contain no Qt, FFmpeg, or platform SDK types;
 - MPEG-4/AAC, AC-3, E-AC-3, and TrueHD decode tests pass.
+- on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, static and shared
+  Release builds pass 19/19 CTest tests, including deterministic WARP D3D11
+  rendering;
+- Windows multi-config FFmpeg imports select matching Debug/Release libraries,
+  and project DLLs, tests, and examples share a runnable `bin/<Config>`
+  directory;
+- installation plus external CMake consumption of `QtAV::RenderD3D11`
+  together with the portable core, render, and audio targets passes.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -154,7 +166,7 @@ renderer or audio device.
 - [x] Add backend capability reporting.
 - [x] Keep concrete platform native-handle types out of generic public
   headers.
-- [ ] Add backend-specific headers for strong native types where useful.
+- [x] Add backend-specific headers for strong native types where useful.
 - [x] Allow multiple renderer instances keyed by application opaque pointer.
 
 ### Audio
@@ -403,11 +415,33 @@ Completed HDR and color-space checkpoint:
 
 Next active implementation order:
 
-1. [ ] Add backend-specific Windows headers for strong borrowed D3D11 types.
-2. [ ] Add `qtav_render_d3d11` and render software frames first.
-3. [ ] Add resize, viewport, aspect-ratio, rotation, surface recreation, and
+1. [x] Add backend-specific Windows headers for strong borrowed D3D11 types.
+2. [x] Add `qtav_render_d3d11` and render software frames first.
+3. [x] Add resize, viewport, aspect-ratio, rotation, surface recreation, and
    device-loss tests.
-4. [ ] Add WASAPI, then D3D11VA and D3D11 zero-copy interop.
+4. [ ] Add WASAPI.
+5. [ ] Add D3D11VA and D3D11 zero-copy interop.
+
+Completed D3D11 software-frame checkpoint:
+
+- `QtAV::RenderD3D11` is Windows-only, optional under
+  `QTAV_RENDER_D3D11=AUTO/ON/OFF`, and keeps D3D11/DXGI/WRL types and headers
+  inside its backend target and backend-specific public header;
+- `BorrowedD3D11Device` and `BorrowedD3D11DeviceContext` make native resource
+  roles explicit, while `D3D11CurrentTargetCallback` obtains the current
+  application-owned render-target view for every frame;
+- the renderer uploads YUV420/422/444, NV12/NV21, P010,
+  RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames into D3D11 shader
+  resources and applies limited/full-range BT.601/BT.709/BT.2020 conversion;
+- Fit, Fill, Stretch, custom viewports, all right-angle rotations, resize,
+  render-target recreation, foreign-device rejection, and missing-surface or
+  device-removal event classification are implemented;
+- deterministic WARP offscreen tests cover RGB24, YUV420P, and NV12 pixel
+  output plus viewport, aspect, rotation, resize, surface recreation, and
+  error handling;
+- Windows multi-config discovery now maps vcpkg FFmpeg Debug and Release
+  libraries correctly, and a common runtime directory makes shared-library
+  tests and examples directly runnable.
 
 Default platform order after the contracts are stable:
 
@@ -463,10 +497,10 @@ Acceptance:
 
 ### D3D11
 
-- [ ] `qtav_render_d3d11`.
-- [ ] Borrowed `ID3D11Device`, context, and render target.
-- [ ] Software-frame texture upload.
-- [ ] Resize, viewport, aspect ratio, rotation, and redraw.
+- [x] `qtav_render_d3d11`.
+- [x] Borrowed `ID3D11Device`, context, and render target.
+- [x] Software-frame texture upload.
+- [x] Resize, viewport, aspect ratio, rotation, and redraw.
 
 ### Audio and hardware decode
 

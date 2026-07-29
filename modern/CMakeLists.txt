@@ -7,6 +7,13 @@ project(
     LANGUAGES CXX
 )
 
+# Keep project DLLs and their consumers together in multi-config Windows
+# builds. This makes the shared-library tests and examples runnable without
+# modifying PATH while leaving the install layout unchanged.
+if(WIN32)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+
 option(QTAV_CORE_BUILD_EXAMPLES "Build QtAVCore examples" ON)
 option(QTAV_CORE_BUILD_TESTS "Build QtAVCore tests" ON)
 option(QTAV_CORE_INSTALL "Generate install rules" ON)

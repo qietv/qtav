@@ -141,6 +141,26 @@ if(TARGET qtav_render_metal)
     target_compile_options(qtav_render_metal_test PRIVATE -fobjc-arc)
 endif()
 
+if(TARGET qtav_render_d3d11)
+    add_executable(
+        qtav_render_d3d11_test
+        d3d11_video_renderer_test.cpp
+    )
+    target_link_libraries(
+        qtav_render_d3d11_test
+        PRIVATE QtAV::RenderD3D11
+    )
+    target_compile_features(
+        qtav_render_d3d11_test
+        PRIVATE cxx_std_17
+    )
+    target_include_directories(
+        qtav_render_d3d11_test
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/backends/render/d3d11/src"
+    )
+endif()
+
 if(TARGET qtav_interop_cvmetal)
     enable_language(OBJCXX)
     find_library(QTAV_TEST_CVMETAL_COREVIDEO_FRAMEWORK CoreVideo)
@@ -401,6 +421,83 @@ if(FFMPEG_EXECUTABLE)
             qtav_render_metal_software_frames
             PROPERTIES
                 FIXTURES_REQUIRED qtav_render_metal_media
+                TIMEOUT 20
+        )
+    endif()
+
+    if(TARGET qtav_render_d3d11_test)
+        set(
+            QTAV_RENDER_D3D11_RGB_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-d3d11-rgb.nut"
+        )
+        set(
+            QTAV_RENDER_D3D11_YUV_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-d3d11-yuv420p.nut"
+        )
+        set(
+            QTAV_RENDER_D3D11_NV12_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-d3d11-nv12.nut"
+        )
+        add_test(
+            NAME qtav_render_d3d11_generate_rgb
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=rgb24"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt rgb24
+                "${QTAV_RENDER_D3D11_RGB_MEDIA}"
+        )
+        add_test(
+            NAME qtav_render_d3d11_generate_yuv
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=yuv420p"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt yuv420p
+                "${QTAV_RENDER_D3D11_YUV_MEDIA}"
+        )
+        add_test(
+            NAME qtav_render_d3d11_generate_nv12
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=nv12"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt nv12
+                "${QTAV_RENDER_D3D11_NV12_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_d3d11_generate_rgb
+            qtav_render_d3d11_generate_yuv
+            qtav_render_d3d11_generate_nv12
+            PROPERTIES FIXTURES_SETUP qtav_render_d3d11_media
+        )
+        add_test(
+            NAME qtav_render_d3d11_software_frames
+            COMMAND
+                qtav_render_d3d11_test
+                "${QTAV_RENDER_D3D11_RGB_MEDIA}"
+                "${QTAV_RENDER_D3D11_YUV_MEDIA}"
+                "${QTAV_RENDER_D3D11_NV12_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_d3d11_software_frames
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_render_d3d11_media
                 TIMEOUT 20
         )
     endif()

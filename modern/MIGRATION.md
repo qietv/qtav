@@ -54,6 +54,8 @@ mdk-sdk:
   NV12/P010 pixel-buffer planes into Metal textures without a CPU map or copy;
 - multiple video renderer instances keyed by an application opaque pointer;
 - libswscale CPU rendering into application-owned packed image buffers;
+- D3D11 rendering of decoded software frames into an application-provided
+  current render-target view;
 - Metal rendering of decoded software frames into an application-provided
   current texture or drawable;
 - media and track information;
@@ -104,6 +106,15 @@ normally use the injected `SwresampleAudioConverter`. The sink copies PCM into
 its native AudioQueue pool, implements pause/flush/natural-end drain, and
 provides the device-master clock and latency consumed by `Player`.
 
+On Windows, `D3D11VideoRenderer` borrows an `ID3D11Device`, its immediate
+context, and the render-target view returned by an application callback. It
+uploads software RGB, YUV, NV12/NV21, P010, and gray frames, performs SDR YUV
+conversion in a pixel shader, and supports resize, custom viewports, aspect
+handling, right-angle rotation, and render-target recreation. The backend
+header contains the Windows SDK types and is never included by a core public
+header. WASAPI, D3D11VA decode, zero-copy decoder-texture interop, and HDR
+output remain separate follow-up work.
+
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
 or pace playback. Decoded planar audio therefore normally uses
@@ -113,7 +124,7 @@ or pace playback. Decoded planar audio therefore normally uses
 
 - remaining platform audio device implementations (WASAPI,
   ALSA/PulseAudio, AAudio);
-- OpenGL, Vulkan, and D3D renderer implementations;
+- OpenGL and Vulkan renderer implementations;
 - remaining hardware decoders and non-Apple GPU zero-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;

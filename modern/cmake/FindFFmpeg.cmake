@@ -65,10 +65,70 @@ foreach(_component IN LISTS _ffmpeg_requested_components)
         endif()
         if(NOT TARGET FFmpeg::${_component})
             add_library(FFmpeg::${_component} UNKNOWN IMPORTED)
+            set(_ffmpeg_component_library
+                "${FFmpeg_${_component}_LIBRARY}")
+            file(TO_CMAKE_PATH
+                "${_ffmpeg_component_library}"
+                _ffmpeg_component_library_normalized)
+            set(_ffmpeg_component_release_library "")
+            set(_ffmpeg_component_debug_library "")
+
+            if(_ffmpeg_component_library_normalized
+               MATCHES "/debug/lib/[^/]+$")
+                set(_ffmpeg_component_debug_library
+                    "${_ffmpeg_component_library}")
+                string(
+                    REGEX REPLACE
+                    "/debug/lib/([^/]+)$"
+                    "/lib/\\1"
+                    _ffmpeg_component_release_candidate
+                    "${_ffmpeg_component_library_normalized}"
+                )
+                if(EXISTS "${_ffmpeg_component_release_candidate}")
+                    set(_ffmpeg_component_release_library
+                        "${_ffmpeg_component_release_candidate}")
+                endif()
+            elseif(_ffmpeg_component_library_normalized
+                   MATCHES "/lib/[^/]+$")
+                set(_ffmpeg_component_release_library
+                    "${_ffmpeg_component_library}")
+                string(
+                    REGEX REPLACE
+                    "/lib/([^/]+)$"
+                    "/debug/lib/\\1"
+                    _ffmpeg_component_debug_candidate
+                    "${_ffmpeg_component_library_normalized}"
+                )
+                if(EXISTS "${_ffmpeg_component_debug_candidate}")
+                    set(_ffmpeg_component_debug_library
+                        "${_ffmpeg_component_debug_candidate}")
+                endif()
+            endif()
+
             set_target_properties(FFmpeg::${_component} PROPERTIES
-                IMPORTED_LOCATION "${FFmpeg_${_component}_LIBRARY}"
-                INTERFACE_INCLUDE_DIRECTORIES "${FFmpeg_${_component}_INCLUDE_DIR}"
+                INTERFACE_INCLUDE_DIRECTORIES
+                    "${FFmpeg_${_component}_INCLUDE_DIR}"
             )
+            if(_ffmpeg_component_release_library
+               AND _ffmpeg_component_debug_library)
+                set_target_properties(FFmpeg::${_component} PROPERTIES
+                    IMPORTED_CONFIGURATIONS
+                        "DEBUG;RELEASE;RELWITHDEBINFO;MINSIZEREL"
+                    IMPORTED_LOCATION_DEBUG
+                        "${_ffmpeg_component_debug_library}"
+                    IMPORTED_LOCATION_RELEASE
+                        "${_ffmpeg_component_release_library}"
+                    IMPORTED_LOCATION_RELWITHDEBINFO
+                        "${_ffmpeg_component_release_library}"
+                    IMPORTED_LOCATION_MINSIZEREL
+                        "${_ffmpeg_component_release_library}"
+                )
+            else()
+                set_target_properties(FFmpeg::${_component} PROPERTIES
+                    IMPORTED_LOCATION
+                        "${FFmpeg_${_component}_LIBRARY}"
+                )
+            endif()
         endif()
     else()
         set(FFmpeg_${_component}_FOUND FALSE)
@@ -99,3 +159,9 @@ unset(_version_header)
 unset(_version_path)
 unset(_version_lines)
 unset(_version_line)
+unset(_ffmpeg_component_library)
+unset(_ffmpeg_component_library_normalized)
+unset(_ffmpeg_component_release_library)
+unset(_ffmpeg_component_debug_library)
+unset(_ffmpeg_component_release_candidate)
+unset(_ffmpeg_component_debug_candidate)
