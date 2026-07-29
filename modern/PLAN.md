@@ -426,7 +426,7 @@ Next active implementation order:
 3. [x] Add resize, viewport, aspect-ratio, rotation, surface recreation, and
    device-loss tests.
 4. [x] Add WASAPI.
-5. [ ] Complete the D3D11VA device, frame-lifetime, and interop design
+5. [x] Complete the D3D11VA device, frame-lifetime, and interop design
    checkpoint below.
 6. [ ] Add D3D11VA and D3D11 zero-copy interop.
 
@@ -478,31 +478,62 @@ Completed WASAPI checkpoint:
 
 D3D11VA and zero-copy design checkpoint:
 
-Complete this checkpoint after WASAPI and before implementing
-`qtav_hw_d3d11va` or `qtav_interop_d3d11`.
+Completed after WASAPI and before implementing `qtav_hw_d3d11va` or
+`qtav_interop_d3d11`. The accepted contract and implementation order are in
+[`D3D11VA.md`](D3D11VA.md).
 
-1. [ ] Decide how the hardware decoder receives the application-selected
+1. [x] Decide how the hardware decoder receives the application-selected
    D3D11 device. Prefer decoding on the same borrowed device used by the
    renderer so the normal path does not require a cross-device copy.
-2. [ ] Define backend-specific retained-frame access to both the
+2. [x] Define backend-specific retained-frame access to both the
    `ID3D11Texture2D` and its array slice while keeping D3D11 and FFmpeg types
    out of core public headers.
-3. [ ] Define device-context locking, playback-worker access, render-thread
+3. [x] Define device-context locking, playback-worker access, render-thread
    access, and frame-pool lifetime using the FFmpeg 8 D3D11VA device and
    frames-context contracts.
-4. [ ] Keep hardware decode, D3D11 texture interop, D3D11 Video Processor
+4. [x] Keep hardware decode, D3D11 texture interop, D3D11 Video Processor
    operations, and final rendering as separate responsibilities and targets
    where the existing module boundaries require them.
-5. [ ] Specify explicit software-map/copy fallback, foreign-device rejection,
+5. [x] Specify explicit software-map/copy fallback, foreign-device rejection,
    seek and flush behavior, device removal, surface recreation, and retained
    frame lifetime after player shutdown.
-6. [ ] Define deterministic WARP coverage for contracts and error paths plus
+6. [x] Define deterministic WARP coverage for contracts and error paths plus
    real-GPU integration coverage for hardware decode and zero-copy texture
    rendering.
-7. [ ] Treat Aleksoid1978/VideoRenderer as an isolated GPL-3.0 behavioral
+7. [x] Treat Aleksoid1978/VideoRenderer as an isolated GPL-3.0 behavioral
    reference only. Do not vendor it, link it, or copy its C++, shaders, data
    tables, or vendor-specific extensions; implement against FFmpeg and
    Microsoft public APIs.
+
+Accepted design summary:
+
+- a shared `D3D11DeviceAccess` object retains the selected device/immediate
+  context and supplies the recursive lock used by FFmpeg, interop, and
+  rendering;
+- an opaque core hardware-device token lets the D3D11VA backend supply a
+  referenced FFmpeg device context without exposing FFmpeg or Windows types in
+  core installed headers;
+- the backend-specific retained frame view carries the decoder
+  `ID3D11Texture2D`, array slice, source-device identity, and source
+  `HardwareFrame`;
+- because decoder texture arrays cannot be shader-resource views, the initial
+  zero-CPU-copy path consumes the decoder slice through the D3D11 Video
+  Processor and returns a same-device shader-readable intermediate to the
+  renderer;
+- hardware-decode fallback and renderer software-map fallback are separate
+  explicit policies; foreign devices are rejected before context access and
+  device removal requires application-led device recreation;
+- WARP covers deterministic API/lifetime/error contracts while opt-in
+  real-GPU tests cover native decode and zero-CPU-copy rendering.
+
+Next implementation slice:
+
+1. Add the common Windows D3D11 device-access target and shared recursive
+   context guard.
+2. Add the opaque supplied-hardware-device token and private FFmpeg bridge in
+   core.
+3. Prove device identity, COM lifetime, locking, and install/export behavior
+   with deterministic tests before opening the native decoder.
 
 Default platform order after the contracts are stable:
 
@@ -567,7 +598,7 @@ Acceptance:
 
 - [x] `qtav_audio_wasapi`.
 - [x] Shared-mode PCM negotiation and audio clock.
-- [ ] Complete the D3D11VA device/frame/interop design checkpoint.
+- [x] Complete the D3D11VA device/frame/interop design checkpoint.
 - [ ] `qtav_hw_d3d11va`.
 - [ ] `qtav_interop_d3d11` for zero-copy decoder textures.
 

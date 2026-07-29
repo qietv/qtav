@@ -123,7 +123,8 @@ conversion in a pixel shader, and supports resize, custom viewports, aspect
 handling, right-angle rotation, and render-target recreation. The backend
 header contains the Windows SDK types and is never included by a core public
 header. D3D11VA decode, zero-copy decoder-texture interop, and HDR output
-remain separate follow-up work.
+remain separate follow-up work. Their accepted device, lifetime, locking, and
+fallback contract is documented in [D3D11VA.md](D3D11VA.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -188,8 +189,8 @@ are separate backend/product work.
 3. Complete the Apple production path by adding CoreAudio, then VideoToolbox
    and CVPixelBuffer/Metal interop.
 4. Add hardware decode and zero-copy frame handles for that path.
-5. Complete the Windows D3D11VA device/frame/interop design checkpoint, then
-   add hardware decode and zero-copy texture rendering.
+5. Implement the accepted Windows D3D11VA device/frame contract, then add
+   zero-CPU-copy texture rendering through D3D11 interop.
 6. Add subtitle and multi-track switching.
 7. Add live-stream buffering and recovery policies.
 

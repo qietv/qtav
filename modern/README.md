@@ -588,4 +588,6 @@ dependencies to the legacy library.
 
 See [MIGRATION.md](MIGRATION.md) for the QtAV API mapping, current limitations,
 and threading contract. See [PLAN.md](PLAN.md) for the persistent milestone
-status, next task, and backend implementation order.
+status, next task, and backend implementation order. The accepted Windows
+D3D11VA device, frame-lifetime, and zero-copy interop design is recorded in
+[D3D11VA.md](D3D11VA.md).
