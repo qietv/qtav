@@ -102,7 +102,8 @@ public:
     // at natural end of stream before close(). The default is a no-op for
     // sinks that consume synchronously or do not queue.
     virtual bool drain();
-    // May be called from Player::position() as well as the playback worker.
+    // Player samples this on its audio-output worker and publishes a cached
+    // clock to position() callers.
     virtual AudioSinkClock clock() const noexcept = 0;
 };
 

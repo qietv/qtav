@@ -12,14 +12,18 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace {
 
 class DeterministicAudioSink final : public qtav::AudioSink {
 public:
-    explicit DeterministicAudioSink(bool requiresConversion = false)
+    explicit DeterministicAudioSink(
+        bool requiresConversion = false,
+        bool blockFirstWrite = false)
         : requiresConversion_(requiresConversion)
+        , blockFirstWrite_(blockFirstWrite)
     {
     }
 
@@ -83,6 +87,12 @@ public:
         if (!open_.load() || paused_.load()) {
             return false;
         }
+        if (blockFirstWrite_ && !firstWriteSeen_.exchange(true)) {
+            std::unique_lock<std::mutex> lock(firstWriteMutex_);
+            firstWriteEntered_ = true;
+            firstWriteChanged_.notify_all();
+            firstWriteChanged_.wait(lock, [&] { return releaseFirstWrite_; });
+        }
         clockPosition_.store(
             std::max<std::int64_t>(
                 clockPosition_.load(),
@@ -140,6 +150,25 @@ public:
     int writeCount() const noexcept { return writeCount_.load(); }
     int clockCount() const noexcept { return clockCount_.load(); }
 
+    bool waitForFirstWrite(
+        std::chrono::milliseconds timeout = std::chrono::seconds(5))
+    {
+        std::unique_lock<std::mutex> lock(firstWriteMutex_);
+        return firstWriteChanged_.wait_for(
+            lock,
+            timeout,
+            [&] { return firstWriteEntered_; });
+    }
+
+    void releaseFirstWrite()
+    {
+        {
+            std::lock_guard<std::mutex> lock(firstWriteMutex_);
+            releaseFirstWrite_ = true;
+        }
+        firstWriteChanged_.notify_all();
+    }
+
 private:
     void notifyChanged()
     {
@@ -157,6 +186,12 @@ private:
     EventCallback callback_;
     bool reportUnderrun_ = false;
     bool requiresConversion_ = false;
+    bool blockFirstWrite_ = false;
+    std::atomic<bool> firstWriteSeen_ { false };
+    std::mutex firstWriteMutex_;
+    std::condition_variable firstWriteChanged_;
+    bool firstWriteEntered_ = false;
+    bool releaseFirstWrite_ = false;
     std::atomic<bool> open_ { false };
     std::atomic<bool> paused_ { false };
     mutable std::atomic<std::int64_t> clockPosition_ { 0 };
@@ -331,6 +366,62 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
     assert(sink->writeCount() == 0);
 }
 
+void testUiAndRenderIsolation(const char* media)
+{
+    auto sink = std::make_shared<DeterministicAudioSink>(false, true);
+    qtav::Player player;
+
+    std::mutex renderMutex;
+    std::condition_variable renderChanged;
+    bool renderEntered = false;
+    bool releaseRender = false;
+
+    player
+        .setAudioSink(sink)
+        .setRenderCallback([&](void*) {
+            std::unique_lock<std::mutex> lock(renderMutex);
+            renderEntered = true;
+            renderChanged.notify_all();
+            renderChanged.wait(lock, [&] { return releaseRender; });
+        });
+
+    player.setMedia(media);
+    player.setState(qtav::State::Playing);
+
+    assert(sink->waitForFirstWrite());
+    {
+        std::unique_lock<std::mutex> lock(renderMutex);
+        assert(renderChanged.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return renderEntered; }));
+    }
+
+    std::thread writeWatchdog([sink] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        sink->releaseFirstWrite();
+    });
+    const auto queryStarted = std::chrono::steady_clock::now();
+    static_cast<void>(player.position());
+    const auto queryElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - queryStarted);
+    sink->releaseFirstWrite();
+    writeWatchdog.join();
+    assert(queryElapsed < std::chrono::milliseconds(100));
+
+    assert(sink->waitFor([&] { return sink->writeCount() >= 3; }));
+    {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        assert(renderEntered);
+        assert(!releaseRender);
+        releaseRender = true;
+    }
+    renderChanged.notify_all();
+
+    player.setState(qtav::State::Stopped);
+    assert(player.waitFor(qtav::State::Stopped, 5'000));
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -339,5 +430,6 @@ int main(int argc, char** argv)
     testLifecycleAndClock(argv[1]);
     testShutdownClosesSink(argv[1]);
     testUnsupportedConversionKeepsFrameCallback(argv[1]);
+    testUiAndRenderIsolation(argv[1]);
     return 0;
 }

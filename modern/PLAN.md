@@ -44,6 +44,11 @@ Continuation checkpoint:
   example wiring, installed target export, and strict native H.264/AAC
   playback through an active WASAPI render endpoint; the implementation,
   SDR-state tests, and active-HDR native display validation are complete;
+- playback scheduling now isolates the FFmpeg demux/decode worker, bounded
+  audio-output queue/worker, and bounded presentation queue/worker; UI/render
+  callbacks cannot block device audio submission, `Player::position()` uses a
+  cached device-clock snapshot, and late video is dropped instead of building
+  unbounded presentation latency;
   Milestone 5 is complete and the active next platform task is the Android
   production path, followed by OHOS and then Linux; the shared Android/OHOS
   responsibility and lifecycle design is now recorded in `MOBILE.md`, and the
@@ -336,6 +341,27 @@ Completed audio integration checkpoint:
   fallback;
 - deterministic mock tests cover device-clock use, backend event reentrancy,
   pause, seek, media replacement, stop, and shutdown.
+
+Completed playback scheduling isolation checkpoint:
+
+- FFmpeg demux and audio/video decode remain together on the asynchronous
+  playback worker so control interruption and codec ownership stay simple;
+- decoded audio crosses a bounded 500 ms queue to a dedicated audio-output
+  worker, preventing render callbacks and UI work from starving the device;
+- decoded video and frame/render notifications cross a bounded,
+  timestamp-ordered presentation queue; stale late video is discarded when the
+  application render path falls behind;
+- device-clock reads are sampled by the audio-output worker and published as a
+  generation-checked cache, so UI calls to `Player::position()` cannot wait on
+  a sink write;
+- a deterministic regression test blocks both the first sink write and the
+  render callback, verifies that `position()` remains non-blocking, and verifies
+  that audio writes continue while presentation is blocked;
+- separate packet-demux and per-stream decoder workers are intentionally
+  deferred: the current bounded post-decode queues remove the observed
+  cross-layer blocking without duplicating FFmpeg ownership. Revisit packet
+  queues when production buffering, track switching, or live-stream recovery
+  requires independent decode back-pressure.
 
 ## Completed deterministic portable audio validation
 

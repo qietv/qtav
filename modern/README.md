@@ -65,7 +65,8 @@ Current backend integration boundary:
   instances keyed by application-owned opaque pointers;
 - `AudioSink` is connected through `Player::setAudioSink()`, follows playback
   lifecycle changes, and supplies the playback master when its device clock is
-  supported and valid; queued audio is drained before close at natural end;
+  supported and valid; decoded PCM crosses a bounded queue to a dedicated
+  audio-output worker, and queued audio is drained before close at natural end;
 - `AudioFrameConverter` is connected through
   `Player::setAudioFrameConverter()` when a sink negotiates different PCM;
   `QtAV::AudioResample` supplies the portable libswresample implementation;
@@ -439,9 +440,13 @@ Passing an empty `std::shared_ptr` removes the renderer for that key. The
 existing `setVideoRenderer()` callback remains available and is used when no
 `VideoRenderAPI` is registered for the requested key.
 
-Callbacks are invoked from the playback worker unless explicitly documented by
-the integration layer. `renderVideo()` runs on the caller's thread, so an
-OpenGL, Vulkan, Metal, or D3D integration can keep ownership of its native
+State/status callbacks are normally invoked from the playback worker. Decoded
+audio/video frame notifications and `setRenderCallback()` run on a separate
+presentation worker, so a slow application redraw path cannot stall demux,
+decode, or device audio submission. The video presentation queue is bounded;
+when the application falls behind, obsolete late frames are discarded instead
+of accumulating unbounded latency. `renderVideo()` runs on the caller's thread,
+so an OpenGL, Vulkan, Metal, or D3D integration can keep ownership of its native
 context and surface.
 
 ### CPU image-buffer renderer
@@ -825,9 +830,10 @@ Without an injected converter, a different device format reports
 `QtAV::AudioResample` implements `SwresampleAudioConverter`. It converts sample
 format, sample rate, and channel layout to interleaved U8, S16, S32, float, or
 double PCM. Conversion result memory belongs to the converter until its next
-operation; `Player` writes it to the sink synchronously. Converter lifecycle
-and conversion calls run on the playback worker, serialized with sink calls
-and without the player mutex held.
+operation; `Player` writes it to the sink synchronously from its audio-output
+worker. Converter and sink calls are serialized without the player mutex held;
+control-driven lifecycle calls run on the playback worker, while conversion
+and ordinary writes run on the audio-output worker.
 
 `QtAV::AudioFile` implements `WavAudioSink`. It negotiates interleaved U8, S16,
 S32, float, or double PCM, writes a little-endian RIFF/WAVE stream, and
@@ -876,11 +882,13 @@ recursive context lock as rendering.
 device, while `latencyMilliseconds` is informational and must not already be
 folded into that position. A sink that advertises a device clock becomes the
 playback master whenever `clock()` returns a valid value; otherwise the player
-falls back to its monotonic software clock. Sink lifecycle and write calls run
-on the playback worker without the player mutex held. Natural-end `drain()`
-also runs on the playback worker and may block until the backend queue is
-presented. `clock()` can also be queried by the thread calling
-`Player::position()`.
+falls back to its monotonic software clock. Ordinary sink writes and clock
+sampling run on the dedicated audio-output worker. The player publishes a
+generation-checked cached clock snapshot, so `Player::position()` never waits
+for a blocking sink write or calls into a platform backend. Sink lifecycle and
+natural-end `drain()` run on the playback worker, serialized with writes and
+without the player mutex held; `drain()` may block until the backend queue is
+presented.
 
 `HardwareDecodeConfig` is copied by `Player` and applied the next time the
 video decoder opens. Changing it while media is loaded interrupts the current
@@ -953,8 +961,11 @@ when a Windows session exposes no endpoint.
 
 ```text
 Player facade
-  ├─ async control/state machine
-  ├─ FFmpeg demux + decoder contexts
+  ├─ async control + FFmpeg demux/decode worker
+  ├─ bounded decoded-audio queue
+  │    └─ audio-output worker + device-clock snapshots
+  ├─ bounded timestamp-ordered presentation queue
+  │    └─ video/frame notification worker with late-frame dropping
   ├─ audio-device master clock with monotonic fallback
   ├─ reference-counted AudioFrame/VideoFrame
   ├─ application render scheduling

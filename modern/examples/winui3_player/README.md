@@ -10,9 +10,11 @@ It uses the QtAVCore Windows backends directly:
 - `qtav::Player` for local files, FFmpeg-supported URLs, play/pause, stop,
   seek, status, and media events.
 
-The Debug toggle opens and closes a separate log window. QtAVCore callbacks
-run on the playback worker, so the example marshals rendering and all WinUI
-updates through the window's `DispatcherQueue`.
+The Debug toggle opens and closes a separate log window. QtAVCore state/status
+callbacks run on the playback worker, while frame/render notifications run on
+the presentation worker. The example marshals rendering and all WinUI updates
+through the window's `DispatcherQueue`; device audio submission remains on the
+independent audio-output worker.
 
 ## Requirements
 

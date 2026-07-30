@@ -21,7 +21,7 @@ range of the legacy root QtAV implementation.
 | Qt paint/update events | `setRenderCallback()` |
 | renderer paint method | `renderVideo()` and optional `VideoRenderAPI` |
 | `AudioOutput` | `onAudioFrame()` and optional `setAudioSink()` |
-| `QThread` playback workers | an internal standard C++ worker |
+| `QThread` playback workers | standard C++ demux/decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
 
 The rendering contract follows the same application-owned pattern used by
@@ -260,9 +260,13 @@ are separate backend/product work.
 ## Threading rules
 
 - control methods are thread-safe;
-- state, status, audio, and video callbacks run on the playback worker;
-- media events normally run on the playback worker; forwarded audio-sink
-  events run on the backend's event thread;
+- demux, FFmpeg decode, asynchronous control, and state/status callbacks
+  normally run on the playback worker;
+- decoded audio/video frame callbacks and `setRenderCallback()` run on the
+  presentation worker; the bounded video queue drops obsolete late frames
+  when application presentation falls behind;
+- media events normally run on the playback or audio-output worker; forwarded
+  audio-sink events run on the backend's event thread;
 - callbacks may request another player state, but must not destroy the player;
 - `renderVideo()` runs synchronously on its caller and should be called from the
   thread that owns the native graphics context;
@@ -273,14 +277,17 @@ are separate backend/product work.
   backend event callbacks may request another player state;
 - audio-sink and video-render backend event callbacks run on the thread chosen
   by the backend and may request another player state;
-- audio-sink lifecycle, write, and natural-end drain calls run on the playback
-  worker without the player mutex held; `drain()` may block until queued audio
-  is presented, while `clock()` may also run on a `position()` caller thread;
-- audio-converter lifecycle and conversion calls run on the playback worker,
-  serialized with sink calls and without the player mutex held;
+- decoded audio crosses a bounded queue to a dedicated audio-output worker;
+  ordinary conversion, sink writes, and device-clock sampling run there without
+  the player mutex held and cannot be blocked by application rendering;
+- audio-sink/converter lifecycle and natural-end drain calls run on the
+  playback worker, serialized with audio-output calls; `drain()` may block
+  until queued audio is presented;
+- `Player::position()` reads a generation-checked cached device-clock snapshot
+  and never calls a sink or waits behind a sink write;
 - changing `HardwareDecodeConfig` while media is open interrupts and
-  asynchronously reopens the decoder; hardware frame callbacks still run on
-  the playback worker;
+  asynchronously reopens the decoder; hardware frame callbacks run on the
+  presentation worker;
 - replacing its supplied `HardwareDecodeDevice` token also reopens the
   decoder; a token/type mismatch follows the selected software-fallback
   policy before decoder open;
