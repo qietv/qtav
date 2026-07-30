@@ -10,7 +10,7 @@ set(QTAV_CORE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(QTAV_CORE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(QTAV_CORE_INSTALL OFF CACHE BOOL "" FORCE)
 set(QTAV_RENDER_CPU OFF CACHE STRING "" FORCE)
-set(QTAV_RENDER_OPENGL OFF CACHE STRING "" FORCE)
+set(QTAV_RENDER_OPENGL ON CACHE STRING "" FORCE)
 set(QTAV_RENDER_VULKAN ON CACHE STRING "" FORCE)
 set(QTAV_RENDER_D3D11 OFF CACHE STRING "" FORCE)
 set(QTAV_RENDER_METAL OFF CACHE STRING "" FORCE)
@@ -38,6 +38,7 @@ add_library(
     qtav_android_test
     SHARED
     native_activity.cpp
+    "${CMAKE_CURRENT_LIST_DIR}/../../tests/opengl_video_renderer_test_support.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../../tests/vulkan_video_renderer_test_support.cpp"
 )
 target_compile_features(qtav_android_test PRIVATE cxx_std_17)
@@ -65,8 +66,11 @@ target_link_options(qtav_android_test PRIVATE
 target_link_libraries(qtav_android_test
     PRIVATE
         QtAV::Core
+        QtAV::RenderOpenGLAndroid
         QtAV::RenderVulkanAndroid
         android
+        EGL
+        GLESv3
         log
         vulkan
 )

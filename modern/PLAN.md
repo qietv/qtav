@@ -58,7 +58,10 @@ Continuation checkpoint:
   platform-neutral Vulkan engine plus Android surface/swapchain adapter on a
   connected Android device, including SDR and native-HDR offscreen pixel
   goldens, required HDR10/PQ swapchain selection, static HDR metadata, and
-  background/foreground HDR surface recreation;
+  background/foreground HDR surface recreation; the shared OpenGL ES 3.x
+  software renderer and Android EGL/window adapter are also complete with
+  all advertised software upload families, SDR color/geometry readback, and
+  real-window P010/PQ-to-SDR presentation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -84,6 +87,8 @@ Current public entry points:
 - `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
 - `modern/backends/render/vulkan/include/qtav/vulkan_video_renderer.h`
 - `modern/backends/render/vulkan/android/include/qtav/android_vulkan_video_renderer.h`
+- `modern/backends/render/opengl/include/qtav/opengl_video_renderer.h`
+- `modern/backends/render/opengl/android/include/qtav/android_opengl_video_renderer.h`
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
@@ -108,6 +113,8 @@ Current implementation:
 - `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
 - `modern/backends/render/vulkan/src/vulkan_video_renderer.cpp`
 - `modern/backends/render/vulkan/android/src/android_vulkan_video_renderer.cpp`
+- `modern/backends/render/opengl/src/opengl_video_renderer.cpp`
+- `modern/backends/render/opengl/android/src/android_opengl_video_renderer.cpp`
 - `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
@@ -128,6 +135,7 @@ Current implementation:
 - `modern/tests/d3d11_video_renderer_test.cpp`
 - `modern/tests/vulkan_video_renderer_test.cpp`
 - `modern/tests/vulkan_video_renderer_test_support.cpp`
+- `modern/tests/opengl_video_renderer_test_support.cpp`
 - `modern/tests/d3d11va_hardware_decoder_test.cpp`
 - `modern/tests/d3d11_frame_interop_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
@@ -139,6 +147,12 @@ Current implementation:
 
 Current verification:
 
+- the current macOS host recheck before and after the OpenGL ES work builds
+  successfully, but CTest is 25/27: `qtav_core_audio_sink_player` consistently
+  misses its expected audio-frame callback and
+  `qtav_simulated_audio_sink_player` misses its expected loop drain. Both
+  failures reproduced on the clean pre-change baseline and are outside this
+  rendering slice;
 - the current static and shared Windows builds pass 33/33 CTest tests,
   including the Advanced Color test, the
   WASAPI device test and strict native H.264/AAC playback;
@@ -202,6 +216,18 @@ Current verification:
   and default-luminance selection; install
   authorization was confirmed manually on the device after the harness
   stopped on `INSTALL_FAILED_USER_RESTRICTED`.
+- the same Android 16/Adreno 830 harness now builds and runs
+  `QtAV::RenderOpenGL` plus `QtAV::RenderOpenGLAndroid`: offscreen readback
+  covers YUV420/422/444, NV12/NV21, P010, RGB/BGR, RGBA/BGRA/ARGB, Gray8,
+  viewport, rotation, and target-generation replacement, and the real EGL
+  window adapter presents a P010/BT.2020/PQ frame through the documented SDR
+  fallback after Vulkan HDR playback and lifecycle validation; the latest
+  combined run passed with more than 170 decoded/presented video callbacks,
+  282 audio frames, and one background/foreground surface recreation.
+- Android install plus external CMake consumption of
+  `QtAV::RenderOpenGLAndroid` and `QtAV::RenderOpenGL` passes; the exported
+  static targets use logical `EGL`/`GLESv3` link names and contain no producer
+  NDK or host path.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -427,12 +453,14 @@ passed 33/33.
    current-target color space explicit, implement HDR10/PQ, HDR10/HLG, and
    extended-linear shader output, select Android HDR swapchains, submit static
    HDR metadata, and validate 10-bit goldens plus a real HDR device lifecycle.
-5. [ ] Add the OpenGL ES/EGL fallback path defined in `MOBILE.md`, sharing
-   shader/color/geometry logic with Vulkan where practical without hiding
-   incompatible API lifecycles. Validate Vulkan-unavailable, initial-failure,
-   fatal-runtime-failure, and both-backends-unavailable cases.
-6. [ ] Add AAudio output and device-clock/latency validation.
-7. [ ] Add MediaCodec hardware decode and direct-surface presentation first,
+5. [x] Add the shared OpenGL ES 3.x renderer and Android EGL/window adapter
+   defined in `MOBILE.md`, sharing color/geometry semantics with Vulkan where
+   practical without hiding incompatible API lifecycles.
+6. [ ] Add the application/platform renderer selector. Validate
+   Vulkan-unavailable, initial-failure, fatal-runtime-failure, recoverable
+   same-API recreation, one-way fallback, and both-backends-unavailable cases.
+7. [ ] Add AAudio output and device-clock/latency validation.
+8. [ ] Add MediaCodec hardware decode and direct-surface presentation first,
    then add the confirmed `AImageReader`/`AHardwareBuffer` Vulkan and
    `SurfaceTexture` external-OES OpenGL ES zero-CPU-copy texture paths only
    after presentation, drop, flush, and surface recreation semantics are
@@ -550,6 +578,28 @@ Completed Android Vulkan implementation checkpoint:
   dependency metadata without embedding the local NDK or build-tree path; an
   external Android consumer compiles the installed HDR preference and
   selected-surface query API.
+
+Completed Android OpenGL ES fallback checkpoint:
+
+- `QtAV::RenderOpenGL` is a reusable OpenGL ES 3.x `VideoRenderAPI` target
+  that draws into a caller-supplied current framebuffer and keeps EGL/window
+  ownership outside the engine;
+- software uploads cover YUV420/422/444, NV12/NV21, little-endian P010,
+  RGB/BGR/RGBA/BGRA/ARGB, and Gray8, with structured range, matrix, transfer,
+  and primaries handling plus the common Fit/Fill/Stretch, custom viewport,
+  and right-angle rotation contract;
+- the fallback output is explicitly SDR sRGB-coded; PQ/HLG inputs use the
+  deterministic HDR-to-SDR shoulder and native HDR EGL output is not claimed;
+- `QtAV::RenderOpenGLAndroid` retains the active `ANativeWindow` generation
+  and owns its EGL display, OpenGL ES 3.x context, window surface, and swap
+  while keeping Android/EGL declarations out of core public headers;
+- Android offscreen readback covers every advertised software family,
+  viewport, rotation, target-generation replacement, and P010/PQ-to-SDR;
+  the real window adapter also presents that fallback frame after the Vulkan
+  HDR playback and background/foreground lifecycle checks complete;
+- the engine and Android adapter do not implement automatic API selection.
+  Startup probing, bounded recovery, fatal one-way fallback, and the
+  no-renderer state remain the next renderer-selector slice.
 
 Completed Metal software-frame checkpoint:
 
@@ -1019,11 +1069,11 @@ Status: complete; resume Milestone 6 from its first unchecked item.
 - [x] Native Vulkan HDR target contract and Android HDR swapchain selection,
   including HDR10/PQ, HDR10/HLG, extended-linear output, static metadata,
   deterministic 10-bit goldens, and connected-device lifecycle validation.
-- [ ] Shared OpenGL ES 3.x renderer plus Android EGL/window adapter as the
+- [x] Shared OpenGL ES 3.x renderer plus Android EGL/window adapter as the
   required Vulkan fallback, without an SDL3 dependency.
 - [ ] Application/platform renderer selector implementing the accepted
   startup, recovery, fatal-error, one-way fallback, and no-renderer behavior.
-- [~] Software YUV/NV12/P010/RGB upload, structured color conversion, viewport,
+- [x] Software YUV/NV12/P010/RGB upload, structured color conversion, viewport,
   aspect ratio, rotation, resize, redraw, and surface recreation.
 
 ### Audio and hardware decode

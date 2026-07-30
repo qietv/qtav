@@ -174,6 +174,9 @@ Implemented under `modern/`:
   geometry shaders, explicit SDR/HDR10/extended-linear output color spaces,
   plus an Android `ANativeWindow` adapter with native HDR swapchain selection
   and optional `VK_EXT_hdr_metadata` submission;
+- platform-neutral OpenGL ES 3.x software-frame rendering for
+  YUV/NV12/P010/RGB families with structured SDR color and geometry handling,
+  plus an Android EGL/`ANativeWindow` adapter for the required SDR fallback;
 - structured video color-space/HDR10 metadata and Metal
   SDR/extended-linear output;
 - libswresample conversion to negotiated interleaved PCM;
@@ -185,8 +188,9 @@ Implemented under `modern/`:
 Known intentional limitations:
 
 - no native audio-device sink outside macOS and Windows yet;
-- no OpenGL renderer yet; the Vulkan software path is validated on Android but
-  still needs OHOS and Linux adapters/device coverage;
+- no automatic Vulkan-to-OpenGL ES selector yet; both software engines and
+  their Android adapters are validated, while OHOS and Linux adapters/device
+  coverage remain;
 - no Linux or Android hardware decoder or GPU zero-copy interop yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
@@ -240,6 +244,10 @@ development host; explicit leak detection aborts as unsupported.
 
 Last verified baseline:
 
+- current macOS recheck builds successfully but is 25/27 CTest because
+  `qtav_core_audio_sink_player` and `qtav_simulated_audio_sink_player` fail
+  existing audio timing assertions; both failures reproduced before the
+  OpenGL ES change;
 - static build: passed;
 - shared build: passed;
 - CTest: 24/24 passed;
@@ -264,6 +272,11 @@ Last verified baseline:
   conversion, native 10-bit PQ/HLG output, HLG-to-PQ conversion, FP16
   extended-linear/BT.2020-linear output, HDR luminance-metadata selection,
   viewport, rotation, and target recreation.
+- Android OpenGL ES 3.2 fallback build, package export, external CMake
+  consumption, offscreen readback, and connected Adreno 830 device
+  presentation: passed for YUV420/422/444, NV12/NV21, P010,
+  RGB/BGR/RGBA/BGRA/ARGB, Gray8, viewport, rotation, target-generation
+  replacement, and real-window P010/PQ-to-SDR presentation.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device

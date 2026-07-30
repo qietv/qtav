@@ -34,6 +34,18 @@ if [ "${device_count}" -ne 1 ]; then
     exit 1
 fi
 
+"${adb}" shell input keyevent KEYCODE_WAKEUP
+"${adb}" shell wm dismiss-keyguard
+sleep 1
+power_state=$("${adb}" shell dumpsys power | tr -d '\r')
+keyguard_state=$("${adb}" shell dumpsys window policy | tr -d '\r')
+if ! printf '%s\n' "${power_state}" | rg -q "mWakefulness=Awake" \
+   || printf '%s\n' "${keyguard_state}" | rg -q "showing=true"; then
+    echo "The Android device must be awake and unlocked for window/HDR validation." >&2
+    echo "Unlock it manually, then ask the user before retrying." >&2
+    exit 2
+fi
+
 mkdir -p "${result_directory}"
 {
     echo "model=$("${adb}" shell getprop ro.product.model | tr -d '\r')"
@@ -66,6 +78,8 @@ while [ "${attempt}" -lt 10 ]; do
         > "${result_directory}/logcat.txt"
     if rg -q "QTAV_ANDROID_TEST: START" "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: OFFSCREEN_PASS" \
+           "${result_directory}/logcat.txt" \
+       && rg -q "QTAV_ANDROID_TEST: GLES_OFFSCREEN_PASS" \
            "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: HDR_SWAPCHAIN" \
            "${result_directory}/logcat.txt" \
@@ -137,7 +151,7 @@ attempt=0
 while [ "${attempt}" -lt 30 ]; do
     "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
         > "${result_directory}/logcat.txt"
-    if rg -q "QTAV_ANDROID_TEST: PASS.*native_hdr=pass.*hdr_source=pass" \
+    if rg -q "QTAV_ANDROID_TEST: PASS.*gles_fallback=pass.*gles_offscreen=pass.*native_hdr=pass.*hdr_source=pass" \
         "${result_directory}/logcat.txt"; then
         cat "${result_directory}/logcat.txt"
         "${adb}" shell am force-stop "${package_name}"

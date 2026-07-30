@@ -60,6 +60,9 @@ mdk-sdk:
 - optional platform-neutral `QtAV::RenderVulkan` software-frame rendering and
   Android `QtAV::RenderVulkanAndroid` surface/swapchain adaptation using
   application-owned Vulkan context objects and NativeActivity lifecycle;
+- optional platform-neutral `QtAV::RenderOpenGL` OpenGL ES 3.x software-frame
+  rendering and Android `QtAV::RenderOpenGLAndroid` EGL/window adaptation for
+  the SDR mobile fallback;
 - multiple video renderer instances keyed by an application opaque pointer;
 - libswscale CPU rendering into application-owned packed image buffers;
 - D3D11 rendering of decoded software frames into an application-provided
@@ -73,8 +76,8 @@ mdk-sdk:
 - interruptible FFmpeg I/O when media changes or playback stops;
 - standalone static/shared CMake builds and installable package metadata;
 - a macOS-hosted Android arm64 cross-build and NativeActivity
-  connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode plus
-  Vulkan presentation without Qt.
+  connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode,
+  Vulkan presentation, and the OpenGL ES/EGL SDR fallback without Qt.
 
 The `VideoRenderAPI` and `AudioSink` contracts are connected to `Player`.
 The default decode path remains software-only. Applications can pass the
@@ -194,7 +197,8 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - remaining platform audio device implementations (ALSA/PulseAudio, AAudio);
-- OpenGL renderer implementations plus Vulkan OHOS and Linux validation;
+- the mobile Vulkan/OpenGL ES renderer selector, the OHOS EGL adapter, and
+  Vulkan OHOS/Linux validation;
 - remaining hardware decoders and Linux/Android GPU zero-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
@@ -239,7 +243,10 @@ borrowed device was created with `VK_EXT_hdr_metadata`. The recorded
 Adreno 830 device passes a required HDR10/PQ swapchain run across
 background/foreground surface recreation, while Android reports the presented
 layer as HDR and a synthetic metadata-bearing P010/BT.2020/PQ frame exercises
-the complete source-to-present path. The OpenGL ES backend and selector,
+the complete source-to-present path. The OpenGL ES 3.x engine and Android EGL
+adapter now cover the advertised software formats, common geometry, SDR color
+conversion, P010/PQ-to-SDR output, offscreen readback, and a real
+`ANativeWindow`; the automatic selector,
 AAudio output, MediaCodec direct-surface presentation, Vulkan/OpenGL ES texture
 interop, and Vulkan validation on OHOS and Linux remain separate backend work
 under the responsibility and lifecycle boundaries in

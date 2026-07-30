@@ -10,7 +10,7 @@ native application, window-system, audio, or codec ABI.
 The reusable pieces are compile-time C++ targets in this repository:
 
 - `qtav_render_vulkan` is the platform-neutral Vulkan renderer engine;
-- `qtav_render_opengl` is the planned platform-neutral OpenGL ES renderer
+- `qtav_render_opengl` is the platform-neutral OpenGL ES renderer
   engine and the required mobile fallback for software-frame presentation;
 - Android surface and swapchain integration belongs under
   `backends/render/vulkan/android/` and small Android lifecycle helpers belong
@@ -102,6 +102,19 @@ conversion where one exists; they are not silently claimed as native support.
 SDL3 is not part of the renderer fallback contract. An application may use
 SDL3 in its own shell, but QtAVCore does not require SDL to select, create, or
 recover either mobile renderer.
+
+The implemented baseline lives under `backends/render/opengl/`.
+`QtAV::RenderOpenGL` uploads YUV420/422/444, NV12/NV21, little-endian P010,
+RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames, applies the same structured
+range, matrix, transfer, primaries, viewport, aspect, and rotation semantics as
+the Vulkan SDR path, and renders to a caller-supplied current framebuffer.
+P010/PQ/HLG input is deterministically tone-mapped to SDR; native HDR EGL
+output is not claimed. `QtAV::RenderOpenGLAndroid` separately owns its EGL
+display, OpenGL ES 3.x context, window surface, and generation while retaining
+the active `ANativeWindow`. Android device checks cover all advertised upload
+families, viewport, rotation, target-generation replacement, P010/PQ-to-SDR
+readback, and a real window-surface presentation. The application/platform
+selector and one-way Vulkan-to-OpenGL ES transition remain separate work.
 
 ## Renderer selection and fallback
 
