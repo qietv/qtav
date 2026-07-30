@@ -15,6 +15,7 @@ endif()
 add_library(qtav_core
     src/backend.cpp
     src/frame.cpp
+    src/hardware_decoder.cpp
     src/player.cpp
 )
 add_library(QtAV::Core ALIAS qtav_core)

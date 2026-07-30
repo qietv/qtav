@@ -32,7 +32,9 @@ Continuation checkpoint:
   clocking;
 - the Apple reference path, including HDR and color-space metadata plumbing,
   and the Windows D3D11 software-frame and WASAPI audio paths are complete;
-  the active next task is the D3D11VA device/frame/interop design checkpoint;
+  the D3D11VA device/frame/interop design and supplied-device core bridge are
+  complete, and the active next task is the native `qtav_hw_d3d11va` decoder
+  backend;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -64,6 +66,7 @@ Current implementation:
 - `modern/core/src/player.cpp`
 - `modern/core/src/frame.cpp`
 - `modern/core/src/backend.cpp`
+- `modern/core/src/hardware_decoder.cpp`
 - `modern/backends/render/cpu/include/qtav/cpu_video_renderer.h`
 - `modern/backends/render/cpu/src/cpu_video_renderer.cpp`
 - `modern/backends/audio/resample/include/qtav/swresample_audio_converter.h`
@@ -91,12 +94,13 @@ Current implementation:
 - `modern/tests/d3d11_video_renderer_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
 - `modern/tests/cvmetal_frame_interop_test.mm`
+- `modern/tests/hardware_decode_device_test.cpp`
 
 Current verification:
 
 - static and shared builds pass 24/24 CTest tests;
 - ASan/UBSan passes 24/24 on macOS with leak detection disabled;
-- the all-backends-disabled build passes 9/9 tests, including the Windows
+- the all-backends-disabled build passes 11/11 tests, including the Windows
   platform device-access contract test;
 - forcing an unimplemented backend to `ON` fails with a clear diagnostic;
 - invalid backend option values are rejected;
@@ -110,14 +114,16 @@ Current verification:
 - core public-header scans contain no Qt, FFmpeg, or platform SDK types;
 - MPEG-4/AAC, AC-3, E-AC-3, and TrueHD decode tests pass.
 - on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, static and shared
-  Release builds pass 22/22 CTest tests, including deterministic WARP D3D11
+  Release builds pass 24/24 CTest tests, including the supplied hardware-device
+  bridge, deterministic WARP D3D11
   rendering, WASAPI device lifecycle, and Player-driven WASAPI playback;
 - Windows multi-config FFmpeg imports select matching Debug/Release libraries,
   and project DLLs, tests, and examples share a runnable `bin/<Config>`
   directory;
 - installation plus external CMake consumption of `QtAV::PlatformWindows`,
   `QtAV::RenderD3D11`, and `QtAV::AudioWASAPI` together with the portable core,
-  render, and audio targets passes.
+  render, and audio targets passes for static and shared builds; the installed
+  core token links without installing its private FFmpeg bridge header.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -531,7 +537,7 @@ Next implementation slice:
 
 1. [x] Add the common Windows D3D11 device-access target and shared recursive
    context guard.
-2. [ ] Add the opaque supplied-hardware-device token and private FFmpeg bridge
+2. [x] Add the opaque supplied-hardware-device token and private FFmpeg bridge
    in core.
 3. [x] Prove device identity, COM lifetime, locking, and install/export
    behavior with deterministic tests before opening the native decoder.
@@ -549,6 +555,22 @@ Completed Windows D3D11 device-access checkpoint:
   exclusion, guard lifetime, and renderer participation in the shared lock;
 - static/shared builds and installed external consumption of
   `QtAV::PlatformWindows` and `QtAV::RenderD3D11` pass.
+
+Completed supplied hardware-device bridge checkpoint:
+
+- public `HardwareDecodeDevice` is a cheap, PIMPL-backed reference-counted
+  token that exposes only `HardwareDeviceType` and an opaque native identity;
+- `HardwareDecodeConfig` optionally carries that token while preserving the
+  existing FFmpeg-created-device path when no token is supplied;
+- an uninstalled core bridge retains and returns referenced FFmpeg
+  `AVHWDeviceContext` buffers for in-tree hardware backends without placing
+  FFmpeg declarations in installed headers;
+- `Player` takes its own device-context reference before decoder open, rejects
+  a token/requested-type mismatch through the existing fallback policy, and
+  asynchronously reopens loaded media when the supplied token changes;
+- deterministic tests cover invalid construction, reference ownership, copy
+  identity, independent tokens, player config copying, and type-mismatch
+  software fallback plus disabled-fallback failure.
 
 Default platform order after the contracts are stable:
 

@@ -76,6 +76,13 @@ explicit read mapping to CPU memory. Device creation and pixel-format
 negotiation failures either report `decoder.hardware.fallback` and continue
 in software or report `decoder.hardware.error`, according to the selected
 fallback policy.
+`HardwareDecodeConfig` can also carry a copied `HardwareDecodeDevice` token
+created by an in-tree backend. The token exposes only a generic device type
+and opaque native identity in the installed core API while privately retaining
+the backend's FFmpeg hardware-device context. This is the common bridge for
+decoding on an application-selected native device; changing the token while
+media is open causes the same asynchronous decoder reopen as changing the
+requested hardware type.
 Applications that link `QtAV::InteropCVMetal` can bind a
 `CVMetalFrameInterop` to `MetalVideoRenderer`. Supported limited- and
 full-range bi-planar NV12 and P010 `CVPixelBuffer` planes are exposed to the
@@ -186,6 +193,9 @@ are separate backend/product work.
 - changing `HardwareDecodeConfig` while media is open interrupts and
   asynchronously reopens the decoder; hardware frame callbacks still run on
   the playback worker;
+- replacing its supplied `HardwareDecodeDevice` token also reopens the
+  decoder; a token/type mismatch follows the selected software-fallback
+  policy before decoder open;
 - frame data remains valid for as long as the copied `AudioFrame` or
   `VideoFrame` object is alive.
 - an opaque hardware native handle remains valid while its `HardwareFrame`

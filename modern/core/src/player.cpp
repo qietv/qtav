@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "frame_internal.h"
+#include "hardware_decode_device_internal.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -409,7 +410,8 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             if (hardwareDecodeConfig_.deviceType == config.deviceType
                 && hardwareDecodeConfig_.allowSoftwareFallback
-                    == config.allowSoftwareFallback) {
+                    == config.allowSoftwareFallback
+                && hardwareDecodeConfig_.device == config.device) {
                 return;
             }
             hardwareDecodeConfig_ = config;
@@ -877,6 +879,9 @@ private:
             ? hardwareDecodeConfig.deviceType
             : HardwareDeviceType::Unknown;
         const auto ffmpegDevice = ffmpegHardwareDeviceType(requestedDevice);
+        const bool suppliedDeviceMismatch =
+            hardwareDecodeConfig.device
+            && hardwareDecodeConfig.device.deviceType() != requestedDevice;
         const AVCodecHWConfig* selectedHardwareConfig = nullptr;
         if (ffmpegDevice != AV_HWDEVICE_TYPE_NONE) {
             for (int index = 0;; ++index) {
@@ -914,12 +919,21 @@ private:
                     hardwareDecodeConfig.allowSoftwareFallback;
                 context->opaque = &result;
                 context->get_format = &Impl::selectHardwarePixelFormat;
-                error = av_hwdevice_ctx_create(
-                    &context->hw_device_ctx,
-                    ffmpegDevice,
-                    nullptr,
-                    nullptr,
-                    0);
+                if (hardwareDecodeConfig.device) {
+                    context->hw_device_ctx =
+                        detail::HardwareDecodeDevicePrivate::contextRef(
+                            hardwareDecodeConfig.device);
+                    if (!context->hw_device_ctx) {
+                        error = AVERROR(ENOMEM);
+                    }
+                } else {
+                    error = av_hwdevice_ctx_create(
+                        &context->hw_device_ctx,
+                        ffmpegDevice,
+                        nullptr,
+                        nullptr,
+                        0);
+                }
             }
             if (error >= 0) {
                 error = avcodec_open2(context, decoder, nullptr);
@@ -933,7 +947,9 @@ private:
         int error = 0;
         AVCodecContext* context = nullptr;
         if (requestedDevice != HardwareDeviceType::Unknown) {
-            if (ffmpegDevice == AV_HWDEVICE_TYPE_NONE
+            if (suppliedDeviceMismatch) {
+                error = AVERROR(EINVAL);
+            } else if (ffmpegDevice == AV_HWDEVICE_TYPE_NONE
                 || !selectedHardwareConfig) {
                 error = AVERROR(ENOSYS);
             } else {

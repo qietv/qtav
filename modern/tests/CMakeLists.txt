@@ -3,12 +3,35 @@ target_link_libraries(qtav_core_api_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_api_test PRIVATE cxx_std_17)
 add_test(NAME qtav_core_api COMMAND qtav_core_api_test)
 
+find_package(FFmpeg REQUIRED COMPONENTS avutil)
+add_executable(
+    qtav_core_hardware_decode_device_test
+    hardware_decode_device_test.cpp
+)
+target_link_libraries(
+    qtav_core_hardware_decode_device_test
+    PRIVATE
+        QtAV::Core
+        FFmpeg::avutil
+)
+target_include_directories(
+    qtav_core_hardware_decode_device_test
+    PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
+)
+target_compile_features(
+    qtav_core_hardware_decode_device_test
+    PRIVATE cxx_std_17
+)
+add_test(
+    NAME qtav_core_hardware_decode_device
+    COMMAND qtav_core_hardware_decode_device_test
+)
+
 add_executable(qtav_core_backend_api_test backend_api_test.cpp)
 target_link_libraries(qtav_core_backend_api_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_backend_api_test PRIVATE cxx_std_17)
 add_test(NAME qtav_core_backend_api COMMAND qtav_core_backend_api_test)
 
-find_package(FFmpeg REQUIRED COMPONENTS avutil)
 add_executable(
     qtav_core_frame_color_metadata_test
     frame_color_metadata_test.cpp
@@ -338,6 +361,18 @@ if(FFMPEG_EXECUTABLE)
     )
     set_tests_properties(
         qtav_core_audio_sink_player
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_media
+            TIMEOUT 15
+    )
+    add_test(
+        NAME qtav_core_hardware_decode_device_player
+        COMMAND
+            qtav_core_hardware_decode_device_test
+            "${QTAV_CORE_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_hardware_decode_device_player
         PROPERTIES
             FIXTURES_REQUIRED qtav_core_media
             TIMEOUT 15

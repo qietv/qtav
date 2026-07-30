@@ -61,6 +61,9 @@ Current backend integration boundary:
   Windows render endpoint, owns an event-driven queue on a dedicated COM
   thread, and supplies an `IAudioClock`-backed playback clock and latency;
 - `HardwareDecodeConfig` selects an optional hardware device for video decode;
+  its optional reference-counted `HardwareDecodeDevice` lets an in-tree
+  backend supply a pre-created native device without exposing FFmpeg or
+  platform SDK types;
   `QtAV::HWVideoToolbox` supplies the Apple configuration helper and produces
   `HardwareFrame` values backed by retained `CVPixelBuffer` storage;
 - `QtAV::RenderCPU` converts and scales decoded software frames into packed
@@ -545,6 +548,17 @@ open/read operation and asynchronously reopens the media. The generic core
 maps `HardwareDeviceType` to FFmpeg's internal hardware-device selection,
 checks the codec's advertised hardware pixel format, and keeps the platform
 types private. An unknown device type selects the ordinary software path.
+
+An in-tree hardware backend may attach a `HardwareDecodeDevice` to the config.
+The public token reports only its generic device type and opaque native
+identity; it is a cheap reference-counted value and keeps the backend-created
+FFmpeg device context alive. Its FFmpeg bridge is a private, uninstalled core
+header. `Player` takes its own device-context reference before decoder open and
+rejects a token whose device type differs from
+`HardwareDecodeConfig::deviceType`, using the configured software-fallback
+policy. Replacing a supplied token while media is loaded also reopens the
+decoder. If no token is supplied, core retains its existing FFmpeg-created
+device behavior.
 
 `HardwareFrame` is a cheap reference-counted view over backend-owned frame
 storage. A native handle is an opaque integer tagged by its role and remains
