@@ -64,6 +64,11 @@ bool BorrowedAndroidVulkanContext::isValid() const noexcept
 
 class AndroidVulkanVideoRenderer::Impl {
 public:
+    struct FrameSync {
+        VkSemaphore imageAvailable = VK_NULL_HANDLE;
+        VkSemaphore renderFinished = VK_NULL_HANDLE;
+    };
+
     explicit Impl(BorrowedAndroidVulkanContext context)
         : context_(context)
         , renderer_(
@@ -124,29 +129,68 @@ public:
 
     bool createSemaphores(std::string& error)
     {
-        if (imageAvailable_ && renderFinished_) {
+        const bool complete = std::all_of(
+            sync_.begin(),
+            sync_.end(),
+            [](const FrameSync& sync) {
+                return sync.imageAvailable && sync.renderFinished;
+            });
+        if (complete) {
             return true;
         }
+        destroySemaphores();
         VkSemaphoreCreateInfo info {
             VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         };
-        VkResult result = vkCreateSemaphore(
-            context_.device.device,
-            &info,
-            nullptr,
-            &imageAvailable_);
-        if (result == VK_SUCCESS) {
-            result = vkCreateSemaphore(
+        for (auto& sync : sync_) {
+            VkResult result = vkCreateSemaphore(
                 context_.device.device,
                 &info,
                 nullptr,
-                &renderFinished_);
-        }
-        if (result != VK_SUCCESS) {
-            error = resultError("vkCreateSemaphore", result);
-            return false;
+                &sync.imageAvailable);
+            if (result == VK_SUCCESS) {
+                result = vkCreateSemaphore(
+                    context_.device.device,
+                    &info,
+                    nullptr,
+                    &sync.renderFinished);
+            }
+            if (result != VK_SUCCESS) {
+                error = resultError("vkCreateSemaphore", result);
+                return false;
+            }
         }
         return true;
+    }
+
+    void destroySemaphores() noexcept
+    {
+        for (auto& sync : sync_) {
+            if (sync.renderFinished) {
+                vkDestroySemaphore(
+                    context_.device.device,
+                    sync.renderFinished,
+                    nullptr);
+            }
+            if (sync.imageAvailable) {
+                vkDestroySemaphore(
+                    context_.device.device,
+                    sync.imageAvailable,
+                    nullptr);
+            }
+            sync = {};
+        }
+        syncIndex_ = 0;
+    }
+
+    FrameSync& activeSync() noexcept
+    {
+        return sync_[syncIndex_];
+    }
+
+    void advanceSync() noexcept
+    {
+        syncIndex_ = (syncIndex_ + 1) % sync_.size();
     }
 
     bool createSurface(std::string& error)
@@ -369,6 +413,7 @@ public:
             return false;
         }
         destroySwapchain();
+        syncIndex_ = 0;
         if (!createSwapchain(error)) {
             return false;
         }
@@ -410,7 +455,7 @@ public:
             context_.device.device,
             swapchain_,
             std::numeric_limits<std::uint64_t>::max(),
-            imageAvailable_,
+            activeSync().imageAvailable,
             VK_NULL_HANDLE,
             &imageIndex_);
         if (result == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -421,7 +466,7 @@ public:
                 context_.device.device,
                 swapchain_,
                 std::numeric_limits<std::uint64_t>::max(),
-                imageAvailable_,
+                activeSync().imageAvailable,
                 VK_NULL_HANDLE,
                 &imageIndex_);
         }
@@ -434,8 +479,8 @@ public:
         activeTarget_.format = format_;
         activeTarget_.extent = extent_;
         activeTarget_.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        activeTarget_.waitSemaphore = imageAvailable_;
-        activeTarget_.signalSemaphore = renderFinished_;
+        activeTarget_.waitSemaphore = activeSync().imageAvailable;
+        activeTarget_.signalSemaphore = activeSync().renderFinished;
         activeTarget_.generation = generation_;
         acquired_ = true;
         return true;
@@ -447,7 +492,7 @@ public:
             VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         };
         info.waitSemaphoreCount = 1;
-        info.pWaitSemaphores = &renderFinished_;
+        info.pWaitSemaphores = &activeSync().renderFinished;
         info.swapchainCount = 1;
         info.pSwapchains = &swapchain_;
         info.pImageIndices = &imageIndex_;
@@ -455,6 +500,7 @@ public:
             vkQueuePresentKHR(context_.device.queue, &info);
         acquired_ = false;
         activeTarget_ = {};
+        advanceSync();
         if (result == VK_ERROR_OUT_OF_DATE_KHR
             || result == VK_SUBOPTIMAL_KHR) {
             return recreate(error);
@@ -474,21 +520,8 @@ public:
             engineOpen_ = false;
             vkDeviceWaitIdle(context_.device.device);
             destroySurface();
-            if (renderFinished_) {
-                vkDestroySemaphore(
-                    context_.device.device,
-                    renderFinished_,
-                    nullptr);
-            }
-            if (imageAvailable_) {
-                vkDestroySemaphore(
-                    context_.device.device,
-                    imageAvailable_,
-                    nullptr);
-            }
+            destroySemaphores();
         }
-        renderFinished_ = VK_NULL_HANDLE;
-        imageAvailable_ = VK_NULL_HANDLE;
         if (window_) {
             ANativeWindow_release(window_);
             window_ = nullptr;
@@ -509,8 +542,10 @@ public:
     std::vector<VkImageView> views_;
     VkExtent2D extent_ {};
     VkFormat format_ = VK_FORMAT_UNDEFINED;
-    VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
-    VkSemaphore renderFinished_ = VK_NULL_HANDLE;
+    std::array<
+        FrameSync,
+        VulkanVideoRenderer::FramesInFlight> sync_;
+    std::size_t syncIndex_ = 0;
     VulkanRenderTarget activeTarget_;
     std::uint32_t imageIndex_ = 0;
     std::uint64_t generation_ = 0;
@@ -621,20 +656,7 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
             impl_->engineOpen_ = false;
             vkDeviceWaitIdle(impl_->context_.device.device);
             impl_->destroySwapchain();
-            if (impl_->renderFinished_) {
-                vkDestroySemaphore(
-                    impl_->context_.device.device,
-                    impl_->renderFinished_,
-                    nullptr);
-                impl_->renderFinished_ = VK_NULL_HANDLE;
-            }
-            if (impl_->imageAvailable_) {
-                vkDestroySemaphore(
-                    impl_->context_.device.device,
-                    impl_->imageAvailable_,
-                    nullptr);
-                impl_->imageAvailable_ = VK_NULL_HANDLE;
-            }
+            impl_->destroySemaphores();
             std::string recoveryError;
             if (impl_->window_
                 && impl_->createSwapchain(recoveryError)) {

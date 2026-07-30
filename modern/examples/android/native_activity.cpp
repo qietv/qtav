@@ -3,6 +3,8 @@
 #include <qtav/android_vulkan_video_renderer.h>
 #include <qtav/player.h>
 
+#include "vulkan_video_renderer_test_support.h"
+
 #include <android/asset_manager.h>
 #include <android/log.h>
 #include <android/native_activity.h>
@@ -328,7 +330,10 @@ struct TestState {
             "QTAV_ANDROID_TEST: PASS video_frames="
             + std::to_string(videoFrames.load())
             + " rendered_frames=" + std::to_string(renderedFrames.load())
-            + " audio_frames=" + std::to_string(audioFrames.load()));
+            + " audio_frames=" + std::to_string(audioFrames.load())
+            + " surface_recreations="
+            + std::to_string(surfaceRecreations.load())
+            + " offscreen=" + (offscreenPassed.load() ? "pass" : "fail"));
     }
 
     void start()
@@ -358,6 +363,10 @@ struct TestState {
                             fail("too few Vulkan-rendered video frames");
                         } else if (audioFrames.load() == 0) {
                             fail("no decoded audio frames");
+                        } else if (surfaceRecreations.load() == 0) {
+                            fail("the Android surface was not recreated");
+                        } else if (!offscreenPassed.load()) {
+                            fail("the Vulkan offscreen checks did not pass");
                         } else {
                             pass();
                         }
@@ -368,6 +377,18 @@ struct TestState {
                 if (!frame || frame.width() != 160 || frame.height() != 90) {
                     fail("unexpected video frame");
                     return;
+                }
+                if (!offscreenChecked.exchange(true)) {
+                    std::string error;
+                    if (!qtav::test::runVulkanOffscreenRendererChecks(
+                            vulkan->borrowed().device,
+                            frame,
+                            error)) {
+                        fail("Vulkan offscreen check: " + error);
+                        return;
+                    }
+                    offscreenPassed = true;
+                    logInfo("QTAV_ANDROID_TEST: OFFSCREEN_PASS");
                 }
                 ++videoFrames;
             })
@@ -384,9 +405,22 @@ struct TestState {
 
     void windowCreated(ANativeWindow* window)
     {
-        if (finished.load() || started.exchange(true)) {
+        if (finished.load()) {
             return;
         }
+        if (started.load()) {
+            if (!renderer || !renderer->setWindow(window)) {
+                fail("could not recreate the Android Vulkan surface");
+                return;
+            }
+            player.setState(qtav::State::Playing);
+            ++surfaceRecreations;
+            logInfo(
+                "QTAV_ANDROID_TEST: SURFACE_RECREATED count="
+                + std::to_string(surfaceRecreations.load()));
+            return;
+        }
+        started = true;
         vulkan = std::make_unique<VulkanContext>();
         std::string error;
         if (!vulkan->create(window, error)) {
@@ -425,17 +459,20 @@ struct TestState {
             + " surface="
             + std::to_string(config.surfaceSize.width)
             + 'x' + std::to_string(config.surfaceSize.height));
-        player.setPlaybackRate(4.0F);
         player.setMedia(mediaPath);
         player.setState(qtav::State::Playing);
     }
 
     void windowDestroyed()
     {
-        player.setState(qtav::State::Stopped);
+        if (!started.load() || finished.load()) {
+            return;
+        }
+        player.setState(qtav::State::Paused);
         if (renderer) {
             renderer->setWindow(nullptr);
         }
+        logInfo("QTAV_ANDROID_TEST: SURFACE_REMOVED");
     }
 
     ANativeActivity* activity = nullptr;
@@ -445,6 +482,9 @@ struct TestState {
     std::atomic<int> videoFrames { 0 };
     std::atomic<int> renderedFrames { 0 };
     std::atomic<int> audioFrames { 0 };
+    std::atomic<int> surfaceRecreations { 0 };
+    std::atomic<bool> offscreenChecked { false };
+    std::atomic<bool> offscreenPassed { false };
     std::atomic<bool> finished { false };
     std::atomic<bool> started { false };
     // Destroyed first so its worker is joined before borrowed Vulkan objects.

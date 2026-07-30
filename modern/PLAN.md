@@ -41,11 +41,12 @@ Continuation checkpoint:
   an active WASAPI render endpoint; Milestone 5 is complete and the active next
   platform task is the Android production path, followed by OHOS and then
   Linux; the shared Android/OHOS responsibility and lifecycle design is now
-  recorded in `MOBILE.md`, and the first Android arm64 checkpoint
+  recorded in `MOBILE.md`, and the Android arm64 Vulkan checkpoint
   cross-builds FFmpeg 8.1.2 plus QtAVCore, packages a minimal NativeActivity
-  APK, verifies generated software A/V decode, and now presents decoded
-  software frames through the platform-neutral Vulkan engine plus Android
-  surface/swapchain adapter on a connected Android device;
+  APK, verifies generated software A/V decode, and presents decoded software
+  frames through a bounded three-frame platform-neutral Vulkan engine plus
+  Android surface/swapchain adapter on a connected Android device, including
+  offscreen pixel goldens and background/foreground surface recreation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -159,9 +160,12 @@ Current verification:
   NativeActivity APK passes 16 KB ELF segment-alignment checks and installs on
   an Android 16/API 36 device with an Adreno 830;
 - the connected-device harness decodes its generated AVI through QtAVCore and
-  reports `PASS` with 30 MPEG-4 video frames, 30 Vulkan-presented frames, and
-  47 PCM audio frames; install authorization was confirmed manually on the
-  device after the harness correctly stopped on
+  reports `PASS` with 180 MPEG-4 video frames, 180 Vulkan-presented frames,
+  281 PCM audio frames, one background/foreground surface recreation without
+  media reopen, and platform-neutral offscreen pixel goldens covering
+  three-frame ring reuse, viewport, rotation, target replacement, limited/full
+  range, and BT.601/BT.709 conversion; install authorization was confirmed
+  manually on the device after the harness correctly stopped on
   `INSTALL_FAILED_USER_RESTRICTED`.
 
 ## Milestone 0 — Qt-free playback core
@@ -354,7 +358,7 @@ Begin the Android production path after the completed Windows milestone:
 2. [x] Establish reproducible macOS-hosted Android NDK and FFmpeg 8+
    cross-builds, package a minimal native test application, and run it on a
    connected arm64 Android device.
-3. [~] Add the reusable Vulkan renderer engine and Android surface adapter,
+3. [x] Add the reusable Vulkan renderer engine and Android surface adapter,
    keeping window, device, and swapchain ownership outside core.
 4. [ ] Add the OpenGL ES/EGL fallback path defined in `MOBILE.md`, sharing
    shader/color/geometry logic with Vulkan where practical without hiding
@@ -426,36 +430,39 @@ Accepted design and Android foundation checkpoint:
   bypassing a modern Android/OHOS authorization prompt;
 - the first connected device is model `2410DPN6CC`, Android 16/API 36,
   `arm64-v8a`, Adreno 830, Vulkan 1.3.284, and OpenGL ES 3.2; generated
-  software playback passed with 30 video and 47 audio frames.
+  software playback now passes with 180 video and 281 audio frames plus one
+  background/foreground surface recreation.
 
-Android Vulkan implementation checkpoint:
+Completed Android Vulkan implementation checkpoint:
 
 - `QtAV::RenderVulkan` is now a platform-neutral backend target with borrowed
   physical/logical device and queue handles plus an application-supplied
   current-image target; Vulkan declarations remain in its backend-specific
   header and do not reach core public headers;
-- the first engine submission path packs YUV420/422/444, NV12/NV21, P010,
+- the engine submission path packs YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 software planes into a coherent storage
   buffer and applies range, matrix, transfer, primaries, viewport, aspect, and
   rotation logic in generated SPIR-V shaders;
-- the engine uses a bounded one-frame in-flight fence and retains its source
-  `VideoFrame` until the submission completes; expanding this to a multi-frame
-  resource ring remains follow-up work;
+- the engine uses a bounded three-frame in-flight ring and retains each source
+  `VideoFrame` until its slot fence completes;
 - `QtAV::RenderVulkanAndroid` retains the active `ANativeWindow` generation
   and owns only its Android `VkSurfaceKHR`, swapchain, image views, and
-  acquire/present semaphores while borrowing the application-created Vulkan
-  instance, device, and graphics/present queue;
+  per-frame acquire/present semaphores while borrowing the
+  application-created Vulkan instance, device, and graphics/present queue;
 - the NativeActivity harness now selects a presentation-capable queue, creates
   the borrowed Vulkan context, renders decoded YUV420P frames through the
-  Android adapter, and passed on the recorded Adreno 830 device with 30/30
-  frames submitted and presented plus 47 decoded audio frames;
+  Android adapter, and passes on the recorded Adreno 830 device with 180/180
+  frames submitted and presented plus 281 decoded audio frames;
+- the deployment test backgrounds and resumes the same NativeActivity,
+  invalidates and rebuilds the active window/swapchain generation, and
+  continues playback without reopening media;
+- platform-neutral offscreen image readback checks exercise six queued
+  submissions across the three-frame ring, Fit letterboxing, custom viewport,
+  180-degree rotation, target-generation replacement, limited/full-range
+  YUV, and BT.601/BT.709 matrices;
 - a standalone Android install exports `QtAV::RenderVulkan` and
   `QtAV::RenderVulkanAndroid` with their installed headers and Vulkan
-  dependency metadata without embedding the local NDK or build-tree path;
-- before marking this slice complete, add platform-neutral offscreen pixel
-  goldens, exercise viewport/rotation/color variants and surface recreation,
-  and replace the serialized one-frame checkpoint with a bounded multi-frame
-  ring.
+  dependency metadata without embedding the local NDK or build-tree path.
 
 Completed Metal software-frame checkpoint:
 
@@ -881,18 +888,18 @@ Status: complete and verified.
 
 - [x] Reproducible macOS-hosted Android NDK build for QtAVCore and the required
   FFmpeg 8+ libraries, initially targeting arm64.
-- [~] Minimal APK/native application shell that owns activity, lifecycle,
+- [x] Minimal APK/native application shell that owns activity, lifecycle,
   permissions, and current rendering surfaces without adding Android types to
   core. NativeActivity creation/destruction, packaged media, active-window
-  retain/release, and the first Vulkan surface generation are proven;
-  background/foreground and replacement-surface scenarios remain.
+  retain/release, background/foreground, and replacement-surface scenarios
+  are proven.
 - [x] Connected-device deployment, logging, generated-media playback, and
   automated result collection.
 
 ### Rendering
 
-- [~] Shared Vulkan renderer engine from the mobile design checkpoint.
-- [~] Android Vulkan surface/swapchain adapter using application-owned native
+- [x] Shared Vulkan renderer engine from the mobile design checkpoint.
+- [x] Android Vulkan surface/swapchain adapter using application-owned native
   resources.
 - [ ] Shared OpenGL ES 3.x renderer plus Android EGL/window adapter as the
   required Vulkan fallback, without an SDL3 dependency.

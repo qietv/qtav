@@ -182,8 +182,7 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - remaining platform audio device implementations (ALSA/PulseAudio, AAudio);
-- OpenGL renderer implementations and remaining Vulkan offscreen, multi-frame,
-  surface-recreation, OHOS, and Linux validation;
+- OpenGL renderer implementations plus Vulkan OHOS and Linux validation;
 - remaining hardware decoders and Linux/Android GPU zero-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
@@ -216,10 +215,12 @@ external-OES texture. OHOS Vulkan remains conditional on adding a retained
 `OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer
 branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
 zero-CPU-copy source as-is.
-Vulkan offscreen goldens, a multi-frame resource ring, surface recreation,
-the OpenGL ES backend and selector, AAudio output, MediaCodec direct-surface
-presentation, and Vulkan/OpenGL ES texture interop remain separate backend
-work under the responsibility and lifecycle boundaries in
+The Vulkan engine now has offscreen goldens, a bounded three-frame resource
+ring, and Android background/foreground surface recreation coverage. The
+OpenGL ES backend and selector, AAudio output, MediaCodec direct-surface
+presentation, Vulkan/OpenGL ES texture interop, and Vulkan validation on OHOS
+and Linux remain separate backend work under the responsibility and lifecycle
+boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and

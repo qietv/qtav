@@ -3,7 +3,8 @@
 This harness proves the first Android production-path slice without Qt or a
 Gradle dependency. It cross-builds a pinned minimal FFmpeg 8.1.2 configuration
 and QtAVCore for `arm64-v8a`, packages a platform `NativeActivity`, and checks
-software MPEG-4 plus PCM decode and Vulkan swapchain presentation on one
+software MPEG-4 plus PCM decode, a bounded three-frame Vulkan submission ring,
+swapchain presentation, and background/foreground surface recreation on one
 connected device.
 
 Requirements:
@@ -44,5 +45,11 @@ asking to retry.
 The application creates its own Vulkan instance, logical device, and
 graphics/present queue. `QtAV::RenderVulkanAndroid` retains the current
 `ANativeWindow` and owns only its surface/swapchain generation. A successful
-result reports decoded video frames, Vulkan-rendered frames, and decoded audio
-frames. The first Adreno 830 run reported 30, 30, and 47 respectively.
+result reports decoded video frames, Vulkan-rendered frames, decoded audio
+frames, and at least one surface recreation. The deployment script sends the
+application to the launcher once and resumes the same activity; playback is
+paused while its window generation is absent and continues without reopening
+the media after the Vulkan surface/swapchain is rebuilt. Before presentation,
+the harness also renders deterministic offscreen goldens for ring reuse,
+limited/full-range BT.601/BT.709 conversion, viewport, rotation, and target
+recreation.

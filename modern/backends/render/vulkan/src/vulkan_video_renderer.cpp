@@ -423,6 +423,8 @@ bool VulkanRenderTarget::isValid() const noexcept
 class VulkanVideoRenderer::Impl {
 public:
     struct FrameResources {
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkFence submitFence = VK_NULL_HANDLE;
         VkBuffer frameBuffer = VK_NULL_HANDLE;
         VkDeviceMemory frameMemory = VK_NULL_HANDLE;
         VkBuffer parameterBuffer = VK_NULL_HANDLE;
@@ -431,6 +433,7 @@ public:
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
         VideoFrame retainedFrame;
+        bool submissionPending = false;
     };
 
     Impl(
@@ -545,62 +548,90 @@ public:
         return true;
     }
 
-    void destroyFrameResources() noexcept
+    void destroyFrameResources(FrameResources& frame) noexcept
     {
         if (!device_.device) {
-            frame_ = {};
+            frame.frameBuffer = VK_NULL_HANDLE;
+            frame.frameMemory = VK_NULL_HANDLE;
+            frame.parameterBuffer = VK_NULL_HANDLE;
+            frame.parameterMemory = VK_NULL_HANDLE;
+            frame.descriptorPool = VK_NULL_HANDLE;
+            frame.descriptorSet = VK_NULL_HANDLE;
+            frame.framebuffer = VK_NULL_HANDLE;
+            frame.retainedFrame = {};
+            frame.submissionPending = false;
             return;
         }
-        if (frame_.framebuffer) {
+        if (frame.framebuffer) {
             vkDestroyFramebuffer(
                 device_.device,
-                frame_.framebuffer,
+                frame.framebuffer,
                 nullptr);
         }
-        if (frame_.descriptorPool) {
+        if (frame.descriptorPool) {
             vkDestroyDescriptorPool(
                 device_.device,
-                frame_.descriptorPool,
+                frame.descriptorPool,
                 nullptr);
         }
-        if (frame_.parameterBuffer) {
+        if (frame.parameterBuffer) {
             vkDestroyBuffer(
                 device_.device,
-                frame_.parameterBuffer,
+                frame.parameterBuffer,
                 nullptr);
         }
-        if (frame_.parameterMemory) {
+        if (frame.parameterMemory) {
             vkFreeMemory(
                 device_.device,
-                frame_.parameterMemory,
+                frame.parameterMemory,
                 nullptr);
         }
-        if (frame_.frameBuffer) {
-            vkDestroyBuffer(device_.device, frame_.frameBuffer, nullptr);
+        if (frame.frameBuffer) {
+            vkDestroyBuffer(device_.device, frame.frameBuffer, nullptr);
         }
-        if (frame_.frameMemory) {
-            vkFreeMemory(device_.device, frame_.frameMemory, nullptr);
+        if (frame.frameMemory) {
+            vkFreeMemory(device_.device, frame.frameMemory, nullptr);
         }
-        frame_ = {};
+        frame.frameBuffer = VK_NULL_HANDLE;
+        frame.frameMemory = VK_NULL_HANDLE;
+        frame.parameterBuffer = VK_NULL_HANDLE;
+        frame.parameterMemory = VK_NULL_HANDLE;
+        frame.descriptorPool = VK_NULL_HANDLE;
+        frame.descriptorSet = VK_NULL_HANDLE;
+        frame.framebuffer = VK_NULL_HANDLE;
+        frame.retainedFrame = {};
+        frame.submissionPending = false;
     }
 
-    bool waitForSubmission(std::string& error)
+    bool waitForSubmission(
+        FrameResources& frame,
+        std::string& error)
     {
-        if (!submissionPending_) {
+        if (!frame.submissionPending) {
             return true;
         }
         const VkResult result = vkWaitForFences(
             device_.device,
             1,
-            &submitFence_,
+            &frame.submitFence,
             VK_TRUE,
             std::numeric_limits<std::uint64_t>::max());
         if (result != VK_SUCCESS) {
             error = resultError("vkWaitForFences", result);
             return false;
         }
-        submissionPending_ = false;
-        destroyFrameResources();
+        frame.submissionPending = false;
+        destroyFrameResources(frame);
+        return true;
+    }
+
+    bool waitForAllSubmissions(std::string& error)
+    {
+        for (auto& frame : frames_) {
+            if (!waitForSubmission(frame, error)) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -677,33 +708,38 @@ public:
             error = resultError("vkCreateCommandPool", result);
             return false;
         }
+        std::array<VkCommandBuffer, FramesInFlight> commandBuffers {};
         VkCommandBufferAllocateInfo commandInfo {
             VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         };
         commandInfo.commandPool = commandPool_;
         commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        commandInfo.commandBufferCount = 1;
+        commandInfo.commandBufferCount =
+            static_cast<std::uint32_t>(commandBuffers.size());
         result = vkAllocateCommandBuffers(
             device_.device,
             &commandInfo,
-            &commandBuffer_);
+            commandBuffers.data());
         if (result != VK_SUCCESS) {
             error = resultError("vkAllocateCommandBuffers", result);
             return false;
         }
 
-        VkFenceCreateInfo fenceInfo {
-            VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        };
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        result = vkCreateFence(
-            device_.device,
-            &fenceInfo,
-            nullptr,
-            &submitFence_);
-        if (result != VK_SUCCESS) {
-            error = resultError("vkCreateFence", result);
-            return false;
+        for (std::size_t index = 0; index < frames_.size(); ++index) {
+            frames_[index].commandBuffer = commandBuffers[index];
+            VkFenceCreateInfo fenceInfo {
+                VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            };
+            fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            result = vkCreateFence(
+                device_.device,
+                &fenceInfo,
+                nullptr,
+                &frames_[index].submitFence);
+            if (result != VK_SUCCESS) {
+                error = resultError("vkCreateFence", result);
+                return false;
+            }
         }
         return true;
     }
@@ -716,6 +752,9 @@ public:
         if (pipeline_ && pipelineFormat_ == format
             && pipelineFinalLayout_ == finalLayout) {
             return true;
+        }
+        if (!waitForAllSubmissions(error)) {
+            return false;
         }
         destroyPipeline();
 
@@ -893,22 +932,23 @@ public:
         const PackedFrame& packed,
         const VulkanRenderTarget& target,
         const VideoFrame& retainedFrame,
+        FrameResources& frame,
         std::string& error)
     {
-        destroyFrameResources();
+        destroyFrameResources(frame);
         if (!createBuffer(
                 packed.bytes.size(),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 packed.bytes.data(),
-                frame_.frameBuffer,
-                frame_.frameMemory,
+                frame.frameBuffer,
+                frame.frameMemory,
                 error)
             || !createBuffer(
                 sizeof(packed.parameters),
                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                 &packed.parameters,
-                frame_.parameterBuffer,
-                frame_.parameterMemory,
+                frame.parameterBuffer,
+                frame.parameterMemory,
                 error)) {
             return false;
         }
@@ -934,7 +974,7 @@ public:
             device_.device,
             &poolInfo,
             nullptr,
-            &frame_.descriptorPool);
+            &frame.descriptorPool);
         if (result != VK_SUCCESS) {
             error = resultError("vkCreateDescriptorPool", result);
             return false;
@@ -942,36 +982,36 @@ public:
         VkDescriptorSetAllocateInfo descriptorInfo {
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         };
-        descriptorInfo.descriptorPool = frame_.descriptorPool;
+        descriptorInfo.descriptorPool = frame.descriptorPool;
         descriptorInfo.descriptorSetCount = 1;
         descriptorInfo.pSetLayouts = &descriptorSetLayout_;
         result = vkAllocateDescriptorSets(
             device_.device,
             &descriptorInfo,
-            &frame_.descriptorSet);
+            &frame.descriptorSet);
         if (result != VK_SUCCESS) {
             error = resultError("vkAllocateDescriptorSets", result);
             return false;
         }
         const VkDescriptorBufferInfo frameInfo {
-            frame_.frameBuffer,
+            frame.frameBuffer,
             0,
             packed.bytes.size(),
         };
         const VkDescriptorBufferInfo parameterInfo {
-            frame_.parameterBuffer,
+            frame.parameterBuffer,
             0,
             sizeof(packed.parameters),
         };
         std::array<VkWriteDescriptorSet, 2> writes {};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = frame_.descriptorSet;
+        writes[0].dstSet = frame.descriptorSet;
         writes[0].dstBinding = 0;
         writes[0].descriptorCount = 1;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[0].pBufferInfo = &frameInfo;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = frame_.descriptorSet;
+        writes[1].dstSet = frame.descriptorSet;
         writes[1].dstBinding = 1;
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -996,21 +1036,22 @@ public:
             device_.device,
             &framebufferInfo,
             nullptr,
-            &frame_.framebuffer);
+            &frame.framebuffer);
         if (result != VK_SUCCESS) {
             error = resultError("vkCreateFramebuffer", result);
             return false;
         }
-        frame_.retainedFrame = retainedFrame;
+        frame.retainedFrame = retainedFrame;
         return true;
     }
 
     bool submit(
         const VulkanRenderTarget& target,
+        FrameResources& frame,
         std::string& error)
     {
         VkResult result =
-            vkResetCommandBuffer(commandBuffer_, 0);
+            vkResetCommandBuffer(frame.commandBuffer, 0);
         if (result != VK_SUCCESS) {
             error = resultError("vkResetCommandBuffer", result);
             return false;
@@ -1020,7 +1061,7 @@ public:
         };
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         result =
-            vkBeginCommandBuffer(commandBuffer_, &beginInfo);
+            vkBeginCommandBuffer(frame.commandBuffer, &beginInfo);
         if (result != VK_SUCCESS) {
             error = resultError("vkBeginCommandBuffer", result);
             return false;
@@ -1030,25 +1071,25 @@ public:
             VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         };
         passInfo.renderPass = renderPass_;
-        passInfo.framebuffer = frame_.framebuffer;
+        passInfo.framebuffer = frame.framebuffer;
         passInfo.renderArea.extent = target.extent;
         passInfo.clearValueCount = 1;
         passInfo.pClearValues = &clear;
         vkCmdBeginRenderPass(
-            commandBuffer_,
+            frame.commandBuffer,
             &passInfo,
             VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(
-            commandBuffer_,
+            frame.commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
             pipeline_);
         vkCmdBindDescriptorSets(
-            commandBuffer_,
+            frame.commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
             pipelineLayout_,
             0,
             1,
-            &frame_.descriptorSet,
+            &frame.descriptorSet,
             0,
             nullptr);
         const VkViewport viewport {
@@ -1060,17 +1101,20 @@ public:
             1.0F,
         };
         const VkRect2D scissor { { 0, 0 }, target.extent };
-        vkCmdSetViewport(commandBuffer_, 0, 1, &viewport);
-        vkCmdSetScissor(commandBuffer_, 0, 1, &scissor);
-        vkCmdDraw(commandBuffer_, 3, 1, 0, 0);
-        vkCmdEndRenderPass(commandBuffer_);
-        result = vkEndCommandBuffer(commandBuffer_);
+        vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
+        vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
+        vkCmdEndRenderPass(frame.commandBuffer);
+        result = vkEndCommandBuffer(frame.commandBuffer);
         if (result != VK_SUCCESS) {
             error = resultError("vkEndCommandBuffer", result);
             return false;
         }
 
-        result = vkResetFences(device_.device, 1, &submitFence_);
+        result = vkResetFences(
+            device_.device,
+            1,
+            &frame.submitFence);
         if (result != VK_SUCCESS) {
             error = resultError("vkResetFences", result);
             return false;
@@ -1082,7 +1126,7 @@ public:
             submitInfo.pWaitDstStageMask = &target.waitStage;
         }
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer_;
+        submitInfo.pCommandBuffers = &frame.commandBuffer;
         if (target.signalSemaphore) {
             submitInfo.signalSemaphoreCount = 1;
             submitInfo.pSignalSemaphores = &target.signalSemaphore;
@@ -1091,13 +1135,14 @@ public:
             device_.queue,
             1,
             &submitInfo,
-            submitFence_);
+            frame.submitFence);
         if (result != VK_SUCCESS) {
             error = resultError("vkQueueSubmit", result);
             return false;
         }
-        submissionPending_ = true;
-        if (target.waitUntilCompleted && !waitForSubmission(error)) {
+        frame.submissionPending = true;
+        if (target.waitUntilCompleted
+            && !waitForSubmission(frame, error)) {
             return false;
         }
         return true;
@@ -1108,11 +1153,18 @@ public:
         std::lock_guard<std::mutex> renderLock(renderMutex_);
         if (device_.device) {
             std::string ignored;
-            waitForSubmission(ignored);
-            destroyFrameResources();
+            waitForAllSubmissions(ignored);
+            for (auto& frame : frames_) {
+                destroyFrameResources(frame);
+            }
             destroyPipeline();
-            if (submitFence_) {
-                vkDestroyFence(device_.device, submitFence_, nullptr);
+            for (auto& frame : frames_) {
+                if (frame.submitFence) {
+                    vkDestroyFence(
+                        device_.device,
+                        frame.submitFence,
+                        nullptr);
+                }
             }
             if (commandPool_) {
                 vkDestroyCommandPool(
@@ -1133,12 +1185,15 @@ public:
                     nullptr);
             }
         }
-        submitFence_ = VK_NULL_HANDLE;
         commandPool_ = VK_NULL_HANDLE;
-        commandBuffer_ = VK_NULL_HANDLE;
+        for (auto& frame : frames_) {
+            frame.commandBuffer = VK_NULL_HANDLE;
+            frame.submitFence = VK_NULL_HANDLE;
+            frame.submissionPending = false;
+        }
+        nextFrame_ = 0;
         pipelineLayout_ = VK_NULL_HANDLE;
         descriptorSetLayout_ = VK_NULL_HANDLE;
-        submissionPending_ = false;
         std::lock_guard<std::mutex> stateLock(stateMutex_);
         open_ = false;
     }
@@ -1154,14 +1209,12 @@ public:
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
-    VkFence submitFence_ = VK_NULL_HANDLE;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkFormat pipelineFormat_ = VK_FORMAT_UNDEFINED;
     VkImageLayout pipelineFinalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    FrameResources frame_;
-    bool submissionPending_ = false;
+    std::array<FrameResources, FramesInFlight> frames_;
+    std::size_t nextFrame_ = 0;
 };
 
 VulkanVideoRenderer::VulkanVideoRenderer(
@@ -1290,6 +1343,12 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
             "The Vulkan renderer is not open");
         return false;
     }
+    auto& frameResources = impl_->frames_[impl_->nextFrame_];
+    std::string error;
+    if (!impl_->waitForSubmission(frameResources, error)) {
+        impl_->notify(VideoRenderEventType::Error, std::move(error));
+        return false;
+    }
     const VulkanRenderTarget target =
         currentTarget ? currentTarget() : VulkanRenderTarget {};
     if (!target.isValid()) {
@@ -1315,9 +1374,7 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
     }
 
     PackedFrame packed;
-    std::string error;
     if (!packFrame(frame, config, packed, error)
-        || !impl_->waitForSubmission(error)
         || !impl_->createPipeline(
             target.format,
             target.finalLayout,
@@ -1326,11 +1383,14 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
             packed,
             target,
             frame,
+            frameResources,
             error)
-        || !impl_->submit(target, error)) {
+        || !impl_->submit(target, frameResources, error)) {
         impl_->notify(VideoRenderEventType::Error, std::move(error));
         return false;
     }
+    impl_->nextFrame_ =
+        (impl_->nextFrame_ + 1) % impl_->frames_.size();
     return true;
 }
 

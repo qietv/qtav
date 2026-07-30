@@ -249,8 +249,11 @@ Last verified baseline:
 - MPEG-4/AAC generated-media playback: passed;
 - AC-3, E-AC-3, and TrueHD audio-only decoding: passed.
 - Android arm64 FFmpeg 8.1.2/QtAVCore/Vulkan build, APK packaging, and
-  connected Adreno 830 device playback: passed with 30 decoded and
-  Vulkan-presented video frames plus 47 decoded audio frames.
+  connected Adreno 830 device playback: passed with 180 decoded and
+  Vulkan-presented video frames, 281 decoded audio frames, a
+  background/foreground surface recreation, and offscreen Vulkan goldens for
+  the three-frame ring, color conversion, viewport, rotation, and target
+  recreation.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device

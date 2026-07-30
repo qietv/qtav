@@ -210,6 +210,28 @@ if(TARGET qtav_render_d3d11)
     )
 endif()
 
+if(TARGET qtav_render_vulkan)
+    add_executable(
+        qtav_render_vulkan_test
+        vulkan_video_renderer_test.cpp
+        vulkan_video_renderer_test_support.cpp
+    )
+    target_link_libraries(
+        qtav_render_vulkan_test
+        PRIVATE
+            QtAV::RenderVulkan
+            FFmpeg::avutil
+    )
+    target_include_directories(
+        qtav_render_vulkan_test
+        PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
+    )
+    target_compile_features(
+        qtav_render_vulkan_test
+        PRIVATE cxx_std_17
+    )
+endif()
+
 if(TARGET qtav_platform_windows)
     add_executable(
         qtav_platform_windows_test
@@ -610,6 +632,44 @@ if(FFMPEG_EXECUTABLE)
             PROPERTIES
                 FIXTURES_REQUIRED qtav_render_metal_media
                 TIMEOUT 20
+        )
+    endif()
+
+    if(TARGET qtav_render_vulkan_test)
+        set(
+            QTAV_RENDER_VULKAN_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-vulkan-yuv420p.nut"
+        )
+        add_test(
+            NAME qtav_render_vulkan_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=160x90:r=1:d=1,drawbox=x=80:y=0:w=80:h=90:color=blue:t=fill,format=yuv420p"
+                -frames:v 1
+                -c:v rawvideo
+                -pix_fmt yuv420p
+                "${QTAV_RENDER_VULKAN_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_vulkan_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_render_vulkan_media
+        )
+        add_test(
+            NAME qtav_render_vulkan_offscreen
+            COMMAND
+                qtav_render_vulkan_test
+                "${QTAV_RENDER_VULKAN_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_render_vulkan_offscreen
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_render_vulkan_media
+                TIMEOUT 20
+                SKIP_RETURN_CODE 77
         )
     endif()
 

@@ -3,6 +3,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -23,8 +24,6 @@ struct QTAV_RENDER_VULKAN_EXPORT BorrowedVulkanDevice {
 
 // The image, view, and synchronization objects remain application-owned. They
 // must stay valid until the submission fence associated with render() signals.
-// The renderer serializes one retained frame at a time in this first engine
-// checkpoint.
 struct QTAV_RENDER_VULKAN_EXPORT VulkanRenderTarget {
     VkImage image = VK_NULL_HANDLE;
     VkImageView imageView = VK_NULL_HANDLE;
@@ -48,6 +47,8 @@ using VulkanCurrentTargetCallback = std::function<VulkanRenderTarget()>;
 class QTAV_RENDER_VULKAN_EXPORT VulkanVideoRenderer final
     : public VideoRenderAPI {
 public:
+    static constexpr std::size_t FramesInFlight = 3;
+
     VulkanVideoRenderer(
         BorrowedVulkanDevice device,
         VulkanCurrentTargetCallback currentTarget);

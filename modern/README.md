@@ -231,16 +231,19 @@ device script requires exactly one authorized device, records ABI/API and
 Vulkan facts, installs once, launches the generated-media playback test, and
 collects its pass/fail log. If installation or replacement fails because the
 device may be waiting for user authorization, stop and approve the prompt
-manually before retrying. The Vulkan-enabled Android 16/arm64 device run
-decoded 30 MPEG-4 video frames, submitted/presented all 30 through an Adreno
-830 Vulkan 1.3.284 swapchain, and decoded 47 PCM audio frames successfully.
+manually before retrying. The Vulkan-enabled Android 16/arm64 device run now
+decodes and presents 180 MPEG-4 video frames through an Adreno 830 Vulkan
+1.3.284 swapchain, decodes 281 PCM audio frames, and recreates the
+surface/swapchain across a background/foreground transition.
 
-This is a toolchain, packaging, software-decode, and initial Vulkan-rendering
-checkpoint. The renderer currently serializes one retained frame at a time;
-platform-neutral offscreen pixel goldens, a bounded multi-frame resource ring,
-and Android surface-recreation scenarios remain. It does not yet provide an
-AAudio sink or MediaCodec backend. Their accepted shared Android/OHOS
-responsibility and lifecycle design is documented in
+This is a toolchain, packaging, software-decode, and Vulkan-rendering
+checkpoint. The renderer uses a bounded three-frame resource ring and retains
+each source frame until its fence completes. Platform-neutral offscreen
+readback goldens run in the Android harness and cover YUV color conversion,
+limited/full range, BT.601/BT.709 matrices, viewport, rotation, target
+recreation, and ring reuse. It does not yet provide the required OpenGL ES/EGL
+fallback and selector, an AAudio sink, or a MediaCodec backend. Their accepted
+shared Android/OHOS responsibility and lifecycle design is documented in
 [`MOBILE.md`](MOBILE.md).
 
 ## API shape
@@ -485,9 +488,12 @@ player.setVideoRenderAPI(renderer);
 ```
 
 The adapter acquires its own window reference and owns the associated
-`VkSurfaceKHR`, swapchain, image views, and acquire/present semaphores. Passing
-`nullptr` to `setWindow()` invalidates that generation. The Vulkan instance,
-device, and queue remain application-owned and must outlive the renderer.
+`VkSurfaceKHR`, swapchain, image views, and per-frame acquire/present
+semaphores. Passing `nullptr` to `setWindow()` invalidates that generation.
+Publishing a new window while the renderer remains open rebuilds the
+surface/swapchain and resumes presentation without reopening media. The Vulkan
+instance, device, and queue remain application-owned and must outlive the
+renderer.
 
 ### D3D11 renderer
 

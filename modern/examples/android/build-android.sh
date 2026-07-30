@@ -166,9 +166,9 @@ fi
     -hide_banner \
     -loglevel error \
     -f lavfi \
-    -i "testsrc2=size=160x90:rate=30:duration=1" \
+    -i "color=c=red:size=160x90:rate=30:duration=6,drawbox=x=80:y=0:w=80:h=90:color=blue:t=fill" \
     -f lavfi \
-    -i "sine=frequency=1000:sample_rate=48000:duration=1" \
+    -i "sine=frequency=1000:sample_rate=48000:duration=6" \
     -c:v mpeg4 \
     -q:v 2 \
     -pix_fmt yuv420p \

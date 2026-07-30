@@ -61,6 +61,54 @@ fi
     >/dev/null
 
 attempt=0
+while [ "${attempt}" -lt 10 ]; do
+    "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
+        > "${result_directory}/logcat.txt"
+    if rg -q "QTAV_ANDROID_TEST: START" "${result_directory}/logcat.txt" \
+       && rg -q "QTAV_ANDROID_TEST: OFFSCREEN_PASS" \
+           "${result_directory}/logcat.txt"; then
+        break
+    fi
+    if rg -q "QTAV_ANDROID_TEST: FAIL" "${result_directory}/logcat.txt"; then
+        cat "${result_directory}/logcat.txt" >&2
+        "${adb}" shell am force-stop "${package_name}"
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+if [ "${attempt}" -ge 10 ]; then
+    cat "${result_directory}/logcat.txt" >&2
+    "${adb}" shell am force-stop "${package_name}"
+    echo "timed out waiting for the native Android test to start" >&2
+    exit 1
+fi
+
+"${adb}" logcat -c
+"${adb}" shell input keyevent KEYCODE_HOME
+attempt=0
+while [ "${attempt}" -lt 10 ]; do
+    "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
+        > "${result_directory}/logcat.txt"
+    if rg -q "QTAV_ANDROID_TEST: SURFACE_REMOVED" \
+        "${result_directory}/logcat.txt"; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+if [ "${attempt}" -ge 10 ]; then
+    cat "${result_directory}/logcat.txt" >&2
+    "${adb}" shell am force-stop "${package_name}"
+    echo "timed out waiting for Android surface removal" >&2
+    exit 1
+fi
+
+"${adb}" shell am start \
+    -n "${package_name}/${activity_name}" \
+    >/dev/null
+
+attempt=0
 while [ "${attempt}" -lt 30 ]; do
     "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
         > "${result_directory}/logcat.txt"

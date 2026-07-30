@@ -34,7 +34,12 @@ add_subdirectory(
     "${CMAKE_CURRENT_BINARY_DIR}/qtavcore"
 )
 
-add_library(qtav_android_test SHARED native_activity.cpp)
+add_library(
+    qtav_android_test
+    SHARED
+    native_activity.cpp
+    "${CMAKE_CURRENT_LIST_DIR}/../../tests/vulkan_video_renderer_test_support.cpp"
+)
 target_compile_features(qtav_android_test PRIVATE cxx_std_17)
 target_compile_options(
     qtav_android_test
@@ -46,6 +51,13 @@ target_compile_options(
 )
 target_compile_definitions(
     qtav_android_test PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+target_include_directories(
+    qtav_android_test
+    PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests"
+        "${CMAKE_CURRENT_LIST_DIR}/../../core/src"
+        "${FFmpeg_avutil_INCLUDE_DIR}"
+)
 target_link_options(qtav_android_test PRIVATE
     "-Wl,--no-undefined"
     "-Wl,-z,max-page-size=16384"
