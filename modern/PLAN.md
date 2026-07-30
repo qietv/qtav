@@ -38,20 +38,22 @@ Continuation checkpoint:
   the D3D11VA device/frame/interop design and supplied-device core bridge are
   complete; the native `qtav_hw_d3d11va` decoder backend and
   `qtav_interop_d3d11` Video Processor path are complete, including
-  same-device validation, color-aware SDR BGRA8 conversion, native H.264/NV12
-  and HEVC Main10/P010 zero-CPU-map rendering, lifecycle coverage, example
-  wiring, installed target export, and strict native H.264/AAC playback through
-  an active WASAPI render endpoint; Milestone 5 is complete and the active next
-  platform task is the Android production path, followed by OHOS and then
-  Linux; the shared Android/OHOS responsibility and lifecycle design is now
-  recorded in `MOBILE.md`, and the Android arm64 Vulkan checkpoint
-  cross-builds FFmpeg 8.1.2 plus QtAVCore, packages a minimal NativeActivity
-  APK, verifies generated software A/V decode, and presents decoded software
-  frames through a bounded three-frame platform-neutral Vulkan engine plus
-  Android surface/swapchain adapter on a connected Android device, including
-  SDR and native-HDR offscreen pixel goldens, required HDR10/PQ swapchain
-  selection, static HDR metadata, and background/foreground HDR surface
-  recreation;
+  same-device validation, SDR BGRA8 plus HDR RGB10/FP16 conversion, native
+  H.264/NV12 and PQ/BT.2020 HEVC Main10/P010 zero-CPU-map rendering,
+  Windows Advanced Color swap-chain/display tracking, lifecycle coverage,
+  example wiring, installed target export, and strict native H.264/AAC
+  playback through an active WASAPI render endpoint; the implementation,
+  SDR-state tests, and active-HDR native display validation are complete;
+  Milestone 5 is complete and the active next platform task is the Android
+  production path, followed by OHOS and then Linux; the shared Android/OHOS
+  responsibility and lifecycle design is now recorded in `MOBILE.md`, and the
+  Android arm64 Vulkan checkpoint cross-builds FFmpeg 8.1.2 plus QtAVCore,
+  packages a minimal NativeActivity APK, verifies generated software A/V
+  decode, and presents decoded software frames through a bounded three-frame
+  platform-neutral Vulkan engine plus Android surface/swapchain adapter on a
+  connected Android device, including SDR and native-HDR offscreen pixel
+  goldens, required HDR10/PQ swapchain selection, static HDR metadata, and
+  background/foreground HDR surface recreation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -132,7 +134,8 @@ Current implementation:
 
 Current verification:
 
-- static and shared builds pass 32/32 CTest tests on Windows, including the
+- the current static and shared Windows builds pass 33/33 CTest tests,
+  including the Advanced Color test, the
   WASAPI device test and strict native H.264/AAC playback;
 - static and shared macOS builds pass 27/27 CTest tests, including numeric
   FP16 HDR/BT.2020/headroom checks and real-screen EDR presentation on the
@@ -160,6 +163,14 @@ Current verification:
   presentation with verified pixels and no CPU mapping, plus pause/resume,
   seek, media replacement, stop, surface recreation, and retained-frame use
   after player shutdown;
+- Windows Advanced Color coverage now includes deterministic PQ/HLG EOTF,
+  BT.2020 conversion, SDR tone mapping, FP16 scRGB and RGB10/PQ numeric
+  readback, a native flip-model swap chain, `IDXGIOutput6`,
+  `SetColorSpace1`, SDR-white lookup, and same-adapter display switching while
+  Windows HDR is disabled and enabled. Active-HDR validation on a
+  PHL 27B1U7903 reported a 10-bit G2084/P2020 output, system-derived 240-nit
+  SDR white, 1405.11-nit peak luminance, and 1000-nit PQ output above scRGB
+  `1.0`;
 - the strict generated H.264/AAC native example test proves simultaneous
   D3D11VA decode, D3D11 rendering, audio decode, and audible WASAPI output
   through the active render endpoint;
@@ -370,7 +381,14 @@ Completed file-output checkpoint:
 
 ## Next task
 
-Begin the Android production path after the completed Windows milestone:
+Begin the Android production path:
+
+Windows Advanced Color validation is complete: on a PHL 27B1U7903,
+`qtav_render_d3d11_advanced_color_test` passed with
+`QTAV_REQUIRE_ACTIVE_HDR=1`, active G2084/P2020 output, an FP16 G10/P709 scRGB
+swap chain, system SDR white and panel luminance queries, and preservation of
+the 1000-nit PQ sample above scRGB `1.0`; static and shared Windows CTest runs
+passed 33/33.
 
 1. [x] Complete the shared Android/OHOS mobile design checkpoint below before
    adding either platform's hardware decoder.
@@ -644,13 +662,18 @@ Completed D3D11 software-frame checkpoint:
   application-owned render-target view for every frame;
 - the renderer uploads YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames into D3D11 shader
-  resources and applies limited/full-range BT.601/BT.709/BT.2020 conversion;
+  resources and applies limited/full-range BT.601/BT.709/BT.2020 conversion,
+  PQ/HLG EOTF, linear primaries conversion, and display-aware tone mapping;
+- BGRA8/RGBA8 SDR, FP16 scRGB, and RGB10/PQ targets are supported; an optional
+  borrowed `IDXGISwapChain3` enables per-frame `IDXGIOutput6` capability
+  discovery, SDR-white lookup, `SetColorSpace1`, and display-switch handling;
 - Fit, Fill, Stretch, custom viewports, all right-angle rotations, resize,
   render-target recreation, foreign-device rejection, and missing-surface or
   device-removal event classification are implemented;
-- deterministic WARP offscreen tests cover RGB24, YUV420P, and NV12 pixel
-  output plus viewport, aspect, rotation, resize, surface recreation, and
-  error handling;
+- deterministic WARP offscreen tests cover RGB24, YUV420P, NV12, PQ/HLG P010,
+  SDR tone mapping, FP16 scRGB/RGB10 numeric output, viewport, aspect,
+  rotation, resize, surface recreation, and error handling; a native
+  flip-model test covers the current output and same-adapter display moves;
 - Windows multi-config discovery now maps vcpkg FFmpeg Debug and Release
   libraries correctly, and a common runtime directory makes shared-library
   tests and examples directly runnable.
@@ -798,7 +821,8 @@ Next implementation slice:
 2. [x] Add renderer capability reporting plus explicit enabled/disabled
    software-map fallback using mock interop tests.
 3. [x] Implement `QtAV::InteropD3D11` with same-device validation and a D3D11
-   Video Processor pass into a shader-readable BGRA8 intermediate.
+   Video Processor pass into shader-readable SDR BGRA8 or HDR RGB10/FP16
+   intermediates.
 4. [x] Add WARP contract tests, native zero-CPU-copy H.264 rendering coverage,
    example wiring, and install-consumer validation.
 
@@ -809,8 +833,8 @@ Completed D3D11 renderer interop-contract checkpoint:
   depending on `QtAV::HWD3D11VA`;
 - an interop object identifies the retained `D3D11DeviceAccess` whose shared
   recursive guard protects its immediate/video-context work;
-- an imported texture frame reports its dimensions and packed pixel format
-  and keeps its borrowed `ID3D11Texture2D` and
+- an imported texture frame reports its dimensions, packed pixel format, DXGI
+  format, and color space and keeps its borrowed `ID3D11Texture2D` and
   `ID3D11ShaderResourceView` valid for the texture-frame lifetime;
 - deterministic WARP coverage proves capability/source-device reporting,
   import dispatch, shared device-access identity, and COM resource retention
@@ -820,8 +844,9 @@ Completed D3D11 renderer interop-consumption checkpoint:
 
 - `D3D11VideoRenderer` advertises hardware devices only while a compatible
   interop object using the same retained `D3D11DeviceAccess` is installed;
-- imported BGRA8/RGBA8 shader-readable texture frames feed the existing final
-  viewport, aspect-ratio, rotation, and render-target pass without CPU mapping;
+- imported SDR BGRA8/RGBA8, FP16 scRGB, or RGB10/PQ shader-readable texture
+  frames feed the final viewport, aspect-ratio, rotation, and color pass
+  without CPU mapping;
 - software mapping is disabled by default and can be explicitly enabled
   independently of decoder fallback; successful use emits an observable
   detail event, while disabled or failed mapping makes rendering fail;
@@ -834,19 +859,20 @@ Completed D3D11 Video Processor interop checkpoint:
   exact source/target device identity, device health, format support, and
   dimensions before entering the shared recursive context guard;
 - `D3D11FrameInterop` caches the Video Processor enumerator/processor and
-  returns a retained per-import SDR BGRA8 texture plus shader-resource view
-  without CPU mapping or a cross-device copy;
+  returns a retained per-import SDR BGRA8, FP16 scRGB, or RGB10/PQ texture plus
+  shader-resource view without CPU mapping or a cross-device copy;
 - the renderer passes structured range/matrix/transfer/chroma metadata through
   a backward-compatible color-aware interop overload; Direct3D 11.1 color
-  spaces are selected when supported, with legacy SDR BT.601/709 fallback;
+  spaces preserve PQ/BT.2020 as RGB10/PQ (or FP16 scRGB) and HLG/BT.2020 as
+  FP16 scRGB (or RGB10/PQ), with legacy SDR BT.601/709 fallback;
 - WARP covers texture-array/slice extraction, retained lifetime, recursive
   locking, and safe Video Processor unavailability while mock WARP tests cover
   renderer consumption and error contracts;
-- the current hardware adapter renders generated H.264/NV12 and HEVC
-  Main10/P010 D3D11VA frames with zero map calls and verified red/blue pixel
-  readback; the H.264 path also covers pause/resume, seek, media replacement,
-  explicit stop, surface recreation, and retained source/import lifetime after
-  `Player` shutdown;
+- the current hardware adapter renders generated H.264/NV12 and PQ/BT.2020
+  HEVC Main10/P010 D3D11VA frames with zero map calls, verified red/blue pixel
+  readback, and FP16 scRGB values above `1.0`; the H.264 path also covers
+  pause/resume, seek, media replacement, explicit stop, surface recreation,
+  and retained source/import lifetime after `Player` shutdown;
 - the console example wires D3D11VA, `QtAV::InteropD3D11`, and offscreen D3D11
   rendering; the strict H.264/AAC test passes through an active WASAPI render
   endpoint and still makes unavailable endpoint coverage an explicit skip;
@@ -919,6 +945,9 @@ Acceptance:
 - [x] Borrowed `ID3D11Device`, context, and render target.
 - [x] Software-frame texture upload.
 - [x] Resize, viewport, aspect ratio, rotation, and redraw.
+- [x] Windows Advanced Color SDR, FP16 scRGB, and RGB10/PQ output.
+- [x] Per-frame display/HDR-state switching, SDR reference white, PQ/HLG,
+  primaries conversion, and display-aware tone mapping.
 
 ### Audio and hardware decode
 
@@ -935,9 +964,12 @@ Acceptance:
   together.
 - [x] Software and D3D11 hardware decode both work.
 - [x] Device-loss and surface-recreation paths are tested.
+- [x] Active-HDR native display validation with the Windows HDR setting
+  enabled, including HDR numeric readback and HDR-disabled native
+  swap-chain/display-switch tests.
 - [x] No Windows type leaks into core public headers.
 
-Status: complete and verified.
+Status: complete; resume Milestone 6 from its first unchecked item.
 
 ## Milestone 6 — Android production path
 

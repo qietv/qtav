@@ -5,6 +5,8 @@
 #  error "qtav/d3d11_video_renderer.h is available only on Windows"
 #endif
 
+#include <dxgi1_4.h>
+
 #include <functional>
 #include <memory>
 
@@ -14,11 +16,45 @@
 
 namespace qtav {
 
-// The view remains application-owned and must stay valid for the render()
-// call. The renderer obtains the current view on every call, so swap-chain
-// resize and other surface recreation do not require rebuilding the renderer.
+enum class D3D11OutputColorSpace {
+    SDR,
+    ScRGB,
+    HDR10,
+};
+
+// Snapshot of the output selected for the most recent render. The renderer
+// refreshes this information on every frame when a swap chain is supplied, so
+// moving a window between displays or changing the Windows HDR setting is
+// observed without rebuilding the renderer.
+struct QTAV_RENDER_D3D11_EXPORT D3D11AdvancedColorInfo {
+    D3D11OutputColorSpace outputColorSpace =
+        D3D11OutputColorSpace::SDR;
+    DXGI_COLOR_SPACE_TYPE swapChainColorSpace =
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    DXGI_COLOR_SPACE_TYPE displayColorSpace =
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    HMONITOR monitor = nullptr;
+    int bitsPerColor = 8;
+    float sdrWhiteLevelNits = 80.0F;
+    float minimumLuminanceNits = 0.0F;
+    float maximumLuminanceNits = 80.0F;
+    float maximumFullFrameLuminanceNits = 80.0F;
+    bool displayDetected = false;
+    bool advancedColorActive = false;
+    bool swapChainColorSpaceConfigured = false;
+    bool sdrWhiteLevelFromSystem = false;
+
+    bool isHdrOutput() const noexcept;
+};
+
+// The view and optional swap chain remain application-owned and must stay
+// valid for the render() call. Supplying the swap chain enables automatic
+// IDXGIOutput6 capability discovery, SDR-white lookup, SetColorSpace1(), and
+// display-switch handling. The renderer obtains both objects on every call,
+// so resize and other surface recreation do not require rebuilding it.
 struct QTAV_RENDER_D3D11_EXPORT D3D11RenderTarget {
     ID3D11RenderTargetView* view = nullptr;
+    IDXGISwapChain3* swapChain = nullptr;
 
     bool isValid() const noexcept;
 };
@@ -38,6 +74,10 @@ public:
     virtual ID3D11Texture2D* texture() const noexcept = 0;
     virtual ID3D11ShaderResourceView*
     shaderResourceView() const noexcept = 0;
+    // Existing implementations default to an SDR BGRA/RGBA interpretation.
+    // HDR-aware interop implementations override these values.
+    virtual DXGI_FORMAT dxgiFormat() const noexcept;
+    virtual DXGI_COLOR_SPACE_TYPE colorSpace() const noexcept;
 };
 
 // Implemented by an optional platform interop target. Import must not map or
@@ -95,6 +135,7 @@ public:
     hardwareFrameInterop() const noexcept;
     void setAllowSoftwareMappingFallback(bool allow) noexcept;
     bool allowSoftwareMappingFallback() const noexcept;
+    D3D11AdvancedColorInfo advancedColorInfo() const noexcept;
 
 private:
     class Impl;

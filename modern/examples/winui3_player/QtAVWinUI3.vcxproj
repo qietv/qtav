@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project
+  DefaultTargets="Build"
+  ToolsVersion="Current"
+  xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7A2BF10B-0DC2-47B4-A49A-978B015F8F68}</ProjectGuid>
+    <ProjectName>QtAVWinUI3</ProjectName>
+    <RootNamespace>QtAVWinUI3</RootNamespace>
+    <TargetName>QtAVWinUI3</TargetName>
+    <DefaultLanguage>zh-CN</DefaultLanguage>
+    <MinimumVisualStudioVersion>18.0</MinimumVisualStudioVersion>
+    <ApplicationType>Windows Store</ApplicationType>
+    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <AppContainerApplication>false</AppContainerApplication>
+    <AppxPackage>false</AppxPackage>
+    <WindowsPackageType>None</WindowsPackageType>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <WindowsAppSDKVerifyTransitiveDependencies>
+      false
+    </WindowsAppSDKVerifyTransitiveDependencies>
+    <WindowsAppSDKMLVerifyTransitiveDependencies>
+      false
+    </WindowsAppSDKMLVerifyTransitiveDependencies>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>
+      10.0.17763.0
+    </WindowsTargetPlatformMinVersion>
+    <CppWinRTOptimized>true</CppWinRTOptimized>
+    <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>
+    <MinimalCoreWin>true</MinimalCoreWin>
+    <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+    <NuGetTargetMoniker>native,Version=v0.0</NuGetTargetMoniker>
+    <RuntimeIdentifier>win10-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win10-x64</RuntimeIdentifiers>
+    <QtAVModernRoot
+      Condition="'$(QtAVModernRoot)'==''">$(MSBuildProjectDirectory)\..\..</QtAVModernRoot>
+    <QtAVBuildDir
+      Condition="'$(QtAVBuildDir)'==''">$(MSBuildProjectDirectory)\..\..\..\build\modern-shared</QtAVBuildDir>
+  </PropertyGroup>
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <DesktopCompatible>true</DesktopCompatible>
+  </PropertyGroup>
+  <PropertyGroup
+    Condition="'$(Configuration)'=='Debug'"
+    Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup
+    Condition="'$(Configuration)'=='Release'"
+    Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(MSBuildProjectDirectory)\bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\obj\$(Platform)\$(Configuration)\</IntDir>
+    <AppxPriInitialPath />
+  </PropertyGroup>
+
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import
+      Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+      Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+      Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>
+        %(AdditionalOptions) /bigobj /utf-8
+      </AdditionalOptions>
+      <DisableSpecificWarnings>
+        4251;%(DisableSpecificWarnings)
+      </DisableSpecificWarnings>
+      <PreprocessorDefinitions>
+        NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>
+        $(QtAVModernRoot)\core\include;
+        $(QtAVModernRoot)\platform\windows\include;
+        $(QtAVModernRoot)\backends\render\d3d11\include;
+        $(QtAVModernRoot)\backends\audio\wasapi\include;
+        $(QtAVModernRoot)\backends\audio\resample\include;
+        $(QtAVModernRoot)\backends\hwaccel\d3d11va\include;
+        $(QtAVModernRoot)\backends\interop\d3d11\include;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AppContainer>false</AppContainer>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalLibraryDirectories>
+        $(QtAVBuildDir)\core\$(Configuration);
+        $(QtAVBuildDir)\platform\windows\$(Configuration);
+        $(QtAVBuildDir)\backends\render\d3d11\$(Configuration);
+        $(QtAVBuildDir)\backends\audio\wasapi\$(Configuration);
+        $(QtAVBuildDir)\backends\audio\resample\$(Configuration);
+        $(QtAVBuildDir)\backends\hwaccel\d3d11va\$(Configuration);
+        $(QtAVBuildDir)\backends\interop\d3d11\$(Configuration);
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
+      <AdditionalDependencies>
+        qtav_core.lib;
+        qtav_platform_windows.lib;
+        qtav_render_d3d11.lib;
+        qtav_audio_wasapi.lib;
+        qtav_audio_resample.lib;
+        qtav_hw_d3d11va.lib;
+        qtav_interop_d3d11.lib;
+        d3d11.lib;
+        dxgi.lib;
+        windowsapp.lib;
+        %(AdditionalDependencies)
+      </AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>
+        _DEBUG;%(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>
+        NDEBUG;%(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml" />
+    <Page Include="MainWindow.xaml" />
+    <Page Include="DebugWindow.xaml" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="App.xaml.h">
+      <DependentUpon>App.xaml</DependentUpon>
+    </ClInclude>
+    <ClInclude Include="MainWindow.xaml.h">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClInclude>
+    <ClInclude Include="DebugWindow.xaml.h">
+      <DependentUpon>DebugWindow.xaml</DependentUpon>
+    </ClInclude>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="App.xaml.cpp">
+      <DependentUpon>App.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="MainWindow.xaml.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="DebugWindow.xaml.cpp">
+      <DependentUpon>DebugWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Midl Include="Project.idl">
+      <SubType>Code</SubType>
+    </Midl>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+    <None Include="build.ps1" />
+    <None Include="README.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CppWinRT">
+      <Version>3.0.260715.1</Version>
+    </PackageReference>
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools">
+      <Version>10.0.26100.8249</Version>
+    </PackageReference>
+    <PackageReference Include="Microsoft.WindowsAppSDK">
+      <Version>2.3.1</Version>
+    </PackageReference>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <ImportGroup Label="ExtensionTargets" />
+
+  <Target Name="ValidateQtAVBuild" BeforeTargets="Link">
+    <Error
+      Condition="!Exists('$(QtAVBuildDir)\core\$(Configuration)\qtav_core.lib')"
+      Text="QtAVCore import libraries were not found. Build shared QtAVCore first or set QtAVBuildDir. Missing: $(QtAVBuildDir)\core\$(Configuration)\qtav_core.lib" />
+  </Target>
+
+  <Target Name="CopyQtAVRuntime" AfterTargets="Build">
+    <ItemGroup>
+      <QtAVRuntimeDll
+        Include="$(QtAVBuildDir)\bin\$(Configuration)\*.dll" />
+    </ItemGroup>
+    <Error
+      Condition="'@(QtAVRuntimeDll)'==''"
+      Text="No QtAVCore or FFmpeg runtime DLLs were found in $(QtAVBuildDir)\bin\$(Configuration)." />
+    <Copy
+      SourceFiles="@(QtAVRuntimeDll)"
+      DestinationFolder="$(OutDir)"
+      SkipUnchangedFiles="true" />
+  </Target>
+</Project>

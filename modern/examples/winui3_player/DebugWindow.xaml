@@ -1,0 +1,40 @@
+<Window
+    x:Class="QtAVWinUI3.DebugWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:QtAVWinUI3">
+    <Grid
+        Padding="12"
+        RowSpacing="8"
+        Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Spacing="2">
+            <TextBlock
+                FontSize="18"
+                FontWeight="SemiBold"
+                Text="QtAVCore Debug" />
+            <TextBlock
+                Opacity="0.68"
+                Text="播放状态、媒体事件、渲染与设备信息" />
+        </StackPanel>
+
+        <TextBox
+            x:Name="LogTextBox"
+            Grid.Row="1"
+            AcceptsReturn="True"
+            FontFamily="Consolas"
+            FontSize="12"
+            HorizontalAlignment="Stretch"
+            HorizontalContentAlignment="Stretch"
+            IsReadOnly="True"
+            ScrollViewer.HorizontalScrollBarVisibility="Auto"
+            ScrollViewer.VerticalScrollBarVisibility="Auto"
+            TextWrapping="NoWrap"
+            VerticalAlignment="Stretch"
+            VerticalContentAlignment="Top" />
+    </Grid>
+</Window>

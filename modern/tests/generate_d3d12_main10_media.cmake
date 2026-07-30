@@ -22,10 +22,12 @@ execute_process(
         -c:v hevc_d3d12va
         -profile:v main10
         -color_range tv
-        -colorspace bt709
-        -color_primaries bt709
-        -color_trc bt709
+        -colorspace bt2020nc
+        -color_primaries bt2020
+        -color_trc smpte2084
         -g 4
+        -bsf:v
+        "hevc_metadata=video_full_range_flag=0:colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9"
         "${OUTPUT_FILE}"
     RESULT_VARIABLE generation_result
     ERROR_VARIABLE generation_error

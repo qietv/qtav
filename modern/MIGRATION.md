@@ -63,7 +63,8 @@ mdk-sdk:
 - multiple video renderer instances keyed by an application opaque pointer;
 - libswscale CPU rendering into application-owned packed image buffers;
 - D3D11 rendering of decoded software frames into an application-provided
-  current render-target view;
+  current render-target view, with optional swap-chain-driven Windows
+  Advanced Color SDR, FP16 scRGB, and RGB10 HDR10 presentation;
 - shared retained D3D11 device/immediate-context access and recursive
   synchronization through `QtAV::PlatformWindows`;
 - Metal rendering of decoded software frames into an application-provided
@@ -142,15 +143,18 @@ device-master position plus engine and stream latency.
 On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
 `ID3D11Device` and its immediate context. `D3D11VideoRenderer` accepts that
 shared access (or creates one from its compatibility constructor), borrows the
-render-target view returned by an application callback, and holds the shared
-recursive context guard while rendering. Applications issuing concurrent
-calls on the same immediate context must acquire
-`D3D11DeviceAccess::contextGuard()` or provide equivalent external
+render-target view and optional `IDXGISwapChain3` returned by an application
+callback, and holds the shared recursive context guard while rendering.
+Applications issuing concurrent calls on the same immediate context must
+acquire `D3D11DeviceAccess::contextGuard()` or provide equivalent external
 serialization. The renderer uploads software RGB, YUV, NV12/NV21, P010, and
-gray frames, performs SDR YUV conversion in a pixel shader, and supports
-resize, custom viewports, aspect handling, right-angle rotation, and
-render-target recreation. Windows SDK types remain in platform/backend
-headers and never enter a core public header.
+gray frames; handles range/matrix, PQ/HLG, primaries, and tone mapping in its
+pixel shader; and supports SDR 8-bit, FP16 scRGB, and RGB10/PQ targets.
+Supplying the swap chain enables per-frame `IDXGIOutput6` discovery,
+`SetColorSpace1()`, Windows SDR-white lookup, and automatic display/HDR-setting
+changes. Resize, custom viewports, aspect handling, right-angle rotation, and
+render-target recreation remain supported. Windows SDK types stay in
+platform/backend headers and never enter a core public header.
 
 `d3d11vaHardwareDecodeConfig()` creates FFmpeg's D3D11VA device on the same
 retained device access, installs callbacks for the shared recursive lock, and
@@ -165,19 +169,22 @@ implemented. `QtAV::RenderD3D11` now exposes decoder-independent
 the adapter layer; imported texture and shader-view pointers remain valid
 while the texture-frame object lives. `QtAV::InteropD3D11` implements the
 adapter with same-device validation and a D3D11 Video Processor pass from the
-decoder NV12/P010 array slice to a shader-readable SDR BGRA8 intermediate.
-The renderer consumes that result, reports D3D11 hardware-frame capability,
-and offers an explicit, disabled-by-default software mapping fallback through
+decoder NV12/P010 array slice to a shader-readable SDR BGRA8, FP16 scRGB, or
+RGB10/PQ intermediate. The imported texture now reports its DXGI format and
+color space. PQ/BT.2020 hardware frames therefore stay HDR through the
+zero-CPU-map path instead of being unconditionally converted to SDR. The
+renderer consumes that result, reports D3D11 hardware-frame capability, and
+offers an explicit, disabled-by-default software mapping fallback through
 `setAllowSoftwareMappingFallback()`. The interop and renderer use the same
 recursive context guard; foreign devices are rejected before context access.
-Windows integration coverage now includes generated H.264/NV12 and
-capability-gated HEVC Main10/P010 zero-CPU-map presentation, pixel readback,
-pause/resume, seek, media replacement, explicit stop, target recreation, and
-retained source/import lifetime after player shutdown. The strict generated
-H.264/AAC console test passes with an active WASAPI render endpoint and audible
-output, while sessions without an endpoint report a CTest skip. HDR
-presentation remains follow-up work under the accepted contract in
-[D3D11VA.md](D3D11VA.md).
+Windows integration coverage includes generated H.264/NV12 and PQ/BT.2020
+HEVC Main10/P010 zero-CPU-map presentation, HDR-preserving FP16 pixel
+readback, swap-chain Advanced Color state, display switching, pause/resume,
+seek, media replacement, explicit stop, target recreation, and retained
+source/import lifetime after player shutdown. The strict generated H.264/AAC
+console test passes with an active WASAPI render endpoint and audible output,
+while sessions without an endpoint report a CTest skip. The retained-resource
+contract remains documented in [D3D11VA.md](D3D11VA.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

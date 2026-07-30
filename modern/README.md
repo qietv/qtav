@@ -24,7 +24,8 @@ code is used.
   contracts;
 - optional libswscale CPU renderer for application-owned image buffers;
 - optional Windows D3D11 renderer for a retained application-selected device
-  and immediate context plus borrowed current render-target views;
+  and immediate context plus borrowed current render-target/swap-chain views,
+  including Windows Advanced Color SDR, FP16 scRGB, and RGB10 HDR10 output;
 - optional Metal renderer for borrowed Apple devices, command queues, and
   current render targets, including complete macOS/iOS extended-linear
   BT.2020 EDR layer presentation;
@@ -95,7 +96,8 @@ Current backend integration boundary:
   texture-array slices through a Windows-only strong frame view;
 - `QtAV::InteropD3D11` consumes same-device D3D11VA NV12/P010 texture-array
   slices through the D3D11 Video Processor and returns shader-readable SDR
-  BGRA8 textures without mapping decoded pixels through CPU memory;
+  BGRA8, FP16 scRGB, or RGB10/PQ textures without mapping decoded pixels
+  through CPU memory;
 - `QtAV::RenderMetal` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders into the application's
   current Metal texture or drawable, accepts an optional hardware-frame
@@ -543,7 +545,10 @@ auto deviceAccess = qtav::D3D11DeviceAccess::create(
 auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
     deviceAccess,
     [&] {
-        return qtav::D3D11RenderTarget { currentRenderTargetView };
+        return qtav::D3D11RenderTarget {
+            currentRenderTargetView,
+            currentSwapChain3,
+        };
     });
 
 qtav::VideoRenderConfig config;
@@ -557,10 +562,12 @@ contexts, retains the selected device and verified immediate context, and
 provides the recursive lock shared by the renderer and future D3D11VA/interop
 backends. The older renderer constructor taking the two borrowed wrappers
 remains a convenience path and creates the same retained access internally.
-The callback and returned `ID3D11RenderTargetView` remain application-owned.
-The callback runs synchronously inside `render()` and is queried for every
-frame, so swap-chain resize or other surface recreation can replace the view
-before calling `configure()` with the new size.
+The callback and returned `ID3D11RenderTargetView`/`IDXGISwapChain3` remain
+application-owned. The swap chain is optional for offscreen rendering, but it
+is required for native Advanced Color presentation. The callback runs
+synchronously inside `render()` and is queried for every frame, so swap-chain
+resize or other surface recreation can replace either pointer before calling
+`configure()` with the new size.
 
 The renderer holds `D3D11DeviceAccess::contextGuard()` while issuing immediate
 context calls. Applications using that immediate context from another thread
@@ -578,10 +585,35 @@ context must restore their state after `renderVideo()`.
 
 The software path uploads YUV420P, YUV422P, YUV444P, NV12, NV21, P010,
 RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8 frames. It renders to single-sample
-BGRA8 or RGBA8 UNORM 2D targets, applies limited/full-range BT.601, BT.709, or
-BT.2020 YUV conversion, and supports custom viewports, Fit/Fill/Stretch, all
+BGRA8/RGBA8 UNORM, `R16G16B16A16_FLOAT`, or
+`R10G10B10A2_UNORM` 2D targets. The shader applies limited/full-range
+BT.601/BT.709/BT.2020 YUV conversion, PQ or HLG EOTF, linear-light
+BT.2020/Display-P3 to BT.709 conversion, display-aware luminance mapping, and
+the output transfer. It also supports custom viewports, Fit/Fill/Stretch, all
 right-angle rotations, resize, surface recreation, and surface/device-loss
 events.
+
+For general-purpose Windows presentation, create a flip-model
+`R16G16B16A16_FLOAT` swap chain. The renderer sets its color space to
+`DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`; scRGB `1.0` represents 80 nits and
+HDR highlights may exceed `1.0`. An `R10G10B10A2_UNORM` flip-model swap chain
+is also accepted: while Windows HDR is active on the current display, the
+renderer selects `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` and writes
+BT.2020/PQ HDR10 values; while HDR is inactive, it switches the same target to
+SDR G22/P709 instead. Eight-bit targets remain SDR.
+
+When a swap chain is supplied, every `render()` obtains its containing output
+and `IDXGIOutput6::GetDesc1()` data. This makes Windows HDR setting changes and
+moving the window between displays take effect on the next frame. The renderer
+also reads `DISPLAYCONFIG_SDR_WHITE_LEVEL`; SDR material composed into an HDR
+surface is scaled to the user's current Windows SDR reference-white setting.
+HDR material is mapped against the current display maximum luminance. On an
+SDR display, FP16 output is mapped into `[0, 1]` before DWM composition rather
+than relying on numeric clipping. `advancedColorInfo()` exposes the most
+recent monitor, active display/swap-chain color spaces, bit depth, SDR white,
+whether that white value came from the system query, and luminance limits for
+diagnostics. Explicit swap-chain HDR metadata is not set; the renderer maps
+pixels into the reported display range.
 
 `QtAV::RenderD3D11` also defines the decoder-independent
 `D3D11HardwareFrameInterop` and `D3D11TextureFrame` contracts implemented by
@@ -591,8 +623,9 @@ borrowed texture/SRV pointers whose COM resources remain valid while the
 returned texture-frame object is alive. Bind it with
 `setHardwareFrameInterop()`; the renderer advertises D3D11 hardware-frame
 support only when both objects use the same `D3D11DeviceAccess`. Imported
-BGRA8 textures are sampled directly by the final viewport/aspect/rotation
-pass.
+textures report their DXGI format and color space so the final
+viewport/aspect/rotation/color pass can preserve or convert SDR, linear scRGB,
+and RGB10/PQ data correctly.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly
@@ -600,8 +633,7 @@ enable `setAllowSoftwareMappingFallback(true)` to call
 `HardwareFrame::map(Read)` and use the existing software upload path when
 interop is unavailable or import fails. A successful mapped fallback emits an
 error/detail event containing `software-mapping fallback` so the CPU transfer
-is observable; a disabled or failed mapping makes `render()` fail. HDR
-presentation remains later Windows work.
+is observable; a disabled or failed mapping makes `render()` fail.
 
 ### D3D11VA hardware decode
 
@@ -662,13 +694,14 @@ player
 device health, and exact COM device identity before entering the shared
 context guard. It caches the Video Processor enumerator/processor for the
 current NV12/P010 size, creates retained input/output views and a
-shader-readable BGRA8 intermediate for each import, and submits
+shader-readable intermediate for each import, and submits
 `VideoProcessorBlt()` on the selected immediate/video context. The renderer
-passes structured frame color metadata to the interop; Direct3D 11.1 color
-spaces are used when available, with a BT.601/BT.709 legacy path otherwise.
-The intermediate and final target are SDR. A driver-reported HDR-to-SDR
-conversion may be used, but this is not HDR presentation or a product
-tone-mapping guarantee.
+passes structured frame color metadata to the interop. SDR input uses BGRA8
+G22/P709 and retains the legacy BT.601/BT.709 fallback. PQ/BT.2020 input
+prefers RGB10/PQ P2020 and falls back to FP16 linear scRGB when the driver
+reports that conversion; HLG/BT.2020 prefers FP16 scRGB and can fall back to
+RGB10/PQ. The final renderer then performs display-specific tone and gamut
+mapping without a CPU map.
 
 ### Metal renderer
 
@@ -895,18 +928,26 @@ Audio-file tests verify RIFF/WAVE headers and little-endian samples, then run
 the player and converter to produce an exact 64,000-byte 16 kHz stereo S16
 payload from deterministic 8 kHz mono input.
 Windows D3D11 tests use the WARP device for deterministic offscreen rendering
-and cover RGB, YUV420P, and NV12 upload, viewport, aspect ratio, rotation,
-resize, target recreation, foreign-device rejection, and missing-surface
-events. D3D11VA tests cover selected-device creation, shared locking, bounded
+and cover RGB, YUV420P, NV12, and synthetic P010 PQ/HLG input; SDR tone
+mapping; FP16 scRGB and RGB10/PQ numeric output; viewport, aspect ratio,
+rotation, resize, target recreation, foreign-device rejection, and
+missing-surface events. A native flip-model test exercises
+`IDXGIOutput6`, `SetColorSpace1`, SDR-white lookup, the current Windows HDR
+state, and display switching when two outputs share the adapter. With Windows
+HDR enabled on a PHL 27B1U7903, the native test verifies a 10-bit
+G2084/P2020 output, system SDR white, nonzero panel luminance, and FP16 scRGB
+highlights above `1.0`. D3D11VA tests cover selected-device creation, shared
+locking, bounded
 extra frames, native texture/slice validation, and invalid handles; an H.264
 hardware integration test covers mapping, pause/resume, seek, media
 replacement, stop, target recreation, and retained source/import access after
 player shutdown, with an explicit software fallback result when the adapter
 has no matching decoder profile. A capability-gated D3D12-generated HEVC
-Main10 test verifies P010 D3D11VA decode, Video Processor conversion, zero CPU
-mapping, and pixel readback. WASAPI device and strict native H.264/AAC example
-tests pass with an active render endpoint and are explicitly skipped when a
-Windows session exposes no endpoint.
+Main10 test uses PQ/BT.2020 metadata and verifies P010 D3D11VA decode,
+HDR-preserving Video Processor conversion, FP16 scRGB output above `1.0`,
+zero CPU mapping, and pixel readback. WASAPI device and strict native H.264/AAC
+example tests pass with an active render endpoint and are explicitly skipped
+when a Windows session exposes no endpoint.
 
 ## Architecture
 

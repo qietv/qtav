@@ -24,6 +24,7 @@ target_link_libraries(qtav_render_d3d11
     PRIVATE
         d3dcompiler
         dxgi
+        user32
 )
 
 if(NOT BUILD_SHARED_LIBS)

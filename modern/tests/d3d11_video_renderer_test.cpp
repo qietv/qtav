@@ -17,9 +17,15 @@
 #include "d3d11_video_renderer_p.h"
 #include "frame_internal.h"
 
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+}
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -50,6 +56,13 @@ struct DeviceResources {
 struct Target {
     ComPtr<ID3D11Texture2D> texture;
     ComPtr<ID3D11RenderTargetView> view;
+};
+
+struct HalfPixel {
+    std::uint16_t red = 0;
+    std::uint16_t green = 0;
+    std::uint16_t blue = 0;
+    std::uint16_t alpha = 0;
 };
 
 class MockMapping final : public qtav::HardwareFrameMapping {
@@ -305,14 +318,18 @@ DeviceResources makeDevice()
     return result;
 }
 
-Target makeTarget(ID3D11Device* device, int width, int height)
+Target makeTarget(
+    ID3D11Device* device,
+    int width,
+    int height,
+    DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM)
 {
     D3D11_TEXTURE2D_DESC descriptor {};
     descriptor.Width = static_cast<UINT>(width);
     descriptor.Height = static_cast<UINT>(height);
     descriptor.MipLevels = 1;
     descriptor.ArraySize = 1;
-    descriptor.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    descriptor.Format = format;
     descriptor.SampleDesc.Count = 1;
     descriptor.Usage = D3D11_USAGE_DEFAULT;
     descriptor.BindFlags =
@@ -330,7 +347,41 @@ Target makeTarget(ID3D11Device* device, int width, int height)
     return result;
 }
 
-std::vector<Pixel> readTarget(
+float halfToFloat(std::uint16_t value)
+{
+    const std::uint32_t sign =
+        static_cast<std::uint32_t>(value & 0x8000U) << 16U;
+    int exponent = static_cast<int>((value >> 10U) & 0x1fU);
+    std::uint32_t mantissa = value & 0x03ffU;
+    std::uint32_t result = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            result = sign;
+        } else {
+            exponent = 1;
+            while ((mantissa & 0x0400U) == 0) {
+                mantissa <<= 1U;
+                --exponent;
+            }
+            mantissa &= 0x03ffU;
+            result = sign
+                | (static_cast<std::uint32_t>(exponent + 112) << 23U)
+                | (mantissa << 13U);
+        }
+    } else if (exponent == 31) {
+        result = sign | 0x7f800000U | (mantissa << 13U);
+    } else {
+        result = sign
+            | (static_cast<std::uint32_t>(exponent + 112) << 23U)
+            | (mantissa << 13U);
+    }
+    float converted = 0.0F;
+    std::memcpy(&converted, &result, sizeof(converted));
+    return converted;
+}
+
+template <typename Value>
+std::vector<Value> readTypedTarget(
     ID3D11Device* device,
     ID3D11DeviceContext* context,
     ID3D11Texture2D* texture)
@@ -358,7 +409,7 @@ std::vector<Pixel> readTarget(
         D3D11_MAP_READ,
         0,
         &mapped)));
-    std::vector<Pixel> result(
+    std::vector<Value> result(
         static_cast<std::size_t>(descriptor.Width)
         * static_cast<std::size_t>(descriptor.Height));
     for (UINT y = 0; y < descriptor.Height; ++y) {
@@ -367,9 +418,77 @@ std::vector<Pixel> readTarget(
                 + static_cast<std::size_t>(y) * descriptor.Width,
             static_cast<const std::uint8_t*>(mapped.pData)
                 + static_cast<std::size_t>(y) * mapped.RowPitch,
-            static_cast<std::size_t>(descriptor.Width) * sizeof(Pixel));
+            static_cast<std::size_t>(descriptor.Width)
+                * sizeof(Value));
     }
     context->Unmap(staging.Get(), 0);
+    return result;
+}
+
+std::vector<Pixel> readTarget(
+    ID3D11Device* device,
+    ID3D11DeviceContext* context,
+    ID3D11Texture2D* texture)
+{
+    return readTypedTarget<Pixel>(device, context, texture);
+}
+
+double pqFromNits(double nits)
+{
+    constexpr double m1 = 2610.0 / 16384.0;
+    constexpr double m2 = 2523.0 / 32.0;
+    constexpr double c1 = 3424.0 / 4096.0;
+    constexpr double c2 = 2413.0 / 128.0;
+    constexpr double c3 = 2392.0 / 128.0;
+    const double power = std::pow(nits / 10000.0, m1);
+    return std::pow(
+        (c1 + c2 * power) / (1.0 + c3 * power),
+        m2);
+}
+
+qtav::VideoFrame makeP010Frame(
+    AVColorTransferCharacteristic transfer,
+    double leftValue,
+    double rightValue)
+{
+    AVFrame* frame = av_frame_alloc();
+    assert(frame);
+    frame->format = AV_PIX_FMT_P010LE;
+    frame->width = 2;
+    frame->height = 2;
+    frame->color_range = AVCOL_RANGE_MPEG;
+    frame->color_primaries = AVCOL_PRI_BT2020;
+    frame->color_trc = transfer;
+    frame->colorspace = AVCOL_SPC_BT2020_NCL;
+    frame->chroma_location = AVCHROMA_LOC_LEFT;
+    assert(av_frame_get_buffer(frame, 32) >= 0);
+
+    const auto limitedCode = [](double normalized) {
+        return static_cast<std::uint16_t>(
+            std::lround(64.0 + normalized * 876.0));
+    };
+    const std::uint16_t leftCode =
+        static_cast<std::uint16_t>(
+            limitedCode(leftValue) << 6U);
+    const std::uint16_t rightCode =
+        static_cast<std::uint16_t>(
+            limitedCode(rightValue) << 6U);
+    for (int y = 0; y < frame->height; ++y) {
+        auto* luma = reinterpret_cast<std::uint16_t*>(
+            frame->data[0]
+            + static_cast<std::ptrdiff_t>(y) * frame->linesize[0]);
+        luma[0] = leftCode;
+        luma[1] = rightCode;
+    }
+    auto* chroma = reinterpret_cast<std::uint16_t*>(
+        frame->data[1]);
+    chroma[0] = static_cast<std::uint16_t>(512U << 6U);
+    chroma[1] = static_cast<std::uint16_t>(512U << 6U);
+
+    qtav::VideoFrame result =
+        qtav::detail::FrameFactory::video(frame, 0, 0);
+    av_frame_free(&frame);
+    assert(result);
     return result;
 }
 
@@ -442,6 +561,126 @@ qtav::VideoFrame renderFile(
     return captured;
 }
 
+void testHdrPresentation(
+    const DeviceResources& d3d,
+    const std::shared_ptr<qtav::D3D11DeviceAccess>& deviceAccess)
+{
+    Target current = makeTarget(
+        d3d.device.Get(),
+        2,
+        2,
+        DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
+        deviceAccess,
+        [&] {
+            return qtav::D3D11RenderTarget {
+                current.view.Get(),
+            };
+        });
+    int errors = 0;
+    renderer->setEventCallback(
+        [&](const qtav::VideoRenderEvent& event) {
+            if (event.type == qtav::VideoRenderEventType::Error
+                || event.type
+                    == qtav::VideoRenderEventType::SurfaceLost) {
+                ++errors;
+            }
+        });
+    qtav::VideoRenderConfig config;
+    config.surfaceSize = { 2, 2 };
+    config.aspectRatio = qtav::VideoAspectRatioMode::Stretch;
+    assert(renderer->open(config));
+
+    const qtav::VideoFrame pq = makeP010Frame(
+        AVCOL_TRC_SMPTE2084,
+        pqFromNits(80.0),
+        pqFromNits(1000.0));
+    assert(pq.colorSpaceInfo().transfer == qtav::ColorTransfer::PQ);
+    assert(
+        pq.colorSpaceInfo().primaries
+        == qtav::ColorPrimaries::BT2020);
+    assert(renderer->render(pq));
+    auto colorInfo = renderer->advancedColorInfo();
+    assert(
+        colorInfo.outputColorSpace
+        == qtav::D3D11OutputColorSpace::ScRGB);
+    assert(
+        colorInfo.swapChainColorSpace
+        == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+    assert(!colorInfo.displayDetected);
+    assert(!colorInfo.swapChainColorSpaceConfigured);
+    assert(colorInfo.maximumLuminanceNits == 1000.0F);
+
+    auto halfPixels = readTypedTarget<HalfPixel>(
+        d3d.device.Get(),
+        d3d.context.Get(),
+        current.texture.Get());
+    const float pqDiffuse = halfToFloat(halfPixels[0].red);
+    const float pqHighlight = halfToFloat(halfPixels[1].red);
+    assert(pqDiffuse > 0.9F && pqDiffuse < 1.1F);
+    assert(pqHighlight > 11.5F && pqHighlight < 13.0F);
+    assert(
+        std::abs(halfToFloat(halfPixels[0].green) - pqDiffuse)
+        < 0.03F);
+    assert(
+        std::abs(halfToFloat(halfPixels[0].blue) - pqDiffuse)
+        < 0.03F);
+
+    const qtav::VideoFrame hlg = makeP010Frame(
+        AVCOL_TRC_ARIB_STD_B67,
+        0.5,
+        1.0);
+    assert(hlg.colorSpaceInfo().transfer == qtav::ColorTransfer::HLG);
+    assert(renderer->render(hlg));
+    halfPixels = readTypedTarget<HalfPixel>(
+        d3d.device.Get(),
+        d3d.context.Get(),
+        current.texture.Get());
+    const float hlgDiffuse = halfToFloat(halfPixels[0].red);
+    const float hlgHighlight = halfToFloat(halfPixels[1].red);
+    assert(hlgDiffuse > 0.9F && hlgDiffuse < 1.2F);
+    assert(hlgHighlight > 11.5F && hlgHighlight < 13.0F);
+
+    current = makeTarget(
+        d3d.device.Get(),
+        2,
+        2,
+        DXGI_FORMAT_R10G10B10A2_UNORM);
+    assert(renderer->render(pq));
+    colorInfo = renderer->advancedColorInfo();
+    assert(
+        colorInfo.outputColorSpace
+        == qtav::D3D11OutputColorSpace::HDR10);
+    assert(
+        colorInfo.swapChainColorSpace
+        == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+    const auto rgb10 = readTypedTarget<std::uint32_t>(
+        d3d.device.Get(),
+        d3d.context.Get(),
+        current.texture.Get());
+    const auto red10 = [](std::uint32_t value) {
+        return static_cast<float>(value & 0x3ffU) / 1023.0F;
+    };
+    assert(red10(rgb10[0]) > 0.45F && red10(rgb10[0]) < 0.52F);
+    assert(red10(rgb10[1]) > 0.72F && red10(rgb10[1]) < 0.79F);
+
+    current = makeTarget(d3d.device.Get(), 2, 2);
+    assert(renderer->render(pq));
+    colorInfo = renderer->advancedColorInfo();
+    assert(
+        colorInfo.outputColorSpace
+        == qtav::D3D11OutputColorSpace::SDR);
+    const auto sdr = readTarget(
+        d3d.device.Get(),
+        d3d.context.Get(),
+        current.texture.Get());
+    assert(sdr[0].red > 160 && sdr[0].red < 220);
+    assert(sdr[1].red > 245);
+    assert(sdr[1].red > sdr[0].red);
+    assert(errors == 0);
+    renderer->close();
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -473,6 +712,7 @@ int main(int argc, char** argv)
         borrowedDevice,
         borrowedContext);
     assert(deviceAccess);
+    testHdrPresentation(d3d, deviceAccess);
 
     Target importedTarget = makeTarget(d3d.device.Get(), 8, 8);
     std::vector<Pixel> importedPixels(64);

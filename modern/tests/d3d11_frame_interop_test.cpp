@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <future>
 #include <iostream>
@@ -40,6 +41,13 @@ struct Pixel {
     std::uint8_t green = 0;
     std::uint8_t red = 0;
     std::uint8_t alpha = 0;
+};
+
+struct HalfPixel {
+    std::uint16_t red = 0;
+    std::uint16_t green = 0;
+    std::uint16_t blue = 0;
+    std::uint16_t alpha = 0;
 };
 
 struct DeviceResources {
@@ -426,6 +434,12 @@ void testWarpContracts()
     assert(imported->width() == 64);
     assert(imported->height() == 32);
     assert(imported->format() == qtav::PixelFormat::BGRA);
+    assert(
+        imported->dxgiFormat()
+        == DXGI_FORMAT_B8G8R8A8_UNORM);
+    assert(
+        imported->colorSpace()
+        == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
     assert(imported->texture());
     assert(imported->shaderResourceView());
     ComPtr<ID3D11Device> importedDevice;
@@ -445,14 +459,15 @@ void testWarpContracts()
 RenderTarget makeTarget(
     ID3D11Device* device,
     int width,
-    int height)
+    int height,
+    DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM)
 {
     D3D11_TEXTURE2D_DESC description {};
     description.Width = static_cast<UINT>(width);
     description.Height = static_cast<UINT>(height);
     description.MipLevels = 1;
     description.ArraySize = 1;
-    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.Format = format;
     description.SampleDesc.Count = 1;
     description.Usage = D3D11_USAGE_DEFAULT;
     description.BindFlags =
@@ -513,6 +528,81 @@ std::vector<Pixel> readTarget(
                 + static_cast<std::ptrdiff_t>(row * source.Width));
     }
     context->Unmap(readback.Get(), 0);
+    return result;
+}
+
+std::vector<HalfPixel> readHalfTarget(
+    ID3D11Device* device,
+    ID3D11DeviceContext* context,
+    ID3D11Texture2D* texture)
+{
+    D3D11_TEXTURE2D_DESC source {};
+    texture->GetDesc(&source);
+    D3D11_TEXTURE2D_DESC staging = source;
+    staging.Usage = D3D11_USAGE_STAGING;
+    staging.BindFlags = 0;
+    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    ComPtr<ID3D11Texture2D> readback;
+    assert(SUCCEEDED(device->CreateTexture2D(
+        &staging,
+        nullptr,
+        &readback)));
+    context->CopyResource(readback.Get(), texture);
+
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    assert(SUCCEEDED(context->Map(
+        readback.Get(),
+        0,
+        D3D11_MAP_READ,
+        0,
+        &mapped)));
+    std::vector<HalfPixel> result(
+        static_cast<std::size_t>(source.Width)
+        * static_cast<std::size_t>(source.Height));
+    for (UINT row = 0; row < source.Height; ++row) {
+        std::memcpy(
+            result.data()
+                + static_cast<std::size_t>(row) * source.Width,
+            static_cast<const std::uint8_t*>(mapped.pData)
+                + static_cast<std::size_t>(row) * mapped.RowPitch,
+            static_cast<std::size_t>(source.Width)
+                * sizeof(HalfPixel));
+    }
+    context->Unmap(readback.Get(), 0);
+    return result;
+}
+
+float halfToFloat(std::uint16_t value)
+{
+    const std::uint32_t sign =
+        static_cast<std::uint32_t>(value & 0x8000U) << 16U;
+    int exponent = static_cast<int>((value >> 10U) & 0x1fU);
+    std::uint32_t mantissa = value & 0x03ffU;
+    std::uint32_t bits = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            exponent = 1;
+            while ((mantissa & 0x0400U) == 0) {
+                mantissa <<= 1U;
+                --exponent;
+            }
+            mantissa &= 0x03ffU;
+            bits = sign
+                | (static_cast<std::uint32_t>(exponent + 112) << 23U)
+                | (mantissa << 13U);
+        }
+    } else if (exponent == 31) {
+        bits = sign | 0x7f800000U | (mantissa << 13U);
+    } else {
+        bits = sign
+            | (static_cast<std::uint32_t>(exponent + 112) << 23U)
+            | (mantissa << 13U);
+    }
+    float result = 0.0F;
+    std::memcpy(&result, &bits, sizeof(result));
     return result;
 }
 
@@ -686,13 +776,22 @@ void testNativeZeroCopy(
                     std::abort();
                 }
                 if (hardwareFrames.fetch_add(1) == 0) {
-                    qtav::VideoColorSpace color;
-                    color.range = qtav::ColorRange::Limited;
-                    color.primaries = qtav::ColorPrimaries::BT709;
-                    color.transfer = qtav::ColorTransfer::BT709;
-                    color.matrix = qtav::ColorMatrix::BT709;
-                    color.chromaLocation =
-                        qtav::ChromaLocation::Left;
+                    const qtav::VideoColorSpace color =
+                        frame.colorSpaceInfo();
+                    if (expectedFormat == qtav::PixelFormat::P010) {
+                        assert(
+                            color.range
+                            == qtav::ColorRange::Limited);
+                        assert(
+                            color.primaries
+                            == qtav::ColorPrimaries::BT2020);
+                        assert(
+                            color.transfer
+                            == qtav::ColorTransfer::PQ);
+                        assert(
+                            color.matrix
+                            == qtav::ColorMatrix::BT2020NCL);
+                    }
                     retainedImport = interop->importFrame(
                         frame.hardwareFrame(),
                         color);
@@ -819,6 +918,31 @@ void testNativeZeroCopy(
     assert(retainedImport);
     assert(retainedImport->texture());
     assert(retainedImport->shaderResourceView());
+    if (expectedFormat == qtav::PixelFormat::P010) {
+        assert(retainedImport->format() == qtav::PixelFormat::RGBA);
+        assert(
+            retainedImport->dxgiFormat()
+                == DXGI_FORMAT_R10G10B10A2_UNORM
+            || retainedImport->dxgiFormat()
+                == DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert(
+            (retainedImport->dxgiFormat()
+                    == DXGI_FORMAT_R10G10B10A2_UNORM
+                && retainedImport->colorSpace()
+                    == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+            || (retainedImport->dxgiFormat()
+                    == DXGI_FORMAT_R16G16B16A16_FLOAT
+                && retainedImport->colorSpace()
+                    == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709));
+    } else {
+        assert(retainedImport->format() == qtav::PixelFormat::BGRA);
+        assert(
+            retainedImport->dxgiFormat()
+            == DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert(
+            retainedImport->colorSpace()
+            == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    }
 
     interop->flush();
     assert(retainedImport->texture());
@@ -827,36 +951,77 @@ void testNativeZeroCopy(
     target = makeTarget(
         resources.device.Get(),
         width,
-        height);
+        height,
+        expectedFormat == qtav::PixelFormat::P010
+            ? DXGI_FORMAT_R16G16B16A16_FLOAT
+            : DXGI_FORMAT_B8G8R8A8_UNORM);
     assert(target.texture && target.view);
     assert(renderer->configure(renderConfig));
     assert(renderer->render(retainedFrame));
 
     auto guard = access->contextGuard();
-    const auto pixels = readTarget(
-        resources.device.Get(),
-        resources.context.Get(),
-        target.texture.Get());
-    (void)guard;
-    std::uint64_t leftRed = 0;
-    std::uint64_t leftBlue = 0;
-    std::uint64_t rightRed = 0;
-    std::uint64_t rightBlue = 0;
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            const auto& pixel = pixels[
-                static_cast<std::size_t>(y * width + x)];
-            if (x < width / 2) {
-                leftRed += pixel.red;
-                leftBlue += pixel.blue;
-            } else {
-                rightRed += pixel.red;
-                rightBlue += pixel.blue;
+    if (expectedFormat == qtav::PixelFormat::P010) {
+        const auto pixels = readHalfTarget(
+            resources.device.Get(),
+            resources.context.Get(),
+            target.texture.Get());
+        (void)guard;
+        double leftRed = 0.0;
+        double leftBlue = 0.0;
+        double rightRed = 0.0;
+        double rightBlue = 0.0;
+        float maximumComponent = 0.0F;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const auto& pixel = pixels[
+                    static_cast<std::size_t>(y * width + x)];
+                const float red = halfToFloat(pixel.red);
+                const float blue = halfToFloat(pixel.blue);
+                maximumComponent = std::max(
+                    maximumComponent,
+                    std::max(red, blue));
+                if (x < width / 2) {
+                    leftRed += red;
+                    leftBlue += blue;
+                } else {
+                    rightRed += red;
+                    rightBlue += blue;
+                }
             }
         }
+        assert(leftRed > leftBlue * 2.0);
+        assert(rightBlue > rightRed * 2.0);
+        assert(maximumComponent > 1.0F);
+        const auto output = renderer->advancedColorInfo();
+        assert(
+            output.outputColorSpace
+            == qtav::D3D11OutputColorSpace::ScRGB);
+    } else {
+        const auto pixels = readTarget(
+            resources.device.Get(),
+            resources.context.Get(),
+            target.texture.Get());
+        (void)guard;
+        std::uint64_t leftRed = 0;
+        std::uint64_t leftBlue = 0;
+        std::uint64_t rightRed = 0;
+        std::uint64_t rightBlue = 0;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const auto& pixel = pixels[
+                    static_cast<std::size_t>(y * width + x)];
+                if (x < width / 2) {
+                    leftRed += pixel.red;
+                    leftBlue += pixel.blue;
+                } else {
+                    rightRed += pixel.red;
+                    rightBlue += pixel.blue;
+                }
+            }
+        }
+        assert(leftRed > leftBlue * 2);
+        assert(rightBlue > rightRed * 2);
     }
-    assert(leftRed > leftBlue * 2);
-    assert(rightBlue > rightRed * 2);
     std::cout
         << (expectedFormat == qtav::PixelFormat::P010
                 ? "HEVC Main10/P010"

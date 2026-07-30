@@ -7,7 +7,7 @@
 #include <qtav/d3d11_video_renderer.h>
 
 #include <d3dcompiler.h>
-#include <dxgi.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include "d3d11_video_renderer_p.h"
@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -48,7 +49,13 @@ cbuffer ColorParameters : register(b0) {
     float4 colorRow1;
     float4 colorRow2;
     uint sourceType;
-    float3 colorPadding;
+    uint sourceTransfer;
+    uint sourcePrimaries;
+    uint outputColorSpace;
+    float sdrWhiteLevelNits;
+    float displayMaximumLuminanceNits;
+    float contentMaximumLuminanceNits;
+    uint advancedColorActive;
 };
 
 Texture2D<float4> source0 : register(t0);
@@ -64,16 +71,119 @@ PixelInput vertexMain(VertexInput input)
     return result;
 }
 
-float4 pixelMain(PixelInput input) : SV_TARGET
+float3 pqToNits(float3 value)
+{
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    const float3 power = pow(max(value, 0.0), 1.0 / m2);
+    const float3 numerator = max(power - c1, 0.0);
+    const float3 denominator = max(c2 - c3 * power, 0.000001);
+    return 10000.0 * pow(numerator / denominator, 1.0 / m1);
+}
+
+float3 nitsToPq(float3 value)
+{
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    const float3 power = pow(max(value, 0.0) / 10000.0, m1);
+    return pow((c1 + c2 * power) / (1.0 + c3 * power), m2);
+}
+
+float3 hlgToNits(float3 value)
+{
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    const float3 low = value * value / 3.0;
+    const float3 high = (exp((value - c) / a) + b) / 12.0;
+    return 1000.0 * lerp(low, high, step(0.5, value));
+}
+
+float3 sdrToLinear(float3 value)
+{
+    const float3 low = value / 4.5;
+    const float3 high = pow((value + 0.099) / 1.099, 1.0 / 0.45);
+    return lerp(low, high, step(0.081, value));
+}
+
+float3 srgbToLinear(float3 value)
+{
+    const float3 low = value / 12.92;
+    const float3 high = pow((value + 0.055) / 1.055, 2.4);
+    return lerp(low, high, step(0.04045, value));
+}
+
+float3 linearToSrgb(float3 value)
+{
+    const float3 low = 12.92 * value;
+    const float3 high =
+        1.055 * pow(max(value, 0.0), 1.0 / 2.4) - 0.055;
+    return lerp(low, high, step(0.0031308, value));
+}
+
+float3 toBt709(float3 value, uint primaries)
+{
+    if (primaries == 1) {
+        return float3(
+            1.660491 * value.r - 0.587641 * value.g
+                - 0.072850 * value.b,
+            -0.124550 * value.r + 1.132900 * value.g
+                - 0.008349 * value.b,
+            -0.018151 * value.r - 0.100579 * value.g
+                + 1.118730 * value.b);
+    }
+    if (primaries == 2) {
+        return float3(
+            1.224745 * value.r - 0.224904 * value.g,
+            -0.042058 * value.r + 1.042081 * value.g,
+            -0.019642 * value.r - 0.078655 * value.g
+                + 1.098537 * value.b);
+    }
+    return value;
+}
+
+float3 bt709ToBt2020(float3 value)
+{
+    return float3(
+        0.627404 * value.r + 0.329283 * value.g
+            + 0.043313 * value.b,
+        0.069097 * value.r + 0.919540 * value.g
+            + 0.011362 * value.b,
+        0.016391 * value.r + 0.088013 * value.g
+            + 0.895595 * value.b);
+}
+
+float3 toneMapToPeak(float3 value, float contentPeak, float outputPeak)
+{
+    const float3 positive = max(value, 0.0);
+    const float luminance =
+        dot(positive, float3(0.2126, 0.7152, 0.0722));
+    if (contentPeak <= outputPeak || luminance <= 0.000001) {
+        return value;
+    }
+    const float relative = luminance / outputPeak;
+    const float white = max(contentPeak / outputPeak, 1.0);
+    const float mapped =
+        relative * (1.0 + relative / (white * white))
+        / (1.0 + relative);
+    return value * (mapped * outputPeak / luminance);
+}
+
+float3 sampleSource(PixelInput input)
 {
     if (sourceType == 0) {
-        return source0.Sample(linearSampler, input.texcoord);
+        return source0.Sample(linearSampler, input.texcoord).rgb;
     }
     if (sourceType == 1) {
         const float value = source0.Sample(linearSampler, input.texcoord).r;
-        return float4(value, value, value, 1.0);
+        return value.xxx;
     }
-
     const float y = source0.Sample(linearSampler, input.texcoord).r;
     float u = 0.5;
     float v = 0.5;
@@ -88,10 +198,56 @@ float4 pixelMain(PixelInput input) : SV_TARGET
     }
 
     const float4 sample = float4(y, u, v, 1.0);
+    return float3(
+        dot(colorRow0, sample),
+        dot(colorRow1, sample),
+        dot(colorRow2, sample));
+}
+
+float4 pixelMain(PixelInput input) : SV_TARGET
+{
+    const float3 encoded = sampleSource(input);
+    float3 linearNits;
+    if (sourceTransfer == 1) {
+        linearNits = pqToNits(encoded);
+    } else if (sourceTransfer == 2) {
+        linearNits = hlgToNits(encoded);
+    } else if (sourceTransfer == 3) {
+        linearNits = max(encoded, 0.0) * sdrWhiteLevelNits;
+    } else if (sourceTransfer == 4) {
+        linearNits = encoded * 80.0;
+    } else if (sourceTransfer == 5) {
+        linearNits =
+            srgbToLinear(max(encoded, 0.0)) * sdrWhiteLevelNits;
+    } else {
+        linearNits =
+            sdrToLinear(max(encoded, 0.0)) * sdrWhiteLevelNits;
+    }
+
+    float3 bt709Nits = toBt709(linearNits, sourcePrimaries);
+    const float outputPeak = max(displayMaximumLuminanceNits, 1.0);
+    bt709Nits = toneMapToPeak(
+        bt709Nits,
+        max(contentMaximumLuminanceNits, sdrWhiteLevelNits),
+        outputPeak);
+
+    if (outputColorSpace == 1) {
+        if (advancedColorActive == 0) {
+            return float4(
+                saturate(bt709Nits / outputPeak),
+                1.0);
+        }
+        return float4(bt709Nits / 80.0, 1.0);
+    }
+    if (outputColorSpace == 2) {
+        const float3 bt2020Nits =
+            max(bt709ToBt2020(bt709Nits), 0.0);
+        return float4(
+            saturate(nitsToPq(min(bt2020Nits, outputPeak))),
+            1.0);
+    }
     return float4(
-        saturate(dot(colorRow0, sample)),
-        saturate(dot(colorRow1, sample)),
-        saturate(dot(colorRow2, sample)),
+        saturate(linearToSrgb(max(bt709Nits, 0.0) / outputPeak)),
         1.0);
 }
 )HLSL";
@@ -108,7 +264,13 @@ struct ColorParameters {
     std::array<float, 4> row1 {};
     std::array<float, 4> row2 {};
     std::uint32_t sourceType = 0;
-    std::array<float, 3> padding {};
+    std::uint32_t sourceTransfer = 0;
+    std::uint32_t sourcePrimaries = 0;
+    std::uint32_t outputColorSpace = 0;
+    float sdrWhiteLevelNits = 80.0F;
+    float displayMaximumLuminanceNits = 80.0F;
+    float contentMaximumLuminanceNits = 80.0F;
+    std::uint32_t advancedColorActive = 0;
 };
 
 static_assert(sizeof(ColorParameters) % 16 == 0);
@@ -141,10 +303,248 @@ bool isSupportedTargetFormat(DXGI_FORMAT format) noexcept
     switch (format) {
     case DXGI_FORMAT_B8G8R8A8_UNORM:
     case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
         return true;
     default:
         return false;
     }
+}
+
+std::string hresultText(const char* operation, HRESULT result);
+
+bool sameAdvancedColorInfo(
+    const D3D11AdvancedColorInfo& left,
+    const D3D11AdvancedColorInfo& right) noexcept
+{
+    return left.outputColorSpace == right.outputColorSpace
+        && left.swapChainColorSpace == right.swapChainColorSpace
+        && left.displayColorSpace == right.displayColorSpace
+        && left.monitor == right.monitor
+        && left.bitsPerColor == right.bitsPerColor
+        && left.sdrWhiteLevelNits == right.sdrWhiteLevelNits
+        && left.minimumLuminanceNits == right.minimumLuminanceNits
+        && left.maximumLuminanceNits == right.maximumLuminanceNits
+        && left.maximumFullFrameLuminanceNits
+            == right.maximumFullFrameLuminanceNits
+        && left.displayDetected == right.displayDetected
+        && left.advancedColorActive == right.advancedColorActive
+        && left.swapChainColorSpaceConfigured
+            == right.swapChainColorSpaceConfigured
+        && left.sdrWhiteLevelFromSystem
+            == right.sdrWhiteLevelFromSystem;
+}
+
+float querySdrWhiteLevelNits(const wchar_t* deviceName) noexcept
+{
+    if (!deviceName || !*deviceName) {
+        return 0.0F;
+    }
+
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(
+            QDC_ONLY_ACTIVE_PATHS,
+            &pathCount,
+            &modeCount)
+        != ERROR_SUCCESS) {
+        return 0.0F;
+    }
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    LONG status = QueryDisplayConfig(
+        QDC_ONLY_ACTIVE_PATHS,
+        &pathCount,
+        paths.data(),
+        &modeCount,
+        modes.data(),
+        nullptr);
+    if (status != ERROR_SUCCESS) {
+        return 0.0F;
+    }
+    paths.resize(pathCount);
+
+    for (const auto& path : paths) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
+        source.header.type =
+            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId =
+            path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header)
+                != ERROR_SUCCESS
+            || std::wcscmp(
+                   source.viewGdiDeviceName,
+                   deviceName)
+                != 0) {
+            continue;
+        }
+
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white {};
+        white.header.type =
+            DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof(white);
+        white.header.adapterId =
+            path.targetInfo.adapterId;
+        white.header.id = path.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header)
+                == ERROR_SUCCESS
+            && white.SDRWhiteLevel > 0) {
+            return static_cast<float>(white.SDRWhiteLevel)
+                * (80.0F / 1000.0F);
+        }
+    }
+    return 0.0F;
+}
+
+bool configureAdvancedColor(
+    ID3D11Device* expectedDevice,
+    const D3D11RenderTarget& target,
+    DXGI_FORMAT targetFormat,
+    D3D11AdvancedColorInfo& info,
+    std::string& error)
+{
+    info = {};
+    if (targetFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        info.outputColorSpace = D3D11OutputColorSpace::ScRGB;
+        info.swapChainColorSpace =
+            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        info.bitsPerColor = 16;
+        info.maximumLuminanceNits = 1000.0F;
+        info.maximumFullFrameLuminanceNits = 1000.0F;
+    } else if (targetFormat == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        info.outputColorSpace = D3D11OutputColorSpace::HDR10;
+        info.swapChainColorSpace =
+            DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        info.bitsPerColor = 10;
+        info.maximumLuminanceNits = 1000.0F;
+        info.maximumFullFrameLuminanceNits = 1000.0F;
+    }
+
+    if (!target.swapChain) {
+        return true;
+    }
+
+    ComPtr<ID3D11Device> swapChainDevice;
+    HRESULT result = target.swapChain->GetDevice(
+        IID_PPV_ARGS(&swapChainDevice));
+    if (FAILED(result) || swapChainDevice.Get() != expectedDevice) {
+        error =
+            "The current D3D11 swap chain belongs to another device";
+        return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 swapDescription {};
+    result = target.swapChain->GetDesc1(&swapDescription);
+    if (FAILED(result)) {
+        error = hresultText(
+            "IDXGISwapChain1::GetDesc1",
+            result);
+        return false;
+    }
+    if (swapDescription.Format != targetFormat
+        || (swapDescription.SwapEffect
+                != DXGI_SWAP_EFFECT_FLIP_DISCARD
+            && swapDescription.SwapEffect
+                != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)) {
+        error =
+            "Advanced Color requires a matching flip-model D3D11 swap chain";
+        return false;
+    }
+
+    ComPtr<IDXGIOutput> output;
+    result = target.swapChain->GetContainingOutput(&output);
+    if (FAILED(result) || !output) {
+        error = hresultText(
+            "IDXGISwapChain::GetContainingOutput",
+            result);
+        return false;
+    }
+    ComPtr<IDXGIOutput6> output6;
+    result = output.As(&output6);
+    if (FAILED(result) || !output6) {
+        error =
+            "The current display does not expose IDXGIOutput6 Advanced Color information";
+        return false;
+    }
+
+    DXGI_OUTPUT_DESC1 outputDescription {};
+    result = output6->GetDesc1(&outputDescription);
+    if (FAILED(result)) {
+        error = hresultText(
+            "IDXGIOutput6::GetDesc1",
+            result);
+        return false;
+    }
+
+    info.displayDetected = true;
+    info.monitor = outputDescription.Monitor;
+    info.bitsPerColor =
+        static_cast<int>(outputDescription.BitsPerColor);
+    info.displayColorSpace = outputDescription.ColorSpace;
+    info.minimumLuminanceNits =
+        outputDescription.MinLuminance;
+    info.maximumLuminanceNits =
+        outputDescription.MaxLuminance;
+    info.maximumFullFrameLuminanceNits =
+        outputDescription.MaxFullFrameLuminance;
+    info.advancedColorActive =
+        outputDescription.ColorSpace
+        == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+
+    const float queriedSdrWhite =
+        querySdrWhiteLevelNits(outputDescription.DeviceName);
+    if (queriedSdrWhite > 0.0F) {
+        info.sdrWhiteLevelNits = queriedSdrWhite;
+        info.sdrWhiteLevelFromSystem = true;
+    }
+
+    if (targetFormat == DXGI_FORMAT_R10G10B10A2_UNORM
+        && !info.advancedColorActive) {
+        info.outputColorSpace = D3D11OutputColorSpace::SDR;
+        info.swapChainColorSpace =
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    }
+    if (!info.advancedColorActive
+        || info.outputColorSpace
+            == D3D11OutputColorSpace::SDR) {
+        info.maximumLuminanceNits =
+            info.sdrWhiteLevelNits;
+        info.maximumFullFrameLuminanceNits =
+            info.sdrWhiteLevelNits;
+    } else {
+        if (!(info.maximumLuminanceNits > 0.0F)) {
+            info.maximumLuminanceNits = 1000.0F;
+        }
+        if (!(info.maximumFullFrameLuminanceNits > 0.0F)) {
+            info.maximumFullFrameLuminanceNits =
+                info.maximumLuminanceNits;
+        }
+    }
+
+    UINT colorSpaceSupport = 0;
+    result = target.swapChain->CheckColorSpaceSupport(
+        info.swapChainColorSpace,
+        &colorSpaceSupport);
+    if (FAILED(result)
+        || !(colorSpaceSupport
+            & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+        error =
+            "The current flip-model swap chain cannot present the required Advanced Color space";
+        return false;
+    }
+    result = target.swapChain->SetColorSpace1(
+        info.swapChainColorSpace);
+    if (FAILED(result)) {
+        error = hresultText(
+            "IDXGISwapChain3::SetColorSpace1",
+            result);
+        return false;
+    }
+    info.swapChainColorSpaceConfigured = true;
+    return true;
 }
 
 std::string hresultText(const char* operation, HRESULT result)
@@ -441,6 +841,104 @@ void setYuvMatrix(
     parameters.row2 = row(bCb, 0.0);
 }
 
+std::uint32_t shaderTransfer(ColorTransfer transfer) noexcept
+{
+    switch (transfer) {
+    case ColorTransfer::PQ:
+        return 1;
+    case ColorTransfer::HLG:
+        return 2;
+    case ColorTransfer::Linear:
+        return 3;
+    case ColorTransfer::SRGB:
+        return 5;
+    default:
+        return 0;
+    }
+}
+
+std::uint32_t shaderPrimaries(ColorPrimaries primaries) noexcept
+{
+    switch (primaries) {
+    case ColorPrimaries::BT2020:
+        return 1;
+    case ColorPrimaries::SMPTE432:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+float contentMaximumLuminance(const VideoFrame& frame) noexcept
+{
+    const ContentLightMetadata content =
+        frame.contentLightMetadata();
+    if (content.maximumContentLightLevel > 0) {
+        return static_cast<float>(
+            content.maximumContentLightLevel);
+    }
+    const MasteringDisplayMetadata mastering =
+        frame.masteringDisplayMetadata();
+    if (mastering.hasLuminance
+        && mastering.maximumLuminance > 0.0) {
+        return static_cast<float>(
+            mastering.maximumLuminance);
+    }
+    return frame.colorSpaceInfo().isHdr() ? 1000.0F : 80.0F;
+}
+
+void setPresentationParameters(
+    const VideoFrame& frame,
+    const D3D11TextureFrame* imported,
+    const D3D11AdvancedColorInfo& output,
+    ColorParameters& parameters) noexcept
+{
+    const VideoColorSpace source = frame.colorSpaceInfo();
+    parameters.sourceTransfer =
+        shaderTransfer(source.transfer);
+    parameters.sourcePrimaries =
+        shaderPrimaries(source.primaries);
+    parameters.contentMaximumLuminanceNits =
+        contentMaximumLuminance(frame);
+
+    if (imported) {
+        switch (imported->colorSpace()) {
+        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+            parameters.sourceTransfer = 1;
+            parameters.sourcePrimaries = 1;
+            break;
+        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+            parameters.sourceTransfer = 4;
+            parameters.sourcePrimaries = 0;
+            break;
+        default:
+            parameters.sourceTransfer = 5;
+            parameters.sourcePrimaries = 0;
+            parameters.contentMaximumLuminanceNits =
+                output.sdrWhiteLevelNits;
+            break;
+        }
+    }
+
+    parameters.outputColorSpace =
+        static_cast<std::uint32_t>(output.outputColorSpace);
+    parameters.sdrWhiteLevelNits =
+        output.sdrWhiteLevelNits > 0.0F
+        ? output.sdrWhiteLevelNits
+        : 80.0F;
+    parameters.displayMaximumLuminanceNits =
+        output.maximumLuminanceNits > 0.0F
+        ? output.maximumLuminanceNits
+        : parameters.sdrWhiteLevelNits;
+    parameters.contentMaximumLuminanceNits = std::max(
+        parameters.contentMaximumLuminanceNits,
+        parameters.sdrWhiteLevelNits);
+    parameters.advancedColorActive =
+        (output.advancedColorActive || !output.displayDetected)
+        ? 1U
+        : 0U;
+}
+
 template <typename Frame>
 bool uploadSoftwareFrame(
     ID3D11Device* device,
@@ -629,8 +1127,6 @@ bool importTextureFrame(
 {
     if (imported.width() != source.width()
         || imported.height() != source.height()
-        || (imported.format() != PixelFormat::BGRA
-            && imported.format() != PixelFormat::RGBA)
         || !imported.texture()
         || !imported.shaderResourceView()) {
         error =
@@ -653,14 +1149,21 @@ bool importTextureFrame(
     imported.texture()->GetDesc(&textureDescription);
     D3D11_SHADER_RESOURCE_VIEW_DESC viewDescription {};
     imported.shaderResourceView()->GetDesc(&viewDescription);
-    const bool bgra = imported.format() == PixelFormat::BGRA;
-    const DXGI_FORMAT expectedFormat = bgra
-        ? DXGI_FORMAT_B8G8R8A8_UNORM
-        : DXGI_FORMAT_R8G8B8A8_UNORM;
+    const DXGI_FORMAT expectedFormat = imported.dxgiFormat();
+    const bool validFormat =
+        (expectedFormat == DXGI_FORMAT_B8G8R8A8_UNORM
+            && imported.format() == PixelFormat::BGRA)
+        || ((expectedFormat == DXGI_FORMAT_R8G8B8A8_UNORM
+                || expectedFormat
+                    == DXGI_FORMAT_R10G10B10A2_UNORM
+                || expectedFormat
+                    == DXGI_FORMAT_R16G16B16A16_FLOAT)
+            && imported.format() == PixelFormat::RGBA);
     if (textureDescription.Width != static_cast<UINT>(source.width())
         || textureDescription.Height != static_cast<UINT>(source.height())
         || textureDescription.ArraySize != 1
         || textureDescription.SampleDesc.Count != 1
+        || !validFormat
         || textureDescription.Format != expectedFormat
         || viewDescription.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D
         || (viewDescription.Format != DXGI_FORMAT_UNKNOWN
@@ -823,12 +1326,34 @@ bool targetDescription(
 
 } // namespace
 
+bool D3D11AdvancedColorInfo::isHdrOutput() const noexcept
+{
+    return advancedColorActive
+        && outputColorSpace != D3D11OutputColorSpace::SDR;
+}
+
 bool D3D11RenderTarget::isValid() const noexcept
 {
     return view != nullptr;
 }
 
 D3D11TextureFrame::~D3D11TextureFrame() = default;
+
+DXGI_FORMAT D3D11TextureFrame::dxgiFormat() const noexcept
+{
+    return format() == PixelFormat::BGRA
+        ? DXGI_FORMAT_B8G8R8A8_UNORM
+        : format() == PixelFormat::RGBA
+        ? DXGI_FORMAT_R8G8B8A8_UNORM
+        : DXGI_FORMAT_UNKNOWN;
+}
+
+DXGI_COLOR_SPACE_TYPE
+D3D11TextureFrame::colorSpace() const noexcept
+{
+    return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+}
+
 D3D11HardwareFrameInterop::~D3D11HardwareFrameInterop() = default;
 std::shared_ptr<D3D11TextureFrame>
 D3D11HardwareFrameInterop::importFrame(
@@ -1069,6 +1594,7 @@ public:
     std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop_;
     EventCallback eventCallback_;
     VideoRenderConfig config_;
+    D3D11AdvancedColorInfo advancedColorInfo_;
     bool allowSoftwareMappingFallback_ = false;
     bool open_ = false;
 
@@ -1269,6 +1795,8 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     std::string fallbackDetail;
     VideoRenderEventType errorType = VideoRenderEventType::Error;
     bool rendered = false;
+    D3D11AdvancedColorInfo advancedColorInfo;
+    bool advancedColorInfoResolved = false;
     {
         std::lock_guard<std::mutex> lock(impl_->renderMutex_);
         auto contextGuard = impl_->deviceAccess_->contextGuard();
@@ -1302,6 +1830,14 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 error =
                     "The current D3D11 target size, sample count, or pixel format is unsupported";
             }
+        }
+        if (error.empty()) {
+            advancedColorInfoResolved = configureAdvancedColor(
+                impl_->device_.get(),
+                target,
+                targetFormat,
+                advancedColorInfo,
+                error);
         }
 
         UploadedFrame uploaded;
@@ -1363,6 +1899,13 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 uploaded,
                 error)) {
             // The common error classification below handles this failure.
+        }
+        if (error.empty()) {
+            setPresentationParameters(
+                frame,
+                textureFrame.get(),
+                advancedColorInfo,
+                uploaded.color);
         }
         if (!error.empty()) {
             const HRESULT uploadReason =
@@ -1512,6 +2055,14 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         }
     }
 
+    if (advancedColorInfoResolved) {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        if (!sameAdvancedColorInfo(
+                impl_->advancedColorInfo_,
+                advancedColorInfo)) {
+            impl_->advancedColorInfo_ = advancedColorInfo;
+        }
+    }
     if (!rendered) {
         impl_->notify(errorType, std::move(error));
     } else if (!fallbackDetail.empty()) {
@@ -1613,6 +2164,16 @@ bool D3D11VideoRenderer::allowSoftwareMappingFallback() const noexcept
     }
     std::lock_guard<std::mutex> lock(impl_->stateMutex_);
     return impl_->allowSoftwareMappingFallback_;
+}
+
+D3D11AdvancedColorInfo
+D3D11VideoRenderer::advancedColorInfo() const noexcept
+{
+    if (!impl_) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    return impl_->advancedColorInfo_;
 }
 
 } // namespace qtav

@@ -1,0 +1,16 @@
+namespace QtAVWinUI3
+{
+    [default_interface]
+    runtimeclass MainWindow : Microsoft.UI.Xaml.Window
+    {
+        MainWindow();
+    }
+
+    [default_interface]
+    runtimeclass DebugWindow : Microsoft.UI.Xaml.Window
+    {
+        DebugWindow();
+        void SetLog(String text);
+        void AppendLine(String line);
+    }
+}

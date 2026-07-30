@@ -156,11 +156,16 @@ Implemented under `modern/`:
 - mdk-style render scheduling with `setRenderCallback()`,
   `setVideoRenderer()`, and `renderVideo()`;
 - libswscale CPU rendering into application-owned image buffers;
-- D3D11 software-frame rendering into borrowed Windows render-target views;
+- D3D11 software-frame rendering into borrowed Windows render-target views,
+  with optional swap-chain-driven Advanced Color SDR, FP16 scRGB, and RGB10
+  HDR10 output;
 - WASAPI shared-mode device output with playback clock and latency reporting;
 - D3D11VA hardware decoding into retained NV12/P010 texture-array slices;
 - zero-CPU-map D3D11VA/D3D11 Video Processor interop into shader-readable
-  SDR BGRA8 textures;
+  SDR BGRA8, FP16 scRGB, or RGB10/PQ textures;
+- Windows PQ/HLG EOTF, BT.2020 conversion, display-aware tone mapping,
+  per-frame `IDXGIOutput6` capability/display switching, and system SDR
+  reference-white handling;
 - Metal software-frame rendering into borrowed textures or drawables;
 - CoreAudio device output with playback clock and latency reporting;
 - VideoToolbox hardware decoding into retained `CVPixelBuffer` frames;
@@ -267,6 +272,11 @@ Last verified baseline:
 - Windows static/shared install plus external `QtAV::RenderD3D11`,
   `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`, and `QtAV::AudioWASAPI`
   CMake consumption: passed.
+- current Windows static/shared Release CTest after Advanced Color
+  implementation: 33/33 passed with Windows HDR disabled and enabled,
+  including native FP16/RGB10 flip-model output, PQ/BT.2020 Main10
+  HDR-preserving zero-CPU-map readback, and active-HDR validation on a
+  PHL 27B1U7903.
 
 Before finishing any implementation turn:
 

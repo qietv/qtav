@@ -238,7 +238,9 @@ if(TARGET qtav_render_d3d11)
     )
     target_link_libraries(
         qtav_render_d3d11_test
-        PRIVATE QtAV::RenderD3D11
+        PRIVATE
+            QtAV::RenderD3D11
+            FFmpeg::avutil
     )
     target_compile_features(
         qtav_render_d3d11_test
@@ -249,6 +251,37 @@ if(TARGET qtav_render_d3d11)
         PRIVATE
             "${PROJECT_SOURCE_DIR}/backends/render/d3d11/src"
             "${PROJECT_SOURCE_DIR}/core/src"
+    )
+
+    add_executable(
+        qtav_render_d3d11_advanced_color_test
+        d3d11_advanced_color_test.cpp
+    )
+    target_link_libraries(
+        qtav_render_d3d11_advanced_color_test
+        PRIVATE
+            QtAV::RenderD3D11
+            FFmpeg::avutil
+            dxgi
+            user32
+    )
+    target_compile_features(
+        qtav_render_d3d11_advanced_color_test
+        PRIVATE cxx_std_17
+    )
+    target_include_directories(
+        qtav_render_d3d11_advanced_color_test
+        PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
+    )
+    add_test(
+        NAME qtav_render_d3d11_advanced_color
+        COMMAND qtav_render_d3d11_advanced_color_test
+    )
+    set_tests_properties(
+        qtav_render_d3d11_advanced_color
+        PROPERTIES
+            SKIP_RETURN_CODE 77
+            TIMEOUT 15
     )
 endif()
 

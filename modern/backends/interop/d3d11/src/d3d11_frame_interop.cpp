@@ -10,6 +10,7 @@
 #include <qtav/d3d11_frame_interop.h>
 #include <qtav/d3d11va_hardware_decoder.h>
 
+#include <array>
 #include <utility>
 
 namespace qtav {
@@ -17,10 +18,24 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr DXGI_FORMAT outputFormat =
-    DXGI_FORMAT_B8G8R8A8_UNORM;
-constexpr DXGI_COLOR_SPACE_TYPE outputColorSpace =
-    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+struct OutputProfile {
+    DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    DXGI_COLOR_SPACE_TYPE colorSpace =
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    PixelFormat pixelFormat = PixelFormat::BGRA;
+};
+
+constexpr OutputProfile sdrOutput {};
+constexpr OutputProfile scRgbOutput {
+    DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+    PixelFormat::RGBA,
+};
+constexpr OutputProfile hdr10Output {
+    DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+    PixelFormat::RGBA,
+};
 
 DXGI_FORMAT sourceFormat(PixelFormat format) noexcept
 {
@@ -185,12 +200,14 @@ public:
         ComPtr<ID3D11VideoProcessorInputView> inputView,
         ComPtr<ID3D11VideoProcessorOutputView> outputView,
         ComPtr<ID3D11Texture2D> texture,
-        ComPtr<ID3D11ShaderResourceView> shaderView)
+        ComPtr<ID3D11ShaderResourceView> shaderView,
+        OutputProfile output)
         : source_(std::move(source))
         , inputView_(std::move(inputView))
         , outputView_(std::move(outputView))
         , texture_(std::move(texture))
         , shaderView_(std::move(shaderView))
+        , output_(output)
     {
     }
 
@@ -206,7 +223,7 @@ public:
 
     PixelFormat format() const noexcept override
     {
-        return PixelFormat::BGRA;
+        return output_.pixelFormat;
     }
 
     ID3D11Texture2D* texture() const noexcept override
@@ -220,12 +237,23 @@ public:
         return shaderView_.Get();
     }
 
+    DXGI_FORMAT dxgiFormat() const noexcept override
+    {
+        return output_.format;
+    }
+
+    DXGI_COLOR_SPACE_TYPE colorSpace() const noexcept override
+    {
+        return output_.colorSpace;
+    }
+
 private:
     HardwareFrame source_;
     ComPtr<ID3D11VideoProcessorInputView> inputView_;
     ComPtr<ID3D11VideoProcessorOutputView> outputView_;
     ComPtr<ID3D11Texture2D> texture_;
     ComPtr<ID3D11ShaderResourceView> shaderView_;
+    OutputProfile output_;
 };
 
 struct ProcessorState {
@@ -308,17 +336,11 @@ public:
         }
 
         UINT inputSupport = 0;
-        UINT outputSupport = 0;
         if (FAILED(enumerator->CheckVideoProcessorFormat(
                 sourceFormat(frame.softwareFormat()),
                 &inputSupport))
             || !(inputSupport
-                & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)
-            || FAILED(enumerator->CheckVideoProcessorFormat(
-                outputFormat,
-                &outputSupport))
-            || !(outputSupport
-                & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
+                & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
             return false;
         }
 
@@ -346,7 +368,8 @@ public:
 
     bool configureColor(
         const D3D11VAFrame& frame,
-        const VideoColorSpace& color)
+        const VideoColorSpace& color,
+        OutputProfile& selectedOutput)
     {
         DXGI_COLOR_SPACE_TYPE input {};
         if (!dxgiInputColorSpace(color, frame.height(), input)) {
@@ -356,28 +379,74 @@ public:
         ComPtr<ID3D11VideoProcessorEnumerator1> enumerator1;
         if (videoContext1_
             && SUCCEEDED(processor_.enumerator.As(&enumerator1))) {
-            BOOL supported = FALSE;
-            if (FAILED(
-                    enumerator1->CheckVideoProcessorFormatConversion(
-                        sourceFormat(frame.softwareFormat()),
-                        input,
-                        outputFormat,
-                        outputColorSpace,
-                        &supported))
-                || !supported) {
-                return false;
+            std::array<OutputProfile, 2> candidates {
+                sdrOutput,
+                sdrOutput,
+            };
+            std::size_t candidateCount = 1;
+            if (color.transfer == ColorTransfer::PQ
+                && color.primaries == ColorPrimaries::BT2020) {
+                candidates[0] = hdr10Output;
+                candidates[1] = scRgbOutput;
+                candidateCount = 2;
+            } else if (
+                color.transfer == ColorTransfer::HLG
+                && color.primaries == ColorPrimaries::BT2020) {
+                candidates[0] = scRgbOutput;
+                candidates[1] = hdr10Output;
+                candidateCount = 2;
+            } else if (extendedColorRequired(
+                           color,
+                           frame.height())) {
+                candidates[0] = scRgbOutput;
             }
-            videoContext1_->VideoProcessorSetStreamColorSpace1(
-                processor_.processor.Get(),
-                0,
-                input);
-            videoContext1_->VideoProcessorSetOutputColorSpace1(
-                processor_.processor.Get(),
-                outputColorSpace);
-            return true;
+
+            for (std::size_t index = 0;
+                 index < candidateCount;
+                 ++index) {
+                const OutputProfile candidate = candidates[index];
+                UINT outputSupport = 0;
+                BOOL conversionSupported = FALSE;
+                if (FAILED(
+                        processor_.enumerator
+                            ->CheckVideoProcessorFormat(
+                                candidate.format,
+                                &outputSupport))
+                    || !(outputSupport
+                        & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)
+                    || FAILED(
+                        enumerator1
+                            ->CheckVideoProcessorFormatConversion(
+                                sourceFormat(frame.softwareFormat()),
+                                input,
+                                candidate.format,
+                                candidate.colorSpace,
+                                &conversionSupported))
+                    || !conversionSupported) {
+                    continue;
+                }
+                videoContext1_->VideoProcessorSetStreamColorSpace1(
+                    processor_.processor.Get(),
+                    0,
+                    input);
+                videoContext1_->VideoProcessorSetOutputColorSpace1(
+                    processor_.processor.Get(),
+                    candidate.colorSpace);
+                selectedOutput = candidate;
+                return true;
+            }
+            return false;
         }
 
         if (extendedColorRequired(color, frame.height())) {
+            return false;
+        }
+        UINT outputSupport = 0;
+        if (FAILED(processor_.enumerator->CheckVideoProcessorFormat(
+                sdrOutput.format,
+                &outputSupport))
+            || !(outputSupport
+                & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
             return false;
         }
         const auto inputLegacy =
@@ -390,6 +459,7 @@ public:
         videoContext_->VideoProcessorSetOutputColorSpace(
             processor_.processor.Get(),
             &outputLegacy);
+        selectedOutput = sdrOutput;
         return true;
     }
 
@@ -467,9 +537,10 @@ D3D11FrameInterop::importFrame(
 
     auto contextGuard = impl_->deviceAccess_->contextGuard();
     (void)contextGuard;
+    OutputProfile output;
     if (!impl_->available()
         || !impl_->ensureProcessor(native)
-        || !impl_->configureColor(native, color)) {
+        || !impl_->configureColor(native, color, output)) {
         return {};
     }
 
@@ -495,7 +566,7 @@ D3D11FrameInterop::importFrame(
         static_cast<UINT>(native.height());
     outputDescription.MipLevels = 1;
     outputDescription.ArraySize = 1;
-    outputDescription.Format = outputFormat;
+    outputDescription.Format = output.format;
     outputDescription.SampleDesc.Count = 1;
     outputDescription.Usage = D3D11_USAGE_DEFAULT;
     outputDescription.BindFlags =
@@ -582,7 +653,8 @@ D3D11FrameInterop::importFrame(
         std::move(inputView),
         std::move(outputView),
         std::move(outputTexture),
-        std::move(shaderView));
+        std::move(shaderView),
+        output);
 }
 
 void D3D11FrameInterop::flush() noexcept

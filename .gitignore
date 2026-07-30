@@ -18,6 +18,7 @@ contrib/include
 !/.gitmodules
 !/.qmake.conf
 !/.travis.yml
+!/modern/examples/winui3_player/.gitignore
 
 # .install files in debian/ are generated and ignored
 debian/*.install
@@ -51,6 +52,7 @@ Makefile*
 *.idb
 *.layout
 *.manifest
+!/modern/examples/winui3_player/app.manifest
 *.ncb
 *.obj
 *.pdb

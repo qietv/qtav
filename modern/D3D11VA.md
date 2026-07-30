@@ -1,7 +1,8 @@
 # D3D11VA device, frame, and interop design
 
 Status: implemented and verified on Windows; both `QtAV::HWD3D11VA` and
-`QtAV::InteropD3D11` are complete for the documented SDR output path.
+`QtAV::InteropD3D11` support the documented SDR and HDR-preserving output
+paths. Native active-HDR presentation is verified on a PHL 27B1U7903.
 
 This document records the ownership, threading, fallback, and test contracts
 implemented by `QtAV::HWD3D11VA` and `QtAV::InteropD3D11`. It is deliberately
@@ -195,14 +196,18 @@ hardware-frame support only while a compatible interop object is installed.
 4. configure source/destination rectangles and color space from structured
    frame metadata;
 5. submit `VideoProcessorBlt()` under the shared context guard;
-6. return a retained texture frame which keeps the source frame and all
-   imported resources alive through the renderer submission.
+6. return a retained texture frame which reports its DXGI format/color space
+   and keeps the source frame and all imported resources alive through the
+   renderer submission.
 
-The initial intermediate is SDR BGRA8. HDR transfer/output remains a later
-extension and must not be silently described as HDR presentation. The renderer
-then applies its existing geometry to the current application-owned render
-target. Target/swap-chain recreation changes only the current-target callback
-and renderer configuration; it does not rebuild the decoder device or pool.
+SDR input uses a BGRA8 G22/P709 intermediate. PQ/BT.2020 input prefers an
+RGB10/PQ P2020 intermediate and falls back to FP16 linear scRGB when the driver
+reports that conversion. HLG/BT.2020 prefers FP16 scRGB and can fall back to
+RGB10/PQ. The renderer then applies geometry plus display-specific transfer,
+gamut, and tone mapping to the current application-owned SDR, scRGB, or HDR10
+render target. Target/swap-chain recreation changes only the current-target
+callback and renderer configuration; it does not rebuild the decoder device
+or pool.
 
 Direct shader views over the decoder array are not an initial path. A future
 implementation may add a proven vendor/runtime path, but it must be capability
@@ -292,6 +297,8 @@ the Qt-dependency scan remain release gates.
 5. [x] Add the Video Processor implementation in `qtav_interop_d3d11`.
 6. [x] Add WARP contract tests, native zero-copy tests, console-example
    wiring, install/export validation, and final public documentation.
+7. [x] Preserve PQ/HLG HDR through RGB10/PQ or FP16 scRGB intermediates and
+   validate Main10/P010 output above scRGB `1.0` without CPU mapping.
 
 Completed Video Processor checkpoint:
 
@@ -301,8 +308,9 @@ Completed Video Processor checkpoint:
   removed or foreign devices before context work, then serializes Video
   Processor operations through the shared recursive guard;
 - the interop caches the enumerator/processor for the active size and format,
-  creates retained per-import views and an SDR BGRA8 shader resource, and
-  keeps the decoder frame alive through final renderer submission;
+  creates retained per-import views and an SDR BGRA8, FP16 scRGB, or
+  RGB10/PQ shader resource, and keeps the decoder frame alive through final
+  renderer submission;
 - the renderer supplies structured color metadata through a backward-
   compatible color-aware import overload; Direct3D 11.1 color spaces cover
   range, BT.601/709/2020, PQ, HLG, and chroma siting when the driver reports
@@ -310,9 +318,10 @@ Completed Video Processor checkpoint:
 - WARP verifies texture/slice extraction, retained lifetime, recursive locking,
   and safe unavailable behavior on systems without software Video Processor
   support;
-- hardware-adapter tests prove generated H.264/NV12 and HEVC Main10/P010
-  D3D11VA frames reach the render target with correct pixel readback and no CPU
-  mapping; Main10 media generation and decode are capability-gated;
+- hardware-adapter tests prove generated H.264/NV12 and PQ/BT.2020 HEVC
+  Main10/P010 D3D11VA frames reach the render target with correct pixel
+  readback and no CPU mapping; Main10 additionally reaches FP16 scRGB above
+  `1.0`, and its media generation/decode remain capability-gated;
 - the H.264 zero-copy test covers pause/resume, seek, media replacement,
   explicit stop, target recreation, and retained source/import use after
   `Player` shutdown;
