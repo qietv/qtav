@@ -31,6 +31,9 @@ code is used.
 - optional RIFF/WAVE PCM diagnostic file sink;
 - optional macOS CoreAudio device sink with native playback timing;
 - optional Windows WASAPI shared-mode device sink with native playback timing;
+- optional D3D11VA hardware decoding on an application-selected retained
+  D3D11 device, with reference-counted decoder texture-array slices and
+  explicit software fallback;
 - optional VideoToolbox hardware decoding with reference-counted
   `CVPixelBuffer` frames and explicit software fallback;
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
@@ -74,6 +77,9 @@ Current backend integration boundary:
   application-owned render-target view;
 - `QtAV::PlatformWindows` retains an application-selected D3D11 device and
   its verified immediate context behind a shared recursive context guard;
+- `QtAV::HWD3D11VA` creates FFmpeg's hardware device on that selected D3D11
+  device, shares the same context lock, and exposes retained NV12/P010 decoder
+  texture-array slices through a Windows-only strong frame view;
 - `QtAV::RenderMetal` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders into the application's
   current Metal texture or drawable, accepts an optional hardware-frame
@@ -82,7 +88,7 @@ Current backend integration boundary:
 - `QtAV::InteropCVMetal` imports supported VideoToolbox `CVPixelBuffer` planes
   as retained Metal textures without mapping or copying through CPU memory,
   preserving whether the native pixel buffer is limited or full range;
-- no Windows hardware-decoder backend, and no Linux or Android native backend,
+- no D3D11 zero-copy renderer interop, and no Linux or Android native backend,
   has been implemented yet.
 
 ## Build
@@ -126,9 +132,10 @@ and CoreAudio are available, and `QTAV_HW_VIDEOTOOLBOX=AUTO` builds the Apple
 hardware-decode selection and native-frame access target when VideoToolbox and
 CoreVideo are available. `QTAV_INTEROP_CVMETAL=AUTO` builds the Apple
 VideoToolbox/Metal interop target when the Metal renderer and CoreVideo are
-available. Other backend implementations are not present yet, so their `AUTO`
-behavior is to remain disabled and explicitly requesting one with `ON` is an
-error.
+available. `QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
+selection and native-frame access target. Other backend implementations are
+not present yet, so their `AUTO` behavior is to remain disabled and explicitly
+requesting one with `ON` is an error.
 
 Run the headless example:
 
@@ -412,6 +419,49 @@ BT.2020 YUV conversion, and supports custom viewports, Fit/Fill/Stretch, all
 right-angle rotations, resize, surface recreation, and surface/device-loss
 events. HDR transfer and D3D11VA zero-copy interop remain later Windows work.
 
+### D3D11VA hardware decode
+
+Link `QtAV::HWD3D11VA` and pass the same retained device access used by the
+renderer before opening media:
+
+```cpp
+#include <qtav/d3d11va_hardware_decoder.h>
+
+auto deviceAccess = qtav::D3D11DeviceAccess::create(
+    qtav::BorrowedD3D11Device(device),
+    qtav::BorrowedD3D11DeviceContext(immediateContext));
+
+player
+    .setHardwareDecodeConfig(
+        qtav::d3d11vaHardwareDecodeConfig(deviceAccess))
+    .onVideoFrame([](const qtav::VideoFrame& frame, int) {
+        const auto native =
+            qtav::d3d11vaFrame(frame.hardwareFrame());
+        if (!native) {
+            return; // Explicit software fallback may be active.
+        }
+        ID3D11Texture2D* texture = native.texture();
+        const UINT slice = native.arraySlice();
+        // Both remain valid while native or its source frame is alive.
+    });
+```
+
+The helper creates and initializes FFmpeg's D3D11VA device context on the
+selected device, retains its verified immediate context, and installs lock
+callbacks backed by the same recursive guard used by the renderer. Its default
+pool allowance is four extra hardware frames and is bounded to 64. If selected
+device initialization, codec capability, pixel-format negotiation, or decoder
+open fails, the default policy reports `decoder.hardware.fallback` and
+continues in software; disabling fallback makes the failure terminal.
+
+Decoded D3D11 frames expose NV12 or P010 `ID3D11Texture2D` array slices through
+`D3D11VAFrame`. A copied view retains the underlying FFmpeg frame, pool,
+hardware device, COM resources, and lock state. `HardwareFrame::map()` remains
+the explicit CPU-copy path and can be used after seek, media replacement,
+stop, or player shutdown while the copied frame is alive. Feeding decoder
+slices to the renderer without a CPU copy remains the separate
+`QtAV::InteropD3D11` implementation task.
+
 ### Metal renderer
 
 `QtAV::RenderMetal` is an Objective-C++ API. Include
@@ -531,6 +581,13 @@ shared access, compiles shaders for its device, uploads software-frame planes
 into per-frame shader resources, and obtains the current borrowed render
 target immediately before drawing.
 
+`QtAV::HWD3D11VA` also retains the shared device access while its FFmpeg
+hardware-device token, decoder pools, or copied frames remain alive. The
+backend-specific `D3D11VAFrame` validates the decoded texture format, array
+slice, dimensions, and source device before exposing borrowed native pointers.
+Its decoder and mapping calls use FFmpeg lock callbacks connected to the same
+recursive context lock as rendering.
+
 `AudioSinkClock` fields are measured in milliseconds on the media timeline.
 `positionMilliseconds` is the sample position currently presented by the
 device, while `latencyMilliseconds` is informational and must not already be
@@ -590,7 +647,11 @@ payload from deterministic 8 kHz mono input.
 Windows D3D11 tests use the WARP device for deterministic offscreen rendering
 and cover RGB, YUV420P, and NV12 upload, viewport, aspect ratio, rotation,
 resize, target recreation, foreign-device rejection, and missing-surface
-events.
+events. D3D11VA tests cover selected-device creation, shared locking, bounded
+extra frames, native texture/slice validation, and invalid handles; an H.264
+hardware integration test covers mapping, seek, media replacement, stop, and
+retained-frame access after player shutdown, with an explicit software
+fallback result when the adapter has no matching decoder profile.
 
 ## Architecture
 
@@ -609,6 +670,7 @@ Player facade
        ├─ RIFF/WAVE diagnostic PCM file sink
        ├─ CoreAudio device sink with AudioQueue clocking
        ├─ WASAPI shared-mode device sink with IAudioClock clocking
+       ├─ D3D11VA decoder producing retained texture-array slices
        ├─ Metal software/hardware-frame renderer with borrowed native resources
        ├─ VideoToolbox decoder producing retained CVPixelBuffer frames
        ├─ CVMetalTextureCache zero-copy frame interop

@@ -268,6 +268,35 @@ if(TARGET qtav_hw_videotoolbox)
     )
 endif()
 
+if(TARGET qtav_hw_d3d11va)
+    add_executable(
+        qtav_hw_d3d11va_test
+        d3d11va_hardware_decoder_test.cpp
+    )
+    target_link_libraries(
+        qtav_hw_d3d11va_test
+        PRIVATE
+            QtAV::HWD3D11VA
+            FFmpeg::avutil
+    )
+    target_include_directories(
+        qtav_hw_d3d11va_test
+        PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
+    )
+    target_compile_features(
+        qtav_hw_d3d11va_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_hw_d3d11va_contract
+        COMMAND qtav_hw_d3d11va_test
+    )
+    set_tests_properties(
+        qtav_hw_d3d11va_contract
+        PROPERTIES TIMEOUT 10
+    )
+endif()
+
 if(TARGET qtav_audio_resample)
     add_executable(
         qtav_audio_resample_test
@@ -633,6 +662,44 @@ if(FFMPEG_EXECUTABLE)
             PROPERTIES
                 FIXTURES_REQUIRED qtav_hw_videotoolbox_media
                 TIMEOUT 15
+        )
+    endif()
+
+    if(TARGET qtav_hw_d3d11va_test)
+        set(
+            QTAV_HW_D3D11VA_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-d3d11va-test.mp4"
+        )
+        add_test(
+            NAME qtav_hw_d3d11va_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i testsrc2=size=160x90:rate=12
+                -t 2
+                -c:v h264_mf
+                -pix_fmt yuv420p
+                -g 12
+                "${QTAV_HW_D3D11VA_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_hw_d3d11va_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_hw_d3d11va_media
+        )
+        add_test(
+            NAME qtav_hw_d3d11va_lifecycle
+            COMMAND
+                qtav_hw_d3d11va_test
+                "${QTAV_HW_D3D11VA_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_hw_d3d11va_lifecycle
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_hw_d3d11va_media
+                TIMEOUT 20
         )
     endif()
 

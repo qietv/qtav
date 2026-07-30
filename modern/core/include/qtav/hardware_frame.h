@@ -38,6 +38,9 @@ enum class HardwareMapMode {
 struct QTAV_CORE_EXPORT NativeHandle {
     HardwareHandleType type = HardwareHandleType::Frame;
     std::uintptr_t value = 0;
+    // Optional backend-defined subresource or array index. D3D11 hardware
+    // frames use this for the decoder texture-array slice.
+    std::uint32_t subresource = 0;
 
     explicit operator bool() const noexcept
     {

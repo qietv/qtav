@@ -33,8 +33,9 @@ Continuation checkpoint:
 - the Apple reference path, including HDR and color-space metadata plumbing,
   and the Windows D3D11 software-frame and WASAPI audio paths are complete;
   the D3D11VA device/frame/interop design and supplied-device core bridge are
-  complete, and the active next task is the native `qtav_hw_d3d11va` decoder
-  backend;
+  complete; the native `qtav_hw_d3d11va` decoder backend is now complete, and
+  the active next task is the decoder-independent D3D11 renderer interop
+  interface followed by its Video Processor implementation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -58,6 +59,7 @@ Current public entry points:
 - `modern/backends/audio/wasapi/include/qtav/wasapi_audio_sink.h`
 - `modern/backends/render/metal/include/qtav/metal_video_renderer.h`
 - `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
+- `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
 
@@ -77,6 +79,7 @@ Current implementation:
 - `modern/backends/audio/wasapi/src/wasapi_audio_sink.cpp`
 - `modern/backends/render/metal/src/metal_video_renderer.mm`
 - `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
+- `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
 - `modern/tests/audio_sink_player_test.cpp`
@@ -92,14 +95,17 @@ Current implementation:
 - `modern/tests/wasapi_audio_sink_test.cpp`
 - `modern/tests/metal_video_renderer_test.mm`
 - `modern/tests/d3d11_video_renderer_test.cpp`
+- `modern/tests/d3d11va_hardware_decoder_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
 - `modern/tests/cvmetal_frame_interop_test.mm`
 - `modern/tests/hardware_decode_device_test.cpp`
 
 Current verification:
 
-- static and shared builds pass 24/24 CTest tests;
-- ASan/UBSan passes 24/24 on macOS with leak detection disabled;
+- static and shared builds pass 27/27 CTest tests on Windows after adding the
+  D3D11VA contract and native lifecycle coverage;
+- ASan/UBSan passes the prior 24/24 macOS-applicable tests with leak detection
+  disabled;
 - the all-backends-disabled build passes 11/11 tests, including the Windows
   platform device-access contract test;
 - forcing an unimplemented backend to `ON` fails with a clear diagnostic;
@@ -113,17 +119,19 @@ Current verification:
 - runtime linkage contains no Qt;
 - core public-header scans contain no Qt, FFmpeg, or platform SDK types;
 - MPEG-4/AAC, AC-3, E-AC-3, and TrueHD decode tests pass.
-- on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, static and shared
-  Release builds pass 24/24 CTest tests, including the supplied hardware-device
-  bridge, deterministic WARP D3D11
-  rendering, WASAPI device lifecycle, and Player-driven WASAPI playback;
+- on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, the static Release
+  build passes 27/27 CTest tests, including the supplied hardware-device
+  bridge, deterministic WARP D3D11 rendering, WASAPI device lifecycle,
+  Player-driven WASAPI playback, and native H.264 D3D11VA decode with mapping,
+  seek, media replacement, stop, and retained-frame shutdown lifetime;
 - Windows multi-config FFmpeg imports select matching Debug/Release libraries,
   and project DLLs, tests, and examples share a runnable `bin/<Config>`
   directory;
 - installation plus external CMake consumption of `QtAV::PlatformWindows`,
-  `QtAV::RenderD3D11`, and `QtAV::AudioWASAPI` together with the portable core,
-  render, and audio targets passes for static and shared builds; the installed
-  core token links without installing its private FFmpeg bridge header.
+  `QtAV::HWD3D11VA`, `QtAV::RenderD3D11`, and `QtAV::AudioWASAPI` together
+  with the portable core, render, and audio targets passes for static and
+  shared builds; the installed core token links without installing its private
+  FFmpeg bridge header.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -435,7 +443,7 @@ Next active implementation order:
 4. [x] Add WASAPI.
 5. [x] Complete the D3D11VA device, frame-lifetime, and interop design
    checkpoint below.
-6. [ ] Add D3D11VA and D3D11 zero-copy interop.
+6. [~] D3D11VA decode is complete; add D3D11 zero-copy interop.
 
 Completed D3D11 software-frame checkpoint:
 
@@ -572,6 +580,39 @@ Completed supplied hardware-device bridge checkpoint:
   identity, independent tokens, player config copying, and type-mismatch
   software fallback plus disabled-fallback failure.
 
+Completed D3D11VA hardware-decode checkpoint:
+
+- `QtAV::HWD3D11VA` is Windows-only, optional under
+  `QTAV_HW_D3D11VA=AUTO/ON/OFF`, installable as an exported package target,
+  and depends on `QtAV::PlatformWindows` without depending on the renderer;
+- `d3d11vaHardwareDecodeConfig()` allocates FFmpeg's D3D11VA device on the
+  application-selected retained device and immediate context, installs
+  callbacks using the shared recursive context lock, and requests a bounded
+  zero-to-64 extra decoder surfaces with a default of four;
+- a required-supplied-device flag prevents a failed selected-device setup from
+  silently opening a different FFmpeg-created device while preserving the
+  explicit software-fallback policy;
+- core `NativeHandle` carries the D3D11 decoder texture-array slice without
+  exposing D3D11 or FFmpeg types, while the Windows-only `D3D11VAFrame`
+  validates and retains NV12/P010 texture, slice, dimensions, and device;
+- deterministic tests cover device/context identity, shared-lock exclusion,
+  option bounds, native frame validation, invalid slice/format/size/type, and
+  retained synthetic texture lifetime;
+- the current Windows adapter passes generated H.264 native decode, CPU
+  mapping, seek, media replacement, stop, and retained frame access after
+  player shutdown.
+
+Next implementation slice:
+
+1. [ ] Add decoder-independent `D3D11HardwareFrameInterop` and retained
+   `D3D11TextureFrame` interfaces to `QtAV::RenderD3D11`.
+2. [ ] Add renderer capability reporting plus explicit enabled/disabled
+   software-map fallback using mock interop tests.
+3. [ ] Implement `QtAV::InteropD3D11` with same-device validation and a D3D11
+   Video Processor pass into a shader-readable BGRA8 intermediate.
+4. [ ] Add WARP contract tests, native zero-CPU-copy H.264 rendering coverage,
+   example wiring, and install-consumer validation.
+
 Default platform order after the contracts are stable:
 
 1. Apple reference path on the current macOS host.
@@ -636,7 +677,7 @@ Acceptance:
 - [x] `qtav_audio_wasapi`.
 - [x] Shared-mode PCM negotiation and audio clock.
 - [x] Complete the D3D11VA device/frame/interop design checkpoint.
-- [ ] `qtav_hw_d3d11va`.
+- [x] `qtav_hw_d3d11va`.
 - [ ] `qtav_interop_d3d11` for zero-copy decoder textures.
 
 Acceptance:

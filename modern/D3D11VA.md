@@ -1,6 +1,7 @@
 # D3D11VA device, frame, and interop design
 
-Status: accepted design checkpoint for the initial Windows hardware path.
+Status: accepted design; the `QtAV::HWD3D11VA` decoder slice is implemented
+and the `QtAV::InteropD3D11` slice remains active.
 
 This document fixes the ownership, threading, fallback, and test contracts to
 be implemented by `QtAV::HWD3D11VA` and `QtAV::InteropD3D11`. It is deliberately
@@ -280,14 +281,14 @@ the Qt-dependency scan remain release gates.
 
 ## Implementation order
 
-1. Add the common Windows device-access target and the opaque supplied-device
-   bridge in core.
-2. Add `qtav_hw_d3d11va`, decoder configuration, retained texture/slice
+1. [x] Add the common Windows device-access target and the opaque
+   supplied-device bridge in core.
+2. [x] Add `qtav_hw_d3d11va`, decoder configuration, retained texture/slice
    access, mapping, and lifecycle tests.
-3. Add decoder-independent D3D11 renderer interop interfaces.
-4. Add the Video Processor implementation in `qtav_interop_d3d11`.
-5. Add WARP contract tests, opt-in real-GPU tests, console-example wiring,
-   install/export validation, and public documentation.
+3. [ ] Add decoder-independent D3D11 renderer interop interfaces.
+4. [ ] Add the Video Processor implementation in `qtav_interop_d3d11`.
+5. [ ] Add WARP contract tests, native zero-copy tests, console-example
+   wiring, install/export validation, and final public documentation.
 
 ## Source and license boundary
 

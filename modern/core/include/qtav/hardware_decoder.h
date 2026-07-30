@@ -50,6 +50,12 @@ struct QTAV_CORE_EXPORT HardwareDecodeConfig {
     HardwareDeviceType deviceType = HardwareDeviceType::Unknown;
     bool allowSoftwareFallback = true;
     HardwareDecodeDevice device;
+    // Additional decoder-owned hardware surfaces. Values are clamped to the
+    // core-supported range before AVCodecContext is opened.
+    int extraHardwareFrames = 0;
+    // Backend helpers which promise an application-selected device set this
+    // so a failed token creation cannot silently select another native device.
+    bool requireSuppliedDevice = false;
 
     bool isValid() const noexcept
     {

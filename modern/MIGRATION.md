@@ -50,6 +50,9 @@ mdk-sdk:
   `QtAV::AudioCoreAudio`;
 - optional Windows `WasapiAudioSink` shared-mode device output through
   `QtAV::AudioWASAPI`;
+- optional D3D11VA hardware decode through `QtAV::HWD3D11VA`, using the
+  application-selected `D3D11DeviceAccess` and retained decoder texture-array
+  slices;
 - optional VideoToolbox hardware decode through `QtAV::HWVideoToolbox`, with
   reference-counted `CVPixelBuffer` frames and explicit software fallback;
 - optional `QtAV::InteropCVMetal` import of limited/full-range VideoToolbox
@@ -136,10 +139,18 @@ serialization. The renderer uploads software RGB, YUV, NV12/NV21, P010, and
 gray frames, performs SDR YUV conversion in a pixel shader, and supports
 resize, custom viewports, aspect handling, right-angle rotation, and
 render-target recreation. Windows SDK types remain in platform/backend
-headers and never enter a core public header. D3D11VA decode, zero-copy
-decoder-texture interop, and HDR output remain separate follow-up work. Their
-accepted device, lifetime, locking, and fallback contract is documented in
-[D3D11VA.md](D3D11VA.md).
+headers and never enter a core public header.
+
+`d3d11vaHardwareDecodeConfig()` creates FFmpeg's D3D11VA device on the same
+retained device access, installs callbacks for the shared recursive lock, and
+requests a bounded number of extra decoder surfaces. `D3D11VAFrame` retains a
+decoded NV12/P010 texture-array slice and validates its native resource before
+returning borrowed D3D11 pointers. The core `NativeHandle` now carries an
+optional subresource index, while Windows SDK and FFmpeg declarations remain
+outside installed core headers. Explicit CPU mapping, software fallback, seek,
+media replacement, stop, and retained lifetime after player shutdown are
+implemented. Zero-copy decoder-texture interop and HDR output remain separate
+follow-up work under the accepted contract in [D3D11VA.md](D3D11VA.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -150,7 +161,7 @@ or pace playback. Decoded planar audio therefore normally uses
 
 - remaining platform audio device implementations (ALSA/PulseAudio, AAudio);
 - OpenGL and Vulkan renderer implementations;
-- remaining hardware decoders and non-Apple GPU zero-copy interop;
+- remaining hardware decoders and D3D11/non-Apple GPU zero-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;

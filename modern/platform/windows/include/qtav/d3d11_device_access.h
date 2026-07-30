@@ -17,6 +17,10 @@
 
 namespace qtav {
 
+namespace detail {
+class D3D11DeviceAccessPrivate;
+}
+
 class QTAV_PLATFORM_WINDOWS_EXPORT BorrowedD3D11Device final {
 public:
     explicit BorrowedD3D11Device(ID3D11Device* value = nullptr) noexcept;
@@ -82,6 +86,8 @@ public:
     D3D11ContextGuard contextGuard() const;
 
 private:
+    friend class detail::D3D11DeviceAccessPrivate;
+
     class Impl;
 
     explicit D3D11DeviceAccess(std::shared_ptr<Impl> impl);

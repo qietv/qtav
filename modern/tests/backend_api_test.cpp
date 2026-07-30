@@ -51,7 +51,11 @@ public:
     qtav::NativeHandle nativeHandle(
         qtav::HardwareHandleType type) const noexcept override
     {
-        return { type, type == qtav::HardwareHandleType::Texture ? 0x1234U : 0 };
+        return {
+            type,
+            type == qtav::HardwareHandleType::Texture ? 0x1234U : 0,
+            type == qtav::HardwareHandleType::Texture ? 3U : 0U,
+        };
     }
     bool isMappable(qtav::HardwareMapMode mode) const noexcept override
     {
@@ -196,6 +200,9 @@ int main()
     assert(hardware.softwareFormat() == qtav::PixelFormat::RGBA);
     assert(hardware.nativeHandle(qtav::HardwareHandleType::Texture).value
         == 0x1234U);
+    assert(
+        hardware.nativeHandle(qtav::HardwareHandleType::Texture).subresource
+        == 3U);
     assert(hardware.isMappable());
     const auto mapping = hardware.map();
     assert(mapping);

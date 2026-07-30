@@ -411,7 +411,11 @@ public:
             if (hardwareDecodeConfig_.deviceType == config.deviceType
                 && hardwareDecodeConfig_.allowSoftwareFallback
                     == config.allowSoftwareFallback
-                && hardwareDecodeConfig_.device == config.device) {
+                && hardwareDecodeConfig_.device == config.device
+                && hardwareDecodeConfig_.extraHardwareFrames
+                    == config.extraHardwareFrames
+                && hardwareDecodeConfig_.requireSuppliedDevice
+                    == config.requireSuppliedDevice) {
                 return;
             }
             hardwareDecodeConfig_ = config;
@@ -882,6 +886,9 @@ private:
         const bool suppliedDeviceMismatch =
             hardwareDecodeConfig.device
             && hardwareDecodeConfig.device.deviceType() != requestedDevice;
+        const bool requiredDeviceMissing =
+            hardwareDecodeConfig.requireSuppliedDevice
+            && !hardwareDecodeConfig.device;
         const AVCodecHWConfig* selectedHardwareConfig = nullptr;
         if (ffmpegDevice != AV_HWDEVICE_TYPE_NONE) {
             for (int index = 0;; ++index) {
@@ -919,6 +926,10 @@ private:
                     hardwareDecodeConfig.allowSoftwareFallback;
                 context->opaque = &result;
                 context->get_format = &Impl::selectHardwarePixelFormat;
+                context->extra_hw_frames = std::clamp(
+                    hardwareDecodeConfig.extraHardwareFrames,
+                    0,
+                    64);
                 if (hardwareDecodeConfig.device) {
                     context->hw_device_ctx =
                         detail::HardwareDecodeDevicePrivate::contextRef(
@@ -947,7 +958,7 @@ private:
         int error = 0;
         AVCodecContext* context = nullptr;
         if (requestedDevice != HardwareDeviceType::Unknown) {
-            if (suppliedDeviceMismatch) {
+            if (suppliedDeviceMismatch || requiredDeviceMissing) {
                 error = AVERROR(EINVAL);
             } else if (ffmpegDevice == AV_HWDEVICE_TYPE_NONE
                 || !selectedHardwareConfig) {

@@ -7,6 +7,8 @@
 #include <mutex>
 #include <utility>
 
+#include "d3d11_device_access_internal.h"
+
 namespace qtav {
 namespace {
 
@@ -168,4 +170,19 @@ D3D11ContextGuard D3D11DeviceAccess::contextGuard() const
         &impl_->contextMutex_);
 }
 
+namespace detail {
+
+void D3D11DeviceAccessPrivate::lock(
+    D3D11DeviceAccess& access) noexcept
+{
+    access.impl_->contextMutex_.lock();
+}
+
+void D3D11DeviceAccessPrivate::unlock(
+    D3D11DeviceAccess& access) noexcept
+{
+    access.impl_->contextMutex_.unlock();
+}
+
+} // namespace detail
 } // namespace qtav

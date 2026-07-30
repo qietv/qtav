@@ -91,7 +91,8 @@ PixelFormat HardwareFrame::softwareFormat() const noexcept
 
 NativeHandle HardwareFrame::nativeHandle(HardwareHandleType type) const noexcept
 {
-    return data_ ? data_->nativeHandle(type) : NativeHandle { type, 0 };
+    return data_ ? data_->nativeHandle(type)
+                 : NativeHandle { type, 0, 0 };
 }
 
 bool HardwareFrame::isMappable(HardwareMapMode mode) const noexcept

@@ -114,6 +114,8 @@ void testTokenLifetimeAndIdentity()
         qtav::HardwareDeviceType::D3D11,
         false,
         device,
+        7,
+        true,
     };
     assert(config.isValid());
     assert(config.device == device);
@@ -124,6 +126,8 @@ void testTokenLifetimeAndIdentity()
     assert(copiedConfig.deviceType == qtav::HardwareDeviceType::D3D11);
     assert(!copiedConfig.allowSoftwareFallback);
     assert(copiedConfig.device == device);
+    assert(copiedConfig.extraHardwareFrames == 7);
+    assert(copiedConfig.requireSuppliedDevice);
 }
 
 void testMismatchedSuppliedDeviceFallsBack(const char* media)

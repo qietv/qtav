@@ -351,7 +351,7 @@ public:
         HardwareHandleType type) const noexcept override
     {
         if (!frame_) {
-            return { type, 0 };
+            return { type, 0, 0 };
         }
         if (deviceType_ == HardwareDeviceType::VideoToolbox
             && (type == HardwareHandleType::Frame
@@ -359,9 +359,19 @@ public:
             return {
                 type,
                 reinterpret_cast<std::uintptr_t>(frame_->data[3]),
+                0,
             };
         }
-        return { type, 0 };
+        if (deviceType_ == HardwareDeviceType::D3D11
+            && type == HardwareHandleType::Texture) {
+            return {
+                type,
+                reinterpret_cast<std::uintptr_t>(frame_->data[0]),
+                static_cast<std::uint32_t>(
+                    reinterpret_cast<std::uintptr_t>(frame_->data[1])),
+            };
+        }
+        return { type, 0, 0 };
     }
 
     bool isMappable(HardwareMapMode mode) const noexcept override
