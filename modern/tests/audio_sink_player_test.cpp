@@ -134,6 +134,21 @@ public:
         reportUnderrun_ = true;
     }
 
+    void reportUnderrun()
+    {
+        EventCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = callback_;
+        }
+        if (callback) {
+            callback({
+                qtav::AudioSinkEventType::Underrun,
+                "deterministic test underrun",
+            });
+        }
+    }
+
     bool waitFor(
         const std::function<bool()>& predicate,
         std::chrono::milliseconds timeout = std::chrono::seconds(5))
@@ -208,15 +223,10 @@ void testLifecycleAndClock(const char* media)
 {
     auto sink = std::make_shared<DeterministicAudioSink>();
     qtav::Player player;
-    std::atomic<int> audioFrames { 0 };
     std::atomic<int> eventPhase { 0 };
     std::atomic<int> underruns { 0 };
 
     player
-        .onAudioFrame([&](const qtav::AudioFrame& frame, int) {
-            assert(frame);
-            ++audioFrames;
-        })
         .onEvent([&](const qtav::MediaEvent& event) {
             if (event.category != "audio.sink.underrun") {
                 return false;
@@ -244,7 +254,6 @@ void testLifecycleAndClock(const char* media)
     assert(sink->waitFor([&] { return sink->pauseCount() >= 1; }));
     assert(sink->openCount() == 1);
     assert(sink->writeCount() >= 1);
-    assert(audioFrames.load() >= 1);
     assert(underruns.load() == 1);
     assert(sink->clockCount() > 0);
 
@@ -276,11 +285,17 @@ void testLifecycleAndClock(const char* media)
     const int closesBeforeReplacement = sink->closeCount();
     const int flushesBeforeReplacement = sink->flushCount();
     eventPhase.store(2);
-    sink->reportUnderrunOnNextWrite();
+    std::thread replacementEvent([sink] { sink->reportUnderrun(); });
+    replacementEvent.join();
+    assert(eventPhase.load() == 3);
     player.setState(qtav::State::Playing);
 
-    assert(sink->waitFor(
-        [&] { return sink->openCount() > opensBeforeReplacement; }));
+    assert(sink->waitFor([&] {
+        return sink->openCount() > opensBeforeReplacement
+            && sink->closeCount() > closesBeforeReplacement
+            && sink->flushCount() > flushesBeforeReplacement
+            && sink->resumeCount() >= 2;
+    }));
     assert(sink->closeCount() > closesBeforeReplacement);
     assert(sink->flushCount() > flushesBeforeReplacement);
     assert(sink->resumeCount() >= 2);
@@ -332,10 +347,17 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
     std::mutex mutex;
     std::condition_variable changed;
     bool formatEvent = false;
-    std::atomic<int> audioFrames { 0 };
+    int audioFrames = 0;
 
     player
-        .onAudioFrame([&](const qtav::AudioFrame&, int) { ++audioFrames; })
+        .onAudioFrame([&](const qtav::AudioFrame& frame, int) {
+            assert(frame);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++audioFrames;
+            }
+            changed.notify_all();
+        })
         .onEvent([&](const qtav::MediaEvent& event) {
             if (event.category != "audio.sink.format") {
                 return false;
@@ -345,7 +367,6 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
                 formatEvent = true;
             }
             changed.notify_all();
-            player.setState(qtav::State::Stopped);
             return true;
         })
         .setAudioSink(sink);
@@ -357,10 +378,15 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
         assert(changed.wait_for(
             lock,
             std::chrono::seconds(5),
-            [&] { return formatEvent; }));
+            [&] { return formatEvent && audioFrames >= 1; }));
     }
+    player.setState(qtav::State::Stopped);
     assert(player.waitFor(qtav::State::Stopped, 5'000));
-    assert(audioFrames.load() >= 1);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        assert(formatEvent);
+        assert(audioFrames >= 1);
+    }
     assert(sink->openCount() == 1);
     assert(sink->closeCount() == 1);
     assert(sink->writeCount() == 0);

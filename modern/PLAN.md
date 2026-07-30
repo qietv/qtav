@@ -147,12 +147,11 @@ Current implementation:
 
 Current verification:
 
-- the current macOS host recheck before and after the OpenGL ES work builds
-  successfully, but CTest is 25/27: `qtav_core_audio_sink_player` consistently
-  misses its expected audio-frame callback and
-  `qtav_simulated_audio_sink_player` misses its expected loop drain. Both
-  failures reproduced on the clean pre-change baseline and are outside this
-  rendering slice;
+- the current macOS host recheck builds successfully and passes 27/27 CTest
+  tests after the scheduling-isolation audio tests were updated to wait for
+  frame callbacks explicitly and to expect one sink drain per completed loop
+  segment; both corrected audio-player executables also pass 100 consecutive
+  Release runs;
 - the current static and shared Windows builds pass 33/33 CTest tests,
   including the Advanced Color test, the
   WASAPI device test and strict native H.264/AAC playback;
@@ -383,6 +382,9 @@ Completed playback scheduling isolation checkpoint:
 - a deterministic regression test blocks both the first sink write and the
   render callback, verifies that `position()` remains non-blocking, and verifies
   that audio writes continue while presentation is blocked;
+- shutdown pairs the quitting predicate with each worker condition-variable
+  mutex before notification, closing the lost-wake window exposed by repeated
+  audio-player destruction;
 - separate packet-demux and per-stream decoder workers are intentionally
   deferred: the current bounded post-decode queues remove the observed
   cross-layer blocking without duplicating FFmpeg ownership. Revisit packet
@@ -410,7 +412,8 @@ Decision checkpoint:
   snapshots, and test synchronization API are intentionally not an installed
   playback backend;
 - `AudioSink::drain()` now has a source-compatible default no-op, and `Player`
-  drains queued sink audio at natural end after draining the converter;
+  drains queued sink audio after every completed playback segment, including
+  loop boundaries, after draining the converter;
 - deterministic tests cover capacity rejection, dynamic queued latency,
   pause/resume, flush/re-anchor, underrun de-duplication, drain, resampling,
   A/V device-master timing, seek, loop, media replacement, and invalid-clock

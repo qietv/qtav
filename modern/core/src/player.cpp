@@ -135,9 +135,21 @@ public:
         quitting_.store(true, std::memory_order_release);
         interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
         presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
+        // Pair shutdown with each condition variable's wait mutex so a waiter
+        // cannot observe the old predicate and go to sleep after notification.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+        }
         controlChanged_.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        }
         audioQueueChanged_.notify_all();
         audioQueueSpace_.notify_all();
+        audioQueueDrained_.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(presentationMutex_);
+        }
         presentationChanged_.notify_all();
         presentationDrained_.notify_all();
         {

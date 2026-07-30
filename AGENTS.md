@@ -244,13 +244,12 @@ development host; explicit leak detection aborts as unsupported.
 
 Last verified baseline:
 
-- current macOS recheck builds successfully but is 25/27 CTest because
-  `qtav_core_audio_sink_player` and `qtav_simulated_audio_sink_player` fail
-  existing audio timing assertions; both failures reproduced before the
-  OpenGL ES change;
+- current macOS recheck builds successfully and passes 27/27 CTest after the
+  scheduling-isolation audio tests were updated to wait explicitly for frame
+  callbacks and to expect one sink drain per completed loop segment;
 - static build: passed;
 - shared build: passed;
-- CTest: 24/24 passed;
+- CTest: 27/27 passed;
 - ASan/UBSan: 24/24 passed;
 - all-backends-disabled CTest: 8/8 passed;
 - install plus external `find_package(QtAVCore)` consumption of

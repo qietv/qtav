@@ -118,10 +118,11 @@ the narrower BT.709/sRGB gamut and is not the full HDR10/BT.2020 path.
 `AudioSink` can use an injected `AudioFrameConverter` when decoded and device
 PCM formats differ. Applications link `QtAV::AudioResample` and pass a
 `SwresampleAudioConverter` through `Player::setAudioFrameConverter()`.
-`AudioSink::drain()` is called at natural end after the converter is drained
-and before the sink is closed; the default implementation is a no-op for
-existing synchronous or non-queuing sinks. The CPU renderer currently supports
-full-surface `Stretch` rendering with no rotation. The Apple-only
+`AudioSink::drain()` is called after each completed playback segment, including
+a loop boundary, after the converter is drained and before the final sink
+close; the default implementation is a no-op for existing synchronous or
+non-queuing sinks. The CPU renderer currently supports full-surface `Stretch`
+rendering with no rotation. The Apple-only
 Objective-C++ Metal renderer supports Fit, Fill, Stretch, custom viewports,
 resize, and all right-angle rotations for software YUV, NV12/NV21, P010, and
 RGB-family frames. Its strongly typed device and command queue are borrowed,
@@ -287,9 +288,12 @@ are separate backend/product work.
 - decoded audio crosses a bounded queue to a dedicated audio-output worker;
   ordinary conversion, sink writes, and device-clock sampling run there without
   the player mutex held and cannot be blocked by application rendering;
-- audio-sink/converter lifecycle and natural-end drain calls run on the
+- audio-sink/converter lifecycle and segment-end drain calls run on the
   playback worker, serialized with audio-output calls; `drain()` may block
   until queued audio is presented;
+- player shutdown synchronizes its quitting predicate with each worker
+  condition-variable mutex before notification, preventing a worker from
+  sleeping after the final wake-up;
 - `Player::position()` reads a generation-checked cached device-clock snapshot
   and never calls a sink or waits behind a sink write;
 - changing `HardwareDecodeConfig` while media is open interrupts and

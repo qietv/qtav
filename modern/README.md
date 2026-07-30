@@ -69,7 +69,8 @@ Current backend integration boundary:
 - `AudioSink` is connected through `Player::setAudioSink()`, follows playback
   lifecycle changes, and supplies the playback master when its device clock is
   supported and valid; decoded PCM crosses a bounded queue to a dedicated
-  audio-output worker, and queued audio is drained before close at natural end;
+  audio-output worker, and queued audio is drained at completed playback
+  segments, including loop boundaries, and before final close;
 - `AudioFrameConverter` is connected through
   `Player::setAudioFrameConverter()` when a sink negotiates different PCM;
   `QtAV::AudioResample` supplies the portable libswresample implementation;
@@ -876,13 +877,15 @@ belong in a backend's public header.
 negotiated device format returned by it. It defines close, pause, flush, write,
 drain, event, latency, and device-clock operations. `write()` consumes a
 synchronous non-owning `AudioBufferView` in the negotiated device format.
-`drain()` waits until accepted buffers have been presented and is called at
-natural end before `close()`; its default implementation is a no-op for
-synchronous or non-queuing sinks. The `audioBufferView()` helper creates a view
-when no conversion is required. `Player` opens an injected
+`drain()` waits until accepted buffers have been presented and is called after
+each completed playback segment, including a loop boundary, and before
+`close()` at final natural end; its default implementation is a no-op for
+synchronous or non-queuing sinks. The `audioBufferView()` helper creates a
+view when no conversion is required. `Player` opens an injected
 `AudioFrameConverter` when the negotiated format differs, resets it on
-flush/seek, drains the converter and sink at natural end, and closes them.
-Without an injected converter, a different device format reports
+flush/seek, drains the converter and sink at each completed segment, and closes
+them at final natural end. Without an injected converter, a different device
+format reports
 `audio.sink.format` while `onAudioFrame()` continues normally.
 
 `QtAV::AudioResample` implements `SwresampleAudioConverter`. It converts sample
@@ -944,9 +947,11 @@ falls back to its monotonic software clock. Ordinary sink writes and clock
 sampling run on the dedicated audio-output worker. The player publishes a
 generation-checked cached clock snapshot, so `Player::position()` never waits
 for a blocking sink write or calls into a platform backend. Sink lifecycle and
-natural-end `drain()` run on the playback worker, serialized with writes and
+segment-end `drain()` run on the playback worker, serialized with writes and
 without the player mutex held; `drain()` may block until the backend queue is
-presented.
+presented. Shutdown synchronizes the quitting predicate with each worker
+condition-variable mutex before notification so worker joins cannot lose the
+wake-up.
 
 `HardwareDecodeConfig` is copied by `Player` and applied the next time the
 video decoder opens. Changing it while media is loaded interrupts the current

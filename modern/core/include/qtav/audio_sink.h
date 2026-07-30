@@ -99,8 +99,9 @@ public:
     virtual void flush() = 0;
     virtual bool write(const AudioBufferView& buffer) = 0;
     // Wait until all accepted buffers have been presented. Player calls this
-    // at natural end of stream before close(). The default is a no-op for
-    // sinks that consume synchronously or do not queue.
+    // after each completed playback segment, including loop boundaries, and
+    // before close() at final natural end. The default is a no-op for sinks
+    // that consume synchronously or do not queue.
     virtual bool drain();
     // Player samples this on its audio-output worker and publishes a cached
     // clock to position() callers.
