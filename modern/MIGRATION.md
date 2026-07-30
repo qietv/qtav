@@ -151,12 +151,21 @@ outside installed core headers. Explicit CPU mapping, software fallback, seek,
 media replacement, stop, and retained lifetime after player shutdown are
 implemented. `QtAV::RenderD3D11` now exposes decoder-independent
 `D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces for
-the next adapter layer; imported texture and shader-view pointers remain valid
-while the texture-frame object lives. The renderer now consumes compatible
-same-device interop results, reports their hardware-device capabilities, and
-offers an explicit, disabled-by-default software mapping fallback through
-`setAllowSoftwareMappingFallback()`. Zero-copy decoder-texture conversion and
-HDR output remain separate follow-up work under the accepted contract in
+the adapter layer; imported texture and shader-view pointers remain valid
+while the texture-frame object lives. `QtAV::InteropD3D11` implements the
+adapter with same-device validation and a D3D11 Video Processor pass from the
+decoder NV12/P010 array slice to a shader-readable SDR BGRA8 intermediate.
+The renderer consumes that result, reports D3D11 hardware-frame capability,
+and offers an explicit, disabled-by-default software mapping fallback through
+`setAllowSoftwareMappingFallback()`. The interop and renderer use the same
+recursive context guard; foreign devices are rejected before context access.
+Windows integration coverage now includes generated H.264/NV12 and
+capability-gated HEVC Main10/P010 zero-CPU-map presentation, pixel readback,
+pause/resume, seek, media replacement, explicit stop, target recreation, and
+retained source/import lifetime after player shutdown. The strict generated
+H.264/AAC console test passes with an active WASAPI render endpoint and audible
+output, while sessions without an endpoint report a CTest skip. HDR
+presentation remains follow-up work under the accepted contract in
 [D3D11VA.md](D3D11VA.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
@@ -168,7 +177,7 @@ or pace playback. Decoded planar audio therefore normally uses
 
 - remaining platform audio device implementations (ALSA/PulseAudio, AAudio);
 - OpenGL and Vulkan renderer implementations;
-- remaining hardware decoders and D3D11/non-Apple GPU zero-copy interop;
+- remaining hardware decoders and Linux/Android GPU zero-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;

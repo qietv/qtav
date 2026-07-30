@@ -50,7 +50,7 @@ int main()
         assert(!opened.error.empty());
         std::cout << "WASAPI device integration skipped: "
                   << opened.error << '\n';
-        return 0;
+        return 77;
     }
 
     assert(opened.deviceFormat.isValid());

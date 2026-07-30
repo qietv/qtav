@@ -80,6 +80,9 @@ Current backend integration boundary:
 - `QtAV::HWD3D11VA` creates FFmpeg's hardware device on that selected D3D11
   device, shares the same context lock, and exposes retained NV12/P010 decoder
   texture-array slices through a Windows-only strong frame view;
+- `QtAV::InteropD3D11` consumes same-device D3D11VA NV12/P010 texture-array
+  slices through the D3D11 Video Processor and returns shader-readable SDR
+  BGRA8 textures without mapping decoded pixels through CPU memory;
 - `QtAV::RenderMetal` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders into the application's
   current Metal texture or drawable, accepts an optional hardware-frame
@@ -88,8 +91,7 @@ Current backend integration boundary:
 - `QtAV::InteropCVMetal` imports supported VideoToolbox `CVPixelBuffer` planes
   as retained Metal textures without mapping or copying through CPU memory,
   preserving whether the native pixel buffer is limited or full range;
-- no D3D11 zero-copy renderer interop, and no Linux or Android native backend,
-  has been implemented yet.
+- no Linux or Android native backend has been implemented yet.
 
 ## Build
 
@@ -133,9 +135,11 @@ hardware-decode selection and native-frame access target when VideoToolbox and
 CoreVideo are available. `QTAV_INTEROP_CVMETAL=AUTO` builds the Apple
 VideoToolbox/Metal interop target when the Metal renderer and CoreVideo are
 available. `QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
-selection and native-frame access target. Other backend implementations are
-not present yet, so their `AUTO` behavior is to remain disabled and explicitly
-requesting one with `ON` is an error.
+selection and native-frame access target. `QTAV_INTEROP_D3D11=AUTO` builds the
+Windows Video Processor adapter when the D3D11 renderer and D3D11VA decoder
+targets are available. Other backend implementations are not present yet, so
+their `AUTO` behavior is to remain disabled and explicitly requesting one with
+`ON` is an error.
 
 Run the headless example:
 
@@ -149,8 +153,18 @@ under `build/modern/bin/<Config>`, for example
 
 On macOS, when `QtAV::AudioCoreAudio` and `QtAV::AudioResample` are available,
 the console example sends decoded audio to the default output device. On
-Windows it does the same through `QtAV::AudioWASAPI`. Other hosts retain
-callback-only audio inspection.
+Windows it does the same through `QtAV::AudioWASAPI` and, when the D3D11
+targets are available, exercises D3D11VA plus `QtAV::InteropD3D11` into an
+offscreen D3D11 render target. Other hosts retain callback-only audio
+inspection.
+
+Windows CTest runs the example against generated H.264/AAC media with
+`QTAV_CORE_REQUIRE_NATIVE_WINDOWS_AV=1`. In that strict mode the example
+requires hardware video frames, successful D3D11 rendering, decoded audio, and
+a usable WASAPI endpoint. A session without an active render endpoint returns
+CTest skip code 77, so unavailable device validation is not reported as a
+pass. The strict test has also been exercised with an active endpoint, where
+H.264/AAC playback passed and produced audible output.
 
 ## API shape
 
@@ -420,15 +434,15 @@ right-angle rotations, resize, surface recreation, and surface/device-loss
 events.
 
 `QtAV::RenderD3D11` also defines the decoder-independent
-`D3D11HardwareFrameInterop` and `D3D11TextureFrame` contracts used by the
-pending `QtAV::InteropD3D11` backend. An interop implementation binds to the
-same retained `D3D11DeviceAccess`, performs no CPU map during `importFrame()`,
-and returns borrowed texture/SRV pointers whose COM resources remain valid
-while the returned texture-frame object is alive. Bind it with
-`setHardwareFrameInterop()`; the renderer advertises the interop's source
-hardware devices only when both objects use the same `D3D11DeviceAccess`.
-Imported BGRA8 or RGBA8 texture frames are sampled directly by the final
-viewport/aspect/rotation pass.
+`D3D11HardwareFrameInterop` and `D3D11TextureFrame` contracts implemented by
+`QtAV::InteropD3D11`. The interop binds to the same retained
+`D3D11DeviceAccess`, performs no CPU map during `importFrame()`, and returns
+borrowed texture/SRV pointers whose COM resources remain valid while the
+returned texture-frame object is alive. Bind it with
+`setHardwareFrameInterop()`; the renderer advertises D3D11 hardware-frame
+support only when both objects use the same `D3D11DeviceAccess`. Imported
+BGRA8 textures are sampled directly by the final viewport/aspect/rotation
+pass.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly
@@ -436,9 +450,8 @@ enable `setAllowSoftwareMappingFallback(true)` to call
 `HardwareFrame::map(Read)` and use the existing software upload path when
 interop is unavailable or import fails. A successful mapped fallback emits an
 error/detail event containing `software-mapping fallback` so the CPU transfer
-is observable; a disabled or failed mapping makes `render()` fail. The
-production `QtAV::InteropD3D11` Video Processor implementation, D3D11VA
-zero-copy rendering, and HDR transfer remain later Windows work.
+is observable; a disabled or failed mapping makes `render()` fail. HDR
+presentation remains later Windows work.
 
 ### D3D11VA hardware decode
 
@@ -480,8 +493,32 @@ Decoded D3D11 frames expose NV12 or P010 `ID3D11Texture2D` array slices through
 hardware device, COM resources, and lock state. `HardwareFrame::map()` remains
 the explicit CPU-copy path and can be used after seek, media replacement,
 stop, or player shutdown while the copied frame is alive. Feeding decoder
-slices to the renderer without a CPU copy remains the separate
-`QtAV::InteropD3D11` implementation task.
+slices to the renderer without a CPU copy uses the separate
+`QtAV::InteropD3D11` target:
+
+```cpp
+#include <qtav/d3d11_frame_interop.h>
+
+auto interop = std::make_shared<qtav::D3D11FrameInterop>(
+    deviceAccess);
+renderer->setHardwareFrameInterop(interop);
+player
+    .setHardwareDecodeConfig(
+        qtav::d3d11vaHardwareDecodeConfig(deviceAccess))
+    .setVideoRenderAPI(renderer);
+```
+
+`D3D11FrameInterop` validates the decoder texture, array slice, source format,
+device health, and exact COM device identity before entering the shared
+context guard. It caches the Video Processor enumerator/processor for the
+current NV12/P010 size, creates retained input/output views and a
+shader-readable BGRA8 intermediate for each import, and submits
+`VideoProcessorBlt()` on the selected immediate/video context. The renderer
+passes structured frame color metadata to the interop; Direct3D 11.1 color
+spaces are used when available, with a BT.601/BT.709 legacy path otherwise.
+The intermediate and final target are SDR. A driver-reported HDR-to-SDR
+conversion may be used, but this is not HDR presentation or a product
+tone-mapping guarantee.
 
 ### Metal renderer
 
@@ -670,9 +707,14 @@ and cover RGB, YUV420P, and NV12 upload, viewport, aspect ratio, rotation,
 resize, target recreation, foreign-device rejection, and missing-surface
 events. D3D11VA tests cover selected-device creation, shared locking, bounded
 extra frames, native texture/slice validation, and invalid handles; an H.264
-hardware integration test covers mapping, seek, media replacement, stop, and
-retained-frame access after player shutdown, with an explicit software
-fallback result when the adapter has no matching decoder profile.
+hardware integration test covers mapping, pause/resume, seek, media
+replacement, stop, target recreation, and retained source/import access after
+player shutdown, with an explicit software fallback result when the adapter
+has no matching decoder profile. A capability-gated D3D12-generated HEVC
+Main10 test verifies P010 D3D11VA decode, Video Processor conversion, zero CPU
+mapping, and pixel readback. WASAPI device and strict native H.264/AAC example
+tests pass with an active render endpoint and are explicitly skipped when a
+Windows session exposes no endpoint.
 
 ## Architecture
 

@@ -1,10 +1,10 @@
 # D3D11VA device, frame, and interop design
 
-Status: accepted design; the `QtAV::HWD3D11VA` decoder slice is implemented
-and the `QtAV::InteropD3D11` slice remains active.
+Status: implemented and verified on Windows; both `QtAV::HWD3D11VA` and
+`QtAV::InteropD3D11` are complete for the documented SDR output path.
 
-This document fixes the ownership, threading, fallback, and test contracts to
-be implemented by `QtAV::HWD3D11VA` and `QtAV::InteropD3D11`. It is deliberately
+This document records the ownership, threading, fallback, and test contracts
+implemented by `QtAV::HWD3D11VA` and `QtAV::InteropD3D11`. It is deliberately
 limited to FFmpeg 8's modern `AV_PIX_FMT_D3D11` path. The legacy
 `AV_PIX_FMT_D3D11VA_VLD` API is out of scope.
 
@@ -178,19 +178,20 @@ serialization.
 
 ## Interop and final rendering
 
-`qtav_render_d3d11` will define decoder-independent
+`qtav_render_d3d11` defines decoder-independent
 `D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces,
 parallel to the Metal renderer contracts. The renderer advertises D3D11
 hardware-frame support only while a compatible interop object is installed.
 
-`qtav_interop_d3d11` will implement the interface as follows:
+`qtav_interop_d3d11` implements the interface as follows:
 
 1. validate the D3D11VA retained frame and compare source and target COM device
    identity;
 2. validate NV12 or P010 software format, coded size, array slice, device
    health, and Video Processor format support;
-3. create/cache the enumerator, processor, input view for the decoder array
-   slice, and a same-device shader-readable RGB intermediate;
+3. cache the enumerator and processor for the current size/format, then create
+   retained input/output views and a same-device shader-readable RGB
+   intermediate for the import;
 4. configure source/destination rectangles and color space from structured
    frame metadata;
 5. submit `VideoProcessorBlt()` under the shared context guard;
@@ -288,9 +289,38 @@ the Qt-dependency scan remain release gates.
 3. [x] Add decoder-independent D3D11 renderer interop interfaces.
 4. [x] Add renderer capability reporting, texture-frame consumption, and
    explicit software-map fallback with mock WARP tests.
-5. [ ] Add the Video Processor implementation in `qtav_interop_d3d11`.
-6. [ ] Add WARP contract tests, native zero-copy tests, console-example
+5. [x] Add the Video Processor implementation in `qtav_interop_d3d11`.
+6. [x] Add WARP contract tests, native zero-copy tests, console-example
    wiring, install/export validation, and final public documentation.
+
+Completed Video Processor checkpoint:
+
+- `QtAV::InteropD3D11` is an optional Windows target that depends on the
+  decoder and renderer contracts without merging their responsibilities;
+- `D3D11FrameInterop` rejects invalid slices, unsupported NV12/P010 resources,
+  removed or foreign devices before context work, then serializes Video
+  Processor operations through the shared recursive guard;
+- the interop caches the enumerator/processor for the active size and format,
+  creates retained per-import views and an SDR BGRA8 shader resource, and
+  keeps the decoder frame alive through final renderer submission;
+- the renderer supplies structured color metadata through a backward-
+  compatible color-aware import overload; Direct3D 11.1 color spaces cover
+  range, BT.601/709/2020, PQ, HLG, and chroma siting when the driver reports
+  the conversion, with a legacy SDR BT.601/709 fallback;
+- WARP verifies texture/slice extraction, retained lifetime, recursive locking,
+  and safe unavailable behavior on systems without software Video Processor
+  support;
+- hardware-adapter tests prove generated H.264/NV12 and HEVC Main10/P010
+  D3D11VA frames reach the render target with correct pixel readback and no CPU
+  mapping; Main10 media generation and decode are capability-gated;
+- the H.264 zero-copy test covers pause/resume, seek, media replacement,
+  explicit stop, target recreation, and retained source/import use after
+  `Player` shutdown;
+- the headless console example wires the selected device, D3D11VA decoder,
+  Video Processor interop, offscreen D3D11 renderer, and WASAPI audio path; its
+  strict H.264/AAC CTest has passed with an active WASAPI render endpoint and
+  audible output, while unavailable endpoints still return skip code 77
+  instead of reporting a false device pass.
 
 ## Source and license boundary
 

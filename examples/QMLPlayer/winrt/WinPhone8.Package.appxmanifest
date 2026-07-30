@@ -1,4 +1,4 @@
-﻿<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <Package xmlns=\"http://schemas.microsoft.com/appx/2010/manifest\" xmlns:m3=\"http://schemas.microsoft.com/appx/2014/manifest\" xmlns:mp=\"http://schemas.microsoft.com/appx/2014/phone/manifest\">
   <Identity
     Name=\"org.qtav.qmlplayer\"

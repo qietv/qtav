@@ -136,7 +136,7 @@ namespace QtAV
 		updateUniformBuffer(currentSwapChainImageIndex);
 		updateTextureImage(currentSwapChainImageIndex);
 
-		// äÖÈ¾Í¨µÀÆô¶¯ĞÅÏ¢
+		// æ¸²æŸ“é€šé“å¯åŠ¨ä¿¡æ¯
 		VkRenderPassBeginInfo renderPassInfo{};
 		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 		renderPassInfo.renderPass = m_renderPass;
@@ -197,11 +197,11 @@ namespace QtAV
 
 	void VulkanWindowRenderer::createGraphicsPipeline()
 	{
-		// ´´½¨×ÅÉ«Æ÷
+		// åˆ›å»ºç€è‰²å™¨
 		VkShaderModule vertShaderModule = createShaderModule(readShaderFile("shaders/vert.spv"));
 		VkShaderModule fragShaderModule = createShaderModule(readShaderFile("shaders/frag.spv"));
 
-		// ×ÅÉ«Æ÷ĞÅÏ¢
+		// ç€è‰²å™¨ä¿¡æ¯
 		VkPipelineShaderStageCreateInfo vertShaderStageInfo{};
 		vertShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 		vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -216,26 +216,26 @@ namespace QtAV
 
 		VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
 
-		// ¶¥µãĞÅÏ¢
+		// é¡¶ç‚¹ä¿¡æ¯
 		VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
 		vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 		vertexInputInfo.vertexBindingDescriptionCount = 0;
 		vertexInputInfo.vertexAttributeDescriptionCount = 0;
 
-		auto bindingDescription = Vertex::getBindingDescription();			// ¶¥µã°ó¶¨ËµÃ÷
-		auto attributeDescriptions = Vertex::getAttributeDescriptions();	// ÊôĞÔËµÃ÷
+		auto bindingDescription = Vertex::getBindingDescription();			// é¡¶ç‚¹ç»‘å®šè¯´æ˜
+		auto attributeDescriptions = Vertex::getAttributeDescriptions();	// å±æ€§è¯´æ˜
 		vertexInputInfo.vertexBindingDescriptionCount = 1;
 		vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
 		vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
 		vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
-		// Í¼Ôª×°ÅäĞÅÏ¢
+		// å›¾å…ƒè£…é…ä¿¡æ¯
 		VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
 		inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;	// Í¼ÔªÍØÆËÀàĞÍ
-		inputAssembly.primitiveRestartEnable = VK_FALSE;	// ÊÇ·ñÆôÓÃÍ¼ÔªÖØÆô
+		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;	// å›¾å…ƒæ‹“æ‰‘ç±»å‹
+		inputAssembly.primitiveRestartEnable = VK_FALSE;	// æ˜¯å¦å¯ç”¨å›¾å…ƒé‡å¯
 
-		// ÊÓ¿ÚºÍ²Ã¼ôĞÅÏ¢
+		// è§†å£å’Œè£å‰ªä¿¡æ¯
 		VkViewport viewport{};
 		viewport.x = 0.0f;
 		viewport.y = 0.0f;
@@ -255,40 +255,40 @@ namespace QtAV
 		viewportState.scissorCount = 1;
 		viewportState.pScissors = &scissor;
 
-		// ¹âÕ¤»¯ĞÅÏ¢
+		// å…‰æ …åŒ–ä¿¡æ¯
 		VkPipelineRasterizationStateCreateInfo rasterizer{};
 		rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-		rasterizer.depthClampEnable = VK_FALSE;	// ÊÇ·ñÆôÓÃÉî¶ÈÇ¯Î»
-		rasterizer.rasterizerDiscardEnable = VK_FALSE;	// ÊÇ·ñÆôÓÃ¹âÕ¤»¯
-		rasterizer.polygonMode = VK_POLYGON_MODE_FILL;	// Ìî³äÄ£Ê½
+		rasterizer.depthClampEnable = VK_FALSE;	// æ˜¯å¦å¯ç”¨æ·±åº¦é’³ä½
+		rasterizer.rasterizerDiscardEnable = VK_FALSE;	// æ˜¯å¦å¯ç”¨å…‰æ …åŒ–
+		rasterizer.polygonMode = VK_POLYGON_MODE_FILL;	// å¡«å……æ¨¡å¼
 		rasterizer.lineWidth = 1.0f;
-		rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;	// ÃæÌŞ³ıÄ£Ê½	
-		rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;	// ¶¨ÒåÕıÃæ
-		rasterizer.depthBiasEnable = VK_FALSE;	// ÊÇ·ñÆôÓÃÉî¶ÈÆ«ÒÆ
+		rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;	// é¢å‰”é™¤æ¨¡å¼
+		rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;	// å®šä¹‰æ­£é¢
+		rasterizer.depthBiasEnable = VK_FALSE;	// æ˜¯å¦å¯ç”¨æ·±åº¦åç§»
 
-		// ¶àÖØ²ÉÑùĞÅÏ¢
+		// å¤šé‡é‡‡æ ·ä¿¡æ¯
 		VkPipelineMultisampleStateCreateInfo multisampling{};
 		multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-		multisampling.sampleShadingEnable = VK_FALSE;	// ÊÇ·ñÆôÓÃÑù±¾×ÅÉ«
-		multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;	// Ã¿¸öÏñËØµÄ²ÉÑùÊı
+		multisampling.sampleShadingEnable = VK_FALSE;	// æ˜¯å¦å¯ç”¨æ ·æœ¬ç€è‰²
+		multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;	// æ¯ä¸ªåƒç´ çš„é‡‡æ ·æ•°
 
-		// ÑÕÉ«»ìºÏĞÅÏ¢
-		VkPipelineColorBlendAttachmentState colorBlendAttachment{};	// ÑÕÉ«»ìºÏ¸½¼şĞÅÏ¢
-		colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;	// ÑÕÉ«Ğ´ÈëÑÚÂë
-		colorBlendAttachment.blendEnable = VK_FALSE;	// ÊÇ·ñÆôÓÃ»ìºÏ
+		// é¢œè‰²æ··åˆä¿¡æ¯
+		VkPipelineColorBlendAttachmentState colorBlendAttachment{};	// é¢œè‰²æ··åˆé™„ä»¶ä¿¡æ¯
+		colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;	// é¢œè‰²å†™å…¥æ©ç 
+		colorBlendAttachment.blendEnable = VK_FALSE;	// æ˜¯å¦å¯ç”¨æ··åˆ
 
 		VkPipelineColorBlendStateCreateInfo colorBlending{};
 		colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-		colorBlending.logicOpEnable = VK_FALSE;	// ÊÇ·ñÆôÓÃÂß¼­²Ù×÷
-		colorBlending.logicOp = VK_LOGIC_OP_COPY;	// Âß¼­²Ù×÷ÀàĞÍ
-		colorBlending.attachmentCount = 1;	// ÑÕÉ«¸½¼şµÄÊıÁ¿
+		colorBlending.logicOpEnable = VK_FALSE;	// æ˜¯å¦å¯ç”¨é€»è¾‘æ“ä½œ
+		colorBlending.logicOp = VK_LOGIC_OP_COPY;	// é€»è¾‘æ“ä½œç±»å‹
+		colorBlending.attachmentCount = 1;	// é¢œè‰²é™„ä»¶çš„æ•°é‡
 		colorBlending.pAttachments = &colorBlendAttachment;
 		colorBlending.blendConstants[0] = 0.0f;
 		colorBlending.blendConstants[1] = 0.0f;
 		colorBlending.blendConstants[2] = 0.0f;
 		colorBlending.blendConstants[3] = 0.0f;
 
-		// ¹ÜÏß²¼¾ÖĞÅÏ¢
+		// ç®¡çº¿å¸ƒå±€ä¿¡æ¯
 		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 		pipelineLayoutInfo.pushConstantRangeCount = 0;
@@ -303,11 +303,11 @@ namespace QtAV
 
 		VkPipelineDepthStencilStateCreateInfo depthStencil{};
 		depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-		depthStencil.depthTestEnable = VK_FALSE;      // ¹Ø±ÕÉî¶È²âÊÔ
-		depthStencil.depthWriteEnable = VK_FALSE;     // ¹Ø±ÕÉî¶ÈĞ´Èë
-		depthStencil.depthCompareOp = VK_COMPARE_OP_ALWAYS; // ±È½Ï²Ù×÷£¨ÎŞÊµ¼ÊÒâÒå£¬ÒòÎª²âÊÔÒÑ¹Ø±Õ£©
-		depthStencil.depthBoundsTestEnable = VK_FALSE; // ¹Ø±ÕÉî¶È±ß½ç²âÊÔ
-		depthStencil.stencilTestEnable = VK_FALSE;    // ¹Ø±ÕÄ£°å²âÊÔ
+		depthStencil.depthTestEnable = VK_FALSE;      // å…³é—­æ·±åº¦æµ‹è¯•
+		depthStencil.depthWriteEnable = VK_FALSE;     // å…³é—­æ·±åº¦å†™å…¥
+		depthStencil.depthCompareOp = VK_COMPARE_OP_ALWAYS; // æ¯”è¾ƒæ“ä½œï¼ˆæ— å®é™…æ„ä¹‰ï¼Œå› ä¸ºæµ‹è¯•å·²å…³é—­ï¼‰
+		depthStencil.depthBoundsTestEnable = VK_FALSE; // å…³é—­æ·±åº¦è¾¹ç•Œæµ‹è¯•
+		depthStencil.stencilTestEnable = VK_FALSE;    // å…³é—­æ¨¡æ¿æµ‹è¯•
 
 		VkGraphicsPipelineCreateInfo pipelineInfo{};
 		pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -359,11 +359,11 @@ namespace QtAV
 	void VulkanWindowRenderer::createDescriptorSetLayout()
 	{
 		VkDescriptorSetLayoutBinding uboLayoutBinding{};
-		uboLayoutBinding.binding = 0;	// °ó¶¨µãË÷Òı
-		uboLayoutBinding.descriptorCount = 1;	// ´Ë°ó¶¨µãµÄÃèÊö·ûÊıÁ¿
-		uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;	// ÃèÊö·ûÀàĞÍ
+		uboLayoutBinding.binding = 0;	// ç»‘å®šç‚¹ç´¢å¼•
+		uboLayoutBinding.descriptorCount = 1;	// æ­¤ç»‘å®šç‚¹çš„æè¿°ç¬¦æ•°é‡
+		uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;	// æè¿°ç¬¦ç±»å‹
 		uboLayoutBinding.pImmutableSamplers = nullptr;
-		uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;	// Ö¸¶¨ÄÄĞ©×ÅÉ«Æ÷¿ÉÒÔ·ÃÎÊ´Ë°ó¶¨µã
+		uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;	// æŒ‡å®šå“ªäº›ç€è‰²å™¨å¯ä»¥è®¿é—®æ­¤ç»‘å®šç‚¹
 
 		VkDescriptorSetLayoutBinding ySamplerLayoutBinding{};
 		ySamplerLayoutBinding.binding = 1;
@@ -531,7 +531,7 @@ namespace QtAV
 		subresource.mipLevel = 0;
 		subresource.arrayLayer = 0;
 
-		// ·â×°ÎÆÀí´´½¨µÄlambdaº¯Êı
+		// å°è£…çº¹ç†åˆ›å»ºçš„lambdaå‡½æ•°
 		auto createPlaneTextures = [&](std::vector<TextureObject>& textures, int planeIndex) {
 			for (size_t i = 0; i < m_swapChainImageCount; ++i)
 			{
@@ -584,16 +584,16 @@ namespace QtAV
 		VkSamplerCreateInfo samplerInfo{};
 		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
 
-		// ÏßĞÔ¹ıÂË
+		// çº¿æ€§è¿‡æ»¤
 		samplerInfo.magFilter = VK_FILTER_LINEAR;
 		samplerInfo.minFilter = VK_FILTER_LINEAR;
 
-		// ÎÆÀí×ø±ê³¬³ö·¶Î§Ê±Ç¯Î»µ½±ßÔµ£¬±ÜÃâÊÓÆµ±ßÔµ³öÏÖÖØ¸´»òÔÓÉ«
+		// çº¹ç†åæ ‡è¶…å‡ºèŒƒå›´æ—¶é’³ä½åˆ°è¾¹ç¼˜ï¼Œé¿å…è§†é¢‘è¾¹ç¼˜å‡ºç°é‡å¤æˆ–æ‚è‰²
 		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 
-		// ½ûÓÃ¸÷ÏòÒìĞÔ¹ıÂË
+		// ç¦ç”¨å„å‘å¼‚æ€§è¿‡æ»¤
 		samplerInfo.anisotropyEnable = VK_FALSE;
 		samplerInfo.maxAnisotropy = properties.limits.maxSamplerAnisotropy;
 
@@ -899,7 +899,7 @@ namespace QtAV
 		viewInfo.subresourceRange.levelCount = 1;
 		viewInfo.subresourceRange.baseArrayLayer = 0;
 		viewInfo.subresourceRange.layerCount = 1;
-		viewInfo.components.r = VK_COMPONENT_SWIZZLE_R;  // ÑÕÉ«Í¨µÀÓ³Éä£¨Ö±½ÓÊ¹ÓÃÔ­Ê¼Í¨µÀ£©
+		viewInfo.components.r = VK_COMPONENT_SWIZZLE_R;  // é¢œè‰²é€šé“æ˜ å°„ï¼ˆç›´æ¥ä½¿ç”¨åŸå§‹é€šé“ï¼‰
 		viewInfo.components.g = VK_COMPONENT_SWIZZLE_G;
 		viewInfo.components.b = VK_COMPONENT_SWIZZLE_B;
 		viewInfo.components.a = VK_COMPONENT_SWIZZLE_A;

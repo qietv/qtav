@@ -830,6 +830,13 @@ bool D3D11RenderTarget::isValid() const noexcept
 
 D3D11TextureFrame::~D3D11TextureFrame() = default;
 D3D11HardwareFrameInterop::~D3D11HardwareFrameInterop() = default;
+std::shared_ptr<D3D11TextureFrame>
+D3D11HardwareFrameInterop::importFrame(
+    const HardwareFrame& frame,
+    const VideoColorSpace&)
+{
+    return importFrame(frame);
+}
 
 class D3D11VideoRenderer::Impl {
 public:
@@ -1308,7 +1315,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                     == impl_->deviceAccess_
                 && hardwareInterop->supports(hardwareFrame);
             if (compatibleInterop) {
-                textureFrame = hardwareInterop->importFrame(hardwareFrame);
+                textureFrame = hardwareInterop->importFrame(
+                    hardwareFrame,
+                    frame.colorSpaceInfo());
                 if (textureFrame) {
                     if (!importTextureFrame(
                             impl_->device_.get(),

@@ -53,6 +53,12 @@ public:
     virtual bool supports(const HardwareFrame& frame) const noexcept = 0;
     virtual std::shared_ptr<D3D11TextureFrame> importFrame(
         const HardwareFrame& frame) = 0;
+    // Color-aware import used by the renderer. Existing interop
+    // implementations remain source-compatible through the default
+    // forwarding implementation.
+    virtual std::shared_ptr<D3D11TextureFrame> importFrame(
+        const HardwareFrame& frame,
+        const VideoColorSpace& color);
 };
 
 class QTAV_RENDER_D3D11_EXPORT D3D11VideoRenderer final

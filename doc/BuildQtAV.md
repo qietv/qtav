@@ -85,7 +85,7 @@ It's the simplest and best way. Qt include and lib dir are always searched in Qt
     qmake QtAV_source_dir/QtAV.pro
     make -j4
 
-  It's strongly recommended not to build in source dir(especially OSX).  
+  It's strongly recommended not to build in source dir(especially OSX).
 
   qmake will check the required libraries to make sure they can be found by compiler.
 
@@ -100,13 +100,13 @@ _WARNING_: If you are in windows mingw with sh.exe environment, you may need run
 
 #### Visual Studio/MSBuild
 
-I don't put any vs project file in QtAV, because it's easy to create by qmake.  
+I don't put any vs project file in QtAV, because it's easy to create by qmake.
 
 Open cmd
 
     qmake -r -tp vc QtAV.pro
 
-Then sln and vcxproj(vcproj) files will be created. Run `msbuild /m` to build the projects. You can also open QtAV.sln in your Visual Studio to Compile it. 
+Then sln and vcxproj(vcproj) files will be created. Run `msbuild /m` to build the projects. You can also open QtAV.sln in your Visual Studio to Compile it.
 
 Another solution is using Qt vs plugin. It will help you to load qmake projects(not tested).
 

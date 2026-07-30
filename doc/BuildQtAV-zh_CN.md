@@ -73,7 +73,7 @@ windows 无sh.exe的环境下的 gcc
     qmake
     make
 
-强烈建议不要在源码目录编译，而是使用如下的方法 
+强烈建议不要在源码目录编译，而是使用如下的方法
 
     cd your_build_dir
     qmake QtAV_source_dir/QtAV.pro

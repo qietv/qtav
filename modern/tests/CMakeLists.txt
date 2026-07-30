@@ -160,7 +160,9 @@ if(TARGET qtav_audio_wasapi)
     )
     set_tests_properties(
         qtav_audio_wasapi
-        PROPERTIES TIMEOUT 15
+        PROPERTIES
+            TIMEOUT 15
+            SKIP_RETURN_CODE 77
     )
 endif()
 
@@ -266,6 +268,32 @@ if(TARGET qtav_hw_videotoolbox)
     target_compile_features(
         qtav_hw_videotoolbox_test
         PRIVATE cxx_std_17
+    )
+endif()
+
+if(TARGET qtav_interop_d3d11)
+    add_executable(
+        qtav_interop_d3d11_test
+        d3d11_frame_interop_test.cpp
+    )
+    target_link_libraries(
+        qtav_interop_d3d11_test
+        PRIVATE
+            QtAV::InteropD3D11
+            QtAV::HWD3D11VA
+            dxguid
+    )
+    target_compile_features(
+        qtav_interop_d3d11_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_interop_d3d11_contract
+        COMMAND qtav_interop_d3d11_test
+    )
+    set_tests_properties(
+        qtav_interop_d3d11_contract
+        PROPERTIES TIMEOUT 10
     )
 endif()
 
@@ -410,16 +438,50 @@ if(FFMPEG_EXECUTABLE)
 
     if(TARGET qtav_audio_wasapi
        AND TARGET qtav_audio_resample
+       AND TARGET qtav_interop_d3d11
+       AND TARGET qtav_hw_d3d11va
+       AND TARGET qtav_render_d3d11
        AND TARGET qtav_core_console)
+        set(
+            QTAV_WINDOWS_NATIVE_AV_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-windows-native-av.mp4"
+        )
         add_test(
-            NAME qtav_audio_wasapi_player
-            COMMAND qtav_core_console "${QTAV_CORE_TEST_MEDIA}"
+            NAME qtav_windows_native_av_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=160x90:r=12:d=1,drawbox=x=80:y=0:w=80:h=90:color=blue:t=fill"
+                -f lavfi
+                -i sine=frequency=440:sample_rate=48000
+                -t 1
+                -c:v h264_mf
+                -pix_fmt yuv420p
+                -g 12
+                -c:a aac
+                "${QTAV_WINDOWS_NATIVE_AV_MEDIA}"
         )
         set_tests_properties(
-            qtav_audio_wasapi_player
+            qtav_windows_native_av_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_windows_native_av_media
+        )
+        add_test(
+            NAME qtav_windows_native_av
+            COMMAND
+                qtav_core_console
+                "${QTAV_WINDOWS_NATIVE_AV_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_windows_native_av
             PROPERTIES
-                FIXTURES_REQUIRED qtav_core_media
+                FIXTURES_REQUIRED qtav_windows_native_av_media
                 TIMEOUT 15
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT QTAV_CORE_REQUIRE_NATIVE_WINDOWS_AV=1
         )
     endif()
 
@@ -739,6 +801,69 @@ if(FFMPEG_EXECUTABLE)
             PROPERTIES
                 FIXTURES_REQUIRED qtav_interop_cvmetal_media
                 TIMEOUT 20
+        )
+    endif()
+
+    if(TARGET qtav_interop_d3d11_test)
+        set(
+            QTAV_INTEROP_D3D11_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-d3d11-interop-test.mp4"
+        )
+        set(
+            QTAV_INTEROP_D3D11_MAIN10_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-d3d11-interop-main10-test.mp4"
+        )
+        add_test(
+            NAME qtav_interop_d3d11_generate_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i
+                "color=c=red:s=160x90:r=4:d=1,drawbox=x=80:y=0:w=80:h=90:color=blue:t=fill,format=yuv420p"
+                -frames:v 4
+                -c:v h264_mf
+                -pix_fmt yuv420p
+                -color_range tv
+                -colorspace bt709
+                -color_primaries bt709
+                -color_trc bt709
+                -g 4
+                "${QTAV_INTEROP_D3D11_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_interop_d3d11_generate_media
+            PROPERTIES FIXTURES_SETUP qtav_interop_d3d11_media
+        )
+        add_test(
+            NAME qtav_interop_d3d11_generate_main10_media
+            COMMAND
+                "${CMAKE_COMMAND}"
+                "-DFFMPEG_EXECUTABLE=${FFMPEG_EXECUTABLE}"
+                "-DOUTPUT_FILE=${QTAV_INTEROP_D3D11_MAIN10_TEST_MEDIA}"
+                -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/generate_d3d12_main10_media.cmake"
+        )
+        set_tests_properties(
+            qtav_interop_d3d11_generate_main10_media
+            PROPERTIES
+                FIXTURES_SETUP qtav_interop_d3d11_main10_media
+        )
+        add_test(
+            NAME qtav_interop_d3d11_zero_copy
+            COMMAND
+                qtav_interop_d3d11_test
+                "${QTAV_INTEROP_D3D11_TEST_MEDIA}"
+                "${QTAV_INTEROP_D3D11_MAIN10_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_interop_d3d11_zero_copy
+            PROPERTIES
+                FIXTURES_REQUIRED
+                    "qtav_interop_d3d11_media;qtav_interop_d3d11_main10_media"
+                TIMEOUT 30
         )
     endif()
 
