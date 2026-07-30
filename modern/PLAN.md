@@ -33,10 +33,14 @@ Continuation checkpoint:
 - the Apple reference path, including HDR and color-space metadata plumbing,
   and the Windows D3D11 software-frame and WASAPI audio paths are complete;
   the D3D11VA device/frame/interop design and supplied-device core bridge are
-  complete; the native `qtav_hw_d3d11va` decoder backend is now complete, and
-  the decoder-independent D3D11 renderer interop interfaces, capability
-  reporting, texture consumption, and explicit software-map fallback are
-  complete; the active next task is the Video Processor implementation;
+  complete; the native `qtav_hw_d3d11va` decoder backend and
+  `qtav_interop_d3d11` Video Processor path are complete, including
+  same-device validation, color-aware SDR BGRA8 conversion, native H.264/NV12
+  and HEVC Main10/P010 zero-CPU-map rendering, lifecycle coverage, example
+  wiring, installed target export, and strict native H.264/AAC playback through
+  an active WASAPI render endpoint; Milestone 5 is complete and the active next
+  platform task is the Android production path, followed by OHOS and then
+  Linux;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -63,6 +67,7 @@ Current public entry points:
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
+- `modern/backends/interop/d3d11/include/qtav/d3d11_frame_interop.h`
 
 Current implementation:
 
@@ -83,6 +88,7 @@ Current implementation:
 - `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
+- `modern/backends/interop/d3d11/src/d3d11_frame_interop.cpp`
 - `modern/tests/audio_sink_player_test.cpp`
 - `modern/tests/simulated_audio_sink.h`
 - `modern/tests/simulated_audio_sink.cpp`
@@ -97,14 +103,15 @@ Current implementation:
 - `modern/tests/metal_video_renderer_test.mm`
 - `modern/tests/d3d11_video_renderer_test.cpp`
 - `modern/tests/d3d11va_hardware_decoder_test.cpp`
+- `modern/tests/d3d11_frame_interop_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
 - `modern/tests/cvmetal_frame_interop_test.mm`
 - `modern/tests/hardware_decode_device_test.cpp`
 
 Current verification:
 
-- static and shared builds pass 27/27 CTest tests on Windows after adding the
-  D3D11VA lifecycle and mock renderer interop/fallback coverage;
+- static and shared builds pass 32/32 CTest tests on Windows, including the
+  WASAPI device test and strict native H.264/AAC playback;
 - ASan/UBSan passes the prior 24/24 macOS-applicable tests with leak detection
   disabled;
 - the all-backends-disabled build passes 11/11 tests, including the Windows
@@ -120,20 +127,24 @@ Current verification:
 - runtime linkage contains no Qt;
 - core public-header scans contain no Qt, FFmpeg, or platform SDK types;
 - MPEG-4/AAC, AC-3, E-AC-3, and TrueHD decode tests pass.
-- on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, the static Release
-  build passes 27/27 CTest tests, including the supplied hardware-device
-  bridge, deterministic WARP D3D11 software/imported/mapped rendering, WASAPI
-  device lifecycle, Player-driven WASAPI playback, and native H.264 D3D11VA
-  decode with mapping, seek, media replacement, stop, and retained-frame
-  shutdown lifetime;
+- on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, static/shared
+  Release tests cover the supplied hardware-device bridge, deterministic WARP
+  texture/slice/lifetime/locking contracts, D3D11 software/imported/mapped
+  rendering, native H.264/NV12 and HEVC Main10/P010 D3D11VA-to-Video-Processor
+  presentation with verified pixels and no CPU mapping, plus pause/resume,
+  seek, media replacement, stop, surface recreation, and retained-frame use
+  after player shutdown;
+- the strict generated H.264/AAC native example test proves simultaneous
+  D3D11VA decode, D3D11 rendering, audio decode, and audible WASAPI output
+  through the active render endpoint;
 - Windows multi-config FFmpeg imports select matching Debug/Release libraries,
   and project DLLs, tests, and examples share a runnable `bin/<Config>`
   directory;
 - installation plus external CMake consumption of `QtAV::PlatformWindows`,
-  `QtAV::HWD3D11VA`, `QtAV::RenderD3D11`, and `QtAV::AudioWASAPI` together
-  with the portable core, render, and audio targets passes for static and
-  shared builds; the installed core token links without installing its private
-  FFmpeg bridge header.
+  `QtAV::HWD3D11VA`, `QtAV::RenderD3D11`, `QtAV::InteropD3D11`, and
+  `QtAV::AudioWASAPI` together with the portable core, render, and audio
+  targets passes for static and shared builds; the installed core token links
+  without installing its private FFmpeg bridge header.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -318,17 +329,51 @@ Completed file-output checkpoint:
 
 ## Next task
 
-Continue the Apple reference path on the current macOS host:
+Begin the Android production path after the completed Windows milestone:
 
-1. [x] Add backend-specific Apple headers for strong borrowed native types
-   without including them from core public headers.
-2. [x] Add the `qtav_render_metal` target and define borrowed `MTLDevice`,
-   command-queue, and current-target callback ownership.
-3. [x] Render software NV12/YUV/RGB frames through Metal before adding hardware
-   decode or zero-copy interop.
-4. [x] Add resize, viewport, aspect-ratio, rotation, and redraw tests.
-5. [x] Add `qtav_audio_coreaudio` only after the Metal software-frame path is
-   stable.
+1. [ ] Complete the shared Android/OHOS mobile design checkpoint below before
+   adding either platform's hardware decoder.
+2. [ ] Establish reproducible macOS-hosted Android NDK and FFmpeg 8+
+   cross-builds, package a minimal native test application, and run it on a
+   connected arm64 Android device.
+3. [ ] Add the reusable Vulkan renderer engine and Android surface adapter,
+   keeping window, device, and swapchain ownership outside core.
+4. [ ] Add an OpenGL ES path where it materially improves device coverage,
+   sharing shader/color/geometry logic with Vulkan where practical without
+   hiding incompatible API lifecycles.
+5. [ ] Add AAudio output and device-clock/latency validation.
+6. [ ] Add MediaCodec hardware decode and direct-surface presentation first,
+   then add texture interop only after presentation, drop, flush, and surface
+   recreation semantics are deterministic.
+
+### Shared Android/OHOS mobile design checkpoint
+
+Complete this checkpoint once and reuse it for both mobile production paths:
+
+1. [ ] Define a platform-neutral Vulkan renderer engine for software-frame
+   upload, YUV/RGB conversion, range/matrix/transfer/primaries handling,
+   viewport, aspect ratio, rotation, synchronization, and retained in-flight
+   resources.
+2. [ ] Keep Android `ANativeWindow`/EGL/Vulkan objects and OHOS
+   `OHNativeWindow`/XComponent/EGL/Vulkan objects in separate platform or
+   backend-specific adapters; do not expose either SDK through core public
+   headers or merge the two SDK lifecycles into one platform class.
+3. [ ] Reuse shader inputs, color-conversion math, geometry generation,
+   staging/upload helpers, capability rules, golden test vectors, and
+   renderer contract tests between Android and OHOS. Share OpenGL ES code only
+   where the API and resource-lifetime behavior actually match.
+4. [ ] Define a surface-backed hardware-decode presentation contract shared
+   by MediaCodec and FFmpeg 8 OHCodec: explicit decoder selection, frame
+   present/drop, playback-clock scheduling, bounded outstanding buffers,
+   seek/flush, stop, media replacement, surface loss/recreation, and retained
+   frame lifetime.
+5. [ ] Preserve separate targets for hardware decode, hardware-frame interop,
+   rendering, and audio output. Android uses MediaCodec/AAudio; OHOS uses
+   OHCodec/OHAudio. Shared code must not introduce a lowest-common-denominator
+   platform ABI.
+6. [ ] Create reusable device-test media and lifecycle scenarios, plus thin
+   platform-specific APK/HAP launch, signing, deployment, log collection, and
+   result adapters for connected-device validation from macOS.
 
 Completed Metal software-frame checkpoint:
 
@@ -445,7 +490,7 @@ Next active implementation order:
 4. [x] Add WASAPI.
 5. [x] Complete the D3D11VA device, frame-lifetime, and interop design
    checkpoint below.
-6. [~] D3D11VA decode is complete; add D3D11 zero-copy interop.
+6. [x] Add D3D11VA decode and D3D11 zero-copy interop.
 
 Completed D3D11 software-frame checkpoint:
 
@@ -610,9 +655,9 @@ Next implementation slice:
    `D3D11TextureFrame` interfaces to `QtAV::RenderD3D11`.
 2. [x] Add renderer capability reporting plus explicit enabled/disabled
    software-map fallback using mock interop tests.
-3. [ ] Implement `QtAV::InteropD3D11` with same-device validation and a D3D11
+3. [x] Implement `QtAV::InteropD3D11` with same-device validation and a D3D11
    Video Processor pass into a shader-readable BGRA8 intermediate.
-4. [ ] Add WARP contract tests, native zero-CPU-copy H.264 rendering coverage,
+4. [x] Add WARP contract tests, native zero-CPU-copy H.264 rendering coverage,
    example wiring, and install-consumer validation.
 
 Completed D3D11 renderer interop-contract checkpoint:
@@ -641,14 +686,43 @@ Completed D3D11 renderer interop-consumption checkpoint:
 - mock WARP tests cover direct import with zero map calls, capability changes,
   enabled/disabled mapping fallback, mapped pixel output, and mapping failure.
 
-Default platform order after the contracts are stable:
+Completed D3D11 Video Processor interop checkpoint:
+
+- `QtAV::InteropD3D11` validates D3D11VA NV12/P010 texture-array slices,
+  exact source/target device identity, device health, format support, and
+  dimensions before entering the shared recursive context guard;
+- `D3D11FrameInterop` caches the Video Processor enumerator/processor and
+  returns a retained per-import SDR BGRA8 texture plus shader-resource view
+  without CPU mapping or a cross-device copy;
+- the renderer passes structured range/matrix/transfer/chroma metadata through
+  a backward-compatible color-aware interop overload; Direct3D 11.1 color
+  spaces are selected when supported, with legacy SDR BT.601/709 fallback;
+- WARP covers texture-array/slice extraction, retained lifetime, recursive
+  locking, and safe Video Processor unavailability while mock WARP tests cover
+  renderer consumption and error contracts;
+- the current hardware adapter renders generated H.264/NV12 and HEVC
+  Main10/P010 D3D11VA frames with zero map calls and verified red/blue pixel
+  readback; the H.264 path also covers pause/resume, seek, media replacement,
+  explicit stop, surface recreation, and retained source/import lifetime after
+  `Player` shutdown;
+- the console example wires D3D11VA, `QtAV::InteropD3D11`, and offscreen D3D11
+  rendering; the strict H.264/AAC test passes through an active WASAPI render
+  endpoint and still makes unavailable endpoint coverage an explicit skip;
+  the installed CMake package exports `QtAV::InteropD3D11`.
+
+Following platform slice:
+
+1. [ ] Begin the Android production path with the shared Android/OHOS mobile
+   design checkpoint and connected-device build harness.
+
+Platform implementation order after the contracts are stable:
 
 1. Apple reference path on the current macOS host.
 2. Windows reference path.
-3. Linux path.
-4. Android path.
-
-The user may override this order.
+3. Android production path from macOS with connected-device validation.
+4. OHOS production path from macOS with connected-device validation.
+5. Linux production path, beginning in WSL and moving to native Linux at the
+   mandatory environment gate defined in Milestone 8.
 
 ## Milestone 3 — Portable reference backends
 
@@ -706,31 +780,179 @@ Acceptance:
 - [x] Shared-mode PCM negotiation and audio clock.
 - [x] Complete the D3D11VA device/frame/interop design checkpoint.
 - [x] `qtav_hw_d3d11va`.
-- [ ] `qtav_interop_d3d11` for zero-copy decoder textures.
+- [x] `qtav_interop_d3d11` for zero-copy decoder textures.
 
 Acceptance:
 
-- Windows native example plays A/V without Qt;
-- software and D3D11 hardware decode both work;
-- device-loss and surface-recreation paths are tested;
-- no Windows type leaks into core public headers.
+- [x] Windows native example plays A/V without Qt. Generated H.264/AAC proves
+  D3D11VA decode, zero-copy rendering, audio decode, and audible WASAPI output
+  together.
+- [x] Software and D3D11 hardware decode both work.
+- [x] Device-loss and surface-recreation paths are tested.
+- [x] No Windows type leaks into core public headers.
 
-## Milestone 6 — Linux and Android
+Status: complete and verified.
 
-### Linux
+## Milestone 6 — Android production path
 
-- [ ] OpenGL renderer.
-- [ ] Vulkan renderer.
-- [ ] ALSA and/or PulseAudio sink.
-- [ ] VAAPI hardware decode and interop.
+### Toolchain and application shell
 
-### Android
+- [ ] Reproducible macOS-hosted Android NDK build for QtAVCore and the required
+  FFmpeg 8+ libraries, initially targeting arm64.
+- [ ] Minimal APK/native application shell that owns activity, lifecycle,
+  permissions, and current rendering surfaces without adding Android types to
+  core.
+- [ ] Connected-device deployment, logging, generated-media playback, and
+  automated result collection.
 
-- [ ] OpenGL ES and/or Vulkan renderer.
-- [ ] AAudio sink, with OpenSL fallback only if required.
-- [ ] MediaCodec hardware decode and surface/texture interop.
+### Rendering
 
-## Milestone 7 — Playback feature parity
+- [ ] Shared Vulkan renderer engine from the mobile design checkpoint.
+- [ ] Android Vulkan surface/swapchain adapter using application-owned native
+  resources.
+- [ ] OpenGL ES renderer or adapter when required for the supported-device
+  matrix.
+- [ ] Software YUV/NV12/P010/RGB upload, structured color conversion, viewport,
+  aspect ratio, rotation, resize, redraw, and surface recreation.
+
+### Audio and hardware decode
+
+- [ ] `qtav_audio_aaudio`, with OpenSL fallback only if the selected minimum
+  Android API or real-device coverage requires it.
+- [ ] Device format negotiation, bounded callback-safe buffering, device clock,
+  latency, pause, flush, drain, route change, and disconnect handling.
+- [ ] `qtav_hw_mediacodec` with explicit wrapper-decoder selection and
+  application-supplied surface/device lifetime.
+- [ ] Direct-surface presentation with explicit present/drop behavior before
+  optional SurfaceTexture/AHardwareBuffer/Vulkan texture interop.
+- [ ] Software fallback independent of renderer mapping/interop fallback.
+
+Acceptance:
+
+- a macOS-hosted build installs and runs on at least one connected arm64
+  Android device;
+- software decode renders through Vulkan or OpenGL ES and AAudio produces
+  synchronized audible output;
+- MediaCodec H.264 and HEVC paths cover pause/resume, seek, media replacement,
+  stop, background/foreground transition, surface recreation, and shutdown;
+- direct-surface hardware output is verified before any texture-interoperable
+  path is described as complete;
+- Android SDK types remain outside core public headers.
+
+## Milestone 7 — OHOS production path
+
+Target clarification gate:
+
+- [ ] Record whether the initial target is a HarmonyOS NEXT commercial device
+  application, a specific OpenHarmony distribution/device, or both; record the
+  SDK/API version, signing requirements, available system capabilities, and
+  connected-device workflow before fixing backend availability rules.
+
+### Toolchain and application shell
+
+- [ ] Reproducible macOS-hosted OHOS native build for QtAVCore and FFmpeg 8+,
+  initially targeting arm64.
+- [ ] Add `modern/platform/ohos/` for small shared OHOS helpers while keeping
+  media, graphics, and audio implementations in their responsibility-specific
+  backend targets.
+- [ ] Minimal HAP/native application shell using ArkUI/XComponent only at the
+  integration boundary.
+- [ ] Connected-device deployment, signing, logging, generated-media playback,
+  and automated result collection through thin OHOS-specific adapters to the
+  shared mobile test scenarios.
+
+### Vulkan and OpenGL ES rendering
+
+- [ ] Reuse the Android-proven platform-neutral Vulkan renderer engine,
+  shaders, color conversion, geometry, synchronization rules, golden vectors,
+  and renderer contract tests.
+- [ ] Add the OHOS `OHNativeWindow`/XComponent Vulkan surface and swapchain
+  adapter as a separate target or platform helper.
+- [ ] Reuse OpenGL ES renderer internals where compatible, with a separate OHOS
+  EGL/window adapter and explicit capability checks.
+- [ ] Validate software YUV/NV12/P010/RGB upload, viewport, aspect ratio,
+  rotation, resize, redraw, surface loss/recreation, SDR, and supported HDR
+  output behavior on a real device.
+
+### Audio and hardware decode
+
+- [ ] Add an OHOS OHAudio sink target with negotiated PCM, bounded callback-safe
+  buffering, device clock/latency, pause, flush, drain, route change, and
+  disconnect behavior.
+- [ ] Add an OHOS OHCodec hardware-decode target using FFmpeg 8
+  `AV_HWDEVICE_TYPE_OHCODEC` and explicit H.264/HEVC wrapper-decoder selection.
+- [ ] Reuse the shared surface-backed presentation contract for playback-clock
+  scheduling, present/drop, outstanding-buffer bounds, flush, stop, and surface
+  recreation.
+- [ ] Implement direct `OHNativeWindow` presentation first; investigate
+  NativeBuffer/Vulkan texture interop only after direct presentation is stable
+  and the target device exposes the required supported APIs.
+- [ ] Keep software decode fallback independent of Vulkan/OpenGL ES interop
+  fallback.
+
+Acceptance:
+
+- a macOS-hosted build installs and runs on the recorded connected arm64 OHOS
+  target;
+- software decode renders through Vulkan or OpenGL ES and OHAudio produces
+  synchronized audible output;
+- OHCodec H.264 and HEVC paths cover pause/resume, seek, media replacement,
+  stop, background/foreground transition, surface recreation, and shutdown;
+- Android/OHOS share renderer engines and deterministic tests without sharing
+  platform SDK types or incorrectly treating their native lifecycles as ABI
+  compatible;
+- OHOS SDK types remain outside core public headers.
+
+## Milestone 8 — Linux production path
+
+### WSL development and mandatory native-Linux migration gate
+
+- [ ] Begin with WSL/WSLg for Linux cross-platform compilation, all-backends-off
+  tests, reusable Vulkan/OpenGL code, deterministic offscreen tests, and
+  integration work that does not require authoritative physical Linux device
+  behavior.
+- [ ] Before starting work whose result depends on native Linux graphics,
+  audio, hardware decode, driver, device-loss, or display-server behavior,
+  explicitly remind the user that migration to a native Linux installation is
+  now required and wait for confirmation of the new environment.
+- [ ] Do not mark native Linux rendering, audio, VAAPI, or the milestone
+  acceptance complete from WSL-only results. At the latest, migrate before
+  real Wayland/X11 presentation, physical ALSA/PulseAudio device validation,
+  VAAPI zero-copy validation, or GPU/display driver recovery testing.
+- [ ] After migration, record the Linux distribution, compositor/display
+  server, GPU, driver, audio stack, and FFmpeg 8+ build used for validation.
+
+### Rendering
+
+- [ ] Reuse the Android/OHOS-proven Vulkan renderer engine, shaders, color
+  conversion, geometry, upload helpers, synchronization rules, and tests.
+- [ ] Add native Linux Vulkan surface/swapchain adapters without coupling core
+  to Wayland or X11.
+- [ ] Adapt the shared OpenGL ES renderer internals to the selected native
+  Linux OpenGL/EGL path, keeping display-server context and surface ownership
+  in Linux-specific code.
+- [ ] Validate resize, viewport, aspect ratio, rotation, redraw, surface loss,
+  display-server recreation, and SDR/HDR capability reporting on native Linux.
+
+### Audio and hardware decode
+
+- [ ] ALSA and/or PulseAudio sink with negotiated PCM, device clock, latency,
+  pause, flush, drain, route/device loss, and recovery.
+- [ ] VAAPI hardware decode.
+- [ ] VAAPI/Vulkan or VAAPI/OpenGL interop with explicit software mapping
+  fallback and no default CPU copy.
+
+Acceptance:
+
+- native Linux software playback produces synchronized A/V without Qt;
+- Vulkan and the selected OpenGL path reuse the mobile-proven implementation
+  where appropriate while Linux window-system code remains isolated;
+- native audio-device timing and VAAPI zero-copy behavior are validated on a
+  real Linux installation, not only WSL;
+- no Linux, Wayland, X11, ALSA, PulseAudio, or VAAPI type leaks into core public
+  headers.
+
+## Milestone 9 — Playback feature parity
 
 - [ ] Active audio/video track switching after load.
 - [ ] Subtitle packet decode.
@@ -744,7 +966,7 @@ Acceptance:
 - [ ] Audio time-stretch for playback rate without pitch change.
 - [ ] Filter/plugin contracts.
 
-## Milestone 8 — Dolby and HDR scope
+## Milestone 10 — Dolby and HDR scope
 
 - [x] Generic FFmpeg AC-3 software decode.
 - [x] Generic FFmpeg E-AC-3 software decode.

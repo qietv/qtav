@@ -100,6 +100,7 @@ qtav_audio_wasapi
 qtav_audio_coreaudio
 qtav_hw_d3d11va
 qtav_hw_videotoolbox
+qtav_interop_d3d11
 qtav_interop_cvmetal
 ```
 
@@ -149,6 +150,9 @@ Implemented under `modern/`:
 - libswscale CPU rendering into application-owned image buffers;
 - D3D11 software-frame rendering into borrowed Windows render-target views;
 - WASAPI shared-mode device output with playback clock and latency reporting;
+- D3D11VA hardware decoding into retained NV12/P010 texture-array slices;
+- zero-CPU-map D3D11VA/D3D11 Video Processor interop into shader-readable
+  SDR BGRA8 textures;
 - Metal software-frame rendering into borrowed textures or drawables;
 - CoreAudio device output with playback clock and latency reporting;
 - VideoToolbox hardware decoding into retained `CVPixelBuffer` frames;
@@ -165,7 +169,7 @@ Known intentional limitations:
 
 - no native audio-device sink outside macOS and Windows yet;
 - no OpenGL or Vulkan renderer yet;
-- no non-Apple hardware decoder or GPU zero-copy interop yet;
+- no Linux or Android hardware decoder or GPU zero-copy interop yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
 - no compressed Dolby passthrough, Atmos object rendering, Dolby Vision, or
@@ -232,11 +236,14 @@ Last verified baseline:
   system libraries only; no Qt dependency;
 - MPEG-4/AAC generated-media playback: passed;
 - AC-3, E-AC-3, and TrueHD audio-only decoding: passed.
-- Windows Visual Studio 2026 static/shared Release CTest: 21/21 passed,
-  including WARP D3D11 rendering and WASAPI device/Player playback;
-  all-backends-disabled CTest: 8/8 passed;
-- Windows install plus external `QtAV::RenderD3D11` and
-  `QtAV::AudioWASAPI` CMake consumption: passed.
+- Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
+  including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
+  HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device
+  output, and strict H.264/AAC native A/V playback with audible output;
+  all-backends-disabled CTest: 11/11 passed;
+- Windows static/shared install plus external `QtAV::RenderD3D11`,
+  `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`, and `QtAV::AudioWASAPI`
+  CMake consumption: passed.
 
 Before finishing any implementation turn:
 
