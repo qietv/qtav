@@ -178,9 +178,8 @@ Implemented under `modern/`:
 Known intentional limitations:
 
 - no native audio-device sink outside macOS and Windows yet;
-- no OpenGL renderer yet; Vulkan still needs offscreen goldens, a multi-frame
-  in-flight ring, and surface-recreation coverage beyond its Android device
-  checkpoint;
+- no OpenGL renderer yet; the Vulkan software path is validated on Android but
+  still needs OHOS and Linux adapters/device coverage;
 - no Linux or Android hardware decoder or GPU zero-copy interop yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
@@ -250,10 +249,10 @@ Last verified baseline:
 - AC-3, E-AC-3, and TrueHD audio-only decoding: passed.
 - Android arm64 FFmpeg 8.1.2/QtAVCore/Vulkan build, APK packaging, and
   connected Adreno 830 device playback: passed with 180 decoded and
-  Vulkan-presented video frames, 281 decoded audio frames, a
+  Vulkan-presented video frames, 282 decoded audio frames, a
   background/foreground surface recreation, and offscreen Vulkan goldens for
-  the three-frame ring, color conversion, viewport, rotation, and target
-  recreation.
+  the three-frame ring, SDR and P010/BT.2020 PQ/HLG color conversion, HDR
+  luminance-metadata selection, viewport, rotation, and target recreation.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device

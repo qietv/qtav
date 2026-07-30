@@ -26,7 +26,8 @@ code is used.
 - optional Windows D3D11 renderer for a retained application-selected device
   and immediate context plus borrowed current render-target views;
 - optional Metal renderer for borrowed Apple devices, command queues, and
-  current render targets;
+  current render targets, including complete macOS/iOS extended-linear
+  BT.2020 EDR layer presentation;
 - optional libswresample converter for negotiated interleaved PCM output;
 - optional RIFF/WAVE PCM diagnostic file sink;
 - optional macOS CoreAudio device sink with native playback timing;
@@ -233,7 +234,7 @@ collects its pass/fail log. If installation or replacement fails because the
 device may be waiting for user authorization, stop and approve the prompt
 manually before retrying. The Vulkan-enabled Android 16/arm64 device run now
 decodes and presents 180 MPEG-4 video frames through an Adreno 830 Vulkan
-1.3.284 swapchain, decodes 281 PCM audio frames, and recreates the
+1.3.284 swapchain, decodes 282 PCM audio frames, and recreates the
 surface/swapchain across a background/foreground transition.
 
 This is a toolchain, packaging, software-decode, and Vulkan-rendering
@@ -241,9 +242,12 @@ checkpoint. The renderer uses a bounded three-frame resource ring and retains
 each source frame until its fence completes. Platform-neutral offscreen
 readback goldens run in the Android harness and cover YUV color conversion,
 limited/full range, BT.601/BT.709 matrices, viewport, rotation, target
-recreation, and ring reuse. It does not yet provide the required OpenGL ES/EGL
-fallback and selector, an AAudio sink, or a MediaCodec backend. Their accepted
-shared Android/OHOS responsibility and lifecycle design is documented in
+recreation, ring reuse, and P010/BT.2020 PQ/HLG input with mastering-display,
+MaxCLL, and default-luminance selection. Vulkan output remains SDR BGRA8 with
+deterministic luminance compression; this is not native HDR swapchain
+presentation. It does not yet provide the required OpenGL ES/EGL fallback and
+selector, an AAudio sink, or a MediaCodec backend. Their accepted shared
+Android/OHOS responsibility and lifecycle design is documented in
 [`MOBILE.md`](MOBILE.md).
 
 ## API shape
@@ -680,12 +684,54 @@ NV12 and P010 VideoToolbox frames without a CPU copy.
 
 `MetalRenderTarget::outputColorSpace` defaults to `SDR`. In this mode the
 renderer preserves ordinary SDR presentation and maps PQ/HLG input into the
-target range. For an EDR/HDR application surface, use an `RGBA16Float` texture
-and `MetalOutputColorSpace::ExtendedLinearSRGB`; shader output is then linear
-BT.709/sRGB-primary light where `1.0` equals
-`MetalRenderTarget::referenceWhiteNits`, and HDR highlights may exceed `1.0`.
-The application remains responsible for configuring its `CAMetalLayer`,
-display color space, and EDR headroom consistently with that target.
+target range. For complete Apple EDR presentation, return the application-owned
+`CAMetalLayer` and its active display instead of obtaining the drawable first:
+
+```objective-c++
+qtav::MetalRenderTarget target;
+target.layer = metalLayer;
+#if TARGET_OS_OSX
+target.display = view.window.screen;
+#else
+target.display = view.window.windowScene.screen;
+#endif
+target.outputColorSpace =
+    qtav::MetalOutputColorSpace::ExtendedLinearBT2020;
+target.edrToneMapping = qtav::MetalEDRToneMapping::System;
+```
+
+The renderer configures that layer before calling `nextDrawable`: device and
+drawable size, `MTLPixelFormatRGBA16Float`,
+`kCGColorSpaceExtendedLinearITUR_2020`,
+`wantsExtendedDynamicRangeContent = YES`, and frame-derived HDR10 or HLG
+`CAEDRMetadata`. PQ/HLG input is decoded into display-referred linear light
+where `1.0` equals `MetalRenderTarget::referenceWhiteNits`; BT.2020 input
+remains in BT.2020 primaries instead of being reduced to BT.709. This preserves
+the source HDR luminance and gamut representation through the render target;
+it is a color-managed linear representation, not bit-identical compressed
+HDR10 data.
+
+`MetalEDRToneMapping::System` lets Core Animation adapt the layer using
+`CAEDRMetadata`. `DisplayAdaptive` instead samples
+`NSScreen.maximumExtendedDynamicRangeColorComponentValue` on macOS or
+`UIScreen.currentEDRHeadroom` on iOS for every render call, clears layer EDR
+metadata to avoid double tone mapping, and compresses HDR into the live
+display headroom. It preserves values through SDR white when headroom is
+greater than `1.0`; at `1.0` it uses an HDR-to-SDR shoulder instead of clipping
+all highlights. `None` preserves unmodified extended-linear values for
+reference displays and offscreen processing.
+`MetalRenderTarget::currentEDRHeadroom` can provide a positive explicit
+override for deterministic tests; zero uses the live display query.
+`metalCurrentEDRHeadroom()` and `metalPotentialEDRHeadroom()` expose the same
+screen queries to Objective-C++ applications.
+
+`ExtendedLinearSRGB` remains available for applications that deliberately use
+BT.709/sRGB primaries, but it does not preserve the complete BT.2020 gamut.
+For onscreen EDR, returning `layer` is required so metadata is installed before
+the drawable is acquired. Deterministic GPU readback verifies HDR pixels above
+`1.0`, BT.2020 preservation, and adaptive 2x/4x headroom. A separate macOS
+display test presents through a real EDR-capable screen and reports a CTest
+skip when no screen has live EDR headroom.
 
 `VideoFrame::colorSpaceInfo()` returns structured range, primaries, transfer,
 matrix, and chroma location. `masteringDisplayMetadata()` and

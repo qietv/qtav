@@ -64,8 +64,11 @@ planned software pixel family through a storage-buffer shader, applies the
 structured SDR/HDR color inputs plus viewport/aspect/rotation geometry, and
 uses a bounded three-frame resource ring with one retained source frame per
 submission fence. Deterministic offscreen readback checks cover ring reuse,
-YUV output, limited/full range, BT.601/BT.709 conversion, viewport, rotation,
-and target-generation replacement.
+YUV output, limited/full range, BT.601/BT.709 conversion, P010/BT.2020 PQ and
+HLG input, HDR mastering-display/MaxCLL/default-luminance selection, viewport,
+rotation, and target-generation replacement. The current Vulkan target is SDR
+BGRA8, so the HDR checks validate deterministic HDR-input-to-SDR compression,
+not native HDR surface presentation.
 
 Shader input structures, color conversion constants, geometry generation,
 staging layout, capability decisions, and golden pixel vectors are shared

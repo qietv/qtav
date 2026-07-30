@@ -183,10 +183,52 @@ if(TARGET qtav_render_metal)
     )
     target_link_libraries(
         qtav_render_metal_test
-        PRIVATE QtAV::RenderMetal
+        PRIVATE
+            QtAV::RenderMetal
+            FFmpeg::avutil
+    )
+    target_include_directories(
+        qtav_render_metal_test
+        PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
     )
     target_compile_features(qtav_render_metal_test PRIVATE cxx_std_17)
     target_compile_options(qtav_render_metal_test PRIVATE -fobjc-arc)
+
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "iOS|tvOS|watchOS|visionOS")
+        add_executable(
+            qtav_render_metal_edr_display_test
+            metal_edr_display_test.mm
+        )
+        target_link_libraries(
+            qtav_render_metal_edr_display_test
+            PRIVATE
+                QtAV::RenderMetal
+                FFmpeg::avutil
+        )
+        target_include_directories(
+            qtav_render_metal_edr_display_test
+            PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
+        )
+        target_compile_features(
+            qtav_render_metal_edr_display_test
+            PRIVATE cxx_std_17
+        )
+        target_compile_options(
+            qtav_render_metal_edr_display_test
+            PRIVATE -fobjc-arc
+        )
+        add_test(
+            NAME qtav_render_metal_edr_display
+            COMMAND qtav_render_metal_edr_display_test
+        )
+        set_tests_properties(
+            qtav_render_metal_edr_display
+            PROPERTIES
+                RUN_SERIAL TRUE
+                SKIP_RETURN_CODE 77
+                TIMEOUT 15
+        )
+    endif()
 endif()
 
 if(TARGET qtav_render_d3d11)

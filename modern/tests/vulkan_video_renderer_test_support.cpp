@@ -4,6 +4,9 @@
 
 #include "frame_internal.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -13,6 +16,7 @@
 
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -534,6 +538,191 @@ VideoFrame makeColorVariant(bool fullRange, bool bt709)
     return result;
 }
 
+enum class HdrTransfer {
+    PQ,
+    HLG,
+};
+
+struct HdrVariant {
+    VideoFrame frame;
+    std::array<std::uint16_t, 4> lumaCodes {};
+};
+
+double pqSignalForNits(double nits) noexcept
+{
+    constexpr double M1 = 2610.0 / 16384.0;
+    constexpr double M2 = 2523.0 / 32.0;
+    constexpr double C1 = 3424.0 / 4096.0;
+    constexpr double C2 = 2413.0 / 128.0;
+    constexpr double C3 = 2392.0 / 128.0;
+    const double luminance =
+        std::clamp(nits / 10000.0, 0.0, 1.0);
+    const double power = std::pow(luminance, M1);
+    return std::pow(
+        (C1 + C2 * power) / (1.0 + C3 * power),
+        M2);
+}
+
+double hlgSignalForNits(double nits) noexcept
+{
+    constexpr double A = 0.17883277;
+    constexpr double B = 0.28466892;
+    constexpr double C = 0.55991073;
+    const double luminance =
+        std::clamp(nits / 1000.0, 0.0, 1.0);
+    if (luminance <= 1.0 / 12.0) {
+        return std::sqrt(3.0 * luminance);
+    }
+    return A * std::log(12.0 * luminance - B) + C;
+}
+
+double pqNits(double signal) noexcept
+{
+    constexpr double M1 = 2610.0 / 16384.0;
+    constexpr double M2 = 2523.0 / 32.0;
+    constexpr double C1 = 3424.0 / 4096.0;
+    constexpr double C2 = 2413.0 / 128.0;
+    constexpr double C3 = 2392.0 / 128.0;
+    const double power =
+        std::pow(std::max(signal, 0.0), 1.0 / M2);
+    const double numerator = std::max(power - C1, 0.0);
+    const double denominator = std::max(C2 - C3 * power, 0.000001);
+    return 10000.0
+        * std::pow(numerator / denominator, 1.0 / M1);
+}
+
+double hlgNits(double signal) noexcept
+{
+    constexpr double A = 0.17883277;
+    constexpr double B = 0.28466892;
+    constexpr double C = 0.55991073;
+    if (signal <= 0.5) {
+        return 1000.0 * signal * signal / 3.0;
+    }
+    return 1000.0
+        * (std::exp((signal - C) / A) + B) / 12.0;
+}
+
+std::uint8_t expectedHdrSdrCode(
+    std::uint16_t lumaCode,
+    HdrTransfer transfer,
+    double maximumLuminance) noexcept
+{
+    const double signal = std::clamp(
+        (static_cast<double>(lumaCode) - 64.0) / 876.0,
+        0.0,
+        1.0);
+    const double nits = transfer == HdrTransfer::PQ
+        ? pqNits(signal)
+        : hlgNits(signal);
+    const double compressed =
+        nits / (1.0 + nits / maximumLuminance);
+    const double linear =
+        std::clamp(compressed / 100.0, 0.0, 1.0);
+    const double srgb = linear > 0.0031308
+        ? 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055
+        : 12.92 * linear;
+    return static_cast<std::uint8_t>(
+        std::clamp(std::lround(srgb * 255.0), 0L, 255L));
+}
+
+HdrVariant makeHdrVariant(
+    HdrTransfer transfer,
+    int masteringMaximumLuminance,
+    unsigned int maximumContentLightLevel)
+{
+    HdrVariant result;
+    AVFrame* native = av_frame_alloc();
+    if (!native) {
+        return result;
+    }
+    native->width = 4;
+    native->height = 2;
+    native->format = AV_PIX_FMT_P010LE;
+    if (av_frame_get_buffer(native, 32) < 0) {
+        av_frame_free(&native);
+        return result;
+    }
+
+    constexpr std::array<double, 4> SampleNits {
+        0.0,
+        10.0,
+        50.0,
+        100.0,
+    };
+    for (std::size_t column = 0; column < SampleNits.size(); ++column) {
+        const double signal = transfer == HdrTransfer::PQ
+            ? pqSignalForNits(SampleNits[column])
+            : hlgSignalForNits(SampleNits[column]);
+        result.lumaCodes[column] =
+            static_cast<std::uint16_t>(std::clamp(
+                std::lround(64.0 + signal * 876.0),
+                64L,
+                940L));
+    }
+    for (int row = 0; row < native->height; ++row) {
+        auto* luma = reinterpret_cast<std::uint16_t*>(
+            native->data[0] + row * native->linesize[0]);
+        for (std::size_t column = 0;
+             column < result.lumaCodes.size();
+             ++column) {
+            luma[column] = static_cast<std::uint16_t>(
+                result.lumaCodes[column] << 6U);
+        }
+    }
+    auto* chroma =
+        reinterpret_cast<std::uint16_t*>(native->data[1]);
+    for (int pair = 0; pair < 2; ++pair) {
+        chroma[pair * 2] = static_cast<std::uint16_t>(512U << 6U);
+        chroma[pair * 2 + 1] =
+            static_cast<std::uint16_t>(512U << 6U);
+    }
+
+    native->color_range = AVCOL_RANGE_MPEG;
+    native->colorspace = AVCOL_SPC_BT2020_NCL;
+    native->color_primaries = AVCOL_PRI_BT2020;
+    native->color_trc = transfer == HdrTransfer::PQ
+        ? AVCOL_TRC_SMPTE2084
+        : AVCOL_TRC_ARIB_STD_B67;
+    native->chroma_location = AVCHROMA_LOC_LEFT;
+
+    if (masteringMaximumLuminance > 0) {
+        AVMasteringDisplayMetadata* mastering =
+            av_mastering_display_metadata_create_side_data(native);
+        if (!mastering) {
+            av_frame_free(&native);
+            return {};
+        }
+        mastering->has_luminance = 1;
+        mastering->min_luminance = { 1, 10000 };
+        mastering->max_luminance = {
+            masteringMaximumLuminance,
+            1,
+        };
+    }
+    if (maximumContentLightLevel > 0) {
+        AVContentLightMetadata* content =
+            av_content_light_metadata_create_side_data(native);
+        if (!content) {
+            av_frame_free(&native);
+            return {};
+        }
+        content->MaxCLL = maximumContentLightLevel;
+        content->MaxFALL = maximumContentLightLevel / 2;
+    }
+
+    result.frame = detail::FrameFactory::video(native, 0, 0);
+    av_frame_free(&native);
+    return result;
+}
+
+bool closeToCode(std::uint8_t actual, std::uint8_t expected) noexcept
+{
+    return std::abs(
+        static_cast<int>(actual) - static_cast<int>(expected))
+        <= 4;
+}
+
 } // namespace
 
 bool runVulkanOffscreenRendererChecks(
@@ -634,6 +823,134 @@ bool runVulkanOffscreenRendererChecks(
         };
     if (!renderColorVariant(fullRange, "full-range BT.601")
         || !renderColorVariant(bt709, "limited-range BT.709")) {
+        return false;
+    }
+
+    const HdrVariant pqMastering =
+        makeHdrVariant(HdrTransfer::PQ, 1000, 4000);
+    const HdrVariant pqContent =
+        makeHdrVariant(HdrTransfer::PQ, 0, 4000);
+    const HdrVariant pqFallback =
+        makeHdrVariant(HdrTransfer::PQ, 0, 0);
+    const HdrVariant hlgMastering =
+        makeHdrVariant(HdrTransfer::HLG, 1000, 0);
+    if (!pqMastering.frame || !pqContent.frame || !pqFallback.frame
+        || !hlgMastering.frame) {
+        error = "Could not create Vulkan P010 HDR golden frames";
+        return false;
+    }
+    const auto validateHdrMetadata =
+        [&](const HdrVariant& variant,
+            ColorTransfer transfer,
+            bool expectsMastering,
+            bool expectsContent,
+            const char* name) {
+            const VideoColorSpace color =
+                variant.frame.colorSpaceInfo();
+            const MasteringDisplayMetadata mastering =
+                variant.frame.masteringDisplayMetadata();
+            const ContentLightMetadata content =
+                variant.frame.contentLightMetadata();
+            if (variant.frame.format() != PixelFormat::P010
+                || color.range != ColorRange::Limited
+                || color.matrix != ColorMatrix::BT2020NCL
+                || color.primaries != ColorPrimaries::BT2020
+                || color.transfer != transfer
+                || mastering.isValid() != expectsMastering
+                || content.isValid() != expectsContent) {
+                error = std::string(
+                    "Vulkan HDR metadata did not survive for ")
+                    + name;
+                return false;
+            }
+            return true;
+        };
+    if (!validateHdrMetadata(
+            pqMastering,
+            ColorTransfer::PQ,
+            true,
+            true,
+            "PQ mastering precedence")
+        || !validateHdrMetadata(
+            pqContent,
+            ColorTransfer::PQ,
+            false,
+            true,
+            "PQ MaxCLL fallback")
+        || !validateHdrMetadata(
+            pqFallback,
+            ColorTransfer::PQ,
+            false,
+            false,
+            "PQ default luminance fallback")
+        || !validateHdrMetadata(
+            hlgMastering,
+            ColorTransfer::HLG,
+            true,
+            false,
+            "HLG mastering")) {
+        return false;
+    }
+
+    const auto renderHdrVariant =
+        [&](const HdrVariant& variant,
+            HdrTransfer transfer,
+            double maximumLuminance,
+            const char* name) {
+            if (!renderer->configure(config)
+                || !renderer->render(variant.frame)
+                || !target.readPixels(pixels, error)) {
+                if (error.empty()) {
+                    error = std::string("Vulkan HDR rendering failed for ")
+                        + name;
+                }
+                return false;
+            }
+            constexpr std::array<int, 4> SampleX { 1, 3, 5, 7 };
+            for (std::size_t index = 0; index < SampleX.size(); ++index) {
+                const Pixel actual =
+                    pixel(pixels, 8, SampleX[index], 4);
+                const std::uint8_t expected = expectedHdrSdrCode(
+                    variant.lumaCodes[index],
+                    transfer,
+                    maximumLuminance);
+                if (!closeToCode(actual.red, expected)
+                    || !closeToCode(actual.green, expected)
+                    || !closeToCode(actual.blue, expected)
+                    || actual.alpha < 239) {
+                    error = std::string(
+                        "Vulkan HDR-to-SDR numeric golden failed for ")
+                        + name + " sample "
+                        + std::to_string(index) + ": expected "
+                        + std::to_string(expected) + ", got RGB("
+                        + std::to_string(actual.red) + ','
+                        + std::to_string(actual.green) + ','
+                        + std::to_string(actual.blue) + ')';
+                    return false;
+                }
+            }
+            return true;
+        };
+    if (!renderHdrVariant(
+            pqMastering,
+            HdrTransfer::PQ,
+            1000.0,
+            "P010 BT.2020 PQ mastering")
+        || !renderHdrVariant(
+            pqContent,
+            HdrTransfer::PQ,
+            4000.0,
+            "P010 BT.2020 PQ MaxCLL")
+        || !renderHdrVariant(
+            pqFallback,
+            HdrTransfer::PQ,
+            1000.0,
+            "P010 BT.2020 PQ default")
+        || !renderHdrVariant(
+            hlgMastering,
+            HdrTransfer::HLG,
+            1000.0,
+            "P010 BT.2020 HLG")) {
         return false;
     }
 

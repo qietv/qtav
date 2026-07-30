@@ -51,5 +51,7 @@ application to the launcher once and resumes the same activity; playback is
 paused while its window generation is absent and continues without reopening
 the media after the Vulkan surface/swapchain is rebuilt. Before presentation,
 the harness also renders deterministic offscreen goldens for ring reuse,
-limited/full-range BT.601/BT.709 conversion, viewport, rotation, and target
-recreation.
+limited/full-range BT.601/BT.709 conversion, P010/BT.2020 PQ/HLG
+HDR-input-to-SDR numeric output, mastering-display/MaxCLL/default-luminance
+selection, viewport, rotation, and target recreation. The target is SDR BGRA8;
+these checks do not claim native HDR swapchain presentation.

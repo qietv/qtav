@@ -30,8 +30,11 @@ Continuation checkpoint:
   software-frame renderer using borrowed native resources and the Windows
   WASAPI shared-mode device sink with event-driven playback and native
   clocking;
-- the Apple reference path, including HDR and color-space metadata plumbing,
-  and the Windows D3D11 software-frame and WASAPI audio paths are complete;
+- the Apple reference path, including full extended-linear BT.2020 Metal EDR
+  layer configuration, HDR10/HLG `CAEDRMetadata`, real-time display-headroom
+  adaptation, HDR FP16 pixel validation, and a conditional real-screen EDR
+  test, and the Windows D3D11 software-frame and WASAPI audio paths are
+  complete;
   the D3D11VA device/frame/interop design and supplied-device core bridge are
   complete; the native `qtav_hw_d3d11va` decoder backend and
   `qtav_interop_d3d11` Video Processor path are complete, including
@@ -108,6 +111,7 @@ Current implementation:
 - `modern/tests/coreaudio_audio_sink_test.cpp`
 - `modern/tests/wasapi_audio_sink_test.cpp`
 - `modern/tests/metal_video_renderer_test.mm`
+- `modern/tests/metal_edr_display_test.mm`
 - `modern/tests/d3d11_video_renderer_test.cpp`
 - `modern/tests/d3d11va_hardware_decoder_test.cpp`
 - `modern/tests/d3d11_frame_interop_test.cpp`
@@ -122,13 +126,17 @@ Current verification:
 
 - static and shared builds pass 32/32 CTest tests on Windows, including the
   WASAPI device test and strict native H.264/AAC playback;
-- ASan/UBSan passes the prior 24/24 macOS-applicable tests with leak detection
-  disabled;
+- static and shared macOS builds pass 27/27 CTest tests, including numeric
+  FP16 HDR/BT.2020/headroom checks and real-screen EDR presentation on the
+  active EDR-capable display;
+- ASan/UBSan passes 27/27 macOS-applicable tests with leak detection disabled;
+- the Metal renderer passes an iOS 16 arm64 Objective-C++ syntax build;
 - the all-backends-disabled build passes 11/11 tests, including the Windows
   platform device-access contract test;
 - forcing an unimplemented backend to `ON` fails with a clear diagnostic;
 - invalid backend option values are rejected;
-- installation and external `QtAV::RenderCPU`, `QtAV::RenderMetal`,
+- installation and external `QtAV::RenderCPU`, `QtAV::RenderMetal` including
+  the EDR API,
   `QtAV::AudioResample`, `QtAV::AudioFile`, plus
   `QtAV::AudioCoreAudio`, `QtAV::HWVideoToolbox`, and
   `QtAV::InteropCVMetal` CMake consumption pass;
@@ -161,12 +169,13 @@ Current verification:
   an Android 16/API 36 device with an Adreno 830;
 - the connected-device harness decodes its generated AVI through QtAVCore and
   reports `PASS` with 180 MPEG-4 video frames, 180 Vulkan-presented frames,
-  281 PCM audio frames, one background/foreground surface recreation without
+  282 PCM audio frames, one background/foreground surface recreation without
   media reopen, and platform-neutral offscreen pixel goldens covering
   three-frame ring reuse, viewport, rotation, target replacement, limited/full
-  range, and BT.601/BT.709 conversion; install authorization was confirmed
-  manually on the device after the harness correctly stopped on
-  `INSTALL_FAILED_USER_RESTRICTED`.
+  range, BT.601/BT.709 conversion, and P010/BT.2020 PQ/HLG HDR input with
+  mastering-display, MaxCLL, and default-luminance selection; install
+  authorization was confirmed manually on the device after the harness
+  stopped on `INSTALL_FAILED_USER_RESTRICTED`.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -430,7 +439,7 @@ Accepted design and Android foundation checkpoint:
   bypassing a modern Android/OHOS authorization prompt;
 - the first connected device is model `2410DPN6CC`, Android 16/API 36,
   `arm64-v8a`, Adreno 830, Vulkan 1.3.284, and OpenGL ES 3.2; generated
-  software playback now passes with 180 video and 281 audio frames plus one
+  software playback now passes with 180 video and 282 audio frames plus one
   background/foreground surface recreation.
 
 Completed Android Vulkan implementation checkpoint:
@@ -452,14 +461,19 @@ Completed Android Vulkan implementation checkpoint:
 - the NativeActivity harness now selects a presentation-capable queue, creates
   the borrowed Vulkan context, renders decoded YUV420P frames through the
   Android adapter, and passes on the recorded Adreno 830 device with 180/180
-  frames submitted and presented plus 281 decoded audio frames;
+  frames submitted and presented plus 282 decoded audio frames;
 - the deployment test backgrounds and resumes the same NativeActivity,
   invalidates and rebuilds the active window/swapchain generation, and
   continues playback without reopening media;
 - platform-neutral offscreen image readback checks exercise six queued
   submissions across the three-frame ring, Fit letterboxing, custom viewport,
   180-degree rotation, target-generation replacement, limited/full-range
-  YUV, and BT.601/BT.709 matrices;
+  YUV, BT.601/BT.709 matrices, and numeric P010/BT.2020 PQ/HLG
+  HDR-input-to-SDR goldens;
+- HDR checks verify mastering-display maximum luminance takes precedence over
+  MaxCLL, MaxCLL is used when mastering luminance is absent, and HDR input
+  without either uses the renderer's documented 1000-nit default; native HDR
+  swapchain output remains outside this SDR Vulkan checkpoint;
 - a standalone Android install exports `QtAV::RenderVulkan` and
   `QtAV::RenderVulkanAndroid` with their installed headers and Vulkan
   dependency metadata without embedding the local NDK or build-tree path.
@@ -564,11 +578,21 @@ Completed HDR and color-space checkpoint:
 - Metal selects BT.601, BT.709, or BT.2020 YUV conversion, handles full versus
   limited code values, and processes PQ/HLG transfer plus BT.2020/Display-P3
   source primaries;
-- `MetalRenderTarget` can request `ExtendedLinearSRGB` on `RGBA16Float`, with
-  configurable reference-white luminance and values above `1.0` retained for
-  application-configured EDR output;
-- deterministic tests cover structured HDR10 side-data lifetime, the extended
-  linear target contract, and full-range CVMetal import.
+- `MetalRenderTarget` can return an application-owned `CAMetalLayer` for
+  renderer configuration before `nextDrawable`: `RGBA16Float`,
+  extended-linear BT.2020, `wantsExtendedDynamicRangeContent`, and
+  frame-derived HDR10/HLG `CAEDRMetadata`;
+- extended-linear BT.2020 output preserves BT.2020 source primaries and linear
+  HDR brightness above `1.0`; the older extended-linear sRGB mode remains an
+  explicit narrower-gamut option;
+- system tone mapping and shader-based display-adaptive tone mapping are
+  explicit modes. The adaptive path samples live `NSScreen`/`UIScreen`
+  headroom for every frame and avoids double tone mapping;
+- deterministic FP16 readback verifies HDR pixels above `1.0`, BT.2020 gamut
+  preservation, and changing 2x/4x headroom; a macOS onscreen test presents
+  through a real EDR display and skips when live EDR headroom is unavailable;
+- structured HDR10 side-data lifetime and full-range CVMetal import remain
+  covered.
 
 Next active implementation order:
 
@@ -839,6 +863,10 @@ Status: complete and verified.
 - [x] NV12/P010/YUV/RGB upload and shader conversion.
 - [x] Resize, viewport, aspect ratio, rotation, and redraw.
 - [x] HDR metadata and color-space plumbing after the SDR path is stable.
+- [x] Complete `CAMetalLayer` EDR configuration and extended-linear BT.2020
+  output with HDR10/HLG `CAEDRMetadata`.
+- [x] Adapt to live macOS/iOS EDR headroom and validate HDR FP16 pixels plus a
+  conditional real-screen EDR presentation path.
 
 ### Audio and hardware decode
 

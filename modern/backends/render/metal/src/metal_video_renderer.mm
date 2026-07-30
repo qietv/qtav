@@ -2,6 +2,15 @@
 
 #import <qtav/metal_video_renderer.h>
 
+#import <CoreGraphics/CGColorSpace.h>
+#import <TargetConditionals.h>
+
+#if TARGET_OS_OSX
+#  import <AppKit/NSScreen.h>
+#else
+#  import <UIKit/UIScreen.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -73,8 +82,10 @@ struct ShaderParameters {
     std::uint32_t colorTransfer = 0;
     std::uint32_t colorPrimaries = 0;
     std::uint32_t outputColorSpace = 0;
+    std::uint32_t edrToneMapping = 0;
     float referenceWhiteNits = 100.0F;
     float maximumLuminanceNits = 100.0F;
+    float edrHeadroom = 1.0F;
 };
 
 struct PackedFrame {
@@ -109,8 +120,10 @@ struct Parameters {
     uint colorTransfer;
     uint colorPrimaries;
     uint outputColorSpace;
+    uint edrToneMapping;
     float referenceWhiteNits;
     float maximumLuminanceNits;
+    float edrHeadroom;
 };
 
 struct VertexOutput {
@@ -259,8 +272,24 @@ float3 linearToSrgb(float3 value)
     return select(low, high, value > 0.0031308);
 }
 
-float3 convertToBt709(float3 value, uint primaries)
+float3 convertPrimaries(float3 value, uint primaries, uint outputColorSpace)
 {
+    if (outputColorSpace == 2) {
+        if (primaries == 0) {
+            return float3(
+                0.627404 * value.r + 0.329283 * value.g + 0.043313 * value.b,
+                0.069097 * value.r + 0.919540 * value.g + 0.011362 * value.b,
+                0.016391 * value.r + 0.088013 * value.g + 0.895595 * value.b);
+        }
+        if (primaries == 2) {
+            return float3(
+                0.753833 * value.r + 0.198597 * value.g + 0.047570 * value.b,
+                0.045744 * value.r + 0.941777 * value.g + 0.012479 * value.b,
+                -0.001210 * value.r + 0.017602 * value.g + 0.983609 * value.b);
+        }
+        return value;
+    }
+
     if (primaries == 1) {
         return float3(
             1.660491 * value.r - 0.587641 * value.g - 0.072850 * value.b,
@@ -269,11 +298,48 @@ float3 convertToBt709(float3 value, uint primaries)
     }
     if (primaries == 2) {
         return float3(
-            1.224745 * value.r - 0.224904 * value.g - 0.000000 * value.b,
-            -0.042058 * value.r + 1.042081 * value.g - 0.000000 * value.b,
-            -0.019642 * value.r - 0.078655 * value.g + 1.098537 * value.b);
+            1.224940 * value.r - 0.224940 * value.g,
+            -0.042057 * value.r + 1.042057 * value.g,
+            -0.019638 * value.r - 0.078636 * value.g + 1.098274 * value.b);
     }
     return value;
+}
+
+float3 toneMapToHeadroom(
+    float3 relative,
+    constant Parameters& parameters)
+{
+    if (parameters.edrToneMapping == 0) {
+        return relative;
+    }
+
+    const float targetPeak = max(parameters.edrHeadroom, 1.0);
+    const float sourcePeak = max(
+        parameters.maximumLuminanceNits / parameters.referenceWhiteNits,
+        1.0);
+    const float pixelPeak = max(relative.r, max(relative.g, relative.b));
+    if (sourcePeak <= targetPeak) {
+        return min(relative, targetPeak);
+    }
+    if (targetPeak <= 1.000001) {
+        const float sourceScale = sourcePeak / (1.0 + sourcePeak);
+        const float mappedPeak = min(
+            (pixelPeak / (1.0 + pixelPeak)) / sourceScale,
+            1.0);
+        return pixelPeak > 0.0
+            ? relative * (mappedPeak / pixelPeak)
+            : relative;
+    }
+    if (pixelPeak <= 1.0) {
+        return relative;
+    }
+
+    const float normalized = clamp(
+        (pixelPeak - 1.0) / max(sourcePeak - 1.0, 0.000001),
+        0.0,
+        1.0);
+    const float mappedPeak = 1.0 + normalized * (targetPeak - 1.0);
+    return relative * (mappedPeak / pixelPeak);
 }
 
 float3 presentColor(float3 nonlinear, constant Parameters& parameters)
@@ -296,11 +362,14 @@ float3 presentColor(float3 nonlinear, constant Parameters& parameters)
         linearNits =
             sdrToLinear(max(nonlinear, 0.0)) * parameters.referenceWhiteNits;
     }
-    linearNits = max(
-        convertToBt709(linearNits, parameters.colorPrimaries),
-        0.0);
-    if (parameters.outputColorSpace == 1) {
-        return linearNits / parameters.referenceWhiteNits;
+    linearNits = max(convertPrimaries(
+        linearNits,
+        parameters.colorPrimaries,
+        parameters.outputColorSpace), 0.0);
+    if (parameters.outputColorSpace != 0) {
+        return toneMapToHeadroom(
+            linearNits / parameters.referenceWhiteNits,
+            parameters);
     }
 
     const float peak = max(
@@ -753,6 +822,24 @@ float maximumLuminance(const VideoFrame& frame) noexcept
     return frame.colorSpaceInfo().isHdr() ? 1000.0F : 100.0F;
 }
 
+float minimumLuminance(const VideoFrame& frame) noexcept
+{
+    const MasteringDisplayMetadata mastering =
+        frame.masteringDisplayMetadata();
+    return mastering.hasLuminance && mastering.minimumLuminance >= 0.0
+        ? static_cast<float>(mastering.minimumLuminance)
+        : 0.0F;
+}
+
+float targetEDRHeadroom(const MetalRenderTarget& target) noexcept
+{
+    if (std::isfinite(target.currentEDRHeadroom)
+        && target.currentEDRHeadroom > 0.0F) {
+        return std::max(target.currentEDRHeadroom, 1.0F);
+    }
+    return metalCurrentEDRHeadroom(target.display);
+}
+
 void fillPresentationParameters(
     const VideoFrame& frame,
     ShaderPixelFormat format,
@@ -789,12 +876,21 @@ void fillPresentationParameters(
         static_cast<std::uint32_t>(shaderColorTransfer(color.transfer));
     parameters.colorPrimaries =
         static_cast<std::uint32_t>(shaderColorPrimaries(color.primaries));
-    parameters.outputColorSpace =
-        target.outputColorSpace == MetalOutputColorSpace::ExtendedLinearSRGB
+    parameters.outputColorSpace = target.outputColorSpace
+            == MetalOutputColorSpace::ExtendedLinearSRGB
+        ? 1U
+        : target.outputColorSpace
+                == MetalOutputColorSpace::ExtendedLinearBT2020
+            ? 2U
+            : 0U;
+    parameters.edrToneMapping =
+        target.edrToneMapping == MetalEDRToneMapping::DisplayAdaptive
+        && target.outputColorSpace != MetalOutputColorSpace::SDR
         ? 1U
         : 0U;
     parameters.referenceWhiteNits = target.referenceWhiteNits;
     parameters.maximumLuminanceNits = maximumLuminance(frame);
+    parameters.edrHeadroom = targetEDRHeadroom(target);
 }
 
 bool packFrame(
@@ -917,6 +1013,192 @@ bool prepareTextureFrame(
     return true;
 }
 
+std::uint16_t metadataChromaticity(double value) noexcept
+{
+    return static_cast<std::uint16_t>(std::clamp(
+        std::llround(value * 50000.0),
+        0LL,
+        static_cast<long long>(std::numeric_limits<std::uint16_t>::max())));
+}
+
+std::uint32_t metadataLuminance(double value) noexcept
+{
+    return static_cast<std::uint32_t>(std::clamp(
+        std::llround(value * 10000.0),
+        0LL,
+        static_cast<long long>(std::numeric_limits<std::uint32_t>::max())));
+}
+
+void writeBigEndian16(
+    std::uint8_t* destination,
+    std::uint16_t value) noexcept
+{
+    destination[0] = static_cast<std::uint8_t>(value >> 8);
+    destination[1] = static_cast<std::uint8_t>(value);
+}
+
+void writeBigEndian32(
+    std::uint8_t* destination,
+    std::uint32_t value) noexcept
+{
+    destination[0] = static_cast<std::uint8_t>(value >> 24);
+    destination[1] = static_cast<std::uint8_t>(value >> 16);
+    destination[2] = static_cast<std::uint8_t>(value >> 8);
+    destination[3] = static_cast<std::uint8_t>(value);
+}
+
+CAEDRMetadata* hdr10Metadata(
+    const VideoFrame& frame,
+    float referenceWhiteNits)
+{
+    const MasteringDisplayMetadata mastering =
+        frame.masteringDisplayMetadata();
+    const ContentLightMetadata content = frame.contentLightMetadata();
+    if (mastering.hasPrimaries && mastering.hasLuminance) {
+        std::array<std::uint8_t, 24> displayBytes {};
+        std::size_t offset = 0;
+        constexpr std::array<std::size_t, 3> SeiPrimaryOrder { 1, 2, 0 };
+        for (const std::size_t index : SeiPrimaryOrder) {
+            const Chromaticity& primary = mastering.primaries[index];
+            writeBigEndian16(
+                displayBytes.data() + offset,
+                metadataChromaticity(primary.x));
+            writeBigEndian16(
+                displayBytes.data() + offset + 2,
+                metadataChromaticity(primary.y));
+            offset += 4;
+        }
+        writeBigEndian16(
+            displayBytes.data() + offset,
+            metadataChromaticity(mastering.whitePoint.x));
+        writeBigEndian16(
+            displayBytes.data() + offset + 2,
+            metadataChromaticity(mastering.whitePoint.y));
+        offset += 4;
+        writeBigEndian32(
+            displayBytes.data() + offset,
+            metadataLuminance(mastering.maximumLuminance));
+        writeBigEndian32(
+            displayBytes.data() + offset + 4,
+            metadataLuminance(mastering.minimumLuminance));
+
+        NSData* displayData = [NSData dataWithBytes:displayBytes.data()
+                                            length:displayBytes.size()];
+        NSData* contentData = nil;
+        std::array<std::uint8_t, 4> contentBytes {};
+        if (content.isValid()) {
+            writeBigEndian16(
+                contentBytes.data(),
+                static_cast<std::uint16_t>(std::min(
+                    content.maximumContentLightLevel,
+                    static_cast<std::uint32_t>(
+                        std::numeric_limits<std::uint16_t>::max()))));
+            writeBigEndian16(
+                contentBytes.data() + 2,
+                static_cast<std::uint16_t>(std::min(
+                    content.maximumFrameAverageLightLevel,
+                    static_cast<std::uint32_t>(
+                        std::numeric_limits<std::uint16_t>::max()))));
+            contentData = [NSData dataWithBytes:contentBytes.data()
+                                        length:contentBytes.size()];
+        }
+        return [CAEDRMetadata
+            HDR10MetadataWithDisplayInfo:displayData
+                             contentInfo:contentData
+                      opticalOutputScale:referenceWhiteNits];
+    }
+    return [CAEDRMetadata
+        HDR10MetadataWithMinLuminance:minimumLuminance(frame)
+                         maxLuminance:maximumLuminance(frame)
+                   opticalOutputScale:referenceWhiteNits];
+}
+
+CGColorSpaceRef outputColorSpace(MetalOutputColorSpace output)
+{
+    const CFStringRef name =
+        output == MetalOutputColorSpace::ExtendedLinearBT2020
+        ? kCGColorSpaceExtendedLinearITUR_2020
+        : output == MetalOutputColorSpace::ExtendedLinearSRGB
+            ? kCGColorSpaceExtendedLinearSRGB
+            : kCGColorSpaceSRGB;
+    return CGColorSpaceCreateWithName(name);
+}
+
+bool configureLayer(
+    CAMetalLayer* layer,
+    id<MTLDevice> device,
+    const VideoFrame& frame,
+    const VideoRenderConfig& config,
+    const MetalRenderTarget& target,
+    std::string& error)
+{
+    if (!layer || !device) {
+        error = "The Metal layer or device is unavailable";
+        return false;
+    }
+    if (layer.device && layer.device != device) {
+        error = "The current Metal layer belongs to another device";
+        return false;
+    }
+
+    const bool edr =
+        target.outputColorSpace != MetalOutputColorSpace::SDR;
+    @try {
+        layer.device = device;
+        layer.drawableSize = CGSizeMake(
+            static_cast<CGFloat>(config.surfaceSize.width),
+            static_cast<CGFloat>(config.surfaceSize.height));
+        layer.framebufferOnly = YES;
+        layer.pixelFormat =
+            edr ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+
+        CGColorSpaceRef colorSpace =
+            outputColorSpace(target.outputColorSpace);
+        if (!colorSpace) {
+            error = "The requested Metal layer color space is unavailable";
+            return false;
+        }
+        layer.colorspace = colorSpace;
+        CGColorSpaceRelease(colorSpace);
+
+#if TARGET_OS_OSX || TARGET_OS_IOS || TARGET_OS_MACCATALYST
+#  if TARGET_OS_OSX
+        if (@available(macOS 10.15, *)) {
+#  else
+        if (@available(iOS 16.0, *)) {
+#  endif
+            layer.wantsExtendedDynamicRangeContent = edr;
+            layer.EDRMetadata = nil;
+            if (edr
+                && target.edrToneMapping == MetalEDRToneMapping::System) {
+                const VideoColorSpace color = frame.colorSpaceInfo();
+                if (color.transfer == ColorTransfer::PQ) {
+                    layer.EDRMetadata =
+                        hdr10Metadata(frame, target.referenceWhiteNits);
+                } else if (color.transfer == ColorTransfer::HLG) {
+                    layer.EDRMetadata = CAEDRMetadata.HLGMetadata;
+                }
+            }
+        } else if (edr) {
+            error =
+                "Apple EDR Metal layers require macOS 10.15 or iOS 16";
+            return false;
+        }
+#else
+        if (edr) {
+            error = "Apple EDR Metal layers require macOS or iOS";
+            return false;
+        }
+#endif
+    } @catch (NSException* exception) {
+        NSString* reason = exception.reason;
+        error = "Metal layer EDR configuration failed: "
+            + std::string(reason ? reason.UTF8String : "unknown exception");
+        return false;
+    }
+    return true;
+}
+
 bool supportedTargetFormat(MTLPixelFormat format) noexcept
 {
     return format == MTLPixelFormatRGBA8Unorm
@@ -932,7 +1214,9 @@ bool supportedOutput(
 {
     return std::isfinite(target.referenceWhiteNits)
         && target.referenceWhiteNits > 0.0F
-        && (target.outputColorSpace != MetalOutputColorSpace::ExtendedLinearSRGB
+        && std::isfinite(target.currentEDRHeadroom)
+        && target.currentEDRHeadroom >= 0.0F
+        && (target.outputColorSpace == MetalOutputColorSpace::SDR
             || format == MTLPixelFormatRGBA16Float);
 }
 
@@ -942,6 +1226,75 @@ std::string nsString(NSString* value)
 }
 
 } // namespace
+
+float metalCurrentEDRHeadroom(MetalEDRDisplay display) noexcept
+{
+    @autoreleasepool {
+#if TARGET_OS_OSX
+        if (![display isKindOfClass:NSScreen.class]) {
+            return 1.0F;
+        }
+        const CGFloat value =
+            static_cast<NSScreen*>(display)
+                .maximumExtendedDynamicRangeColorComponentValue;
+        return std::isfinite(static_cast<double>(value)) && value > 1.0
+            ? static_cast<float>(value)
+            : 1.0F;
+#elif TARGET_OS_IOS || TARGET_OS_MACCATALYST
+        if (@available(iOS 16.0, *)) {
+            if (![display isKindOfClass:UIScreen.class]) {
+                return 1.0F;
+            }
+            const CGFloat value =
+                static_cast<UIScreen*>(display).currentEDRHeadroom;
+            return std::isfinite(static_cast<double>(value))
+                    && value > 1.0
+                ? static_cast<float>(value)
+                : 1.0F;
+        }
+        return 1.0F;
+#else
+        (void)display;
+        return 1.0F;
+#endif
+    }
+}
+
+float metalPotentialEDRHeadroom(MetalEDRDisplay display) noexcept
+{
+    @autoreleasepool {
+#if TARGET_OS_OSX
+        if (@available(macOS 10.15, *)) {
+            if (![display isKindOfClass:NSScreen.class]) {
+                return 1.0F;
+            }
+            const CGFloat value =
+                static_cast<NSScreen*>(display)
+                    .maximumPotentialExtendedDynamicRangeColorComponentValue;
+            return std::isfinite(static_cast<double>(value)) && value > 1.0
+                ? static_cast<float>(value)
+                : 1.0F;
+        }
+        return 1.0F;
+#elif TARGET_OS_IOS || TARGET_OS_MACCATALYST
+        if (@available(iOS 16.0, *)) {
+            if (![display isKindOfClass:UIScreen.class]) {
+                return 1.0F;
+            }
+            const CGFloat value =
+                static_cast<UIScreen*>(display).potentialEDRHeadroom;
+            return std::isfinite(static_cast<double>(value))
+                    && value > 1.0
+                ? static_cast<float>(value)
+                : 1.0F;
+        }
+        return 1.0F;
+#else
+        (void)display;
+        return 1.0F;
+#endif
+    }
+}
 
 BorrowedMetalDevice::BorrowedMetalDevice(id<MTLDevice> value) noexcept
     : value_(value)
@@ -976,9 +1329,13 @@ BorrowedMetalCommandQueue::operator bool() const noexcept
 
 bool MetalRenderTarget::isValid() const noexcept
 {
-    return (texture != nil || drawable != nil)
+    const int sourceCount = (texture ? 1 : 0) + (drawable ? 1 : 0)
+        + (layer ? 1 : 0);
+    return sourceCount == 1
         && std::isfinite(referenceWhiteNits)
-        && referenceWhiteNits > 0.0F;
+        && referenceWhiteNits > 0.0F
+        && std::isfinite(currentEDRHeadroom)
+        && currentEDRHeadroom >= 0.0F;
 }
 
 MetalTextureFrame::~MetalTextureFrame() = default;
@@ -1238,8 +1595,38 @@ bool MetalVideoRenderer::render(const VideoFrame& frame)
         const MetalRenderTarget target = currentTarget
             ? currentTarget()
             : MetalRenderTarget {};
+        if (!target.texture && !target.drawable && !target.layer) {
+            impl_->notify(
+                VideoRenderEventType::SurfaceLost,
+                "The current Metal target is unavailable");
+            return false;
+        }
+        if (!target.isValid()) {
+            impl_->notify(
+                VideoRenderEventType::Error,
+                "The current Metal target configuration is invalid");
+            return false;
+        }
+
+        std::string error;
+        id<CAMetalDrawable> drawable = target.drawable;
+        if (target.layer) {
+            if (!configureLayer(
+                    target.layer,
+                    impl_->device_.get(),
+                    frame,
+                    config,
+                    target,
+                    error)) {
+                impl_->notify(
+                    VideoRenderEventType::Error,
+                    std::move(error));
+                return false;
+            }
+            drawable = [target.layer nextDrawable];
+        }
         id<MTLTexture> texture =
-            target.texture ? target.texture : target.drawable.texture;
+            target.texture ? target.texture : drawable.texture;
         if (!texture) {
             impl_->notify(
                 VideoRenderEventType::SurfaceLost,
@@ -1257,7 +1644,6 @@ bool MetalVideoRenderer::render(const VideoFrame& frame)
             return false;
         }
 
-        std::string error;
         PackedFrame packed;
         ShaderParameters textureParameters;
         std::shared_ptr<MetalTextureFrame> textureFrame;
@@ -1359,8 +1745,8 @@ bool MetalVideoRenderer::render(const VideoFrame& frame)
                     vertexCount:4];
         [encoder endEncoding];
 
-        if (target.drawable) {
-            [commandBuffer presentDrawable:target.drawable];
+        if (drawable) {
+            [commandBuffer presentDrawable:drawable];
         }
         if (textureFrame) {
             const auto retainedTextureFrame = textureFrame;

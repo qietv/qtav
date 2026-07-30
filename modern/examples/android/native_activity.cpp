@@ -333,7 +333,8 @@ struct TestState {
             + " audio_frames=" + std::to_string(audioFrames.load())
             + " surface_recreations="
             + std::to_string(surfaceRecreations.load())
-            + " offscreen=" + (offscreenPassed.load() ? "pass" : "fail"));
+            + " offscreen=" + (offscreenPassed.load() ? "pass" : "fail")
+            + " hdr=pq,hlg");
     }
 
     void start()
@@ -388,7 +389,9 @@ struct TestState {
                         return;
                     }
                     offscreenPassed = true;
-                    logInfo("QTAV_ANDROID_TEST: OFFSCREEN_PASS");
+                    player.setState(qtav::State::Paused);
+                    logInfo(
+                        "QTAV_ANDROID_TEST: OFFSCREEN_PASS hdr=pq,hlg");
                 }
                 ++videoFrames;
             })

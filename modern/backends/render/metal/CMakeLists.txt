@@ -7,9 +7,17 @@ enable_language(OBJCXX)
 find_library(QTAV_METAL_FRAMEWORK Metal)
 find_library(QTAV_QUARTZCORE_FRAMEWORK QuartzCore)
 find_library(QTAV_FOUNDATION_FRAMEWORK Foundation)
+find_library(QTAV_COREGRAPHICS_FRAMEWORK CoreGraphics)
+if(CMAKE_SYSTEM_NAME MATCHES "iOS|tvOS|watchOS|visionOS")
+    find_library(QTAV_METAL_UI_FRAMEWORK UIKit)
+else()
+    find_library(QTAV_METAL_UI_FRAMEWORK AppKit)
+endif()
 if(NOT QTAV_METAL_FRAMEWORK
    OR NOT QTAV_QUARTZCORE_FRAMEWORK
-   OR NOT QTAV_FOUNDATION_FRAMEWORK)
+   OR NOT QTAV_FOUNDATION_FRAMEWORK
+   OR NOT QTAV_COREGRAPHICS_FRAMEWORK
+   OR NOT QTAV_METAL_UI_FRAMEWORK)
     return()
 endif()
 
@@ -32,8 +40,10 @@ target_include_directories(qtav_render_metal
 target_link_libraries(qtav_render_metal
     PUBLIC
         QtAV::Core
+        "${QTAV_COREGRAPHICS_FRAMEWORK}"
         "${QTAV_FOUNDATION_FRAMEWORK}"
         "${QTAV_METAL_FRAMEWORK}"
+        "${QTAV_METAL_UI_FRAMEWORK}"
         "${QTAV_QUARTZCORE_FRAMEWORK}"
 )
 

@@ -102,10 +102,15 @@ remain alive until asynchronous Metal execution completes.
 transfer, matrix, and chroma location. HDR10 mastering-display and content
 light side data are copied into toolkit-independent value types. Metal uses
 that metadata for limited/full-range YUV conversion, BT.601/BT.709/BT.2020
-matrix selection, PQ/HLG handling, and source-primary conversion. An
-`RGBA16Float` target may request `ExtendedLinearSRGB` output so EDR highlights
-remain above reference white; configuring the application-owned Metal layer
-and display remains the caller's responsibility.
+matrix selection, PQ/HLG handling, and source-primary conversion. The complete
+Apple EDR path accepts an application-owned `CAMetalLayer` and active
+`NSScreen`/`UIScreen`, configures `RGBA16Float`, extended-linear BT.2020,
+`wantsExtendedDynamicRangeContent`, and HDR10/HLG `CAEDRMetadata` before
+acquiring each drawable, and preserves BT.2020 primaries plus linear HDR
+values above reference white. System tone mapping and renderer-controlled
+live-headroom adaptation are explicit modes. The older
+`ExtendedLinearSRGB` output remains available, but deliberately converts into
+the narrower BT.709/sRGB gamut and is not the full HDR10/BT.2020 path.
 `AudioSink` can use an injected `AudioFrameConverter` when decoded and device
 PCM formats differ. Applications link `QtAV::AudioResample` and pass a
 `SwresampleAudioConverter` through `Player::setAudioFrameConverter()`.
@@ -216,8 +221,10 @@ external-OES texture. OHOS Vulkan remains conditional on adding a retained
 branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
 zero-CPU-copy source as-is.
 The Vulkan engine now has offscreen goldens, a bounded three-frame resource
-ring, and Android background/foreground surface recreation coverage. The
-OpenGL ES backend and selector, AAudio output, MediaCodec direct-surface
+ring, Android background/foreground surface recreation coverage, and numeric
+P010/BT.2020 PQ/HLG HDR-input-to-SDR checks for mastering-display, MaxCLL, and
+default luminance. This does not claim native HDR Vulkan surface presentation.
+The OpenGL ES backend and selector, AAudio output, MediaCodec direct-surface
 presentation, Vulkan/OpenGL ES texture interop, and Vulkan validation on OHOS
 and Linux remain separate backend work under the responsibility and lifecycle
 boundaries in
