@@ -222,12 +222,20 @@ branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
 zero-CPU-copy source as-is.
 The Vulkan engine now has offscreen goldens, a bounded three-frame resource
 ring, Android background/foreground surface recreation coverage, and numeric
-P010/BT.2020 PQ/HLG HDR-input-to-SDR checks for mastering-display, MaxCLL, and
-default luminance. This does not claim native HDR Vulkan surface presentation.
-The OpenGL ES backend and selector, AAudio output, MediaCodec direct-surface
-presentation, Vulkan/OpenGL ES texture interop, and Vulkan validation on OHOS
-and Linux remain separate backend work under the responsibility and lifecycle
-boundaries in
+P010/BT.2020 PQ/HLG checks for mastering-display, MaxCLL, default luminance,
+SDR tone mapping, native 10-bit HDR10/PQ plus HDR10/HLG encoding, HLG-to-PQ
+conversion, and FP16 extended-linear output above reference white. The Android
+adapter now exposes output preference and selected-surface queries, enables
+HDR format/color-space selection when the application created its instance
+with `VK_EXT_swapchain_colorspace`, and submits static metadata when the
+borrowed device was created with `VK_EXT_hdr_metadata`. The recorded
+Adreno 830 device passes a required HDR10/PQ swapchain run across
+background/foreground surface recreation, while Android reports the presented
+layer as HDR and a synthetic metadata-bearing P010/BT.2020/PQ frame exercises
+the complete source-to-present path. The OpenGL ES backend and selector,
+AAudio output, MediaCodec direct-surface presentation, Vulkan/OpenGL ES texture
+interop, and Vulkan validation on OHOS and Linux remain separate backend work
+under the responsibility and lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and

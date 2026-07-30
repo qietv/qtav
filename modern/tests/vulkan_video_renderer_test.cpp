@@ -4,6 +4,7 @@
 
 #include <qtav/player.h>
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -14,6 +15,51 @@
 #include <vector>
 
 namespace {
+
+bool validateSurfaceFormatSelection(std::string& error)
+{
+    const std::array<VkSurfaceFormatKHR, 4> formats {
+        VkSurfaceFormatKHR {
+            VK_FORMAT_B8G8R8A8_UNORM,
+            VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+        VkSurfaceFormatKHR {
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
+        },
+        VkSurfaceFormatKHR {
+            VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            VK_COLOR_SPACE_HDR10_HLG_EXT,
+        },
+        VkSurfaceFormatKHR {
+            VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+            VK_COLOR_SPACE_HDR10_ST2084_EXT,
+        },
+    };
+    const VkSurfaceFormatKHR preferred = qtav::selectVulkanSurfaceFormat(
+        formats.data(),
+        formats.size(),
+        qtav::VulkanOutputPreference::PreferHdr);
+    const VkSurfaceFormatKHR sdr = qtav::selectVulkanSurfaceFormat(
+        formats.data(),
+        formats.size(),
+        qtav::VulkanOutputPreference::SdrOnly);
+    const VkSurfaceFormatKHR unavailable = qtav::selectVulkanSurfaceFormat(
+        formats.data(),
+        1,
+        qtav::VulkanOutputPreference::RequireHdr);
+    if (preferred.format != VK_FORMAT_A2R10G10B10_UNORM_PACK32
+        || preferred.colorSpace != VK_COLOR_SPACE_HDR10_ST2084_EXT
+        || !qtav::vulkanColorSpaceIsHdr(preferred.colorSpace)
+        || sdr.format != VK_FORMAT_B8G8R8A8_UNORM
+        || sdr.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+        || qtav::vulkanColorSpaceIsHdr(sdr.colorSpace)
+        || unavailable.format != VK_FORMAT_UNDEFINED) {
+        error = "Vulkan HDR/SDR surface-format selection contract failed";
+        return false;
+    }
+    return true;
+}
 
 struct VulkanContext {
     ~VulkanContext()
@@ -142,6 +188,10 @@ int main(int argc, char** argv)
 
     VulkanContext context;
     std::string error;
+    if (!validateSurfaceFormatSelection(error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
     if (!context.create(error)) {
         std::cerr << error << '\n';
         return 77;

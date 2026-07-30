@@ -66,6 +66,10 @@ while [ "${attempt}" -lt 10 ]; do
         > "${result_directory}/logcat.txt"
     if rg -q "QTAV_ANDROID_TEST: START" "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: OFFSCREEN_PASS" \
+           "${result_directory}/logcat.txt" \
+       && rg -q "QTAV_ANDROID_TEST: HDR_SWAPCHAIN" \
+           "${result_directory}/logcat.txt" \
+       && rg -q "QTAV_ANDROID_TEST: NATIVE_HDR_FRAME" \
            "${result_directory}/logcat.txt"; then
         break
     fi
@@ -84,6 +88,27 @@ if [ "${attempt}" -ge 10 ]; then
     exit 1
 fi
 
+attempt=0
+while [ "${attempt}" -lt 5 ]; do
+    "${adb}" shell dumpsys display \
+        > "${result_directory}/display-hdr.txt"
+    if rg -q "mIsHdrLayerPresent=true" \
+        "${result_directory}/display-hdr.txt"; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+if [ "${attempt}" -ge 5 ]; then
+    "${adb}" shell am force-stop "${package_name}"
+    echo "Android compositor did not report an active HDR layer" >&2
+    exit 1
+fi
+echo "QTAV_ANDROID_TEST: COMPOSITOR_HDR_PASS"
+
+cp \
+    "${result_directory}/logcat.txt" \
+    "${result_directory}/startup-logcat.txt"
 "${adb}" logcat -c
 "${adb}" shell input keyevent KEYCODE_HOME
 attempt=0
@@ -112,7 +137,8 @@ attempt=0
 while [ "${attempt}" -lt 30 ]; do
     "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
         > "${result_directory}/logcat.txt"
-    if rg -q "QTAV_ANDROID_TEST: PASS" "${result_directory}/logcat.txt"; then
+    if rg -q "QTAV_ANDROID_TEST: PASS.*native_hdr=pass.*hdr_source=pass" \
+        "${result_directory}/logcat.txt"; then
         cat "${result_directory}/logcat.txt"
         "${adb}" shell am force-stop "${package_name}"
         exit 0

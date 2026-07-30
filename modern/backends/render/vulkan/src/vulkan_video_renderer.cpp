@@ -54,6 +54,15 @@ enum class ShaderColorPrimaries : std::uint32_t {
     DisplayP3,
 };
 
+enum class ShaderOutputColorSpace : std::uint32_t {
+    SdrSrgbEncoded,
+    SdrSrgbAttachment,
+    ExtendedSrgbLinear,
+    BT2020Linear,
+    HDR10PQ,
+    HDR10HLG,
+};
+
 struct alignas(16) ShaderParameters {
     std::array<std::uint32_t, 4> source {};
     std::array<std::uint32_t, 4> strides {};
@@ -104,12 +113,67 @@ VideoViewport effectiveViewport(const VideoRenderConfig& config) noexcept
           };
 }
 
-bool supportedTargetFormat(VkFormat format) noexcept
+bool isEightBitTargetFormat(VkFormat format) noexcept
 {
     return format == VK_FORMAT_B8G8R8A8_UNORM
         || format == VK_FORMAT_B8G8R8A8_SRGB
         || format == VK_FORMAT_R8G8B8A8_UNORM
         || format == VK_FORMAT_R8G8B8A8_SRGB;
+}
+
+bool isSrgbTargetFormat(VkFormat format) noexcept
+{
+    return format == VK_FORMAT_B8G8R8A8_SRGB
+        || format == VK_FORMAT_R8G8B8A8_SRGB;
+}
+
+bool isTenBitTargetFormat(VkFormat format) noexcept
+{
+    return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+        || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+}
+
+bool isFloatTargetFormat(VkFormat format) noexcept
+{
+    return format == VK_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+bool supportedTargetFormat(
+    VkFormat format,
+    VkColorSpaceKHR colorSpace) noexcept
+{
+    switch (colorSpace) {
+    case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+    case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
+        return isEightBitTargetFormat(format);
+    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+    case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+        return isFloatTargetFormat(format);
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+    case VK_COLOR_SPACE_HDR10_HLG_EXT:
+        return isTenBitTargetFormat(format);
+    default:
+        return false;
+    }
+}
+
+ShaderOutputColorSpace shaderOutputColorSpace(
+    const VulkanRenderTarget& target) noexcept
+{
+    switch (target.colorSpace) {
+    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+        return ShaderOutputColorSpace::ExtendedSrgbLinear;
+    case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+        return ShaderOutputColorSpace::BT2020Linear;
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+        return ShaderOutputColorSpace::HDR10PQ;
+    case VK_COLOR_SPACE_HDR10_HLG_EXT:
+        return ShaderOutputColorSpace::HDR10HLG;
+    default:
+        return isSrgbTargetFormat(target.format)
+            ? ShaderOutputColorSpace::SdrSrgbAttachment
+            : ShaderOutputColorSpace::SdrSrgbEncoded;
+    }
 }
 
 bool checkedUint(std::size_t value, std::uint32_t& result) noexcept
@@ -291,6 +355,7 @@ float maximumLuminance(const VideoFrame& frame) noexcept
 bool packFrame(
     const VideoFrame& frame,
     const VideoRenderConfig& config,
+    const VulkanRenderTarget& target,
     PackedFrame& result,
     std::string& error)
 {
@@ -320,7 +385,7 @@ bool packFrame(
         static_cast<std::uint32_t>(frame.width()),
         static_cast<std::uint32_t>(frame.height()),
         static_cast<std::uint32_t>(format),
-        0U,
+        static_cast<std::uint32_t>(shaderOutputColorSpace(target)),
     };
     const VideoViewport viewport = effectiveViewport(config);
     const VideoColorSpace color = frame.colorSpaceInfo();
@@ -415,9 +480,114 @@ bool VulkanRenderTarget::isValid() const noexcept
 {
     return image != VK_NULL_HANDLE
         && imageView != VK_NULL_HANDLE
-        && supportedTargetFormat(format)
+        && supportedTargetFormat(format, colorSpace)
         && extent.width > 0
         && extent.height > 0;
+}
+
+bool VulkanRenderTarget::isHdr() const noexcept
+{
+    return isValid() && vulkanColorSpaceIsHdr(colorSpace);
+}
+
+bool vulkanColorSpaceIsHdr(VkColorSpaceKHR colorSpace) noexcept
+{
+    return colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+        || colorSpace == VK_COLOR_SPACE_BT2020_LINEAR_EXT
+        || colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT
+        || colorSpace == VK_COLOR_SPACE_HDR10_HLG_EXT;
+}
+
+VkSurfaceFormatKHR selectVulkanSurfaceFormat(
+    const VkSurfaceFormatKHR* formats,
+    std::size_t count,
+    VulkanOutputPreference preference) noexcept
+{
+    if (!formats || count == 0) {
+        return { VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+    }
+    const auto find = [&](VkFormat format, VkColorSpaceKHR colorSpace) {
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((formats[index].format == format
+                    || formats[index].format == VK_FORMAT_UNDEFINED)
+                && formats[index].colorSpace == colorSpace
+                && supportedTargetFormat(format, colorSpace)) {
+                return VkSurfaceFormatKHR { format, colorSpace };
+            }
+        }
+        return VkSurfaceFormatKHR {
+            VK_FORMAT_UNDEFINED,
+            VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        };
+    };
+    const auto firstSupported =
+        [&](bool hdr) {
+            for (std::size_t index = 0; index < count; ++index) {
+                if (supportedTargetFormat(
+                        formats[index].format,
+                        formats[index].colorSpace)
+                    && vulkanColorSpaceIsHdr(formats[index].colorSpace)
+                        == hdr) {
+                    return formats[index];
+                }
+            }
+            return VkSurfaceFormatKHR {
+                VK_FORMAT_UNDEFINED,
+                VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+            };
+        };
+
+    if (preference != VulkanOutputPreference::SdrOnly) {
+        constexpr std::array<VkFormat, 2> TenBitFormats {
+            VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+        };
+        constexpr std::array<VkColorSpaceKHR, 2> Hdr10ColorSpaces {
+            VK_COLOR_SPACE_HDR10_ST2084_EXT,
+            VK_COLOR_SPACE_HDR10_HLG_EXT,
+        };
+        for (const VkColorSpaceKHR colorSpace : Hdr10ColorSpaces) {
+            for (const VkFormat format : TenBitFormats) {
+                const VkSurfaceFormatKHR selected = find(format, colorSpace);
+                if (selected.format != VK_FORMAT_UNDEFINED) {
+                    return selected;
+                }
+            }
+        }
+        constexpr std::array<VkColorSpaceKHR, 2> LinearHdrColorSpaces {
+            VK_COLOR_SPACE_BT2020_LINEAR_EXT,
+            VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
+        };
+        for (const VkColorSpaceKHR colorSpace : LinearHdrColorSpaces) {
+            const VkSurfaceFormatKHR selected = find(
+                VK_FORMAT_R16G16B16A16_SFLOAT,
+                colorSpace);
+            if (selected.format != VK_FORMAT_UNDEFINED) {
+                return selected;
+            }
+        }
+        const VkSurfaceFormatKHR selected = firstSupported(true);
+        if (selected.format != VK_FORMAT_UNDEFINED
+            || preference == VulkanOutputPreference::RequireHdr) {
+            return selected;
+        }
+    }
+
+    constexpr std::array<VkFormat, 4> SdrFormats {
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_B8G8R8A8_SRGB,
+        VK_FORMAT_R8G8B8A8_SRGB,
+    };
+    for (const VkFormat format : SdrFormats) {
+        const VkSurfaceFormatKHR selected = find(
+            format,
+            VK_COLOR_SPACE_SRGB_NONLINEAR_KHR);
+        if (selected.format != VK_FORMAT_UNDEFINED) {
+            return selected;
+        }
+    }
+    return firstSupported(false);
 }
 
 class VulkanVideoRenderer::Impl {
@@ -1374,7 +1544,7 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
     }
 
     PackedFrame packed;
-    if (!packFrame(frame, config, packed, error)
+    if (!packFrame(frame, config, target, packed, error)
         || !impl_->createPipeline(
             target.format,
             target.finalLayout,

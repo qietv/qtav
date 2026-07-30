@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -29,6 +30,18 @@ namespace {
 
 constexpr const char* LogTag = "QtAVCoreTest";
 constexpr const char* AssetName = "qtav-test.avi";
+
+bool hasExtension(
+    const std::vector<VkExtensionProperties>& extensions,
+    const char* name) noexcept
+{
+    return std::any_of(
+        extensions.begin(),
+        extensions.end(),
+        [name](const VkExtensionProperties& extension) {
+            return std::strcmp(extension.extensionName, name) == 0;
+        });
+}
 
 void logInfo(const std::string& message)
 {
@@ -128,10 +141,34 @@ struct VulkanContext {
 
     bool create(ANativeWindow* window, std::string& error)
     {
-        const std::array<const char*, 2> instanceExtensions {
+        std::uint32_t instanceExtensionCount = 0;
+        VkResult result = vkEnumerateInstanceExtensionProperties(
+            nullptr,
+            &instanceExtensionCount,
+            nullptr);
+        std::vector<VkExtensionProperties> availableInstanceExtensions(
+            instanceExtensionCount);
+        if (result == VK_SUCCESS && instanceExtensionCount > 0) {
+            result = vkEnumerateInstanceExtensionProperties(
+                nullptr,
+                &instanceExtensionCount,
+                availableInstanceExtensions.data());
+        }
+        if (result != VK_SUCCESS) {
+            error = "Could not enumerate Vulkan instance extensions";
+            return false;
+        }
+        std::vector<const char*> instanceExtensions {
             VK_KHR_SURFACE_EXTENSION_NAME,
             VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
         };
+        if (hasExtension(
+                availableInstanceExtensions,
+                VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+            instanceExtensions.push_back(
+                VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+            swapchainColorSpaceEnabled = true;
+        }
         VkApplicationInfo application {
             VK_STRUCTURE_TYPE_APPLICATION_INFO,
         };
@@ -147,8 +184,7 @@ struct VulkanContext {
         instanceInfo.enabledExtensionCount =
             static_cast<std::uint32_t>(instanceExtensions.size());
         instanceInfo.ppEnabledExtensionNames = instanceExtensions.data();
-        VkResult result =
-            vkCreateInstance(&instanceInfo, nullptr, &instance);
+        result = vkCreateInstance(&instanceInfo, nullptr, &instance);
         if (result != VK_SUCCESS) {
             error = "vkCreateInstance failed: "
                 + std::to_string(static_cast<int>(result));
@@ -240,9 +276,38 @@ struct VulkanContext {
         queueInfo.queueFamilyIndex = queueFamilyIndex;
         queueInfo.queueCount = 1;
         queueInfo.pQueuePriorities = &priority;
-        const std::array<const char*, 1> deviceExtensions {
+        std::uint32_t deviceExtensionCount = 0;
+        result = vkEnumerateDeviceExtensionProperties(
+            physicalDevice,
+            nullptr,
+            &deviceExtensionCount,
+            nullptr);
+        std::vector<VkExtensionProperties> availableDeviceExtensions(
+            deviceExtensionCount);
+        if (result == VK_SUCCESS && deviceExtensionCount > 0) {
+            result = vkEnumerateDeviceExtensionProperties(
+                physicalDevice,
+                nullptr,
+                &deviceExtensionCount,
+                availableDeviceExtensions.data());
+        }
+        if (result != VK_SUCCESS
+            || !hasExtension(
+                availableDeviceExtensions,
+                VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+            error =
+                "The Android Vulkan device does not support VK_KHR_swapchain";
+            return false;
+        }
+        std::vector<const char*> deviceExtensions {
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         };
+        if (hasExtension(
+                availableDeviceExtensions,
+                VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
+            deviceExtensions.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+            hdrMetadataEnabled = true;
+        }
         VkDeviceCreateInfo deviceInfo {
             VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         };
@@ -273,7 +338,11 @@ struct VulkanContext {
             + '.'
             + std::to_string(VK_VERSION_MINOR(properties.apiVersion))
             + '.'
-            + std::to_string(VK_VERSION_PATCH(properties.apiVersion)));
+            + std::to_string(VK_VERSION_PATCH(properties.apiVersion))
+            + " swapchain_colorspace="
+            + (swapchainColorSpaceEnabled ? "enabled" : "unavailable")
+            + " hdr_metadata="
+            + (hdrMetadataEnabled ? "enabled" : "unavailable"));
         return queue != VK_NULL_HANDLE;
     }
 
@@ -287,6 +356,7 @@ struct VulkanContext {
                 queue,
                 queueFamilyIndex,
             },
+            hdrMetadataEnabled,
         };
     }
 
@@ -295,6 +365,8 @@ struct VulkanContext {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queueFamilyIndex = 0;
+    bool swapchainColorSpaceEnabled = false;
+    bool hdrMetadataEnabled = false;
 };
 
 struct TestState {
@@ -334,7 +406,14 @@ struct TestState {
             + " surface_recreations="
             + std::to_string(surfaceRecreations.load())
             + " offscreen=" + (offscreenPassed.load() ? "pass" : "fail")
-            + " hdr=pq,hlg");
+            + " hdr=pq,hlg native_hdr="
+            + (renderer && renderer->hdrOutputActive() ? "pass" : "fail")
+            + " hdr_source="
+            + (nativeHdrFramePresented.load() ? "pass" : "fail")
+            + " hdr_metadata="
+            + (vulkan && vulkan->hdrMetadataEnabled
+                    ? "enabled"
+                    : "unavailable"));
     }
 
     void start()
@@ -368,6 +447,8 @@ struct TestState {
                             fail("the Android surface was not recreated");
                         } else if (!offscreenPassed.load()) {
                             fail("the Vulkan offscreen checks did not pass");
+                        } else if (!nativeHdrFramePresented.load()) {
+                            fail("the native HDR source frame was not presented");
                         } else {
                             pass();
                         }
@@ -432,7 +513,8 @@ struct TestState {
         }
         renderer =
             std::make_shared<qtav::AndroidVulkanVideoRenderer>(
-                vulkan->borrowed());
+                vulkan->borrowed(),
+                qtav::VulkanOutputPreference::RequireHdr);
         renderer->setEventCallback(
             [this](const qtav::VideoRenderEvent& event) {
                 if (event.type == qtav::VideoRenderEventType::Error) {
@@ -443,6 +525,18 @@ struct TestState {
             fail("could not create Android Vulkan surface");
             return;
         }
+        if (!renderer->hdrOutputActive()) {
+            fail("the Android Vulkan adapter did not activate native HDR");
+            return;
+        }
+        const VkSurfaceFormatKHR surfaceFormat = renderer->surfaceFormat();
+        logInfo(
+            "QTAV_ANDROID_TEST: HDR_SWAPCHAIN format="
+            + std::to_string(static_cast<int>(surfaceFormat.format))
+            + " color_space="
+            + std::to_string(static_cast<int>(surfaceFormat.colorSpace))
+            + " metadata="
+            + (vulkan->hdrMetadataEnabled ? "enabled" : "unavailable"));
         qtav::VideoRenderConfig config;
         config.surfaceSize = renderer->surfaceSize();
         config.aspectRatio = qtav::VideoAspectRatioMode::Fit;
@@ -450,6 +544,16 @@ struct TestState {
             fail("could not open Android Vulkan renderer");
             return;
         }
+        const qtav::VideoFrame hdrFrame =
+            qtav::test::makeVulkanHdrTestFrame();
+        if (!hdrFrame || !renderer->render(hdrFrame)) {
+            fail("could not present the native HDR test frame");
+            return;
+        }
+        nativeHdrFramePresented = true;
+        logInfo(
+            "QTAV_ANDROID_TEST: NATIVE_HDR_FRAME transfer=pq "
+            "primaries=bt2020 mastering=present maxcll=4000");
         player
             .setVideoRenderAPI(renderer)
             .setRenderCallback([this](void*) {
@@ -488,6 +592,7 @@ struct TestState {
     std::atomic<int> surfaceRecreations { 0 };
     std::atomic<bool> offscreenChecked { false };
     std::atomic<bool> offscreenPassed { false };
+    std::atomic<bool> nativeHdrFramePresented { false };
     std::atomic<bool> finished { false };
     std::atomic<bool> started { false };
     // Destroyed first so its worker is joined before borrowed Vulkan objects.

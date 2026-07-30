@@ -7,7 +7,7 @@ layout(std430, set = 0, binding = 0) readonly buffer FrameBytes {
 } frameBytes;
 
 layout(std140, set = 0, binding = 1) uniform Parameters {
-    // width, height, format, unused
+    // width, height, format, output color space
     uvec4 source;
     // byte strides for planes 0..2
     uvec4 strides;
@@ -141,10 +141,53 @@ vec3 sourceToBt709(vec3 value, uint primaries)
     return value;
 }
 
+vec3 sourceToBt2020(vec3 value, uint primaries)
+{
+    if (primaries == 0U) {
+        return mat3(
+            0.6274, 0.0691, 0.0164,
+            0.3293, 0.9195, 0.0880,
+            0.0433, 0.0114, 0.8956) * value;
+    }
+    if (primaries == 2U) {
+        return mat3(
+             0.7538, 0.0457, -0.0012,
+             0.1986, 0.9418,  0.0176,
+             0.0475, 0.0125,  0.9836) * value;
+    }
+    return value;
+}
+
+vec3 nitsToPq(vec3 value)
+{
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    const vec3 power =
+        pow(clamp(value / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow(
+        (c1 + c2 * power) / (1.0 + c3 * power),
+        vec3(m2));
+}
+
+vec3 nitsToHlg(vec3 value)
+{
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    const vec3 linear = max(value, vec3(0.0)) / 1000.0;
+    const vec3 low = sqrt(3.0 * linear);
+    const vec3 high = a * log(max(12.0 * linear - b, vec3(0.000001))) + c;
+    return mix(low, high, greaterThan(linear, vec3(1.0 / 12.0)));
+}
+
 vec3 presentColor(vec3 rgb)
 {
     const uint transfer = parameters.surface.z;
     const uint primaries = parameters.surface.w;
+    const uint outputMode = parameters.source.w;
     vec3 linear;
     float sourceWhite = parameters.luminance.x;
     if (transfer == 1U) {
@@ -156,14 +199,29 @@ vec3 presentColor(vec3 rgb)
     } else {
         linear = sdrToLinear(clamp(rgb, 0.0, 1.0)) * sourceWhite;
     }
-    linear = sourceToBt709(linear, primaries);
-    // Vulkan swapchain output is SDR in this checkpoint. Apply a simple,
-    // deterministic luminance compression for HDR sources.
+
+    if (outputMode == 4U || outputMode == 5U || outputMode == 3U) {
+        linear = sourceToBt2020(linear, primaries);
+    } else {
+        linear = sourceToBt709(linear, primaries);
+    }
+    if (outputMode == 4U) {
+        return nitsToPq(linear);
+    }
+    if (outputMode == 5U) {
+        return nitsToHlg(linear);
+    }
+    if (outputMode == 2U || outputMode == 3U) {
+        return max(linear / sourceWhite, vec3(0.0));
+    }
+
+    // SDR targets keep the deterministic HDR-to-SDR shoulder.
     const float maximum = max(parameters.luminance.y, sourceWhite);
     if (maximum > sourceWhite) {
         linear = linear / (vec3(1.0) + linear / maximum);
     }
-    return linearToSrgb(clamp(linear / sourceWhite, 0.0, 1.0));
+    linear = clamp(linear / sourceWhite, 0.0, 1.0);
+    return outputMode == 1U ? linear : linearToSrgb(linear);
 }
 
 bool sourceCoordinate(out vec2 sourceCoordinate)

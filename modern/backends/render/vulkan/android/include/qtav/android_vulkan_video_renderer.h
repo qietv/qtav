@@ -19,6 +19,8 @@ struct QTAV_RENDER_VULKAN_ANDROID_EXPORT
 BorrowedAndroidVulkanContext {
     VkInstance instance = VK_NULL_HANDLE;
     BorrowedVulkanDevice device;
+    // True only when VK_EXT_hdr_metadata was enabled at VkDevice creation.
+    bool hdrMetadataEnabled = false;
 
     bool isValid() const noexcept;
 };
@@ -31,7 +33,9 @@ class QTAV_RENDER_VULKAN_ANDROID_EXPORT
 AndroidVulkanVideoRenderer final : public VideoRenderAPI {
 public:
     explicit AndroidVulkanVideoRenderer(
-        BorrowedAndroidVulkanContext context);
+        BorrowedAndroidVulkanContext context,
+        VulkanOutputPreference outputPreference =
+            VulkanOutputPreference::PreferHdr);
     ~AndroidVulkanVideoRenderer() override;
 
     AndroidVulkanVideoRenderer(AndroidVulkanVideoRenderer&&) noexcept;
@@ -52,6 +56,8 @@ public:
     // invalidates the current surface generation.
     bool setWindow(ANativeWindow* window);
     VideoSize surfaceSize() const noexcept;
+    VkSurfaceFormatKHR surfaceFormat() const noexcept;
+    bool hdrOutputActive() const noexcept;
     BorrowedAndroidVulkanContext context() const noexcept;
 
 private:

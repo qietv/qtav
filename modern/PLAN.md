@@ -49,7 +49,9 @@ Continuation checkpoint:
   APK, verifies generated software A/V decode, and presents decoded software
   frames through a bounded three-frame platform-neutral Vulkan engine plus
   Android surface/swapchain adapter on a connected Android device, including
-  offscreen pixel goldens and background/foreground surface recreation;
+  SDR and native-HDR offscreen pixel goldens, required HDR10/PQ swapchain
+  selection, static HDR metadata, and background/foreground HDR surface
+  recreation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -73,6 +75,8 @@ Current public entry points:
 - `modern/backends/audio/wasapi/include/qtav/wasapi_audio_sink.h`
 - `modern/backends/render/metal/include/qtav/metal_video_renderer.h`
 - `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
+- `modern/backends/render/vulkan/include/qtav/vulkan_video_renderer.h`
+- `modern/backends/render/vulkan/android/include/qtav/android_vulkan_video_renderer.h`
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
@@ -95,6 +99,8 @@ Current implementation:
 - `modern/backends/audio/wasapi/src/wasapi_audio_sink.cpp`
 - `modern/backends/render/metal/src/metal_video_renderer.mm`
 - `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
+- `modern/backends/render/vulkan/src/vulkan_video_renderer.cpp`
+- `modern/backends/render/vulkan/android/src/android_vulkan_video_renderer.cpp`
 - `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
@@ -113,6 +119,8 @@ Current implementation:
 - `modern/tests/metal_video_renderer_test.mm`
 - `modern/tests/metal_edr_display_test.mm`
 - `modern/tests/d3d11_video_renderer_test.cpp`
+- `modern/tests/vulkan_video_renderer_test.cpp`
+- `modern/tests/vulkan_video_renderer_test_support.cpp`
 - `modern/tests/d3d11va_hardware_decoder_test.cpp`
 - `modern/tests/d3d11_frame_interop_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
@@ -169,11 +177,13 @@ Current verification:
   an Android 16/API 36 device with an Adreno 830;
 - the connected-device harness decodes its generated AVI through QtAVCore and
   reports `PASS` with 180 MPEG-4 video frames, 180 Vulkan-presented frames,
-  282 PCM audio frames, one background/foreground surface recreation without
-  media reopen, and platform-neutral offscreen pixel goldens covering
+  282 PCM audio frames, a required native HDR10/PQ swapchain with
+  `VK_EXT_hdr_metadata`, one background/foreground HDR surface recreation
+  without media reopen, and platform-neutral offscreen pixel goldens covering
   three-frame ring reuse, viewport, rotation, target replacement, limited/full
-  range, BT.601/BT.709 conversion, and P010/BT.2020 PQ/HLG HDR input with
-  mastering-display, MaxCLL, and default-luminance selection; install
+  range, BT.601/BT.709 conversion, P010/BT.2020 PQ/HLG HDR-to-SDR conversion,
+  native 10-bit PQ/HLG output, HLG-to-PQ conversion, mastering-display, MaxCLL,
+  and default-luminance selection; install
   authorization was confirmed manually on the device after the harness
   stopped on `INSTALL_FAILED_USER_RESTRICTED`.
 
@@ -369,12 +379,16 @@ Begin the Android production path after the completed Windows milestone:
    connected arm64 Android device.
 3. [x] Add the reusable Vulkan renderer engine and Android surface adapter,
    keeping window, device, and swapchain ownership outside core.
-4. [ ] Add the OpenGL ES/EGL fallback path defined in `MOBILE.md`, sharing
+4. [x] Add native Vulkan HDR output before advancing the mobile plan: make the
+   current-target color space explicit, implement HDR10/PQ, HDR10/HLG, and
+   extended-linear shader output, select Android HDR swapchains, submit static
+   HDR metadata, and validate 10-bit goldens plus a real HDR device lifecycle.
+5. [ ] Add the OpenGL ES/EGL fallback path defined in `MOBILE.md`, sharing
    shader/color/geometry logic with Vulkan where practical without hiding
    incompatible API lifecycles. Validate Vulkan-unavailable, initial-failure,
    fatal-runtime-failure, and both-backends-unavailable cases.
-5. [ ] Add AAudio output and device-clock/latency validation.
-6. [ ] Add MediaCodec hardware decode and direct-surface presentation first,
+6. [ ] Add AAudio output and device-clock/latency validation.
+7. [ ] Add MediaCodec hardware decode and direct-surface presentation first,
    then add the confirmed `AImageReader`/`AHardwareBuffer` Vulkan and
    `SurfaceTexture` external-OES OpenGL ES zero-CPU-copy texture paths only
    after presentation, drop, flush, and surface recreation semantics are
@@ -451,13 +465,18 @@ Completed Android Vulkan implementation checkpoint:
 - the engine submission path packs YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 software planes into a coherent storage
   buffer and applies range, matrix, transfer, primaries, viewport, aspect, and
-  rotation logic in generated SPIR-V shaders;
+  rotation logic in generated SPIR-V shaders; the current-target contract now
+  carries `VkColorSpaceKHR` and the shader emits SDR sRGB, native HDR10/PQ,
+  native HDR10/HLG, extended-linear sRGB, or linear BT.2020 as requested;
 - the engine uses a bounded three-frame in-flight ring and retains each source
   `VideoFrame` until its slot fence completes;
 - `QtAV::RenderVulkanAndroid` retains the active `ANativeWindow` generation
   and owns only its Android `VkSurfaceKHR`, swapchain, image views, and
   per-frame acquire/present semaphores while borrowing the
-  application-created Vulkan instance, device, and graphics/present queue;
+  application-created Vulkan instance, device, and graphics/present queue; it
+  exposes prefer-HDR, require-HDR, and SDR-only policies, reports its selected
+  surface format/HDR state, and submits frame-derived `VK_EXT_hdr_metadata`
+  when that borrowed-device extension was enabled;
 - the NativeActivity harness now selects a presentation-capable queue, creates
   the borrowed Vulkan context, renders decoded YUV420P frames through the
   Android adapter, and passes on the recorded Adreno 830 device with 180/180
@@ -469,14 +488,24 @@ Completed Android Vulkan implementation checkpoint:
   submissions across the three-frame ring, Fit letterboxing, custom viewport,
   180-degree rotation, target-generation replacement, limited/full-range
   YUV, BT.601/BT.709 matrices, and numeric P010/BT.2020 PQ/HLG
-  HDR-input-to-SDR goldens;
+  HDR-input-to-SDR goldens, then switch to packed 10-bit targets to verify
+  native HDR10/PQ, HLG-to-PQ, and native HDR10/HLG code values, plus FP16
+  targets to verify extended-linear sRGB and linear BT.2020 values above the
+  100-nit reference white;
 - HDR checks verify mastering-display maximum luminance takes precedence over
   MaxCLL, MaxCLL is used when mastering luminance is absent, and HDR input
-  without either uses the renderer's documented 1000-nit default; native HDR
-  swapchain output remains outside this SDR Vulkan checkpoint;
+  without either uses the renderer's documented 1000-nit default;
+- the NativeActivity enables `VK_EXT_swapchain_colorspace`, enables
+  `VK_EXT_hdr_metadata` when exposed, requires an implemented HDR
+  format/color-space pair, and passes on the recorded Adreno 830 with an
+  `A2B10G10R10`/HDR10-ST2084 swapchain, Android compositor HDR-layer
+  recognition, presentation of a synthetic P010/BT.2020/PQ frame carrying
+  mastering/MaxCLL metadata, and surface recreation;
 - a standalone Android install exports `QtAV::RenderVulkan` and
   `QtAV::RenderVulkanAndroid` with their installed headers and Vulkan
-  dependency metadata without embedding the local NDK or build-tree path.
+  dependency metadata without embedding the local NDK or build-tree path; an
+  external Android consumer compiles the installed HDR preference and
+  selected-surface query API.
 
 Completed Metal software-frame checkpoint:
 
@@ -929,6 +958,9 @@ Status: complete and verified.
 - [x] Shared Vulkan renderer engine from the mobile design checkpoint.
 - [x] Android Vulkan surface/swapchain adapter using application-owned native
   resources.
+- [x] Native Vulkan HDR target contract and Android HDR swapchain selection,
+  including HDR10/PQ, HDR10/HLG, extended-linear output, static metadata,
+  deterministic 10-bit goldens, and connected-device lifecycle validation.
 - [ ] Shared OpenGL ES 3.x renderer plus Android EGL/window adapter as the
   required Vulkan fallback, without an SDL3 dependency.
 - [ ] Application/platform renderer selector implementing the accepted

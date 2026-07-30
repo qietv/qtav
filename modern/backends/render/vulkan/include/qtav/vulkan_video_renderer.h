@@ -13,6 +13,14 @@
 
 namespace qtav {
 
+// PreferHdr falls back to SDR, RequireHdr returns no selection when the
+// surface exposes no implemented HDR pair, and SdrOnly never selects HDR.
+enum class VulkanOutputPreference {
+    PreferHdr,
+    RequireHdr,
+    SdrOnly,
+};
+
 struct QTAV_RENDER_VULKAN_EXPORT BorrowedVulkanDevice {
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -28,6 +36,9 @@ struct QTAV_RENDER_VULKAN_EXPORT VulkanRenderTarget {
     VkImage image = VK_NULL_HANDLE;
     VkImageView imageView = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    // Defines the encoding written by the fragment shader, not just display
+    // metadata. The format/color-space pair must be supported by the renderer.
+    VkColorSpaceKHR colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkExtent2D extent {};
     VkImageLayout finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     VkSemaphore waitSemaphore = VK_NULL_HANDLE;
@@ -40,7 +51,19 @@ struct QTAV_RENDER_VULKAN_EXPORT VulkanRenderTarget {
     bool waitUntilCompleted = false;
 
     bool isValid() const noexcept;
+    bool isHdr() const noexcept;
 };
+
+QTAV_RENDER_VULKAN_EXPORT bool vulkanColorSpaceIsHdr(
+    VkColorSpaceKHR colorSpace) noexcept;
+
+// Selects only format/color-space pairs whose render-target encoding is
+// implemented by VulkanVideoRenderer. An undefined format reports that the
+// requested preference cannot be satisfied.
+QTAV_RENDER_VULKAN_EXPORT VkSurfaceFormatKHR selectVulkanSurfaceFormat(
+    const VkSurfaceFormatKHR* formats,
+    std::size_t count,
+    VulkanOutputPreference preference) noexcept;
 
 using VulkanCurrentTargetCallback = std::function<VulkanRenderTarget()>;
 

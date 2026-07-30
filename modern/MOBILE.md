@@ -54,10 +54,10 @@ target supplied by a platform adapter. It is responsible for:
 The engine borrows the selected Vulkan physical device, logical device, queue,
 and queue-family identity through a Vulkan-backend-specific header. It does
 not create a window surface or swapchain. The current-target contract supplies
-the image/view, format, extent, acquire semaphore, completion fence, and
-presentation semaphore for one render. A target generation changes whenever a
-surface or swapchain is recreated; stale generation resources are retired only
-after their fences complete.
+the image/view, format, output `VkColorSpaceKHR`, extent, acquire semaphore,
+completion fence, and presentation semaphore for one render. A target
+generation changes whenever a surface or swapchain is recreated; stale
+generation resources are retired only after their fences complete.
 
 The implemented engine lives in `backends/render/vulkan/`. It supports every
 planned software pixel family through a storage-buffer shader, applies the
@@ -66,9 +66,11 @@ uses a bounded three-frame resource ring with one retained source frame per
 submission fence. Deterministic offscreen readback checks cover ring reuse,
 YUV output, limited/full range, BT.601/BT.709 conversion, P010/BT.2020 PQ and
 HLG input, HDR mastering-display/MaxCLL/default-luminance selection, viewport,
-rotation, and target-generation replacement. The current Vulkan target is SDR
-BGRA8, so the HDR checks validate deterministic HDR-input-to-SDR compression,
-not native HDR surface presentation.
+rotation, and target-generation replacement. Deterministic targets cover SDR
+BGRA8 HDR-to-SDR compression, 10-bit HDR10/PQ output, 10-bit HDR10/HLG output,
+HLG-to-PQ conversion, and FP16 extended-sRGB-linear plus BT.2020-linear values
+above reference white. Output encoding is explicit rather than being inferred
+from the image format.
 
 Shader input structures, color conversion constants, geometry generation,
 staging layout, capability decisions, and golden pixel vectors are shared
@@ -158,9 +160,15 @@ The Android adapter is implemented as
 `QtAV::RenderVulkanAndroid`. It retains the active `ANativeWindow` and owns its
 surface, swapchain, image views, and per-frame acquire/present semaphores while
 borrowing the application-created instance/device/queue. The NativeActivity
-harness has presented 180 decoded YUV420P frames on the recorded Adreno 830
-device and rebuilt its surface/swapchain after a background/foreground window
-replacement without reopening the media.
+harness enables `VK_EXT_swapchain_colorspace`, requires a supported native HDR
+pair, prefers HDR10/PQ, optionally enables `VK_EXT_hdr_metadata`, and has
+presented 180 decoded YUV420P frames on the recorded Adreno 830 device. It is
+recognized as an active HDR layer by the Android compositor, presents a
+synthetic P010/BT.2020/PQ frame with mastering/MaxCLL metadata, and rebuilds
+the HDR surface/swapchain after a background/foreground window replacement
+without reopening the media. Production callers can instead prefer HDR with
+SDR fallback or require SDR explicitly; selected format/color space and
+HDR-active state remain observable.
 
 The OHOS application owns ArkUI/XComponent state and the current
 `OHNativeWindow`. Its adapter follows the same renderer-target protocol but

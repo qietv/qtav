@@ -4,8 +4,8 @@ This harness proves the first Android production-path slice without Qt or a
 Gradle dependency. It cross-builds a pinned minimal FFmpeg 8.1.2 configuration
 and QtAVCore for `arm64-v8a`, packages a platform `NativeActivity`, and checks
 software MPEG-4 plus PCM decode, a bounded three-frame Vulkan submission ring,
-swapchain presentation, and background/foreground surface recreation on one
-connected device.
+native HDR swapchain presentation, and background/foreground surface
+recreation on one connected device.
 
 Requirements:
 
@@ -16,7 +16,8 @@ Requirements:
 - SDK CMake 4.1.2/Ninja and Android Studio's bundled JBR;
 - CMake, Ninja, curl, and host FFmpeg;
 - the NDK `glslc` shader compiler and an Android Vulkan device;
-- exactly one authorized arm64 Android device for deployment.
+- exactly one authorized arm64 Android device with a Vulkan HDR surface-format
+  pair for deployment.
 
 Build:
 
@@ -43,15 +44,22 @@ authorization, stop and approve the prompt manually on the device before
 asking to retry.
 
 The application creates its own Vulkan instance, logical device, and
-graphics/present queue. `QtAV::RenderVulkanAndroid` retains the current
-`ANativeWindow` and owns only its surface/swapchain generation. A successful
-result reports decoded video frames, Vulkan-rendered frames, decoded audio
-frames, and at least one surface recreation. The deployment script sends the
-application to the launcher once and resumes the same activity; playback is
-paused while its window generation is absent and continues without reopening
-the media after the Vulkan surface/swapchain is rebuilt. Before presentation,
-the harness also renders deterministic offscreen goldens for ring reuse,
-limited/full-range BT.601/BT.709 conversion, P010/BT.2020 PQ/HLG
-HDR-input-to-SDR numeric output, mastering-display/MaxCLL/default-luminance
-selection, viewport, rotation, and target recreation. The target is SDR BGRA8;
-these checks do not claim native HDR swapchain presentation.
+graphics/present queue, enables `VK_EXT_swapchain_colorspace`, and enables
+`VK_EXT_hdr_metadata` when the device exposes it.
+`QtAV::RenderVulkanAndroid` retains the current `ANativeWindow`, requires a
+native HDR target in this harness, and owns only its surface/swapchain
+generation. A successful result reports decoded video frames,
+Vulkan-rendered frames, decoded audio frames, selected HDR format/color space,
+metadata-extension state, Android compositor recognition of an active HDR
+layer, presentation of a synthetic P010/BT.2020/PQ frame carrying mastering
+and MaxCLL metadata, and at least one HDR surface recreation. The deployment
+script sends the application to the launcher once and resumes the same
+activity; playback is paused while its window generation is absent and
+continues without reopening the media after the Vulkan surface/swapchain is
+rebuilt. The harness also renders deterministic offscreen
+goldens for ring reuse, limited/full-range BT.601/BT.709 conversion,
+P010/BT.2020 PQ/HLG HDR-to-SDR numeric output, native 10-bit HDR10/PQ and
+HDR10/HLG encoding, HLG-to-PQ conversion, FP16 extended-linear-sRGB and
+BT.2020-linear output above reference white,
+mastering-display/MaxCLL/default-luminance selection, viewport, rotation, and
+target recreation.

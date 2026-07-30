@@ -30,6 +30,13 @@ struct Pixel {
     std::uint8_t alpha = 0;
 };
 
+struct HalfPixel {
+    std::uint16_t red = 0;
+    std::uint16_t green = 0;
+    std::uint16_t blue = 0;
+    std::uint16_t alpha = 0;
+};
+
 bool isBlack(Pixel pixel) noexcept
 {
     return pixel.red < 16 && pixel.green < 16 && pixel.blue < 16
@@ -76,7 +83,10 @@ public:
     bool create(
         std::uint32_t width,
         std::uint32_t height,
-        std::string& error)
+        std::string& error,
+        VkFormat format = VK_FORMAT_B8G8R8A8_UNORM,
+        VkColorSpaceKHR colorSpace =
+            VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
     {
         if (!device_.isValid() || width == 0 || height == 0) {
             error = "The offscreen Vulkan target configuration is invalid";
@@ -87,7 +97,7 @@ public:
         VkFormatProperties formatProperties {};
         vkGetPhysicalDeviceFormatProperties(
             device_.physicalDevice,
-            VK_FORMAT_B8G8R8A8_UNORM,
+            format,
             &formatProperties);
         constexpr VkFormatFeatureFlags RequiredFormatFeatures =
             VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
@@ -96,16 +106,21 @@ public:
                 & RequiredFormatFeatures)
             != RequiredFormatFeatures) {
             error =
-                "The Vulkan device cannot read back an offscreen BGRA8 target";
+                "The Vulkan device cannot read back the requested offscreen target";
             return false;
         }
 
         extent_ = { width, height };
+        format_ = format;
+        colorSpace_ = colorSpace;
+        pixelBytes_ = format_ == VK_FORMAT_R16G16B16A16_SFLOAT
+            ? sizeof(HalfPixel)
+            : sizeof(Pixel);
         VkImageCreateInfo imageInfo {
             VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         };
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        imageInfo.format = format_;
         imageInfo.extent = { width, height, 1 };
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
@@ -169,7 +184,7 @@ public:
         };
         viewInfo.image = image_;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        viewInfo.format = format_;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.layerCount = 1;
@@ -184,7 +199,7 @@ public:
         }
 
         const VkDeviceSize byteCount =
-            static_cast<VkDeviceSize>(width) * height * sizeof(Pixel);
+            static_cast<VkDeviceSize>(width) * height * pixelBytes_;
         VkBufferCreateInfo bufferInfo {
             VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         };
@@ -286,7 +301,8 @@ public:
         VulkanRenderTarget result;
         result.image = image_;
         result.imageView = view_;
-        result.format = VK_FORMAT_B8G8R8A8_UNORM;
+        result.format = format_;
+        result.colorSpace = colorSpace_;
         result.extent = extent_;
         result.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         result.generation = generation_;
@@ -296,6 +312,25 @@ public:
 
     bool readPixels(std::vector<Pixel>& pixels, std::string& error)
     {
+        return readValues(pixels, error);
+    }
+
+    bool readHalfPixels(
+        std::vector<HalfPixel>& pixels,
+        std::string& error)
+    {
+        return readValues(pixels, error);
+    }
+
+private:
+    template <typename Value>
+    bool readValues(std::vector<Value>& pixels, std::string& error)
+    {
+        if (sizeof(Value) != pixelBytes_) {
+            error =
+                "The offscreen Vulkan readback value size does not match its format";
+            return false;
+        }
         VkResult result = vkWaitForFences(
             device_.device,
             1,
@@ -388,7 +423,7 @@ public:
             device_.device,
             readbackMemory_,
             0,
-            pixelCount * sizeof(Pixel),
+            pixelCount * sizeof(Value),
             0,
             &mapped);
         if (result != VK_SUCCESS) {
@@ -399,12 +434,11 @@ public:
         std::memcpy(
             pixels.data(),
             mapped,
-            pixelCount * sizeof(Pixel));
+            pixelCount * sizeof(Value));
         vkUnmapMemory(device_.device, readbackMemory_);
         return true;
     }
 
-private:
     std::uint32_t memoryType(
         std::uint32_t bits,
         VkMemoryPropertyFlags required) const noexcept
@@ -461,6 +495,9 @@ private:
         image_ = VK_NULL_HANDLE;
         imageMemory_ = VK_NULL_HANDLE;
         extent_ = {};
+        format_ = VK_FORMAT_UNDEFINED;
+        colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        pixelBytes_ = 0;
     }
 
     BorrowedVulkanDevice device_;
@@ -473,6 +510,9 @@ private:
     VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
     VkExtent2D extent_ {};
+    VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkColorSpaceKHR colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    std::size_t pixelBytes_ = 0;
     std::uint64_t generation_ = 0;
 };
 
@@ -647,8 +687,8 @@ HdrVariant makeHdrVariant(
     constexpr std::array<double, 4> SampleNits {
         0.0,
         10.0,
-        50.0,
         100.0,
+        400.0,
     };
     for (std::size_t column = 0; column < SampleNits.size(); ++column) {
         const double signal = transfer == HdrTransfer::PQ
@@ -699,6 +739,15 @@ HdrVariant makeHdrVariant(
             masteringMaximumLuminance,
             1,
         };
+        mastering->has_primaries = 1;
+        mastering->display_primaries[0][0] = { 708, 1000 };
+        mastering->display_primaries[0][1] = { 292, 1000 };
+        mastering->display_primaries[1][0] = { 170, 1000 };
+        mastering->display_primaries[1][1] = { 797, 1000 };
+        mastering->display_primaries[2][0] = { 131, 1000 };
+        mastering->display_primaries[2][1] = { 46, 1000 };
+        mastering->white_point[0] = { 3127, 10000 };
+        mastering->white_point[1] = { 3290, 10000 };
     }
     if (maximumContentLightLevel > 0) {
         AVContentLightMetadata* content =
@@ -723,7 +772,59 @@ bool closeToCode(std::uint8_t actual, std::uint8_t expected) noexcept
         <= 4;
 }
 
+std::uint16_t expectedHdrOutputCode(
+    std::uint16_t lumaCode,
+    HdrTransfer sourceTransfer,
+    VkColorSpaceKHR outputColorSpace) noexcept
+{
+    const double sourceSignal = std::clamp(
+        (static_cast<double>(lumaCode) - 64.0) / 876.0,
+        0.0,
+        1.0);
+    const double nits = sourceTransfer == HdrTransfer::PQ
+        ? pqNits(sourceSignal)
+        : hlgNits(sourceSignal);
+    const double outputSignal =
+        outputColorSpace == VK_COLOR_SPACE_HDR10_HLG_EXT
+        ? hlgSignalForNits(nits)
+        : pqSignalForNits(nits);
+    return static_cast<std::uint16_t>(
+        std::clamp(std::lround(outputSignal * 1023.0), 0L, 1023L));
+}
+
+bool closeToTenBit(std::uint32_t actual, std::uint16_t expected) noexcept
+{
+    return std::abs(
+        static_cast<int>(actual) - static_cast<int>(expected))
+        <= 4;
+}
+
+float halfValue(std::uint16_t value) noexcept
+{
+    const bool negative = (value & 0x8000U) != 0;
+    const int exponent = static_cast<int>((value >> 10U) & 0x1fU);
+    const int mantissa = static_cast<int>(value & 0x03ffU);
+    float result = 0.0F;
+    if (exponent == 0) {
+        result = std::ldexp(static_cast<float>(mantissa), -24);
+    } else if (exponent == 31) {
+        result = mantissa == 0
+            ? std::numeric_limits<float>::infinity()
+            : std::numeric_limits<float>::quiet_NaN();
+    } else {
+        result = std::ldexp(
+            1.0F + static_cast<float>(mantissa) / 1024.0F,
+            exponent - 15);
+    }
+    return negative ? -result : result;
+}
+
 } // namespace
+
+VideoFrame makeVulkanHdrTestFrame()
+{
+    return makeHdrVariant(HdrTransfer::PQ, 1000, 4000).frame;
+}
 
 bool runVulkanOffscreenRendererChecks(
     BorrowedVulkanDevice device,
@@ -732,6 +833,38 @@ bool runVulkanOffscreenRendererChecks(
 {
     if (!device.isValid() || !frame || frame.hasHardwareFrame()) {
         error = "The Vulkan offscreen check requires a software frame and device";
+        return false;
+    }
+    const std::array<VkSurfaceFormatKHR, 3> surfaceFormats {
+        VkSurfaceFormatKHR {
+            VK_FORMAT_B8G8R8A8_UNORM,
+            VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        },
+        VkSurfaceFormatKHR {
+            VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            VK_COLOR_SPACE_HDR10_HLG_EXT,
+        },
+        VkSurfaceFormatKHR {
+            VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+            VK_COLOR_SPACE_HDR10_ST2084_EXT,
+        },
+    };
+    const VkSurfaceFormatKHR preferred = selectVulkanSurfaceFormat(
+        surfaceFormats.data(),
+        surfaceFormats.size(),
+        VulkanOutputPreference::PreferHdr);
+    const VkSurfaceFormatKHR sdr = selectVulkanSurfaceFormat(
+        surfaceFormats.data(),
+        surfaceFormats.size(),
+        VulkanOutputPreference::SdrOnly);
+    const VkSurfaceFormatKHR unavailable = selectVulkanSurfaceFormat(
+        surfaceFormats.data(),
+        1,
+        VulkanOutputPreference::RequireHdr);
+    if (preferred.colorSpace != VK_COLOR_SPACE_HDR10_ST2084_EXT
+        || sdr.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+        || unavailable.format != VK_FORMAT_UNDEFINED) {
+        error = "Vulkan surface-format preference checks failed";
         return false;
     }
 
@@ -857,6 +990,8 @@ bool runVulkanOffscreenRendererChecks(
                 || color.primaries != ColorPrimaries::BT2020
                 || color.transfer != transfer
                 || mastering.isValid() != expectsMastering
+                || mastering.hasPrimaries != expectsMastering
+                || mastering.hasLuminance != expectsMastering
                 || content.isValid() != expectsContent) {
                 error = std::string(
                     "Vulkan HDR metadata did not survive for ")
@@ -951,6 +1086,162 @@ bool runVulkanOffscreenRendererChecks(
             HdrTransfer::HLG,
             1000.0,
             "P010 BT.2020 HLG")) {
+        return false;
+    }
+
+    const auto validateNativeHdrTarget =
+        [&](const HdrVariant& variant,
+            HdrTransfer sourceTransfer,
+            VkColorSpaceKHR outputColorSpace,
+            const char* name) {
+            renderer->close();
+            if (!target.create(
+                    8,
+                    8,
+                    error,
+                    VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                    outputColorSpace)) {
+                return false;
+            }
+            const VulkanRenderTarget renderTarget =
+                target.renderTarget(true);
+            if (!renderTarget.isValid() || !renderTarget.isHdr()) {
+                error = std::string(
+                    "Vulkan native HDR target contract failed for ")
+                    + name;
+                return false;
+            }
+            if (!renderer->open(config)
+                || !renderer->render(variant.frame)
+                || !target.readPixels(pixels, error)) {
+                if (error.empty()) {
+                    error = std::string(
+                        "Vulkan native HDR rendering failed for ")
+                        + name;
+                }
+                return false;
+            }
+            constexpr std::array<int, 4> SampleX { 1, 3, 5, 7 };
+            for (std::size_t index = 0; index < SampleX.size(); ++index) {
+                const Pixel packed =
+                    pixel(pixels, 8, SampleX[index], 4);
+                std::uint32_t word = 0;
+                static_assert(sizeof(word) == sizeof(packed));
+                std::memcpy(&word, &packed, sizeof(word));
+                const std::uint16_t expected = expectedHdrOutputCode(
+                    variant.lumaCodes[index],
+                    sourceTransfer,
+                    outputColorSpace);
+                const std::uint32_t red = word & 1023U;
+                const std::uint32_t green = (word >> 10U) & 1023U;
+                const std::uint32_t blue = (word >> 20U) & 1023U;
+                const std::uint32_t alpha = word >> 30U;
+                if (!closeToTenBit(red, expected)
+                    || !closeToTenBit(green, expected)
+                    || !closeToTenBit(blue, expected)
+                    || alpha != 3U) {
+                    error = std::string(
+                        "Vulkan native HDR numeric golden failed for ")
+                        + name + " sample " + std::to_string(index)
+                        + ": expected " + std::to_string(expected)
+                        + ", got RGB10(" + std::to_string(red) + ','
+                        + std::to_string(green) + ','
+                        + std::to_string(blue) + ')';
+                    return false;
+                }
+            }
+            return true;
+        };
+    if (!validateNativeHdrTarget(
+            pqMastering,
+            HdrTransfer::PQ,
+            VK_COLOR_SPACE_HDR10_ST2084_EXT,
+            "P010 BT.2020 PQ to HDR10/PQ")
+        || !validateNativeHdrTarget(
+            hlgMastering,
+            HdrTransfer::HLG,
+            VK_COLOR_SPACE_HDR10_ST2084_EXT,
+            "P010 BT.2020 HLG to HDR10/PQ")
+        || !validateNativeHdrTarget(
+            hlgMastering,
+            HdrTransfer::HLG,
+            VK_COLOR_SPACE_HDR10_HLG_EXT,
+            "P010 BT.2020 HLG to native HLG")) {
+        return false;
+    }
+    const auto validateLinearHdrTarget =
+        [&](VkColorSpaceKHR outputColorSpace, const char* name) {
+            renderer->close();
+            if (!target.create(
+                    8,
+                    8,
+                    error,
+                    VK_FORMAT_R16G16B16A16_SFLOAT,
+                    outputColorSpace)) {
+                return false;
+            }
+            if (!target.renderTarget(true).isHdr()
+                || !renderer->open(config)
+                || !renderer->render(pqMastering.frame)) {
+                if (error.empty()) {
+                    error = std::string(
+                        "Vulkan linear HDR rendering failed for ")
+                        + name;
+                }
+                return false;
+            }
+            std::vector<HalfPixel> halfPixels;
+            if (!target.readHalfPixels(halfPixels, error)) {
+                return false;
+            }
+            constexpr std::array<int, 4> SampleX { 1, 3, 5, 7 };
+            for (std::size_t index = 0; index < SampleX.size(); ++index) {
+                const HalfPixel actual =
+                    halfPixels[static_cast<std::size_t>(4) * 8
+                        + static_cast<std::size_t>(SampleX[index])];
+                const double signal = std::clamp(
+                    (static_cast<double>(pqMastering.lumaCodes[index]) - 64.0)
+                        / 876.0,
+                    0.0,
+                    1.0);
+                const float expected =
+                    static_cast<float>(pqNits(signal) / 100.0);
+                const float tolerance =
+                    std::max(0.03F, expected * 0.02F);
+                const float red = halfValue(actual.red);
+                const float green = halfValue(actual.green);
+                const float blue = halfValue(actual.blue);
+                const float alpha = halfValue(actual.alpha);
+                if (std::abs(red - expected) > tolerance
+                    || std::abs(green - expected) > tolerance
+                    || std::abs(blue - expected) > tolerance
+                    || std::abs(alpha - 1.0F) > 0.01F) {
+                    error = std::string(
+                        "Vulkan linear HDR numeric golden failed for ")
+                        + name + " sample " + std::to_string(index)
+                        + ": expected " + std::to_string(expected)
+                        + ", got RGB(" + std::to_string(red) + ','
+                        + std::to_string(green) + ','
+                        + std::to_string(blue) + ')';
+                    return false;
+                }
+            }
+            return true;
+        };
+    if (!validateLinearHdrTarget(
+            VK_COLOR_SPACE_BT2020_LINEAR_EXT,
+            "P010 BT.2020 PQ to linear BT.2020")
+        || !validateLinearHdrTarget(
+            VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
+            "P010 BT.2020 PQ to extended linear sRGB")) {
+        return false;
+    }
+    renderer->close();
+    if (!target.create(8, 8, error) || !renderer->open(config)) {
+        if (error.empty()) {
+            error =
+                "Could not restore the Vulkan SDR target after HDR checks";
+        }
         return false;
     }
 

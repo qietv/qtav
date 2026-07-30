@@ -55,6 +55,40 @@ VkCompositeAlphaFlagBitsKHR compositeAlpha(
     return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 }
 
+VkXYColorEXT xyColor(const Chromaticity& value) noexcept
+{
+    return {
+        static_cast<float>(value.x),
+        static_cast<float>(value.y),
+    };
+}
+
+VkHdrMetadataEXT hdrMetadata(const VideoFrame& frame) noexcept
+{
+    const MasteringDisplayMetadata mastering =
+        frame.masteringDisplayMetadata();
+    const ContentLightMetadata content =
+        frame.contentLightMetadata();
+    VkHdrMetadataEXT result { VK_STRUCTURE_TYPE_HDR_METADATA_EXT };
+    if (mastering.hasPrimaries) {
+        result.displayPrimaryRed = xyColor(mastering.primaries[0]);
+        result.displayPrimaryGreen = xyColor(mastering.primaries[1]);
+        result.displayPrimaryBlue = xyColor(mastering.primaries[2]);
+        result.whitePoint = xyColor(mastering.whitePoint);
+    }
+    if (mastering.hasLuminance) {
+        result.maxLuminance =
+            static_cast<float>(mastering.maximumLuminance);
+        result.minLuminance =
+            static_cast<float>(mastering.minimumLuminance);
+    }
+    result.maxContentLightLevel =
+        static_cast<float>(content.maximumContentLightLevel);
+    result.maxFrameAverageLightLevel =
+        static_cast<float>(content.maximumFrameAverageLightLevel);
+    return result;
+}
+
 } // namespace
 
 bool BorrowedAndroidVulkanContext::isValid() const noexcept
@@ -69,12 +103,22 @@ public:
         VkSemaphore renderFinished = VK_NULL_HANDLE;
     };
 
-    explicit Impl(BorrowedAndroidVulkanContext context)
+    Impl(
+        BorrowedAndroidVulkanContext context,
+        VulkanOutputPreference outputPreference)
         : context_(context)
+        , outputPreference_(outputPreference)
         , renderer_(
               context.device,
               [this] { return activeTarget_; })
     {
+        if (context_.hdrMetadataEnabled && context_.device.device) {
+            setHdrMetadata_ =
+                reinterpret_cast<PFN_vkSetHdrMetadataEXT>(
+                    vkGetDeviceProcAddr(
+                        context_.device.device,
+                        "vkSetHdrMetadataEXT"));
+        }
         renderer_.setEventCallback(
             [this](const VideoRenderEvent& event) {
                 notify(event.type, event.detail);
@@ -116,6 +160,7 @@ public:
         }
         extent_ = {};
         format_ = VK_FORMAT_UNDEFINED;
+        colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     }
 
     void destroySurface() noexcept
@@ -238,6 +283,11 @@ public:
         if (swapchain_) {
             return true;
         }
+        if (context_.hdrMetadataEnabled && !setHdrMetadata_) {
+            error =
+                "VK_EXT_hdr_metadata was reported enabled but vkSetHdrMetadataEXT is unavailable";
+            return false;
+        }
         if (!createSurface(error) || !createSemaphores(error)) {
             return false;
         }
@@ -279,21 +329,15 @@ public:
                 result);
             return false;
         }
-        const auto selected = std::find_if(
-            formats.begin(),
-            formats.end(),
-            [](const VkSurfaceFormatKHR& value) {
-                return value.format == VK_FORMAT_B8G8R8A8_UNORM
-                    && value.colorSpace
-                        == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-            });
         const VkSurfaceFormatKHR surfaceFormat =
-            selected != formats.end() ? *selected : formats.front();
-        if (surfaceFormat.format != VK_FORMAT_B8G8R8A8_UNORM
-            && surfaceFormat.format != VK_FORMAT_B8G8R8A8_SRGB
-            && surfaceFormat.format != VK_FORMAT_R8G8B8A8_UNORM
-            && surfaceFormat.format != VK_FORMAT_R8G8B8A8_SRGB) {
-            error = "The Android Vulkan surface has no supported RGBA8/BGRA8 format";
+            selectVulkanSurfaceFormat(
+                formats.data(),
+                formats.size(),
+                outputPreference_);
+        if (surfaceFormat.format == VK_FORMAT_UNDEFINED) {
+            error = outputPreference_ == VulkanOutputPreference::RequireHdr
+                ? "The Android Vulkan surface has no supported native HDR format/color-space pair"
+                : "The Android Vulkan surface has no supported render-target format/color-space pair";
             return false;
         }
 
@@ -395,6 +439,7 @@ public:
         }
         extent_ = extent;
         format_ = surfaceFormat.format;
+        colorSpace_ = surfaceFormat.colorSpace;
         ++generation_;
         return true;
     }
@@ -477,6 +522,7 @@ public:
         activeTarget_.image = images_[imageIndex_];
         activeTarget_.imageView = views_[imageIndex_];
         activeTarget_.format = format_;
+        activeTarget_.colorSpace = colorSpace_;
         activeTarget_.extent = extent_;
         activeTarget_.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         activeTarget_.waitSemaphore = activeSync().imageAvailable;
@@ -484,6 +530,20 @@ public:
         activeTarget_.generation = generation_;
         acquired_ = true;
         return true;
+    }
+
+    void applyHdrMetadata(const VideoFrame& frame) noexcept
+    {
+        if (!swapchain_ || !vulkanColorSpaceIsHdr(colorSpace_)
+            || !setHdrMetadata_) {
+            return;
+        }
+        const VkHdrMetadataEXT metadata = hdrMetadata(frame);
+        setHdrMetadata_(
+            context_.device.device,
+            1,
+            &swapchain_,
+            &metadata);
     }
 
     bool present(std::string& error)
@@ -532,6 +592,8 @@ public:
 
     mutable std::recursive_mutex mutex_;
     BorrowedAndroidVulkanContext context_;
+    VulkanOutputPreference outputPreference_ =
+        VulkanOutputPreference::PreferHdr;
     VulkanVideoRenderer renderer_;
     EventCallback eventCallback_;
     VideoRenderConfig config_;
@@ -542,6 +604,8 @@ public:
     std::vector<VkImageView> views_;
     VkExtent2D extent_ {};
     VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkColorSpaceKHR colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    PFN_vkSetHdrMetadataEXT setHdrMetadata_ = nullptr;
     std::array<
         FrameSync,
         VulkanVideoRenderer::FramesInFlight> sync_;
@@ -555,8 +619,9 @@ public:
 };
 
 AndroidVulkanVideoRenderer::AndroidVulkanVideoRenderer(
-    BorrowedAndroidVulkanContext context)
-    : impl_(std::make_unique<Impl>(context))
+    BorrowedAndroidVulkanContext context,
+    VulkanOutputPreference outputPreference)
+    : impl_(std::make_unique<Impl>(context, outputPreference))
 {
 }
 
@@ -649,29 +714,34 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
             error = "The Android Vulkan renderer is not open";
         } else if (!impl_->acquire(error)) {
             rendered = false;
-        } else if (!impl_->renderer_.render(frame)) {
-            // No submission consumed imageAvailable_. Retire this generation
-            // and its signaled semaphore before permitting another acquire.
-            impl_->renderer_.close();
-            impl_->engineOpen_ = false;
-            vkDeviceWaitIdle(impl_->context_.device.device);
-            impl_->destroySwapchain();
-            impl_->destroySemaphores();
-            std::string recoveryError;
-            if (impl_->window_
-                && impl_->createSwapchain(recoveryError)) {
-                impl_->config_.surfaceSize = {
-                    static_cast<int>(impl_->extent_.width),
-                    static_cast<int>(impl_->extent_.height),
-                };
-                impl_->engineOpen_ =
-                    impl_->renderer_.open(impl_->config_);
-            }
-            impl_->acquired_ = false;
-            impl_->activeTarget_ = {};
-            error = "The Vulkan engine could not render the acquired Android image";
         } else {
-            rendered = impl_->present(error);
+            impl_->applyHdrMetadata(frame);
+            if (!impl_->renderer_.render(frame)) {
+                // No submission consumed imageAvailable_. Retire this
+                // generation and its signaled semaphore before permitting
+                // another acquire.
+                impl_->renderer_.close();
+                impl_->engineOpen_ = false;
+                vkDeviceWaitIdle(impl_->context_.device.device);
+                impl_->destroySwapchain();
+                impl_->destroySemaphores();
+                std::string recoveryError;
+                if (impl_->window_
+                    && impl_->createSwapchain(recoveryError)) {
+                    impl_->config_.surfaceSize = {
+                        static_cast<int>(impl_->extent_.width),
+                        static_cast<int>(impl_->extent_.height),
+                    };
+                    impl_->engineOpen_ =
+                        impl_->renderer_.open(impl_->config_);
+                }
+                impl_->acquired_ = false;
+                impl_->activeTarget_ = {};
+                error =
+                    "The Vulkan engine could not render the acquired Android image";
+            } else {
+                rendered = impl_->present(error);
+            }
         }
     }
     if (!rendered && !error.empty()) {
@@ -751,6 +821,29 @@ VideoSize AndroidVulkanVideoRenderer::surfaceSize() const noexcept
         static_cast<int>(impl_->extent_.width),
         static_cast<int>(impl_->extent_.height),
     };
+}
+
+VkSurfaceFormatKHR
+AndroidVulkanVideoRenderer::surfaceFormat() const noexcept
+{
+    if (!impl_) {
+        return {
+            VK_FORMAT_UNDEFINED,
+            VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        };
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return { impl_->format_, impl_->colorSpace_ };
+}
+
+bool AndroidVulkanVideoRenderer::hdrOutputActive() const noexcept
+{
+    if (!impl_) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->format_ != VK_FORMAT_UNDEFINED
+        && vulkanColorSpaceIsHdr(impl_->colorSpace_);
 }
 
 BorrowedAndroidVulkanContext

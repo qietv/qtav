@@ -40,9 +40,11 @@ code is used.
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
   VideoToolbox-frame rendering through Metal;
 - optional platform-neutral Vulkan software-frame renderer using borrowed
-  application-selected device/queue and current-image resources;
+  application-selected device/queue and current-image resources, with SDR,
+  HDR10/PQ, HDR10/HLG, and extended-linear output contracts;
 - optional Android Vulkan surface adapter that retains the current
-  `ANativeWindow` generation and owns its surface/swapchain synchronization;
+  `ANativeWindow` generation, selects a supported SDR/native-HDR swapchain,
+  publishes its output color space, and owns surface/swapchain synchronization;
 - an accepted Android/OHOS mobile rendering policy that prefers Vulkan and
   uses a separate OpenGL ES/EGL backend after Vulkan is unavailable or fails
   fatally, while keeping recoverable surface recreation within the active API;
@@ -105,9 +107,13 @@ Current backend integration boundary:
 - `QtAV::RenderVulkan` packs supported software planes into a Vulkan storage
   buffer and draws through an application-supplied current image, applying
   structured color metadata and the common viewport/aspect/rotation contract;
+  the target's `VkColorSpaceKHR` selects deterministic HDR-to-SDR output or
+  native HDR10/PQ, HDR10/HLG, or extended-linear encoding;
 - `QtAV::RenderVulkanAndroid` owns Android surface, swapchain, image-view, and
-  acquire/present resources for a retained active `ANativeWindow`, while the
-  application owns the Vulkan instance, device, queue, and NativeActivity;
+  acquire/present resources for a retained active `ANativeWindow`, prefers
+  native HDR format/color-space pairs when available, and submits HDR10 static
+  metadata when the application enabled `VK_EXT_hdr_metadata`; the application
+  owns the Vulkan instance, device, queue, and NativeActivity;
 - no Linux native backend, Android audio sink, or Android hardware decoder has
   been implemented yet.
 
@@ -234,8 +240,9 @@ collects its pass/fail log. If installation or replacement fails because the
 device may be waiting for user authorization, stop and approve the prompt
 manually before retrying. The Vulkan-enabled Android 16/arm64 device run now
 decodes and presents 180 MPEG-4 video frames through an Adreno 830 Vulkan
-1.3.284 swapchain, decodes 282 PCM audio frames, and recreates the
-surface/swapchain across a background/foreground transition.
+1.3.284 native HDR10/PQ swapchain, decodes 282 PCM audio frames, submits
+`VK_EXT_hdr_metadata`, and recreates the HDR surface/swapchain across a
+background/foreground transition.
 
 This is a toolchain, packaging, software-decode, and Vulkan-rendering
 checkpoint. The renderer uses a bounded three-frame resource ring and retains
@@ -243,12 +250,17 @@ each source frame until its fence completes. Platform-neutral offscreen
 readback goldens run in the Android harness and cover YUV color conversion,
 limited/full range, BT.601/BT.709 matrices, viewport, rotation, target
 recreation, ring reuse, and P010/BT.2020 PQ/HLG input with mastering-display,
-MaxCLL, and default-luminance selection. Vulkan output remains SDR BGRA8 with
-deterministic luminance compression; this is not native HDR swapchain
-presentation. It does not yet provide the required OpenGL ES/EGL fallback and
+MaxCLL, and default-luminance selection. The same vectors verify both SDR
+BGRA8 luminance compression and 10-bit native HDR10/PQ plus HDR10/HLG target
+encoding, HLG-to-PQ conversion, and FP16 extended-linear/BT.2020-linear output
+above reference white. The real-device harness requires an HDR swapchain,
+records its format/color space, requires the Android compositor to report an
+active HDR layer, presents a synthetic P010/BT.2020/PQ frame with mastering
+and MaxCLL metadata, and verifies that the swapchain survives surface
+recreation. It does not yet provide the required OpenGL ES/EGL fallback and
 selector, an AAudio sink, or a MediaCodec backend. Their accepted shared
-Android/OHOS responsibility and lifecycle design is documented in
-[`MOBILE.md`](MOBILE.md).
+Android/OHOS
+responsibility and lifecycle design is documented in [`MOBILE.md`](MOBILE.md).
 
 ## API shape
 
@@ -467,9 +479,15 @@ memory with rendering.
 Link `QtAV::RenderVulkan` and construct the engine with an
 application-selected physical device, logical device, graphics queue, and
 queue-family index. The application supplies the current image/view, extent,
-format, wait/signal semaphores, final layout, and surface generation through
-`VulkanCurrentTargetCallback`. These Vulkan objects remain borrowed and must
-survive the submission fence.
+format, `VkColorSpaceKHR`, wait/signal semaphores, final layout, and surface
+generation through `VulkanCurrentTargetCallback`. These Vulkan objects remain
+borrowed and must survive the submission fence. Supported targets are
+RGBA8/BGRA8 with sRGB/BT.709 nonlinear output, 10-bit packed RGB with
+HDR10/PQ or HDR10/HLG output, and RGBA16F with extended-sRGB-linear or
+BT.2020-linear output. PQ/HLG sources preserve BT.2020 and native HDR
+luminance on HDR targets; SDR targets retain the documented BT.709/sRGB tone
+mapping. Linear HDR targets use `1.0` as the renderer's 100-nit reference
+white and preserve brighter values above `1.0`.
 
 On Android, `QtAV::RenderVulkanAndroid` implements that target protocol and
 the `VideoRenderAPI` facade together. The application creates a Vulkan
@@ -482,7 +500,9 @@ auto renderer =
         qtav::BorrowedAndroidVulkanContext {
             instance,
             { physicalDevice, device, queue, queueFamilyIndex },
-        });
+            hdrMetadataExtensionWasEnabled,
+        },
+        qtav::VulkanOutputPreference::PreferHdr);
 renderer->setWindow(nativeWindow);
 
 qtav::VideoRenderConfig config;
@@ -497,7 +517,16 @@ semaphores. Passing `nullptr` to `setWindow()` invalidates that generation.
 Publishing a new window while the renderer remains open rebuilds the
 surface/swapchain and resumes presentation without reopening media. The Vulkan
 instance, device, and queue remain application-owned and must outlive the
-renderer.
+renderer. `PreferHdr` chooses HDR10/PQ first, then native HLG or
+extended-linear output, and falls back to SDR; `RequireHdr` fails explicitly
+when no implemented HDR pair is exposed, while `SdrOnly` preserves an
+application-selected SDR policy. The application must enable
+`VK_EXT_swapchain_colorspace` while creating its instance to expose extended
+surface color spaces. If it also enables `VK_EXT_hdr_metadata` on the logical
+device and reports that fact in `BorrowedAndroidVulkanContext`, the adapter
+submits frame-derived mastering-display and content-light metadata before
+presentation. `surfaceFormat()` and `hdrOutputActive()` expose the selected
+contract for diagnostics and tests.
 
 ### D3D11 renderer
 

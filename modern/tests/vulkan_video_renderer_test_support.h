@@ -8,6 +8,8 @@
 
 namespace qtav::test {
 
+VideoFrame makeVulkanHdrTestFrame();
+
 bool runVulkanOffscreenRendererChecks(
     BorrowedVulkanDevice device,
     const VideoFrame& frame,

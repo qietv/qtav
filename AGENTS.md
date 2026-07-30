@@ -166,7 +166,9 @@ Implemented under `modern/`:
 - VideoToolbox hardware decoding into retained `CVPixelBuffer` frames;
 - zero-copy VideoToolbox/CVMetal plane import and Metal rendering;
 - platform-neutral Vulkan software-frame rendering with structured color and
-  geometry shaders, plus an Android `ANativeWindow` surface/swapchain adapter;
+  geometry shaders, explicit SDR/HDR10/extended-linear output color spaces,
+  plus an Android `ANativeWindow` adapter with native HDR swapchain selection
+  and optional `VK_EXT_hdr_metadata` submission;
 - structured video color-space/HDR10 metadata and Metal
   SDR/extended-linear output;
 - libswresample conversion to negotiated interleaved PCM;
@@ -249,10 +251,14 @@ Last verified baseline:
 - AC-3, E-AC-3, and TrueHD audio-only decoding: passed.
 - Android arm64 FFmpeg 8.1.2/QtAVCore/Vulkan build, APK packaging, and
   connected Adreno 830 device playback: passed with 180 decoded and
-  Vulkan-presented video frames, 282 decoded audio frames, a
-  background/foreground surface recreation, and offscreen Vulkan goldens for
-  the three-frame ring, SDR and P010/BT.2020 PQ/HLG color conversion, HDR
-  luminance-metadata selection, viewport, rotation, and target recreation.
+  Vulkan-presented video frames through a required HDR10/PQ swapchain, 282
+  decoded audio frames, `VK_EXT_hdr_metadata`, a background/foreground HDR
+  surface recreation, synthetic P010/BT.2020/PQ presentation with mastering
+  and MaxCLL metadata, Android compositor HDR-layer recognition, and offscreen
+  Vulkan goldens for the three-frame ring, SDR and P010/BT.2020 PQ/HLG color
+  conversion, native 10-bit PQ/HLG output, HLG-to-PQ conversion, FP16
+  extended-linear/BT.2020-linear output, HDR luminance-metadata selection,
+  viewport, rotation, and target recreation.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device
