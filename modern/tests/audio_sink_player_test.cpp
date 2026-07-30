@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -17,13 +18,22 @@
 
 namespace {
 
+void require(bool condition)
+{
+    if (!condition) {
+        std::abort();
+    }
+}
+
 class DeterministicAudioSink final : public qtav::AudioSink {
 public:
     explicit DeterministicAudioSink(
         bool requiresConversion = false,
-        bool blockFirstWrite = false)
+        bool blockFirstWrite = false,
+        bool simulateQueuedClock = false)
         : requiresConversion_(requiresConversion)
         , blockFirstWrite_(blockFirstWrite)
+        , simulateQueuedClock_(simulateQueuedClock)
     {
     }
 
@@ -93,10 +103,23 @@ public:
             firstWriteChanged_.notify_all();
             firstWriteChanged_.wait(lock, [&] { return releaseFirstWrite_; });
         }
-        clockPosition_.store(
-            std::max<std::int64_t>(
-                clockPosition_.load(),
-                buffer.timestamp + buffer.duration));
+        {
+            std::unique_lock<std::mutex> lock(blockedWriteMutex_);
+            if (blockNextWrite_) {
+                blockNextWrite_ = false;
+                blockedWriteEntered_ = true;
+                blockedWriteChanged_.notify_all();
+                blockedWriteChanged_.wait(
+                    lock,
+                    [&] { return releaseBlockedWrite_; });
+            }
+        }
+        if (!simulateQueuedClock_) {
+            clockPosition_.store(
+                std::max<std::int64_t>(
+                    clockPosition_.load(),
+                    buffer.timestamp + buffer.duration));
+        }
         ++writeCount_;
         notifyChanged();
 
@@ -120,18 +143,53 @@ public:
     qtav::AudioSinkClock clock() const noexcept override
     {
         ++clockCount_;
-        const auto step = paused_.load() ? 0 : 50;
+        const auto step = paused_.load()
+            ? 0
+            : simulateQueuedClock_ ? 1 : 50;
         return {
-            open_.load(),
+            open_.load() && clockValid_.load(),
             clockPosition_.fetch_add(step) + step,
             10,
         };
+    }
+
+    void setClockValid(bool valid)
+    {
+        clockValid_.store(valid);
+        notifyChanged();
     }
 
     void reportUnderrunOnNextWrite()
     {
         std::lock_guard<std::mutex> lock(mutex_);
         reportUnderrun_ = true;
+    }
+
+    void blockNextWrite()
+    {
+        std::lock_guard<std::mutex> lock(blockedWriteMutex_);
+        blockNextWrite_ = true;
+        blockedWriteEntered_ = false;
+        releaseBlockedWrite_ = false;
+    }
+
+    bool waitForBlockedWrite(
+        std::chrono::milliseconds timeout = std::chrono::seconds(5))
+    {
+        std::unique_lock<std::mutex> lock(blockedWriteMutex_);
+        return blockedWriteChanged_.wait_for(
+            lock,
+            timeout,
+            [&] { return blockedWriteEntered_; });
+    }
+
+    void releaseBlockedWrite()
+    {
+        {
+            std::lock_guard<std::mutex> lock(blockedWriteMutex_);
+            releaseBlockedWrite_ = true;
+        }
+        blockedWriteChanged_.notify_all();
     }
 
     bool waitFor(
@@ -187,13 +245,20 @@ private:
     bool reportUnderrun_ = false;
     bool requiresConversion_ = false;
     bool blockFirstWrite_ = false;
+    bool simulateQueuedClock_ = false;
     std::atomic<bool> firstWriteSeen_ { false };
     std::mutex firstWriteMutex_;
     std::condition_variable firstWriteChanged_;
     bool firstWriteEntered_ = false;
     bool releaseFirstWrite_ = false;
+    std::mutex blockedWriteMutex_;
+    std::condition_variable blockedWriteChanged_;
+    bool blockNextWrite_ = false;
+    bool blockedWriteEntered_ = false;
+    bool releaseBlockedWrite_ = false;
     std::atomic<bool> open_ { false };
     std::atomic<bool> paused_ { false };
+    std::atomic<bool> clockValid_ { true };
     mutable std::atomic<std::int64_t> clockPosition_ { 0 };
     std::atomic<int> openCount_ { 0 };
     std::atomic<int> closeCount_ { 0 };
@@ -244,7 +309,6 @@ void testLifecycleAndClock(const char* media)
     assert(sink->waitFor([&] { return sink->pauseCount() >= 1; }));
     assert(sink->openCount() == 1);
     assert(sink->writeCount() >= 1);
-    assert(audioFrames.load() >= 1);
     assert(underruns.load() == 1);
     assert(sink->clockCount() > 0);
 
@@ -295,6 +359,8 @@ void testLifecycleAndClock(const char* media)
     player.setState(qtav::State::Playing);
     assert(replacementSink->waitFor(
         [&] { return replacementSink->writeCount() >= 1; }));
+    assert(replacementSink->waitFor(
+        [&] { return audioFrames.load() >= 1; }));
     player.setState(qtav::State::Stopped);
     assert(player.waitFor(qtav::State::Stopped, 5'000));
     assert(replacementSink->waitFor(
@@ -335,7 +401,10 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
     std::atomic<int> audioFrames { 0 };
 
     player
-        .onAudioFrame([&](const qtav::AudioFrame&, int) { ++audioFrames; })
+        .onAudioFrame([&](const qtav::AudioFrame&, int) {
+            ++audioFrames;
+            changed.notify_all();
+        })
         .onEvent([&](const qtav::MediaEvent& event) {
             if (event.category != "audio.sink.format") {
                 return false;
@@ -345,7 +414,6 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
                 formatEvent = true;
             }
             changed.notify_all();
-            player.setState(qtav::State::Stopped);
             return true;
         })
         .setAudioSink(sink);
@@ -357,8 +425,9 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
         assert(changed.wait_for(
             lock,
             std::chrono::seconds(5),
-            [&] { return formatEvent; }));
+            [&] { return formatEvent && audioFrames.load() >= 1; }));
     }
+    player.setState(qtav::State::Stopped);
     assert(player.waitFor(qtav::State::Stopped, 5'000));
     assert(audioFrames.load() >= 1);
     assert(sink->openCount() == 1);
@@ -422,6 +491,116 @@ void testUiAndRenderIsolation(const char* media)
     assert(player.waitFor(qtav::State::Stopped, 5'000));
 }
 
+void testPlayingSeekWaitsForDeviceClock(const char* media)
+{
+    auto sink = std::make_shared<DeterministicAudioSink>();
+    qtav::Player player;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool buffering = false;
+    bool loadedAfterBuffering = false;
+    bool seeked = false;
+    bool failed = false;
+
+    player
+        .onMediaStatus(
+            [&](qtav::MediaStatus, qtav::MediaStatus status) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (status == qtav::MediaStatus::Buffering) {
+                        buffering = true;
+                    } else if (
+                        status == qtav::MediaStatus::Loaded
+                        && buffering) {
+                        loadedAfterBuffering = true;
+                    } else if (status == qtav::MediaStatus::Invalid) {
+                        failed = true;
+                    }
+                }
+                changed.notify_all();
+                return false;
+            })
+        .setAudioSink(sink);
+    player.setMedia(media);
+    player.setState(qtav::State::Playing);
+
+    assert(sink->waitFor([&] { return sink->writeCount() >= 1; }));
+    sink->setClockValid(false);
+    assert(player.seek(
+        400,
+        qtav::SeekFlag::FromStart,
+        [&](std::int64_t position) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                seeked = position == 400;
+                failed = failed || position < 0;
+            }
+            changed.notify_all();
+        }));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return (buffering && seeked) || failed; }));
+    }
+    assert(!failed);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto frozenPosition = player.position();
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    assert(player.position() == frozenPosition);
+    assert(player.mediaStatus() == qtav::MediaStatus::Buffering);
+
+    sink->setClockValid(true);
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return loadedAfterBuffering || failed; }));
+    }
+    assert(!failed);
+    assert(player.mediaStatus() == qtav::MediaStatus::Loaded);
+
+    player.setState(qtav::State::Stopped);
+    assert(player.waitFor(qtav::State::Stopped, 5'000));
+}
+
+void testPresentationDoesNotWaitForBlockedSinkWrite(const char* media)
+{
+    auto sink = std::make_shared<DeterministicAudioSink>(
+        false,
+        false,
+        true);
+    qtav::Player player;
+    std::atomic<int> videoFrames { 0 };
+
+    player
+        .setAudioSink(sink)
+        .onVideoFrame([&](const qtav::VideoFrame& frame, int) {
+            assert(frame);
+            ++videoFrames;
+        });
+    player.setMedia(media);
+    player.setState(qtav::State::Playing);
+
+    require(sink->waitFor([&] {
+        return sink->writeCount() >= 20 && videoFrames.load() >= 2;
+    }));
+    sink->blockNextWrite();
+    require(sink->waitForBlockedWrite());
+
+    const auto framesBefore = videoFrames.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(160));
+    const auto framesWhileBlocked = videoFrames.load();
+    sink->releaseBlockedWrite();
+
+    require(framesWhileBlocked > framesBefore);
+    player.setState(qtav::State::Stopped);
+    require(player.waitFor(qtav::State::Stopped, 5'000));
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -431,5 +610,7 @@ int main(int argc, char** argv)
     testShutdownClosesSink(argv[1]);
     testUnsupportedConversionKeepsFrameCallback(argv[1]);
     testUiAndRenderIsolation(argv[1]);
+    testPlayingSeekWaitsForDeviceClock(argv[1]);
+    testPresentationDoesNotWaitForBlockedSinkWrite(argv[1]);
     return 0;
 }

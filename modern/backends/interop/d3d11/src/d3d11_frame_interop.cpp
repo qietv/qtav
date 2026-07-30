@@ -10,8 +10,11 @@
 #include <qtav/d3d11_frame_interop.h>
 #include <qtav/d3d11va_hardware_decoder.h>
 
+#include <algorithm>
 #include <array>
+#include <memory>
 #include <utility>
+#include <vector>
 
 namespace qtav {
 namespace {
@@ -195,19 +198,34 @@ bool supportedSource(
 class ImportedD3D11TextureFrame final
     : public D3D11TextureFrame {
 public:
+    struct OutputResource {
+        int width = 0;
+        int height = 0;
+        OutputProfile output;
+        ComPtr<ID3D11VideoProcessorOutputView> outputView;
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> shaderView;
+
+        bool matches(
+            int requestedWidth,
+            int requestedHeight,
+            const OutputProfile& requestedOutput) const noexcept
+        {
+            return width == requestedWidth
+                && height == requestedHeight
+                && output.format == requestedOutput.format
+                && output.colorSpace == requestedOutput.colorSpace
+                && output.pixelFormat == requestedOutput.pixelFormat;
+        }
+    };
+
     ImportedD3D11TextureFrame(
         HardwareFrame source,
         ComPtr<ID3D11VideoProcessorInputView> inputView,
-        ComPtr<ID3D11VideoProcessorOutputView> outputView,
-        ComPtr<ID3D11Texture2D> texture,
-        ComPtr<ID3D11ShaderResourceView> shaderView,
-        OutputProfile output)
+        std::shared_ptr<OutputResource> output)
         : source_(std::move(source))
         , inputView_(std::move(inputView))
-        , outputView_(std::move(outputView))
-        , texture_(std::move(texture))
-        , shaderView_(std::move(shaderView))
-        , output_(output)
+        , output_(std::move(output))
     {
     }
 
@@ -223,37 +241,38 @@ public:
 
     PixelFormat format() const noexcept override
     {
-        return output_.pixelFormat;
+        return output_ ? output_->output.pixelFormat
+                       : PixelFormat::Unknown;
     }
 
     ID3D11Texture2D* texture() const noexcept override
     {
-        return texture_.Get();
+        return output_ ? output_->texture.Get() : nullptr;
     }
 
     ID3D11ShaderResourceView*
     shaderResourceView() const noexcept override
     {
-        return shaderView_.Get();
+        return output_ ? output_->shaderView.Get() : nullptr;
     }
 
     DXGI_FORMAT dxgiFormat() const noexcept override
     {
-        return output_.format;
+        return output_ ? output_->output.format
+                       : DXGI_FORMAT_UNKNOWN;
     }
 
     DXGI_COLOR_SPACE_TYPE colorSpace() const noexcept override
     {
-        return output_.colorSpace;
+        return output_
+            ? output_->output.colorSpace
+            : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     }
 
 private:
     HardwareFrame source_;
     ComPtr<ID3D11VideoProcessorInputView> inputView_;
-    ComPtr<ID3D11VideoProcessorOutputView> outputView_;
-    ComPtr<ID3D11Texture2D> texture_;
-    ComPtr<ID3D11ShaderResourceView> shaderView_;
-    OutputProfile output_;
+    std::shared_ptr<OutputResource> output_;
 };
 
 struct ProcessorState {
@@ -286,6 +305,9 @@ struct ProcessorState {
 
 class D3D11FrameInterop::Impl {
 public:
+    using OutputResource =
+        ImportedD3D11TextureFrame::OutputResource;
+
     explicit Impl(
         std::shared_ptr<D3D11DeviceAccess> selectedAccess)
         : deviceAccess_(std::move(selectedAccess))
@@ -303,6 +325,11 @@ public:
         }
     }
 
+    ~Impl()
+    {
+        flush();
+    }
+
     bool available() const noexcept
     {
         return deviceAccess_ && videoDevice_ && videoContext_
@@ -315,6 +342,7 @@ public:
         if (processor_.matches(frame)) {
             return true;
         }
+        outputPool_.clear();
         processor_.reset();
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC content {};
@@ -463,11 +491,108 @@ public:
         return true;
     }
 
+    std::shared_ptr<OutputResource> acquireOutput(
+        int width,
+        int height,
+        const OutputProfile& output)
+    {
+        for (const auto& resource : outputPool_) {
+            if (resource.use_count() == 1
+                && resource->matches(width, height, output)) {
+                return resource;
+            }
+        }
+
+        D3D11_TEXTURE2D_DESC description {};
+        description.Width = static_cast<UINT>(width);
+        description.Height = static_cast<UINT>(height);
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = output.format;
+        description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags =
+            D3D11_BIND_RENDER_TARGET
+            | D3D11_BIND_SHADER_RESOURCE;
+
+        auto resource = std::make_shared<OutputResource>();
+        resource->width = width;
+        resource->height = height;
+        resource->output = output;
+        if (FAILED(
+                deviceAccess_->device().get()->CreateTexture2D(
+                    &description,
+                    nullptr,
+                    &resource->texture))) {
+            return {};
+        }
+
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC viewDescription {};
+        viewDescription.ViewDimension =
+            D3D11_VPOV_DIMENSION_TEXTURE2D;
+        viewDescription.Texture2D.MipSlice = 0;
+        if (FAILED(videoDevice_->CreateVideoProcessorOutputView(
+                resource->texture.Get(),
+                processor_.enumerator.Get(),
+                &viewDescription,
+                &resource->outputView))) {
+            return {};
+        }
+
+        if (FAILED(
+                deviceAccess_->device()
+                    .get()
+                    ->CreateShaderResourceView(
+                        resource->texture.Get(),
+                        nullptr,
+                        &resource->shaderView))) {
+            return {};
+        }
+
+        constexpr std::size_t maximumPooledOutputs = 3;
+        if (outputPool_.size() < maximumPooledOutputs) {
+            outputPool_.push_back(resource);
+        } else {
+            const auto reusable = std::find_if(
+                outputPool_.begin(),
+                outputPool_.end(),
+                [](const auto& candidate) {
+                    return candidate.use_count() == 1;
+                });
+            if (reusable != outputPool_.end()) {
+                *reusable = resource;
+            }
+        }
+        return resource;
+    }
+
+    void flush() noexcept
+    {
+        if (!deviceAccess_) {
+            outputPool_.clear();
+            processor_.reset();
+            return;
+        }
+        try {
+            auto contextGuard = deviceAccess_->contextGuard();
+            (void)contextGuard;
+            outputPool_.clear();
+            processor_.reset();
+            if (deviceAccess_->immediateContext()) {
+                deviceAccess_->immediateContext().get()->Flush();
+            }
+        } catch (...) {
+            outputPool_.clear();
+            processor_.reset();
+        }
+    }
+
     std::shared_ptr<D3D11DeviceAccess> deviceAccess_;
     ComPtr<ID3D11VideoDevice> videoDevice_;
     ComPtr<ID3D11VideoContext> videoContext_;
     ComPtr<ID3D11VideoContext1> videoContext1_;
     ProcessorState processor_;
+    std::vector<std::shared_ptr<OutputResource>> outputPool_;
 };
 
 D3D11FrameInterop::D3D11FrameInterop(
@@ -559,51 +684,11 @@ D3D11FrameInterop::importFrame(
         return {};
     }
 
-    D3D11_TEXTURE2D_DESC outputDescription {};
-    outputDescription.Width =
-        static_cast<UINT>(native.width());
-    outputDescription.Height =
-        static_cast<UINT>(native.height());
-    outputDescription.MipLevels = 1;
-    outputDescription.ArraySize = 1;
-    outputDescription.Format = output.format;
-    outputDescription.SampleDesc.Count = 1;
-    outputDescription.Usage = D3D11_USAGE_DEFAULT;
-    outputDescription.BindFlags =
-        D3D11_BIND_RENDER_TARGET
-        | D3D11_BIND_SHADER_RESOURCE;
-
-    ComPtr<ID3D11Texture2D> outputTexture;
-    if (FAILED(
-            impl_->deviceAccess_->device().get()->CreateTexture2D(
-                &outputDescription,
-                nullptr,
-                &outputTexture))) {
-        return {};
-    }
-
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC
-        outputViewDescription {};
-    outputViewDescription.ViewDimension =
-        D3D11_VPOV_DIMENSION_TEXTURE2D;
-    outputViewDescription.Texture2D.MipSlice = 0;
-    ComPtr<ID3D11VideoProcessorOutputView> outputView;
-    if (FAILED(impl_->videoDevice_->CreateVideoProcessorOutputView(
-            outputTexture.Get(),
-            impl_->processor_.enumerator.Get(),
-            &outputViewDescription,
-            &outputView))) {
-        return {};
-    }
-
-    ComPtr<ID3D11ShaderResourceView> shaderView;
-    if (FAILED(
-            impl_->deviceAccess_->device()
-                .get()
-                ->CreateShaderResourceView(
-                    outputTexture.Get(),
-                    nullptr,
-                    &shaderView))) {
+    auto outputResource = impl_->acquireOutput(
+        native.width(),
+        native.height(),
+        output);
+    if (!outputResource) {
         return {};
     }
 
@@ -641,7 +726,7 @@ D3D11FrameInterop::importFrame(
     stream.pInputSurface = inputView.Get();
     if (FAILED(impl_->videoContext_->VideoProcessorBlt(
             impl_->processor_.processor.Get(),
-            outputView.Get(),
+            outputResource->outputView.Get(),
             0,
             1,
             &stream))) {
@@ -651,10 +736,7 @@ D3D11FrameInterop::importFrame(
     return std::make_shared<ImportedD3D11TextureFrame>(
         frame,
         std::move(inputView),
-        std::move(outputView),
-        std::move(outputTexture),
-        std::move(shaderView),
-        output);
+        std::move(outputResource));
 }
 
 void D3D11FrameInterop::flush() noexcept
@@ -662,9 +744,7 @@ void D3D11FrameInterop::flush() noexcept
     if (!impl_ || !impl_->deviceAccess_) {
         return;
     }
-    auto contextGuard = impl_->deviceAccess_->contextGuard();
-    (void)contextGuard;
-    impl_->processor_.reset();
+    impl_->flush();
 }
 
 } // namespace qtav

@@ -37,6 +37,7 @@ if (!$sharedSetting) {
 $requiredTargets = @(
     'qtav_core',
     'qtav_platform_windows',
+    'qtav_output_d3d11',
     'qtav_render_d3d11',
     'qtav_audio_wasapi',
     'qtav_audio_resample',

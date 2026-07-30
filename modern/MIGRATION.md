@@ -18,14 +18,22 @@ range of the legacy root QtAV implementation.
 | Qt signals | `std::function` callbacks |
 | `QVariant` properties | string properties |
 | `VideoRenderer::receive()` | `onVideoFrame()` |
-| Qt paint/update events | `setRenderCallback()` |
-| renderer paint method | `renderVideo()` and optional `VideoRenderAPI` |
+| Qt paint/update events | normally owned by a high-level output such as `D3D11VideoOutput`; `setRenderCallback()` for external-context integration |
+| renderer paint method | normally owned by a high-level output; `renderVideo()` and `VideoRenderAPI` for external-context integration |
 | `AudioOutput` | `onAudioFrame()` and optional `setAudioSink()` |
 | `QThread` playback workers | standard C++ demux/decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
 
-The rendering contract follows the same application-owned pattern used by
-mdk-sdk:
+For ordinary Windows composition presentation, `QtAV::OutputD3D11` owns the
+D3D11 device, swap chain, render target, redraw coalescing, render thread,
+`renderVideo()`, `Present()`, and Advanced Color policy. The application
+supplies only its hosting HWND, a native surface-binding callback, attaches a
+`Player`, and forwards surface size or composition-scale changes. The default
+prefers an FP16 scRGB HDR layer and automatically tracks display moves and the
+Windows HDR setting.
+
+The lower-level application-owned contract remains available for engines that
+already own a graphics context or require multiple/custom render targets:
 
 1. decoding makes a frame current;
 2. `setRenderCallback()` asks the application to schedule a redraw;
@@ -50,6 +58,10 @@ mdk-sdk:
   `QtAV::AudioCoreAudio`;
 - optional Windows `WasapiAudioSink` shared-mode device output through
   `QtAV::AudioWASAPI`;
+- optional high-level Windows composition presentation through
+  `QtAV::OutputD3D11`, including owned D3D11 resources, render scheduling,
+  D3D11VA configuration, zero-CPU-map interop, HDR/SDR output selection,
+  per-frame display tracking, resize, presentation, and teardown;
 - optional D3D11VA hardware decode through `QtAV::HWD3D11VA`, using the
   application-selected `D3D11DeviceAccess` and retained decoder texture-array
   slices;
@@ -155,6 +167,21 @@ Supplying the swap chain enables per-frame `IDXGIOutput6` discovery,
 changes. Resize, custom viewports, aspect handling, right-angle rotation, and
 render-target recreation remain supported. Windows SDK types stay in
 platform/backend headers and never enter a core public header.
+
+Applications that do not need to share a D3D11 device should prefer
+`D3D11VideoOutput`. Its `attach()` call takes exclusive ownership of the
+player's default render slot and render callback until `detach()`, configures
+D3D11VA against the output-owned device, and installs the D3D11 Video
+Processor interop path. With a hosting HWND, its default `PreferHdr` policy
+creates an FP16 scRGB composition layer, resolves the current monitor through
+`IDXGIOutput6`, configures the swap-chain color space, and preserves PQ/HLG
+output while Windows HDR is active. `RequireHdr` reports unavailable HDR
+instead of presenting SDR, while `SdrOnly` keeps an explicit BGRA8 path.
+`colorInfo()` exposes the active contract for diagnostics. The player and
+native composition surface must outlive that attachment. Direct
+`D3D11VideoRenderer`, `setRenderCallback()`, and `renderVideo()` use remains
+the advanced path for externally owned graphics contexts, offscreen targets,
+or custom presentation loops.
 
 `d3d11vaHardwareDecodeConfig()` creates FFmpeg's D3D11VA device on the same
 retained device access, installs callbacks for the shared recursive lock, and
@@ -268,6 +295,23 @@ are separate backend/product work.
 - media events normally run on the playback or audio-output worker; forwarded
   audio-sink events run on the backend's event thread;
 - callbacks may request another player state, but must not destroy the player;
+- `seek()` invalidates queued presentation generations without waiting on
+  their queue locks; while a playing seek waits for actual output,
+  `position()` is held at the target and status transitions
+  `Loaded -> Buffering -> Loaded`; a clock-capable audio sink must publish a
+  valid post-flush clock sample before playback time resumes, while
+  callback-only playback resumes after the first new-generation item is
+  delivered;
+- an audio-device underrun re-enters `Buffering`, freezes the fallback clock,
+  and leaves it frozen until output re-anchors instead of letting wall time
+  advance without sound or video;
+- A/V startup and playing seeks perform a bounded video preroll before device
+  audio is released; presentation clock refresh is non-blocking and continues
+  from the cached, submitted-audio-bounded device clock while a sink write is
+  waiting for backend queue space;
+- HTTP(S) inputs default to a 15-second FFmpeg I/O timeout plus bounded
+  reconnect attempts; `avformat.rw_timeout`, `avformat.reconnect`, and the
+  other FFmpeg protocol properties can override those defaults;
 - `renderVideo()` runs synchronously on its caller and should be called from the
   thread that owns the native graphics context;
 - D3D11 renderer, decoder, interop, and application calls sharing one
@@ -278,8 +322,10 @@ are separate backend/product work.
 - audio-sink and video-render backend event callbacks run on the thread chosen
   by the backend and may request another player state;
 - decoded audio crosses a bounded queue to a dedicated audio-output worker;
-  ordinary conversion, sink writes, and device-clock sampling run there without
-  the player mutex held and cannot be blocked by application rendering;
+  ordinary conversion, sink writes, and primary device-clock sampling run
+  there without the player mutex held and cannot be blocked by application
+  rendering; presentation performs only a non-blocking opportunistic clock
+  refresh and otherwise uses the cached sample;
 - audio-sink/converter lifecycle and natural-end drain calls run on the
   playback worker, serialized with audio-output calls; `drain()` may block
   until queued audio is presented;

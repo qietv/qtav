@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 Status legend:
 
@@ -47,8 +47,29 @@ Continuation checkpoint:
 - playback scheduling now isolates the FFmpeg demux/decode worker, bounded
   audio-output queue/worker, and bounded presentation queue/worker; UI/render
   callbacks cannot block device audio submission, `Player::position()` uses a
-  cached device-clock snapshot, and late video is dropped instead of building
-  unbounded presentation latency;
+  cached device-clock snapshot, presentation refresh never waits behind a
+  blocking sink write, repeated device samples are monotonically extrapolated
+  only through submitted audio, and late video is dropped instead of building
+  unbounded presentation latency; A/V startup and playing seeks use bounded
+  video preroll, while playing seeks invalidate queues without blocking the
+  caller and hold the clock in `Buffering` until actual new-generation output
+  arrives; clock-capable audio must re-anchor after flush, audio underruns
+  freeze the fallback clock until recovery, and
+  HTTP(S) inputs use bounded read-timeout/reconnect defaults instead of
+  immediately converting a recoverable disconnect into `Invalid`;
+  the D3D11 Video Processor interop now reuses a bounded three-output texture
+  pool instead of allocating a full-resolution output texture per frame;
+  `QtAV::OutputD3D11` now owns the Windows device, composition swap chain,
+  render target, display/HDR tracking, render scheduling thread,
+  D3D11VA/interop wiring, `renderVideo()`, `Present()`, resize, and teardown;
+  its default FP16 scRGB path resolves the hosting window's monitor without
+  relying on unsupported composition-swap-chain `GetContainingOutput()`,
+  tracks Windows HDR/SDR-white/luminance changes per frame, and exposes
+  prefer-HDR, require-HDR, and SDR-only policies, while the WinUI 3 sample
+  only supplies its HWND, binds its `SwapChainPanel`, attaches the player, and
+  forwards size changes;
+  its progress slider observes already-handled thumb pointer events and
+  commits only one seek when a drag ends instead of issuing intermediate seeks;
   Milestone 5 is complete and the active next platform task is the Android
   production path, followed by OHOS and then Linux; the shared Android/OHOS
   responsibility and lifecycle design is now recorded in `MOBILE.md`, and the
@@ -82,6 +103,7 @@ Current public entry points:
 - `modern/backends/audio/wasapi/include/qtav/wasapi_audio_sink.h`
 - `modern/backends/render/metal/include/qtav/metal_video_renderer.h`
 - `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
+- `modern/backends/output/d3d11/include/qtav/d3d11_video_output.h`
 - `modern/backends/render/vulkan/include/qtav/vulkan_video_renderer.h`
 - `modern/backends/render/vulkan/android/include/qtav/android_vulkan_video_renderer.h`
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
@@ -112,6 +134,7 @@ Current implementation:
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
 - `modern/backends/interop/d3d11/src/d3d11_frame_interop.cpp`
+- `modern/backends/output/d3d11/src/d3d11_video_output.cpp`
 - `modern/tests/audio_sink_player_test.cpp`
 - `modern/tests/simulated_audio_sink.h`
 - `modern/tests/simulated_audio_sink.cpp`
@@ -130,6 +153,7 @@ Current implementation:
 - `modern/tests/vulkan_video_renderer_test_support.cpp`
 - `modern/tests/d3d11va_hardware_decoder_test.cpp`
 - `modern/tests/d3d11_frame_interop_test.cpp`
+- `modern/tests/d3d11_video_output_test.cpp`
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
 - `modern/tests/cvmetal_frame_interop_test.mm`
 - `modern/tests/hardware_decode_device_test.cpp`
@@ -139,9 +163,21 @@ Current implementation:
 
 Current verification:
 
-- the current static and shared Windows builds pass 33/33 CTest tests,
-  including the Advanced Color test, the
-  WASAPI device test and strict native H.264/AAC playback;
+- the current static and shared Windows builds pass 34/34 CTest tests,
+  including the high-level D3D11 composition-output lifecycle test, Advanced
+  Color test, WASAPI device test, and strict native H.264/AAC playback;
+- the WinUI 3 sample, now using `QtAV::OutputD3D11`, sustains 24.9-25.1
+  scheduled and rendered fps on the exercised 3840x2160 HEVC
+  Main10/E-AC-3 HDR file; the migrated output was validated by seeking from
+  35:31 back to 07:22 with both operations returning
+  `Loaded -> Buffering -> Loaded` and resuming picture/audio. Earlier
+  steady-state validation recorded zero coalesced redraws and zero
+  video/render gaps over 80 ms, and a 15-second sample stayed within a bounded
+  933-960 MiB working-set band instead of growing per frame. The same file now
+  validates the completed high-level HDR path as D3D11VA
+  P010/BT.2020/PQ -> FP16 scRGB -> an active Windows HDR layer, reporting
+  system 240-nit SDR white and a 1405-nit display peak while sustaining
+  25.0 fps;
 - static and shared macOS builds pass 27/27 CTest tests, including numeric
   FP16 HDR/BT.2020/headroom checks and real-screen EDR presentation on the
   active EDR-capable display;
@@ -170,9 +206,10 @@ Current verification:
   after player shutdown;
 - Windows Advanced Color coverage now includes deterministic PQ/HLG EOTF,
   BT.2020 conversion, SDR tone mapping, FP16 scRGB and RGB10/PQ numeric
-  readback, a native flip-model swap chain, `IDXGIOutput6`,
-  `SetColorSpace1`, SDR-white lookup, and same-adapter display switching while
-  Windows HDR is disabled and enabled. Active-HDR validation on a
+  readback, native HWND and composition flip-model swap chains,
+  `IDXGIOutput6`, `SetColorSpace1`, composition-monitor lookup, SDR-white
+  lookup, and same-adapter display switching while Windows HDR is disabled
+  and enabled. Active-HDR validation on a
   PHL 27B1U7903 reported a 10-bit G2084/P2020 output, system-derived 240-nit
   SDR white, 1405.11-nit peak luminance, and 1000-nit PQ output above scRGB
   `1.0`;
@@ -184,9 +221,10 @@ Current verification:
   directory;
 - installation plus external CMake consumption of `QtAV::PlatformWindows`,
   `QtAV::HWD3D11VA`, `QtAV::RenderD3D11`, `QtAV::InteropD3D11`, and
-  `QtAV::AudioWASAPI` together with the portable core, render, and audio
-  targets passes for static and shared builds; the installed core token links
-  without installing its private FFmpeg bridge header.
+  `QtAV::OutputD3D11`, and `QtAV::AudioWASAPI` together with the portable
+  core, render, and audio targets passes for static and shared builds; the
+  installed core token links without installing its private FFmpeg bridge
+  header.
 - on the macOS arm64 host, NDK r28c cross-builds the pinned FFmpeg 8.1.2
   minimal libraries and QtAVCore for Android `arm64-v8a`; the signed
   NativeActivity APK passes 16 KB ELF segment-alignment checks and installs on
@@ -352,11 +390,15 @@ Completed playback scheduling isolation checkpoint:
   timestamp-ordered presentation queue; stale late video is discarded when the
   application render path falls behind;
 - device-clock reads are sampled by the audio-output worker and published as a
-  generation-checked cache, so UI calls to `Player::position()` cannot wait on
-  a sink write;
+  generation-checked cache; presentation uses a try-lock refresh plus
+  submitted-audio-bounded monotonic extrapolation, so neither video scheduling
+  nor UI calls to `Player::position()` wait behind a sink write;
 - a deterministic regression test blocks both the first sink write and the
   render callback, verifies that `position()` remains non-blocking, and verifies
   that audio writes continue while presentation is blocked;
+- another deterministic regression holds a later sink write after a device
+  clock has been established and verifies that video presentation continues
+  from the cached clock rather than waiting on the sink serialization lock;
 - separate packet-demux and per-stream decoder workers are intentionally
   deferred: the current bounded post-decode queues remove the observed
   cross-layer blocking without duplicating FFmpeg ownership. Revisit packet
@@ -885,15 +927,18 @@ Completed D3D11 Video Processor interop checkpoint:
   exact source/target device identity, device health, format support, and
   dimensions before entering the shared recursive context guard;
 - `D3D11FrameInterop` caches the Video Processor enumerator/processor and
-  returns a retained per-import SDR BGRA8, FP16 scRGB, or RGB10/PQ texture plus
-  shader-resource view without CPU mapping or a cross-device copy;
+  reuses a bounded pool of up to three SDR BGRA8, FP16 scRGB, or RGB10/PQ
+  output textures plus shader-resource views without CPU mapping or a
+  cross-device copy; overlapping retained imports remain independent and may
+  use a transient output when every pool entry is retained;
 - the renderer passes structured range/matrix/transfer/chroma metadata through
   a backward-compatible color-aware interop overload; Direct3D 11.1 color
   spaces preserve PQ/BT.2020 as RGB10/PQ (or FP16 scRGB) and HLG/BT.2020 as
   FP16 scRGB (or RGB10/PQ), with legacy SDR BT.601/709 fallback;
-- WARP covers texture-array/slice extraction, retained lifetime, recursive
-  locking, and safe Video Processor unavailability while mock WARP tests cover
-  renderer consumption and error contracts;
+- WARP covers texture-array/slice extraction, retained lifetime, sequential
+  output reuse, independent overlapping outputs, recursive locking, and safe
+  Video Processor unavailability while mock WARP tests cover renderer
+  consumption and error contracts;
 - the current hardware adapter renders generated H.264/NV12 and PQ/BT.2020
   HEVC Main10/P010 D3D11VA frames with zero map calls, verified red/blue pixel
   readback, and FP16 scRGB values above `1.0`; the H.264 path also covers
@@ -968,12 +1013,19 @@ Acceptance:
 ### D3D11
 
 - [x] `qtav_render_d3d11`.
+- [x] `qtav_output_d3d11` high-level composition output for ordinary
+  application-owned native surfaces.
 - [x] Borrowed `ID3D11Device`, context, and render target.
 - [x] Software-frame texture upload.
 - [x] Resize, viewport, aspect ratio, rotation, and redraw.
 - [x] Windows Advanced Color SDR, FP16 scRGB, and RGB10/PQ output.
 - [x] Per-frame display/HDR-state switching, SDR reference white, PQ/HLG,
   primaries conversion, and display-aware tone mapping.
+- [x] Library-owned D3D11 device, composition swap chain, render target,
+  redraw-coalescing render thread, `renderVideo()`, `Present()`, resize,
+  D3D11VA/Video Processor setup, per-frame composition-monitor/Advanced Color
+  tracking, FP16 scRGB HDR presentation, and teardown, retaining the
+  borrowed-target renderer as the advanced external-context path.
 
 ### Audio and hardware decode
 
@@ -990,6 +1042,13 @@ Acceptance:
   together.
 - [x] Software and D3D11 hardware decode both work.
 - [x] Device-loss and surface-recreation paths are tested.
+- [x] A composition-output integration test covers WARP creation, native
+  swap-chain binding/unbinding, player attach/detach, hardware-config restore,
+  decoded-frame presentation, redraw, resize, statistics, and teardown.
+- [x] The high-level composition path resolves its explicit current monitor,
+  configures FP16 scRGB through `SetColorSpace1`, exposes active HDR/display
+  luminance diagnostics, falls back to SDR under `PreferHdr`, and rejects
+  inactive HDR under `RequireHdr`.
 - [x] Active-HDR native display validation with the Windows HDR setting
   enabled, including HDR numeric readback and HDR-disabled native
   swap-chain/display-switch tests.

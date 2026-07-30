@@ -449,6 +449,25 @@ void testWarpContracts()
     imported->shaderResourceView()->GetResource(&viewResource);
     assert(viewResource.Get() == imported->texture());
 
+    ID3D11Texture2D* pooledTexture = imported->texture();
+    imported.reset();
+    for (int index = 0; index < 64; ++index) {
+        imported = interop.importFrame(frame);
+        assert(imported);
+        assert(imported->texture() == pooledTexture);
+        imported.reset();
+    }
+
+    auto retainedPooledImport = interop.importFrame(frame);
+    auto overlappingImport = interop.importFrame(frame);
+    assert(retainedPooledImport);
+    assert(overlappingImport);
+    assert(
+        retainedPooledImport->texture()
+        != overlappingImport->texture());
+    imported = std::move(retainedPooledImport);
+    overlappingImport.reset();
+
     frame = {};
     texture.Reset();
     assert(imported->texture());

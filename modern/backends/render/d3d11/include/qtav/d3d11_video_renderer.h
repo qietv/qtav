@@ -50,11 +50,15 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11AdvancedColorInfo {
 // The view and optional swap chain remain application-owned and must stay
 // valid for the render() call. Supplying the swap chain enables automatic
 // IDXGIOutput6 capability discovery, SDR-white lookup, SetColorSpace1(), and
-// display-switch handling. The renderer obtains both objects on every call,
-// so resize and other surface recreation do not require rebuilding it.
+// display-switch handling. Composition swap chains do not implement
+// GetContainingOutput(); set monitor to the native window's current monitor
+// for that presentation path. The renderer obtains all objects on every call,
+// so resize, display moves, and other surface recreation do not require
+// rebuilding it.
 struct QTAV_RENDER_D3D11_EXPORT D3D11RenderTarget {
     ID3D11RenderTargetView* view = nullptr;
     IDXGISwapChain3* swapChain = nullptr;
+    HMONITOR monitor = nullptr;
 
     bool isValid() const noexcept;
 };

@@ -399,6 +399,67 @@ float querySdrWhiteLevelNits(const wchar_t* deviceName) noexcept
     return 0.0F;
 }
 
+HRESULT findOutputForMonitor(
+    ID3D11Device* device,
+    HMONITOR monitor,
+    ComPtr<IDXGIOutput>& output)
+{
+    if (!device || !monitor) {
+        return E_INVALIDARG;
+    }
+
+    ComPtr<IDXGIDevice> dxgiDevice;
+    HRESULT result = device->QueryInterface(
+        IID_PPV_ARGS(&dxgiDevice));
+    if (FAILED(result)) {
+        return result;
+    }
+
+    ComPtr<IDXGIAdapter> deviceAdapter;
+    result = dxgiDevice->GetAdapter(&deviceAdapter);
+    if (FAILED(result)) {
+        return result;
+    }
+
+    ComPtr<IDXGIFactory1> factory;
+    result = deviceAdapter->GetParent(IID_PPV_ARGS(&factory));
+    if (FAILED(result)) {
+        return result;
+    }
+
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        ComPtr<IDXGIAdapter1> adapter;
+        result = factory->EnumAdapters1(adapterIndex, &adapter);
+        if (result == DXGI_ERROR_NOT_FOUND) {
+            return DXGI_ERROR_NOT_FOUND;
+        }
+        if (FAILED(result)) {
+            return result;
+        }
+
+        for (UINT outputIndex = 0;; ++outputIndex) {
+            ComPtr<IDXGIOutput> candidate;
+            result = adapter->EnumOutputs(outputIndex, &candidate);
+            if (result == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (FAILED(result)) {
+                return result;
+            }
+
+            DXGI_OUTPUT_DESC description {};
+            result = candidate->GetDesc(&description);
+            if (FAILED(result)) {
+                continue;
+            }
+            if (description.Monitor == monitor) {
+                output = std::move(candidate);
+                return S_OK;
+            }
+        }
+    }
+}
+
 bool configureAdvancedColor(
     ID3D11Device* expectedDevice,
     const D3D11RenderTarget& target,
@@ -455,11 +516,22 @@ bool configureAdvancedColor(
     }
 
     ComPtr<IDXGIOutput> output;
-    result = target.swapChain->GetContainingOutput(&output);
+    if (target.monitor) {
+        result = findOutputForMonitor(
+            expectedDevice,
+            target.monitor,
+            output);
+    } else {
+        result = target.swapChain->GetContainingOutput(&output);
+    }
     if (FAILED(result) || !output) {
-        error = hresultText(
-            "IDXGISwapChain::GetContainingOutput",
-            result);
+        error = target.monitor
+            ? hresultText(
+                "DXGI output lookup for the current monitor",
+                result)
+            : hresultText(
+                "IDXGISwapChain::GetContainingOutput",
+                result);
         return false;
     }
     ComPtr<IDXGIOutput6> output6;

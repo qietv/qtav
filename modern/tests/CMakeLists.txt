@@ -285,6 +285,21 @@ if(TARGET qtav_render_d3d11)
     )
 endif()
 
+if(TARGET qtav_output_d3d11)
+    add_executable(
+        qtav_output_d3d11_test
+        d3d11_video_output_test.cpp
+    )
+    target_link_libraries(
+        qtav_output_d3d11_test
+        PRIVATE QtAV::OutputD3D11
+    )
+    target_compile_features(
+        qtav_output_d3d11_test
+        PRIVATE cxx_std_17
+    )
+endif()
+
 if(TARGET qtav_render_vulkan)
     add_executable(
         qtav_render_vulkan_test
@@ -532,6 +547,21 @@ if(FFMPEG_EXECUTABLE)
             FIXTURES_REQUIRED qtav_core_media
             TIMEOUT 15
     )
+
+    if(TARGET qtav_output_d3d11_test)
+        add_test(
+            NAME qtav_output_d3d11_composition
+            COMMAND
+                qtav_output_d3d11_test
+                "${QTAV_CORE_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_output_d3d11_composition
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_core_media
+                TIMEOUT 15
+        )
+    endif()
 
     if(TARGET qtav_audio_wasapi
        AND TARGET qtav_audio_resample

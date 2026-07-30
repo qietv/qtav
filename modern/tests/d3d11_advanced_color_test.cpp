@@ -384,6 +384,42 @@ SwapChainTarget makeSwapChainTarget(
     return result;
 }
 
+SwapChainTarget makeCompositionTarget(
+    const DeviceResources& resources,
+    DXGI_FORMAT format =
+        DXGI_FORMAT_R16G16B16A16_FLOAT)
+{
+    DXGI_SWAP_CHAIN_DESC1 description {};
+    description.Width = 64;
+    description.Height = 64;
+    description.Format = format;
+    description.SampleDesc.Count = 1;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    description.BufferCount = 2;
+    description.Scaling = DXGI_SCALING_STRETCH;
+    description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+    SwapChainTarget result;
+    ComPtr<IDXGISwapChain1> swapChain1;
+    if (FAILED(resources.factory->CreateSwapChainForComposition(
+            resources.device.Get(),
+            &description,
+            nullptr,
+            &swapChain1))
+        || FAILED(swapChain1.As(&result.swapChain))
+        || FAILED(result.swapChain->GetBuffer(
+            0,
+            IID_PPV_ARGS(&result.texture)))
+        || FAILED(resources.device->CreateRenderTargetView(
+            result.texture.Get(),
+            nullptr,
+            &result.view))) {
+        return {};
+    }
+    return result;
+}
+
 } // namespace
 
 int main()
@@ -496,6 +532,72 @@ int main()
         return 3;
     }
     assert(SUCCEEDED(target.swapChain->Present(0, 0)));
+
+    SwapChainTarget compositionTarget =
+        makeCompositionTarget(resources);
+    assert(
+        compositionTarget.swapChain
+        && compositionTarget.texture
+        && compositionTarget.view);
+    auto compositionRenderer =
+        std::make_shared<qtav::D3D11VideoRenderer>(
+            access,
+            [&] {
+                return qtav::D3D11RenderTarget {
+                    compositionTarget.view.Get(),
+                    compositionTarget.swapChain.Get(),
+                    outputs.front().Monitor,
+                };
+            });
+    compositionRenderer->setEventCallback(
+        [&](const qtav::VideoRenderEvent& event) {
+            if (event.type == qtav::VideoRenderEventType::Error
+                || event.type
+                    == qtav::VideoRenderEventType::SurfaceLost) {
+                ++errors;
+                std::cerr << event.detail << '\n';
+            }
+        });
+    assert(compositionRenderer->open(config));
+    assert(compositionRenderer->render(pqFrame));
+    const auto compositionInfo =
+        compositionRenderer->advancedColorInfo();
+    assert(compositionInfo.displayDetected);
+    assert(compositionInfo.monitor == outputs.front().Monitor);
+    assert(
+        compositionInfo.outputColorSpace
+        == qtav::D3D11OutputColorSpace::ScRGB);
+    assert(
+        compositionInfo.swapChainColorSpace
+        == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+    assert(compositionInfo.swapChainColorSpaceConfigured);
+    assert(
+        compositionInfo.advancedColorActive
+        == testedInfo.advancedColorActive);
+    assert(
+        compositionInfo.isHdrOutput()
+        == testedInfo.advancedColorActive);
+    const auto compositionRed = readRedChannel(
+        resources.device.Get(),
+        resources.context.Get(),
+        compositionTarget.texture.Get());
+    const float compositionDiffuse =
+        compositionRed[32U * 64U + 16U];
+    const float compositionHighlight =
+        compositionRed[32U * 64U + 48U];
+    assert(compositionHighlight > compositionDiffuse);
+    if (testedInfo.advancedColorActive) {
+        assert(
+            compositionDiffuse > 0.9F
+            && compositionDiffuse < 1.1F);
+        assert(compositionHighlight > 1.1F);
+    } else {
+        assert(
+            compositionDiffuse > 0.0F
+            && compositionDiffuse < 1.0F);
+        assert(compositionHighlight <= 1.01F);
+    }
+    assert(SUCCEEDED(compositionTarget.swapChain->Present(0, 0)));
 
     bool hdr10Validated = false;
     TestWindow hdr10Window = makeWindow(

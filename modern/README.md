@@ -2,8 +2,9 @@
 
 QtAVCore is the Qt-free evolution path for QtAV. It keeps FFmpeg as the media
 engine, replaces Qt types and the Qt event model with standard C++17, and uses
-an application-owned rendering callback inspired by the public shape of
-`mdk-sdk`.
+high-level platform outputs for ordinary presentation while retaining an
+application-owned rendering callback, inspired by the public shape of
+`mdk-sdk`, for custom graphics integration.
 
 It is not source- or binary-compatible with `mdk-sdk`, and no `mdk-sdk` source
 code is used.
@@ -13,7 +14,9 @@ code is used.
 - no Qt headers, libraries, meta-object compiler, or event loop;
 - asynchronous `qtav::Player` state machine;
 - FFmpeg 8+ send/receive decoding API;
-- local files and FFmpeg-supported network protocols;
+- local files and FFmpeg-supported network protocols, with bounded HTTP(S)
+  read timeouts and reconnect defaults that applications can override through
+  `avformat.*` properties;
 - audio and video frame callbacks with reference-counted frame lifetime;
 - structured video range, primaries, transfer, matrix, chroma-location, HDR10
   mastering-display, and content-light metadata;
@@ -26,6 +29,10 @@ code is used.
 - optional Windows D3D11 renderer for a retained application-selected device
   and immediate context plus borrowed current render-target/swap-chain views,
   including Windows Advanced Color SDR, FP16 scRGB, and RGB10 HDR10 output;
+- optional high-level Windows D3D11 composition output that owns the device,
+  HDR-aware FP16 scRGB or SDR swap chain, render target, display tracking,
+  redraw-coalescing thread, D3D11VA/interop wiring, `renderVideo()`,
+  `Present()`, resize, and teardown;
 - optional Metal renderer for borrowed Apple devices, command queues, and
   current render targets, including complete macOS/iOS extended-linear
   BT.2020 EDR layer presentation;
@@ -66,7 +73,9 @@ Current backend integration boundary:
 - `AudioSink` is connected through `Player::setAudioSink()`, follows playback
   lifecycle changes, and supplies the playback master when its device clock is
   supported and valid; decoded PCM crosses a bounded queue to a dedicated
-  audio-output worker, and queued audio is drained before close at natural end;
+  audio-output worker, queued audio is drained before close at natural end,
+  and seek/underrun buffering freezes `position()` until the device clock
+  re-anchors (or callback-only output is actually delivered);
 - `AudioFrameConverter` is connected through
   `Player::setAudioFrameConverter()` when a sink negotiates different PCM;
   `QtAV::AudioResample` supplies the portable libswresample implementation;
@@ -99,6 +108,11 @@ Current backend integration boundary:
   slices through the D3D11 Video Processor and returns shader-readable SDR
   BGRA8, FP16 scRGB, or RGB10/PQ textures without mapping decoded pixels
   through CPU memory;
+- `QtAV::OutputD3D11` combines the Windows device, renderer, decoder, and
+  interop targets into a composition-surface output for ordinary applications;
+  the application supplies a swap-chain binding callback, surface size, and
+  normally its hosting HWND, then the output owns display/HDR tracking,
+  render scheduling, and presentation;
 - `QtAV::RenderMetal` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders into the application's
   current Metal texture or drawable, accepts an optional hardware-frame
@@ -178,6 +192,7 @@ clear error. Current switches are:
   `QTAV_HW_VAAPI`, and `QTAV_HW_MEDIACODEC`;
 - interop: `QTAV_INTEROP_D3D11`, `QTAV_INTEROP_CVMETAL`, and
   `QTAV_INTEROP_VAAPI`.
+- output: `QTAV_OUTPUT_D3D11`.
 
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
 `QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader and
@@ -195,8 +210,11 @@ VideoToolbox/Metal interop target when the Metal renderer and CoreVideo are
 available. `QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
 selection and native-frame access target. `QTAV_INTEROP_D3D11=AUTO` builds the
 Windows Video Processor adapter when the D3D11 renderer and D3D11VA decoder
-targets are available. Backend implementations not otherwise described remain
-disabled under `AUTO`, and explicitly requesting one with `ON` is an error.
+targets are available. `QTAV_OUTPUT_D3D11=AUTO` builds the high-level Windows
+composition output when the D3D11 renderer, D3D11VA decoder, and interop
+targets are available. Backend implementations not otherwise described
+remain disabled under `AUTO`, and explicitly requesting one with `ON` is an
+error.
 
 Run the headless example:
 
@@ -447,7 +465,20 @@ decode, or device audio submission. The video presentation queue is bounded;
 when the application falls behind, obsolete late frames are discarded instead
 of accumulating unbounded latency. `renderVideo()` runs on the caller's thread,
 so an OpenGL, Vulkan, Metal, or D3D integration can keep ownership of its native
-context and surface.
+context and surface. A/V startup and playing seeks use a bounded video preroll
+before releasing device audio, avoiding an audio-first clock sprint while the
+first video frames are still being decoded.
+
+An accepted seek while playing changes the media status to `Buffering` and
+holds `position()` at the requested position until output really resumes. A
+clock-capable audio sink must publish a valid post-flush device-clock sample;
+callback-only playback resumes when the first item from the new presentation
+generation is delivered. Audio-device underruns return to `Buffering` and
+freeze the fallback clock until the device clock re-anchors. Queue invalidation
+in the public `seek()` call does not wait for the presentation or audio workers
+to release their queue locks. HTTP(S) inputs additionally use a 15-second read
+timeout and bounded FFmpeg reconnect defaults, all overridable through
+`avformat.*`; this is not yet a general adaptive/live packet-buffer policy.
 
 ### CPU image-buffer renderer
 
@@ -535,7 +566,73 @@ submits frame-derived mastering-display and content-light metadata before
 presentation. `surfaceFormat()` and `hdrOutputActive()` expose the selected
 contract for diagnostics and tests.
 
-### D3D11 renderer
+### D3D11 composition output
+
+For ordinary Windows presentation, link `QtAV::OutputD3D11` and provide the
+native composition control's swap-chain binding operation. The output owns
+the D3D11 device, HDR-aware flip-model swap chain, target, display tracking,
+render scheduling thread, `renderVideo()`, `Present()`, D3D11VA
+configuration, Video Processor interop, resize, and teardown:
+
+```cpp
+#include <qtav/d3d11_video_output.h>
+#include <qtav/player.h>
+
+qtav::Player player;
+qtav::D3D11VideoOutput output;
+qtav::D3D11CompositionSurface surface;
+surface.size = { width, height };
+surface.compositionScaleX = compositionScaleX;
+surface.compositionScaleY = compositionScaleY;
+surface.window = hwnd;
+surface.bindSwapChain = [panelNative](IDXGISwapChain1* swapChain) {
+    return panelNative->SetSwapChain(swapChain);
+};
+
+if (!output.open(std::move(surface)) || !output.attach(player)) {
+    throw std::runtime_error(output.lastError());
+}
+
+player.setMedia(url).setState(qtav::State::Playing);
+
+// On native surface size/scale changes:
+output.resize({ newWidth, newHeight }, newScaleX, newScaleY);
+
+// Before destroying either the Player or native surface:
+output.detach();
+output.close();
+```
+
+The default `D3D11OutputPreference::PreferHdr` creates an FP16 scRGB
+composition swap chain when `surface.window` or `surface.currentMonitor` can
+identify the active display. Before every presentation, the renderer resolves
+that monitor to `IDXGIOutput6`, observes the current Windows HDR setting,
+system SDR reference white, and panel luminance, and configures
+`DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`. PQ/HLG material therefore remains
+HDR through the final DWM layer while Advanced Color is active; on an SDR
+display or with Windows HDR disabled, the same path tone maps into the SDR
+range. Moving the window between displays takes effect on the next frame.
+
+`D3D11OutputPreference::RequireHdr` refuses to present while the current
+display is not in Advanced Color HDR mode.
+`D3D11OutputPreference::SdrOnly` creates a BGRA8 SDR swap chain. `PreferHdr`
+also falls back to BGRA8 when no HWND or monitor provider is supplied, keeping
+non-windowed composition hosts usable without claiming HDR. `colorInfo()`
+reports the selected format/color space, active display, system SDR white,
+luminance, and whether the presented layer is currently HDR.
+
+`attach()` exclusively owns the player's default render slot and render
+callback until `detach()`. The player and native surface must therefore
+outlive the attachment. Output event and frame-presented callbacks may run on
+the output render thread and must not destroy or detach the output from inside
+the callback. Toolkit-specific UI changes should be posted to that toolkit's
+dispatcher.
+
+The current WinUI 3 example uses only its HWND, this surface binding, and
+`attach()`/`resize()`; it no longer implements a graphics device, swap chain,
+render thread, HDR policy, or presentation loop in application code.
+
+### D3D11 renderer (advanced external-context path)
 
 On Windows, link `QtAV::RenderD3D11`, include
 `<qtav/d3d11_video_renderer.h>`, create shared access to the selected device
@@ -569,9 +666,12 @@ backends. The older renderer constructor taking the two borrowed wrappers
 remains a convenience path and creates the same retained access internally.
 The callback and returned `ID3D11RenderTargetView`/`IDXGISwapChain3` remain
 application-owned. The swap chain is optional for offscreen rendering, but it
-is required for native Advanced Color presentation. The callback runs
-synchronously inside `render()` and is queried for every frame, so swap-chain
-resize or other surface recreation can replace either pointer before calling
+is required for native Advanced Color presentation. Composition swap chains
+also return the hosting window's current `HMONITOR` in
+`D3D11RenderTarget::monitor` because `GetContainingOutput()` is unsupported
+for that swap-chain kind. The callback runs synchronously inside `render()`
+and is queried for every frame, so swap-chain resize, display moves, or other
+surface recreation can replace the current values before calling
 `configure()` with the new size.
 
 The renderer holds `D3D11DeviceAccess::contextGuard()` while issuing immediate
@@ -698,15 +798,19 @@ player
 `D3D11FrameInterop` validates the decoder texture, array slice, source format,
 device health, and exact COM device identity before entering the shared
 context guard. It caches the Video Processor enumerator/processor for the
-current NV12/P010 size, creates retained input/output views and a
-shader-readable intermediate for each import, and submits
-`VideoProcessorBlt()` on the selected immediate/video context. The renderer
-passes structured frame color metadata to the interop. SDR input uses BGRA8
-G22/P709 and retains the legacy BT.601/BT.709 fallback. PQ/BT.2020 input
-prefers RGB10/PQ P2020 and falls back to FP16 linear scRGB when the driver
-reports that conversion; HLG/BT.2020 prefers FP16 scRGB and can fall back to
-RGB10/PQ. The final renderer then performs display-specific tone and gamut
-mapping without a CPU map.
+current NV12/P010 size and keeps a bounded pool of up to three
+shader-readable output textures and their output views. Sequential imports
+reuse a compatible free output; overlapping imported-frame lifetimes receive
+independent pooled or transient outputs, so the retained-frame contract is
+preserved without allocating a full-resolution GPU texture every frame. Each
+import retains its source and input view and submits `VideoProcessorBlt()` on
+the selected immediate/video context. The renderer passes structured frame
+color metadata to the interop. SDR input uses BGRA8 G22/P709 and retains the
+legacy BT.601/BT.709 fallback. PQ/BT.2020 input prefers RGB10/PQ P2020 and
+falls back to FP16 linear scRGB when the driver reports that conversion;
+HLG/BT.2020 prefers FP16 scRGB and can fall back to RGB10/PQ. The final
+renderer then performs display-specific tone and gamut mapping without a CPU
+map.
 
 ### Metal renderer
 
@@ -882,13 +986,16 @@ recursive context lock as rendering.
 device, while `latencyMilliseconds` is informational and must not already be
 folded into that position. A sink that advertises a device clock becomes the
 playback master whenever `clock()` returns a valid value; otherwise the player
-falls back to its monotonic software clock. Ordinary sink writes and clock
-sampling run on the dedicated audio-output worker. The player publishes a
-generation-checked cached clock snapshot, so `Player::position()` never waits
-for a blocking sink write or calls into a platform backend. Sink lifecycle and
-natural-end `drain()` run on the playback worker, serialized with writes and
-without the player mutex held; `drain()` may block until the backend queue is
-presented.
+falls back to its monotonic software clock. Ordinary sink writes and their
+clock samples run on the dedicated audio-output worker. Presentation may
+opportunistically refresh that sample only when the sink-call serialization
+lock is immediately available; a blocking backend write is never allowed to
+stall video scheduling. Repeated device samples are monotonically extrapolated,
+bounded by submitted audio, and published as a generation-checked cache, so
+`Player::position()` never waits for a sink write or calls into a platform
+backend. Sink lifecycle and natural-end `drain()` run on the playback worker,
+serialized with writes and without the player mutex held; `drain()` may block
+until the backend queue is presented.
 
 `HardwareDecodeConfig` is copied by `Player` and applied the next time the
 video decoder opens. Changing it while media is loaded interrupts the current
@@ -939,10 +1046,11 @@ Windows D3D11 tests use the WARP device for deterministic offscreen rendering
 and cover RGB, YUV420P, NV12, and synthetic P010 PQ/HLG input; SDR tone
 mapping; FP16 scRGB and RGB10/PQ numeric output; viewport, aspect ratio,
 rotation, resize, target recreation, foreign-device rejection, and
-missing-surface events. A native flip-model test exercises
+missing-surface events. Native HWND and composition flip-model tests exercise
 `IDXGIOutput6`, `SetColorSpace1`, SDR-white lookup, the current Windows HDR
-state, and display switching when two outputs share the adapter. With Windows
-HDR enabled on a PHL 27B1U7903, the native test verifies a 10-bit
+state, composition-monitor resolution, and display switching when two outputs
+share the adapter. With Windows HDR enabled on a PHL 27B1U7903, the native
+test verifies a 10-bit
 G2084/P2020 output, system SDR white, nonzero panel luminance, and FP16 scRGB
 highlights above `1.0`. D3D11VA tests cover selected-device creation, shared
 locking, bounded

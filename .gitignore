@@ -92,3 +92,6 @@ python/QtAVWidgets
 
 #cache
 *.swp
+
+# Local media fixtures
+/test.mkv

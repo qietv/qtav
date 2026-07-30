@@ -158,6 +158,81 @@ void testRangeLoop(const char* media)
     assert(frames.load() >= 6);
 }
 
+void testPlayingSeekBuffering(const char* media)
+{
+    qtav::Player player;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool buffering = false;
+    bool loadedAfterBuffering = false;
+    bool seeked = false;
+    bool ended = false;
+    bool failed = false;
+    std::atomic<bool> seekRequested { false };
+
+    player
+        .onMediaStatus(
+            [&](qtav::MediaStatus, qtav::MediaStatus status) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (status == qtav::MediaStatus::Buffering) {
+                        buffering = true;
+                    } else if (status == qtav::MediaStatus::Loaded
+                               && buffering) {
+                        loadedAfterBuffering = true;
+                    } else if (
+                        status == qtav::MediaStatus::EndOfMedia) {
+                        ended = true;
+                    } else if (status == qtav::MediaStatus::Invalid) {
+                        failed = true;
+                    }
+                }
+                changed.notify_all();
+                return false;
+            })
+        .onVideoFrame([&](const qtav::VideoFrame&, int) {
+            if (seekRequested.exchange(true)) {
+                return;
+            }
+            const bool accepted = player.seek(
+                600,
+                qtav::SeekFlag::FromStart,
+                [&](std::int64_t position) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        seeked = position == 600;
+                        failed = failed || position < 0;
+                    }
+                    changed.notify_all();
+                });
+            if (!accepted) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    failed = true;
+                }
+                changed.notify_all();
+            }
+        });
+
+    player.setPlaybackRate(8.0F);
+    player.setMedia(media);
+    player.setState(qtav::State::Playing);
+
+    std::unique_lock<std::mutex> lock(mutex);
+    assert(changed.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [&] { return ended || failed; }));
+    lock.unlock();
+
+    assert(!failed);
+    assert(ended);
+    assert(seekRequested.load());
+    assert(seeked);
+    assert(buffering);
+    assert(loadedAfterBuffering);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -165,5 +240,6 @@ int main(int argc, char** argv)
     assert(argc == 2);
     testPrepareSeekAndPause(argv[1]);
     testRangeLoop(argv[1]);
+    testPlayingSeekBuffering(argv[1]);
     return 0;
 }

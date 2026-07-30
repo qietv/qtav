@@ -12,14 +12,9 @@
 #include <microsoft.ui.xaml.media.dxinterop.h>
 #include <microsoft.ui.xaml.window.h>
 
-#include <d3d11.h>
-#include <dxgi1_4.h>
 #include <shobjidl_core.h>
-#include <wrl/client.h>
 
-#include <qtav/d3d11_frame_interop.h>
-#include <qtav/d3d11_video_renderer.h>
-#include <qtav/d3d11va_hardware_decoder.h>
+#include <qtav/d3d11_video_output.h>
 #include <qtav/player.h>
 #include <qtav/swresample_audio_converter.h>
 #include <qtav/wasapi_audio_sink.h>
@@ -32,7 +27,6 @@
 #include <deque>
 #include <functional>
 #include <iomanip>
-#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -41,8 +35,6 @@
 namespace winrt::QtAVWinUI3::implementation {
 
 namespace {
-
-using ::Microsoft::WRL::ComPtr;
 
 const wchar_t* stateName(qtav::State state)
 {
@@ -76,14 +68,12 @@ const wchar_t* statusName(qtav::MediaStatus status)
     return L"unknown";
 }
 
-const wchar_t* renderEventName(qtav::VideoRenderEventType type)
+const wchar_t* renderEventName(qtav::D3D11VideoOutputEventType type)
 {
     switch (type) {
-    case qtav::VideoRenderEventType::RedrawRequested:
-        return L"redraw-requested";
-    case qtav::VideoRenderEventType::SurfaceLost:
+    case qtav::D3D11VideoOutputEventType::SurfaceLost:
         return L"surface-lost";
-    case qtav::VideoRenderEventType::Error:
+    case qtav::D3D11VideoOutputEventType::Error:
         return L"error";
     }
     return L"unknown";
@@ -135,10 +125,45 @@ std::wstring timestamp()
     return output.str();
 }
 
-std::wstring errorText(HRESULT status)
+std::int64_t steadyMicroseconds()
 {
-    return std::wstring(
-        hresult_error(status).message().c_str());
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void updateMaximum(
+    std::atomic<std::int64_t>& maximum,
+    std::int64_t value)
+{
+    auto current = maximum.load(std::memory_order_relaxed);
+    while (value > current
+           && !maximum.compare_exchange_weak(
+               current,
+               value,
+               std::memory_order_relaxed)) {
+    }
+}
+
+void recordCadence(
+    std::atomic<std::uint64_t>& count,
+    std::atomic<std::int64_t>& previousMicroseconds,
+    std::atomic<std::int64_t>& maximumGapMicroseconds,
+    std::atomic<std::uint64_t>& longGaps)
+{
+    constexpr std::int64_t longGapMicroseconds = 80'000;
+    count.fetch_add(1, std::memory_order_relaxed);
+    const auto now = steadyMicroseconds();
+    const auto previous =
+        previousMicroseconds.exchange(now, std::memory_order_relaxed);
+    if (previous <= 0) {
+        return;
+    }
+    const auto gap = now - previous;
+    updateMaximum(maximumGapMicroseconds, gap);
+    if (gap > longGapMicroseconds) {
+        longGaps.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 } // namespace
@@ -167,12 +192,29 @@ struct UiBridge final : std::enable_shared_from_this<UiBridge> {
 
     Microsoft::UI::Dispatching::DispatcherQueue dispatcher { nullptr };
     std::atomic<MainWindowPrivate*> target { nullptr };
-    std::atomic<bool> renderPending { false };
 };
 
 struct CallbackState final {
     std::atomic<bool> firstVideoFrame { false };
     std::atomic<bool> firstAudioFrame { false };
+    std::atomic<bool> firstPresentedFrame { false };
+    std::atomic<std::uint64_t> videoCallbacks { 0 };
+    std::atomic<std::uint64_t> audioCallbacks { 0 };
+    std::atomic<std::int64_t> previousVideoMicroseconds { 0 };
+    std::atomic<std::int64_t> maximumVideoGapMicroseconds { 0 };
+    std::atomic<std::uint64_t> longVideoGaps { 0 };
+
+    void reset()
+    {
+        firstVideoFrame.store(false);
+        firstAudioFrame.store(false);
+        firstPresentedFrame.store(false);
+        videoCallbacks.store(0);
+        audioCallbacks.store(0);
+        previousVideoMicroseconds.store(0);
+        maximumVideoGapMicroseconds.store(0);
+        longVideoGaps.store(0);
+    }
 };
 
 struct MainWindowPrivate final {
@@ -270,6 +312,11 @@ struct MainWindowPrivate final {
                 [bridge, callbackState](
                     const qtav::VideoFrame& frame,
                     int track) {
+                    recordCadence(
+                        callbackState->videoCallbacks,
+                        callbackState->previousVideoMicroseconds,
+                        callbackState->maximumVideoGapMicroseconds,
+                        callbackState->longVideoGaps);
                     if (callbackState->firstVideoFrame.exchange(true)) {
                         return;
                     }
@@ -301,6 +348,9 @@ struct MainWindowPrivate final {
                 [bridge, callbackState](
                     const qtav::AudioFrame& frame,
                     int track) {
+                    callbackState->audioCallbacks.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
                     if (callbackState->firstAudioFrame.exchange(true)) {
                         return;
                     }
@@ -318,19 +368,6 @@ struct MainWindowPrivate final {
                                 << to_hstring(format).c_str();
                             window.AppendLog(message.str());
                         });
-                })
-            .setRenderCallback(
-                [bridge](void*) {
-                    if (bridge->renderPending.exchange(true)) {
-                        return;
-                    }
-                    if (!bridge->post(
-                            [bridge](MainWindowPrivate& window) {
-                                bridge->renderPending.store(false);
-                                window.RenderCurrentFrame();
-                            })) {
-                        bridge->renderPending.store(false);
-                    }
                 });
     }
 
@@ -364,18 +401,67 @@ struct MainWindowPrivate final {
     void RegisterPanelEvents()
     {
         auto bridge = uiBridge_;
+        auto progressSlider = owner_.ProgressSlider();
+        progressSlider.AddHandler(
+            Microsoft::UI::Xaml::UIElement::PointerPressedEvent(),
+            box_value<Microsoft::UI::Xaml::Input::PointerEventHandler>(
+                Microsoft::UI::Xaml::Input::PointerEventHandler {
+                    [bridge](
+                        IInspectable const&,
+                        Microsoft::UI::Xaml::Input::
+                            PointerRoutedEventArgs const&) {
+                        bridge->post(
+                            [](MainWindowPrivate& window) {
+                                window.BeginProgressInteraction();
+                            });
+                    },
+                }
+            ),
+            true);
+        progressSlider.AddHandler(
+            Microsoft::UI::Xaml::UIElement::PointerReleasedEvent(),
+            box_value<Microsoft::UI::Xaml::Input::PointerEventHandler>(
+                Microsoft::UI::Xaml::Input::PointerEventHandler {
+                    [bridge](
+                        IInspectable const&,
+                        Microsoft::UI::Xaml::Input::
+                            PointerRoutedEventArgs const&) {
+                        bridge->post(
+                            [](MainWindowPrivate& window) {
+                                window.EndProgressInteraction();
+                            });
+                    },
+                }
+            ),
+            true);
+        progressSlider.AddHandler(
+            Microsoft::UI::Xaml::UIElement::PointerCaptureLostEvent(),
+            box_value<Microsoft::UI::Xaml::Input::PointerEventHandler>(
+                Microsoft::UI::Xaml::Input::PointerEventHandler {
+                    [bridge](
+                        IInspectable const&,
+                        Microsoft::UI::Xaml::Input::
+                            PointerRoutedEventArgs const&) {
+                        bridge->post(
+                            [](MainWindowPrivate& window) {
+                                window.EndProgressInteraction();
+                            });
+                    },
+                }
+            ),
+            true);
         owner_.VideoPanel().SizeChanged(
             [bridge](auto const&, auto const&) {
                 bridge->post(
                     [](MainWindowPrivate& window) {
-                        window.ResizeSwapChain();
+                        window.ResizeVideoOutput();
                     });
             });
         owner_.VideoPanel().CompositionScaleChanged(
             [bridge](auto const&, auto const&) {
                 bridge->post(
                     [](MainWindowPrivate& window) {
-                        window.ResizeSwapChain();
+                        window.ResizeVideoOutput();
                     });
             });
     }
@@ -428,13 +514,19 @@ struct MainWindowPrivate final {
             return;
         }
 
-        if (!graphicsInitialized_) {
-            InitializeGraphics();
+        if (!videoOutput_ || !videoOutput_->isOpen()) {
+            if (!InitializeVideoOutput()) {
+                return;
+            }
         }
 
-        callbackState_->firstVideoFrame.store(false);
-        callbackState_->firstAudioFrame.store(false);
-        presentedVideoFrame_ = false;
+        callbackState_->reset();
+        static_cast<void>(videoOutput_->takeStatistics());
+        cadenceReportAt_ = std::chrono::steady_clock::now();
+        seekTimer_.Stop();
+        scrubbing_ = false;
+        seekPending_ = false;
+        ++seekSerial_;
         durationMilliseconds_ = 0;
         seekable_ = false;
         updatingProgress_ = true;
@@ -474,6 +566,10 @@ struct MainWindowPrivate final {
 
     void Stop()
     {
+        seekTimer_.Stop();
+        scrubbing_ = false;
+        seekPending_ = false;
+        ++seekSerial_;
         if (player_) {
             player_->setState(qtav::State::Stopped);
         }
@@ -486,8 +582,34 @@ struct MainWindowPrivate final {
         }
         pendingSeekMilliseconds_ =
             static_cast<std::int64_t>(std::llround(value));
+        owner_.CurrentTimeText().Text(
+            formatTime(pendingSeekMilliseconds_));
+        if (scrubbing_) {
+            return;
+        }
         seekTimer_.Stop();
         seekTimer_.Start();
+    }
+
+    void BeginProgressInteraction()
+    {
+        if (!seekable_ || !player_) {
+            return;
+        }
+        scrubbing_ = true;
+        seekTimer_.Stop();
+    }
+
+    void EndProgressInteraction()
+    {
+        if (!scrubbing_) {
+            return;
+        }
+        scrubbing_ = false;
+        pendingSeekMilliseconds_ = static_cast<std::int64_t>(
+            std::llround(owner_.ProgressSlider().Value()));
+        seekTimer_.Stop();
+        CommitSeek();
     }
 
     void CommitSeek()
@@ -499,11 +621,42 @@ struct MainWindowPrivate final {
             pendingSeekMilliseconds_,
             0,
             durationMilliseconds_);
-        if (player_->seek(target)) {
+        const auto serial = ++seekSerial_;
+        seekPending_ = true;
+        updatingProgress_ = true;
+        owner_.ProgressSlider().Value(static_cast<double>(target));
+        owner_.CurrentTimeText().Text(formatTime(target));
+        updatingProgress_ = false;
+
+        auto bridge = uiBridge_;
+        if (player_->seek(
+                target,
+                qtav::SeekFlag::FromStart,
+                [bridge, serial](std::int64_t result) {
+                    bridge->post(
+                        [serial, result](MainWindowPrivate& window) {
+                            window.HandleSeekCompleted(serial, result);
+                        });
+                })) {
             AppendLog(L"seek: " + formatTime(target));
         } else {
+            seekPending_ = false;
             AppendLog(L"seek request was rejected");
         }
+    }
+
+    void HandleSeekCompleted(
+        std::uint64_t serial,
+        std::int64_t result)
+    {
+        if (serial != seekSerial_) {
+            return;
+        }
+        seekPending_ = false;
+        if (result < 0) {
+            AppendLog(L"seek failed");
+        }
+        UpdateProgress();
     }
 
     void HandleStateChanged(qtav::State state)
@@ -537,16 +690,20 @@ struct MainWindowPrivate final {
             SetStatus(L"正在加载…");
             break;
         case qtav::MediaStatus::Loaded:
-            UpdateMediaInfo();
+            if (durationMilliseconds_ <= 0) {
+                UpdateMediaInfo();
+            }
             SetStatus(L"已加载");
             break;
         case qtav::MediaStatus::Buffering:
             SetStatus(L"缓冲中…");
             break;
         case qtav::MediaStatus::EndOfMedia:
+            seekPending_ = false;
             SetStatus(L"播放结束");
             break;
         case qtav::MediaStatus::Invalid:
+            seekPending_ = false;
             SetStatus(L"媒体无效；请查看 Debug 窗口");
             break;
         }
@@ -575,14 +732,9 @@ struct MainWindowPrivate final {
     }
 
     void HandleRenderEvent(
-        qtav::VideoRenderEventType type,
+        qtav::D3D11VideoOutputEventType type,
         std::string const& detail)
     {
-        if (type == qtav::VideoRenderEventType::RedrawRequested) {
-            RenderCurrentFrame();
-            return;
-        }
-
         std::wostringstream message;
         message << L"renderer " << renderEventName(type);
         if (!detail.empty()) {
@@ -590,7 +742,7 @@ struct MainWindowPrivate final {
         }
         AppendLog(message.str());
 
-        if (type == qtav::VideoRenderEventType::SurfaceLost) {
+        if (type == qtav::D3D11VideoOutputEventType::SurfaceLost) {
             SetStatus(L"视频表面已丢失；请查看 Debug 窗口");
         } else {
             SetStatus(L"视频渲染失败；请查看 Debug 窗口");
@@ -635,6 +787,10 @@ struct MainWindowPrivate final {
         if (!player_) {
             return;
         }
+        ReportCadenceMetrics();
+        if (scrubbing_ || seekPending_) {
+            return;
+        }
         const auto position = std::max<std::int64_t>(
             player_->position(),
             0);
@@ -648,6 +804,66 @@ struct MainWindowPrivate final {
             static_cast<double>(
                 std::min(position, durationMilliseconds_)));
         updatingProgress_ = false;
+    }
+
+    void ReportCadenceMetrics()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed =
+            std::chrono::duration<double>(now - cadenceReportAt_).count();
+        if (elapsed < 5.0) {
+            return;
+        }
+        cadenceReportAt_ = now;
+
+        const auto video = callbackState_->videoCallbacks.exchange(0);
+        const auto audio = callbackState_->audioCallbacks.exchange(0);
+        const auto outputStatistics =
+            videoOutput_
+            ? videoOutput_->takeStatistics()
+            : qtav::D3D11VideoOutputStatistics {};
+        const auto requests = outputStatistics.renderRequests;
+        const auto coalesced =
+            outputStatistics.coalescedRenderRequests;
+        const auto passes = outputStatistics.renderPasses;
+        const auto rendered = outputStatistics.presentedFrames;
+        const auto videoLongGaps =
+            callbackState_->longVideoGaps.exchange(0);
+        const auto renderLongGaps = outputStatistics.longRenderGaps;
+        const auto maximumVideoGap =
+            callbackState_->maximumVideoGapMicroseconds.exchange(0);
+        const auto maximumRenderGap =
+            outputStatistics.maximumRenderGapMicroseconds;
+        const auto maximumRender =
+            outputStatistics.maximumRenderMicroseconds;
+        const auto maximumPresent =
+            outputStatistics.maximumPresentMicroseconds;
+        if (video == 0 && audio == 0 && requests == 0
+            && passes == 0 && rendered == 0) {
+            return;
+        }
+
+        std::wostringstream message;
+        message
+            << std::fixed << std::setprecision(1)
+            << L"cadence " << elapsed << L"s: scheduled-video="
+            << static_cast<double>(video) / elapsed
+            << L" fps, audio=" << static_cast<double>(audio) / elapsed
+            << L" fps, render-requests=" << requests
+            << L", passes=" << passes
+            << L", rendered=" << static_cast<double>(rendered) / elapsed
+            << L" fps, coalesced=" << coalesced
+            << L", >80ms gaps(video/render)="
+            << videoLongGaps << L'/' << renderLongGaps
+            << L", max-gap-ms="
+            << static_cast<double>(maximumVideoGap) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumRenderGap) / 1'000.0
+            << L", max-render/present-ms="
+            << static_cast<double>(maximumRender) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumPresent) / 1'000.0;
+        AppendLog(message.str());
     }
 
     void SetStatus(std::wstring const& value)
@@ -744,359 +960,154 @@ struct MainWindowPrivate final {
         return { width, height };
     }
 
-    HRESULT CreateDevice(
-        D3D_DRIVER_TYPE driverType,
-        UINT flags,
-        ComPtr<ID3D11Device>& device,
-        ComPtr<ID3D11DeviceContext>& context)
+    bool InitializeVideoOutput()
     {
-        const D3D_FEATURE_LEVEL levels[] {
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0,
+        if ((videoOutput_ && videoOutput_->isOpen()) || shuttingDown_) {
+            return videoOutput_ && videoOutput_->isOpen();
+        }
+
+        const auto panel = owner_.VideoPanel();
+        const auto panelNative = panel.as<ISwapChainPanelNative>();
+        const auto [width, height] = PanelPixelSize();
+
+        qtav::D3D11CompositionSurface surface;
+        surface.size = {
+            static_cast<int>(width),
+            static_cast<int>(height),
         };
-        D3D_FEATURE_LEVEL selected {};
-        HRESULT status = D3D11CreateDevice(
-            nullptr,
-            driverType,
-            nullptr,
-            flags,
-            levels,
-            static_cast<UINT>(std::size(levels)),
-            D3D11_SDK_VERSION,
-            &device,
-            &selected,
-            &context);
-        if (status == E_INVALIDARG) {
-            device.Reset();
-            context.Reset();
-            status = D3D11CreateDevice(
-                nullptr,
-                driverType,
-                nullptr,
-                flags,
-                levels + 1,
-                1,
-                D3D11_SDK_VERSION,
-                &device,
-                &selected,
-                &context);
-        }
-        return status;
-    }
+        surface.compositionScaleX =
+            std::max(panel.CompositionScaleX(), 0.01F);
+        surface.compositionScaleY =
+            std::max(panel.CompositionScaleY(), 0.01F);
+        surface.bindSwapChain =
+            [panelNative](IDXGISwapChain1* swapChain) {
+                return panelNative->SetSwapChain(swapChain);
+            };
+        surface.window = windowHandle_;
 
-    bool InitializeGraphics()
-    {
-        if (graphicsInitialized_ || shuttingDown_) {
-            return graphicsInitialized_;
-        }
-
-        try {
-            const UINT videoFlags =
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT
-                | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-            HRESULT status = CreateDevice(
-                D3D_DRIVER_TYPE_HARDWARE,
-                videoFlags,
-                device_,
-                context_);
-            std::wstring deviceDescription =
-                L"hardware D3D11 with video support";
-
-            if (FAILED(status)) {
-                status = CreateDevice(
-                    D3D_DRIVER_TYPE_HARDWARE,
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    device_,
-                    context_);
-                deviceDescription = L"hardware D3D11";
-            }
-            if (FAILED(status)) {
-                status = CreateDevice(
-                    D3D_DRIVER_TYPE_WARP,
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    device_,
-                    context_);
-                deviceDescription = L"WARP D3D11";
-            }
-            check_hresult(status);
-
-            deviceAccess_ = qtav::D3D11DeviceAccess::create(
-                qtav::BorrowedD3D11Device(device_.Get()),
-                qtav::BorrowedD3D11DeviceContext(context_.Get()));
-            if (!deviceAccess_) {
-                throw hresult_error(
-                    E_FAIL,
-                    L"QtAVCore rejected the D3D11 immediate context");
-            }
-
-            ComPtr<IDXGIDevice1> dxgiDevice;
-            check_hresult(device_.As(&dxgiDevice));
-            dxgiDevice->SetMaximumFrameLatency(1);
-
-            ComPtr<IDXGIAdapter> adapter;
-            check_hresult(dxgiDevice->GetAdapter(&adapter));
-            ComPtr<IDXGIFactory2> factory;
-            check_hresult(
-                adapter->GetParent(IID_PPV_ARGS(&factory)));
-
-            const auto [width, height] = PanelPixelSize();
-            DXGI_SWAP_CHAIN_DESC1 description {};
-            description.Width = width;
-            description.Height = height;
-            description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            description.SampleDesc.Count = 1;
-            description.BufferUsage =
-                DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            description.BufferCount = 2;
-            description.Scaling = DXGI_SCALING_STRETCH;
-            description.SwapEffect =
-                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-            description.AlphaMode =
-                DXGI_ALPHA_MODE_PREMULTIPLIED;
-
-            ComPtr<IDXGISwapChain1> swapChain;
-            check_hresult(factory->CreateSwapChainForComposition(
-                device_.Get(),
-                &description,
-                nullptr,
-                &swapChain));
-            check_hresult(swapChain.As(&swapChain_));
-
-            auto panelNative =
-                owner_.VideoPanel().as<ISwapChainPanelNative>();
-            check_hresult(panelNative->SetSwapChain(
-                swapChain_.Get()));
-
-            CreateRenderTarget();
-            UpdateSwapChainTransform();
-
-            renderer_ =
-                std::make_shared<qtav::D3D11VideoRenderer>(
-                    deviceAccess_,
-                    [this] {
-                        return qtav::D3D11RenderTarget {
-                            renderTargetView_.Get(),
-                            nullptr,
-                        };
-                    });
-            auto bridge = uiBridge_;
-            renderer_->setEventCallback(
-                [bridge](const qtav::VideoRenderEvent& event) {
+        auto output = std::make_unique<qtav::D3D11VideoOutput>();
+        auto bridge = uiBridge_;
+        auto callbackState = callbackState_;
+        output
+            ->setEventCallback(
+                [bridge](const qtav::D3D11VideoOutputEvent& event) {
                     const auto type = event.type;
                     const std::string detail = event.detail;
                     bridge->post(
-                        [type, detail](
-                            MainWindowPrivate& window) {
+                        [type, detail](MainWindowPrivate& window) {
                             window.HandleRenderEvent(type, detail);
                         });
+                })
+            .setFramePresentedCallback(
+                [bridge, callbackState](double timestamp) {
+                    if (callbackState->firstPresentedFrame.exchange(
+                            true)) {
+                        return;
+                    }
+                    const auto milliseconds =
+                        static_cast<std::int64_t>(
+                            std::llround(timestamp * 1000.0));
+                    bridge->post(
+                        [milliseconds](MainWindowPrivate& window) {
+                            window.AppendLog(
+                                L"first video frame presented at "
+                                + formatTime(milliseconds));
+                            if (!window.videoOutput_) {
+                                return;
+                            }
+                            const auto color =
+                                window.videoOutput_->colorInfo();
+                            std::wostringstream message;
+                            message
+                                << L"output color: "
+                                << (color.isHdrOutput()
+                                        ? L"HDR active"
+                                        : L"SDR")
+                                << L", "
+                                << (color.colorSpace
+                                            == qtav::
+                                                D3D11PresentationColorSpace::
+                                                    ScRGB
+                                        ? L"FP16 scRGB"
+                                        : color.colorSpace
+                                                == qtav::
+                                                    D3D11PresentationColorSpace::
+                                                        HDR10
+                                        ? L"RGB10/PQ"
+                                        : L"BGRA8")
+                                << L", SDR white "
+                                << std::fixed << std::setprecision(0)
+                                << color.sdrWhiteLevelNits
+                                << L" nits, display peak "
+                                << color.maximumLuminanceNits
+                                << L" nits";
+                            window.AppendLog(message.str());
+                        });
                 });
-            interop_ =
-                std::make_shared<qtav::D3D11FrameInterop>(
-                    deviceAccess_);
-            renderer_->setHardwareFrameInterop(interop_);
-            renderer_->setAllowSoftwareMappingFallback(true);
 
-            qtav::VideoRenderConfig renderConfig;
-            renderConfig.surfaceSize = {
-                static_cast<int>(width),
-                static_cast<int>(height),
-            };
-            renderConfig.aspectRatio =
-                qtav::VideoAspectRatioMode::Fit;
-            if (!renderer_->open(renderConfig)) {
-                throw hresult_error(
-                    E_FAIL,
-                    L"QtAVCore D3D11 renderer failed to open");
-            }
-
-            player_
-                ->setHardwareDecodeConfig(
-                    qtav::d3d11vaHardwareDecodeConfig(
-                        deviceAccess_))
-                .setVideoRenderAPI(renderer_);
-
-            surfaceWidth_ = width;
-            surfaceHeight_ = height;
-            graphicsInitialized_ = true;
+        if (!output->open(std::move(surface))
+            || !output->attach(*player_)) {
+            SetStatus(L"D3D11 输出初始化失败；请查看 Debug 窗口");
             AppendLog(
-                L"graphics: " + deviceDescription
-                + L", BGRA8 flip-model SwapChainPanel");
-            AppendLog(
-                L"video path: D3D11VA/Video Processor preferred; "
-                L"software decode/map fallback enabled");
-            return true;
-        } catch (hresult_error const& error) {
-            SetStatus(L"D3D11 初始化失败；请查看 Debug 窗口");
-            AppendLog(
-                L"graphics initialization failed: "
-                + std::wstring(error.message().c_str())
-                + L" (" + errorText(error.code()) + L')');
-            ReleaseGraphics();
+                L"video output initialization failed: "
+                + std::wstring(
+                    to_hstring(output->lastError()).c_str()));
             return false;
         }
+
+        AppendLog(
+            L"graphics: "
+            + std::wstring(
+                to_hstring(output->deviceDescription()).c_str())
+            + L", library-owned HDR-aware FP16 scRGB "
+              L"composition output");
+        AppendLog(
+            L"video path: library-owned render thread, "
+            L"D3D11VA/Video Processor preferred, software fallback");
+        videoOutput_ = std::move(output);
+        return true;
     }
 
-    void CreateRenderTarget()
-    {
-        ComPtr<ID3D11Texture2D> backBuffer;
-        check_hresult(swapChain_->GetBuffer(
-            0,
-            IID_PPV_ARGS(&backBuffer)));
-        check_hresult(device_->CreateRenderTargetView(
-            backBuffer.Get(),
-            nullptr,
-            &renderTargetView_));
-    }
-
-    void UpdateSwapChainTransform()
-    {
-        if (!swapChain_) {
-            return;
-        }
-        const auto panel = owner_.VideoPanel();
-        const float scaleX =
-            std::max(panel.CompositionScaleX(), 0.01F);
-        const float scaleY =
-            std::max(panel.CompositionScaleY(), 0.01F);
-        const DXGI_MATRIX_3X2_F transform {
-            1.0F / scaleX,
-            0.0F,
-            0.0F,
-            1.0F / scaleY,
-            0.0F,
-            0.0F,
-        };
-        check_hresult(swapChain_->SetMatrixTransform(&transform));
-    }
-
-    void ResizeSwapChain()
+    void ResizeVideoOutput()
     {
         if (shuttingDown_) {
             return;
         }
-        if (!graphicsInitialized_) {
-            InitializeGraphics();
+        if (!videoOutput_ || !videoOutput_->isOpen()) {
+            InitializeVideoOutput();
             return;
         }
 
+        const auto panel = owner_.VideoPanel();
         const auto [width, height] = PanelPixelSize();
-        if (width == surfaceWidth_ && height == surfaceHeight_) {
-            try {
-                UpdateSwapChainTransform();
-            } catch (hresult_error const& error) {
-                AppendLog(
-                    L"swap-chain transform failed: "
-                    + std::wstring(error.message().c_str()));
-            }
-            return;
-        }
-
-        try {
-            {
-                auto guard = deviceAccess_->contextGuard();
-                ID3D11RenderTargetView* noTarget = nullptr;
-                context_->OMSetRenderTargets(
-                    1,
-                    &noTarget,
-                    nullptr);
-                context_->Flush();
-                renderTargetView_.Reset();
-                check_hresult(swapChain_->ResizeBuffers(
-                    2,
-                    width,
-                    height,
-                    DXGI_FORMAT_B8G8R8A8_UNORM,
-                    0));
-                CreateRenderTarget();
-            }
-
-            UpdateSwapChainTransform();
-            qtav::VideoRenderConfig renderConfig;
-            renderConfig.surfaceSize = {
-                static_cast<int>(width),
-                static_cast<int>(height),
-            };
-            renderConfig.aspectRatio =
-                qtav::VideoAspectRatioMode::Fit;
-            if (!renderer_->configure(renderConfig)) {
-                throw hresult_error(
-                    E_FAIL,
-                    L"QtAVCore renderer rejected the new surface size");
-            }
-
-            surfaceWidth_ = width;
-            surfaceHeight_ = height;
-            std::wostringstream message;
-            message
-                << L"surface resized: "
-                << width << L'x' << height;
-            AppendLog(message.str());
-            RenderCurrentFrame();
-        } catch (hresult_error const& error) {
+        if (!videoOutput_->resize(
+                {
+                    static_cast<int>(width),
+                    static_cast<int>(height),
+                },
+                std::max(panel.CompositionScaleX(), 0.01F),
+                std::max(panel.CompositionScaleY(), 0.01F))) {
             SetStatus(L"视频表面调整失败；请查看 Debug 窗口");
             AppendLog(
-                L"swap-chain resize failed: "
-                + std::wstring(error.message().c_str())
-                + L" (" + errorText(error.code()) + L')');
-        }
-    }
-
-    void RenderCurrentFrame()
-    {
-        if (!graphicsInitialized_
-            || !renderTargetView_
-            || !swapChain_
-            || !player_) {
+                L"video output resize failed: "
+                + std::wstring(
+                    to_hstring(videoOutput_->lastError()).c_str()));
             return;
         }
 
-        try {
-            {
-                auto guard = deviceAccess_->contextGuard();
-                const float black[] { 0.0F, 0.0F, 0.0F, 1.0F };
-                context_->ClearRenderTargetView(
-                    renderTargetView_.Get(),
-                    black);
-            }
-
-            const double timestamp = player_->renderVideo();
-            if (timestamp < 0.0) {
-                return;
-            }
-            check_hresult(swapChain_->Present(1, 0));
-            if (!presentedVideoFrame_) {
-                presentedVideoFrame_ = true;
-                const auto milliseconds =
-                    static_cast<std::int64_t>(
-                        std::llround(timestamp * 1000.0));
-                AppendLog(
-                    L"first video frame presented at "
-                    + formatTime(milliseconds));
-            }
-        } catch (hresult_error const& error) {
-            SetStatus(L"视频渲染失败；请查看 Debug 窗口");
-            AppendLog(
-                L"render failed: "
-                + std::wstring(error.message().c_str())
-                + L" (" + errorText(error.code()) + L')');
-        }
+        std::wostringstream message;
+        message << L"surface resized: " << width << L'x' << height;
+        AppendLog(message.str());
     }
 
-    void ReleaseGraphics() noexcept
+    void ReleaseVideoOutput() noexcept
     {
-        if (renderer_) {
-            renderer_->close();
+        if (!videoOutput_) {
+            return;
         }
-        interop_.reset();
-        renderer_.reset();
-        deviceAccess_.reset();
-        renderTargetView_.Reset();
-        swapChain_.Reset();
-        context_.Reset();
-        device_.Reset();
-        surfaceWidth_ = 0;
-        surfaceHeight_ = 0;
-        graphicsInitialized_ = false;
+        videoOutput_->detach();
+        videoOutput_->close();
+        videoOutput_.reset();
     }
 
     void Shutdown()
@@ -1117,18 +1128,9 @@ struct MainWindowPrivate final {
 
         if (player_) {
             player_->setState(qtav::State::Stopped);
-            player_.reset();
         }
-
-        if (swapChain_) {
-            try {
-                auto panelNative =
-                    owner_.VideoPanel().as<ISwapChainPanelNative>();
-                panelNative->SetSwapChain(nullptr);
-            } catch (...) {
-            }
-        }
-        ReleaseGraphics();
+        ReleaseVideoOutput();
+        player_.reset();
     }
 
     MainWindow& owner_;
@@ -1136,33 +1138,27 @@ struct MainWindowPrivate final {
     std::shared_ptr<UiBridge> uiBridge_;
     std::shared_ptr<CallbackState> callbackState_;
     std::unique_ptr<qtav::Player> player_;
+    std::unique_ptr<qtav::D3D11VideoOutput> videoOutput_;
 
     Microsoft::UI::Dispatching::DispatcherQueueTimer
         progressTimer_ { nullptr };
     Microsoft::UI::Dispatching::DispatcherQueueTimer
         seekTimer_ { nullptr };
 
-    ComPtr<ID3D11Device> device_;
-    ComPtr<ID3D11DeviceContext> context_;
-    ComPtr<IDXGISwapChain3> swapChain_;
-    ComPtr<ID3D11RenderTargetView> renderTargetView_;
-    std::shared_ptr<qtav::D3D11DeviceAccess> deviceAccess_;
-    std::shared_ptr<qtav::D3D11VideoRenderer> renderer_;
-    std::shared_ptr<qtav::D3D11FrameInterop> interop_;
-
     winrt::QtAVWinUI3::DebugWindow
         debugWindow_ { nullptr };
     std::deque<std::wstring> debugLines_;
     static constexpr std::size_t maximumDebugLines_ = 1000;
 
-    UINT surfaceWidth_ = 0;
-    UINT surfaceHeight_ = 0;
     std::int64_t durationMilliseconds_ = 0;
     std::int64_t pendingSeekMilliseconds_ = 0;
+    std::uint64_t seekSerial_ = 0;
     bool seekable_ = false;
     bool updatingProgress_ = false;
-    bool presentedVideoFrame_ = false;
-    bool graphicsInitialized_ = false;
+    bool scrubbing_ = false;
+    bool seekPending_ = false;
+    std::chrono::steady_clock::time_point cadenceReportAt_ =
+        std::chrono::steady_clock::now();
     bool shuttingDown_ = false;
 };
 
@@ -1246,8 +1242,8 @@ void MainWindow::VideoPanel_Loaded(
     IInspectable const&,
     Microsoft::UI::Xaml::RoutedEventArgs const&)
 {
-    impl_->InitializeGraphics();
-    impl_->ResizeSwapChain();
+    impl_->InitializeVideoOutput();
+    impl_->ResizeVideoOutput();
 }
 
 void MainWindow::Window_Closed(
