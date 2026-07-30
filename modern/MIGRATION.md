@@ -67,7 +67,10 @@ mdk-sdk:
   current texture or drawable;
 - media and track information;
 - interruptible FFmpeg I/O when media changes or playback stops;
-- standalone static/shared CMake builds and installable package metadata.
+- standalone static/shared CMake builds and installable package metadata;
+- a macOS-hosted Android arm64 cross-build and NativeActivity
+  connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode
+  without Qt.
 
 The `VideoRenderAPI` and `AudioSink` contracts are connected to `Player`.
 The default decode path remains software-only. Applications can pass the
@@ -183,6 +186,13 @@ or pace playback. Decoded planar audio therefore normally uses
 - buffering policy for live/network streams;
 - audio time-stretch without pitch change;
 - compressed Dolby passthrough, Atmos object rendering, and Dolby Vision.
+
+The Android harness is currently an integration checkpoint rather than a
+legacy QtAV API replacement. It proves the NDK, packaging, signing,
+connected-device logging, and software decode path. Android Vulkan/OpenGL ES
+rendering, AAudio output, MediaCodec direct-surface presentation, and optional
+texture interop remain separate backend work under the responsibility and
+lifecycle boundaries in [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and
 reference-counted planes. A platform audio sink should convert/resample only

@@ -38,6 +38,9 @@ code is used.
   `CVPixelBuffer` frames and explicit software fallback;
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
   VideoToolbox-frame rendering through Metal;
+- a reproducible macOS-to-Android arm64 build and connected-device
+  NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
+  decoding;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -165,6 +168,32 @@ a usable WASAPI endpoint. A session without an active render endpoint returns
 CTest skip code 77, so unavailable device validation is not reported as a
 pass. The strict test has also been exercised with an active endpoint, where
 H.264/AAC playback passed and produced audible output.
+
+### Android arm64 foundation harness
+
+The initial Android production-path harness is under
+`examples/android/`. It uses SDK CMake/Ninja and NDK r28c to cross-build a
+checksum-pinned minimal FFmpeg 8.1.2 configuration and QtAVCore for
+`arm64-v8a`, then uses AAPT2, zipalign, and apksigner to package a
+NativeActivity without Qt or a Gradle dependency:
+
+```sh
+modern/examples/android/build-android.sh
+modern/examples/android/run-connected-device.sh
+```
+
+Generated inputs and outputs remain under `build/android/`. The connected
+device script requires exactly one authorized device, records ABI/API and
+Vulkan facts, installs once, launches the generated-media playback test, and
+collects its pass/fail log. If installation or replacement fails because the
+device may be waiting for user authorization, stop and approve the prompt
+manually before retrying. The first Android 16/arm64 device run decoded 30
+MPEG-4 video frames and 47 PCM audio frames successfully.
+
+This is a toolchain, packaging, and software-decode checkpoint. It does not yet
+provide an Android renderer, AAudio sink, or MediaCodec backend. Their accepted
+shared Android/OHOS responsibility and lifecycle design is documented in
+[`MOBILE.md`](MOBILE.md).
 
 ## API shape
 
@@ -750,3 +779,6 @@ and threading contract. See [PLAN.md](PLAN.md) for the persistent milestone
 status, next task, and backend implementation order. The accepted Windows
 D3D11VA device, frame-lifetime, and zero-copy interop design is recorded in
 [D3D11VA.md](D3D11VA.md).
+The shared Android/OHOS mobile renderer, native lifecycle, hardware-output,
+audio, and connected-device test boundaries are recorded in
+[`MOBILE.md`](MOBILE.md).

@@ -56,6 +56,11 @@ completed.
   when the user explicitly states that cross-platform development for that
   task is intended; when continuing, clearly identify any Windows-native build
   or runtime validation that cannot be performed on the current host.
+- Newer Android and OHOS releases may require the user to approve installation
+  or replacement of a test application on the physical device. If installing
+  or updating a test application fails and device-side authorization may be
+  pending, pause deployment and ask the user to respond to the prompt manually
+  on the device. Do not repeatedly retry, bypass, or automate that approval.
 - Prefer explicit, optional backend linkage first. Do not introduce runtime
   plugin loading until the backend API is stable.
 - If dynamic plugins are introduced later, use a versioned C ABI at the shared

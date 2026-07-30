@@ -40,7 +40,11 @@ Continuation checkpoint:
   wiring, installed target export, and strict native H.264/AAC playback through
   an active WASAPI render endpoint; Milestone 5 is complete and the active next
   platform task is the Android production path, followed by OHOS and then
-  Linux;
+  Linux; the shared Android/OHOS responsibility and lifecycle design is now
+  recorded in `MOBILE.md`, and the first Android arm64 checkpoint
+  cross-builds FFmpeg 8.1.2 plus QtAVCore, packages a minimal NativeActivity
+  APK, and verifies generated software A/V decode on a connected Android
+  device;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -68,6 +72,7 @@ Current public entry points:
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
 - `modern/backends/interop/d3d11/include/qtav/d3d11_frame_interop.h`
+- `modern/MOBILE.md`
 
 Current implementation:
 
@@ -107,6 +112,9 @@ Current implementation:
 - `modern/tests/videotoolbox_hardware_decoder_test.cpp`
 - `modern/tests/cvmetal_frame_interop_test.mm`
 - `modern/tests/hardware_decode_device_test.cpp`
+- `modern/examples/android/native_activity.cpp`
+- `modern/examples/android/build-android.sh`
+- `modern/examples/android/run-connected-device.sh`
 
 Current verification:
 
@@ -145,6 +153,14 @@ Current verification:
   `QtAV::AudioWASAPI` together with the portable core, render, and audio
   targets passes for static and shared builds; the installed core token links
   without installing its private FFmpeg bridge header.
+- on the macOS arm64 host, NDK r28c cross-builds the pinned FFmpeg 8.1.2
+  minimal libraries and QtAVCore for Android `arm64-v8a`; the signed
+  NativeActivity APK passes 16 KB ELF segment-alignment checks and installs on
+  an Android 16/API 36 device with an Adreno 830;
+- the connected-device harness decodes its generated AVI through QtAVCore and
+  reports `PASS` with 30 MPEG-4 video frames and 47 PCM audio frames; install
+  authorization was confirmed manually on the device after the harness
+  correctly stopped on `INSTALL_FAILED_USER_RESTRICTED`.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -331,9 +347,9 @@ Completed file-output checkpoint:
 
 Begin the Android production path after the completed Windows milestone:
 
-1. [ ] Complete the shared Android/OHOS mobile design checkpoint below before
+1. [x] Complete the shared Android/OHOS mobile design checkpoint below before
    adding either platform's hardware decoder.
-2. [ ] Establish reproducible macOS-hosted Android NDK and FFmpeg 8+
+2. [x] Establish reproducible macOS-hosted Android NDK and FFmpeg 8+
    cross-builds, package a minimal native test application, and run it on a
    connected arm64 Android device.
 3. [ ] Add the reusable Vulkan renderer engine and Android surface adapter,
@@ -350,30 +366,52 @@ Begin the Android production path after the completed Windows milestone:
 
 Complete this checkpoint once and reuse it for both mobile production paths:
 
-1. [ ] Define a platform-neutral Vulkan renderer engine for software-frame
+1. [x] Define a platform-neutral Vulkan renderer engine for software-frame
    upload, YUV/RGB conversion, range/matrix/transfer/primaries handling,
    viewport, aspect ratio, rotation, synchronization, and retained in-flight
    resources.
-2. [ ] Keep Android `ANativeWindow`/EGL/Vulkan objects and OHOS
+2. [x] Keep Android `ANativeWindow`/EGL/Vulkan objects and OHOS
    `OHNativeWindow`/XComponent/EGL/Vulkan objects in separate platform or
    backend-specific adapters; do not expose either SDK through core public
    headers or merge the two SDK lifecycles into one platform class.
-3. [ ] Reuse shader inputs, color-conversion math, geometry generation,
+3. [x] Reuse shader inputs, color-conversion math, geometry generation,
    staging/upload helpers, capability rules, golden test vectors, and
    renderer contract tests between Android and OHOS. Share OpenGL ES code only
    where the API and resource-lifetime behavior actually match.
-4. [ ] Define a surface-backed hardware-decode presentation contract shared
+4. [x] Define a surface-backed hardware-decode presentation contract shared
    by MediaCodec and FFmpeg 8 OHCodec: explicit decoder selection, frame
    present/drop, playback-clock scheduling, bounded outstanding buffers,
    seek/flush, stop, media replacement, surface loss/recreation, and retained
    frame lifetime.
-5. [ ] Preserve separate targets for hardware decode, hardware-frame interop,
+5. [x] Preserve separate targets for hardware decode, hardware-frame interop,
    rendering, and audio output. Android uses MediaCodec/AAudio; OHOS uses
    OHCodec/OHAudio. Shared code must not introduce a lowest-common-denominator
    platform ABI.
-6. [ ] Create reusable device-test media and lifecycle scenarios, plus thin
+6. [x] Create reusable device-test media and lifecycle scenarios, plus thin
    platform-specific APK/HAP launch, signing, deployment, log collection, and
    result adapters for connected-device validation from macOS.
+
+Accepted design and Android foundation checkpoint:
+
+- [`MOBILE.md`](MOBILE.md) fixes the shared Vulkan engine, separate
+  Android/OHOS surface adapters, direct-surface hardware-output state machine,
+  audio boundaries, reusable lifecycle scenarios, and on-device installation
+  authorization gate;
+- the Android harness pins FFmpeg 8.1.2 by checksum, NDK r28c, API 28,
+  compile SDK 36, SDK CMake 4.1.2, and build-tools 37.0.0 while allowing
+  explicit installed-tool overrides;
+- its minimal LGPL-compatible FFmpeg configuration enables AVI, MPEG-4 video,
+  PCM S16 audio, file I/O, libswscale, and libswresample, then statically links
+  QtAVCore into one NativeActivity shared library without Qt;
+- AAPT2, zipalign, Android Studio's JBR, and apksigner produce a debug APK
+  without a Gradle dependency; generated sources, libraries, media, keys,
+  package output, logs, and device facts remain under `build/android/`;
+- deployment requires exactly one authorized device, runs installation once,
+  and stops for manual device confirmation on failure rather than retrying or
+  bypassing a modern Android/OHOS authorization prompt;
+- the first connected device is model `2410DPN6CC`, Android 16/API 36,
+  `arm64-v8a`, Adreno 830, Vulkan 1.3.284, and OpenGL ES 3.2; generated
+  software playback passed with 30 video and 47 audio frames.
 
 Completed Metal software-frame checkpoint:
 
@@ -797,12 +835,13 @@ Status: complete and verified.
 
 ### Toolchain and application shell
 
-- [ ] Reproducible macOS-hosted Android NDK build for QtAVCore and the required
+- [x] Reproducible macOS-hosted Android NDK build for QtAVCore and the required
   FFmpeg 8+ libraries, initially targeting arm64.
-- [ ] Minimal APK/native application shell that owns activity, lifecycle,
+- [~] Minimal APK/native application shell that owns activity, lifecycle,
   permissions, and current rendering surfaces without adding Android types to
-  core.
-- [ ] Connected-device deployment, logging, generated-media playback, and
+  core. NativeActivity creation/destruction and packaged media are proven;
+  window/surface lifecycle is the next Vulkan-adapter slice.
+- [x] Connected-device deployment, logging, generated-media playback, and
   automated result collection.
 
 ### Rendering
