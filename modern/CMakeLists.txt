@@ -25,8 +25,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(QtAVBackend)
 
 add_subdirectory(core)
-add_subdirectory(backends)
 add_subdirectory(platform)
+add_subdirectory(backends)
 
 if(QTAV_CORE_BUILD_EXAMPLES)
     add_subdirectory(examples)

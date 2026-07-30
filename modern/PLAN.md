@@ -96,7 +96,8 @@ Current verification:
 
 - static and shared builds pass 24/24 CTest tests;
 - ASan/UBSan passes 24/24 on macOS with leak detection disabled;
-- the all-backends-disabled build passes its core-only 8/8 tests;
+- the all-backends-disabled build passes 9/9 tests, including the Windows
+  platform device-access contract test;
 - forcing an unimplemented backend to `ON` fails with a clear diagnostic;
 - invalid backend option values are rejected;
 - installation and external `QtAV::RenderCPU`, `QtAV::RenderMetal`,
@@ -109,14 +110,14 @@ Current verification:
 - core public-header scans contain no Qt, FFmpeg, or platform SDK types;
 - MPEG-4/AAC, AC-3, E-AC-3, and TrueHD decode tests pass.
 - on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, static and shared
-  Release builds pass 21/21 CTest tests, including deterministic WARP D3D11
+  Release builds pass 22/22 CTest tests, including deterministic WARP D3D11
   rendering, WASAPI device lifecycle, and Player-driven WASAPI playback;
 - Windows multi-config FFmpeg imports select matching Debug/Release libraries,
   and project DLLs, tests, and examples share a runnable `bin/<Config>`
   directory;
-- installation plus external CMake consumption of `QtAV::RenderD3D11` and
-  `QtAV::AudioWASAPI` together with the portable core, render, and audio
-  targets passes.
+- installation plus external CMake consumption of `QtAV::PlatformWindows`,
+  `QtAV::RenderD3D11`, and `QtAV::AudioWASAPI` together with the portable core,
+  render, and audio targets passes.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -528,12 +529,26 @@ Accepted design summary:
 
 Next implementation slice:
 
-1. Add the common Windows D3D11 device-access target and shared recursive
+1. [x] Add the common Windows D3D11 device-access target and shared recursive
    context guard.
-2. Add the opaque supplied-hardware-device token and private FFmpeg bridge in
-   core.
-3. Prove device identity, COM lifetime, locking, and install/export behavior
-   with deterministic tests before opening the native decoder.
+2. [ ] Add the opaque supplied-hardware-device token and private FFmpeg bridge
+   in core.
+3. [x] Prove device identity, COM lifetime, locking, and install/export
+   behavior with deterministic tests before opening the native decoder.
+
+Completed Windows D3D11 device-access checkpoint:
+
+- `QtAV::PlatformWindows` verifies that a selected context is the chosen
+  device's immediate context, retains both COM interfaces, and exports
+  `D3D11DeviceAccess` plus a move-only recursive `D3D11ContextGuard`;
+- the D3D11 renderer accepts shared device access while preserving its
+  borrowed device/context convenience constructor, and it holds the common
+  guard for immediate-context rendering calls;
+- deterministic WARP tests cover null, foreign, and deferred-context
+  rejection, retained COM lifetime, same-thread recursion, cross-thread
+  exclusion, guard lifetime, and renderer participation in the shared lock;
+- static/shared builds and installed external consumption of
+  `QtAV::PlatformWindows` and `QtAV::RenderD3D11` pass.
 
 Default platform order after the contracts are stable:
 

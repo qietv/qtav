@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -250,9 +251,12 @@ int main(int argc, char** argv)
 
     Target target = makeTarget(d3d.device.Get(), 8, 8);
     bool exposeTarget = true;
-    auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
+    auto deviceAccess = qtav::D3D11DeviceAccess::create(
         borrowedDevice,
-        borrowedContext,
+        borrowedContext);
+    assert(deviceAccess);
+    auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
+        deviceAccess,
         [&] {
             return qtav::D3D11RenderTarget {
                 exposeTarget ? target.view.Get() : nullptr,
@@ -298,9 +302,23 @@ int main(int argc, char** argv)
     assert(renderer->open(config));
     assert(renderer->device().get() == d3d.device.Get());
     assert(renderer->context().get() == d3d.context.Get());
+    assert(renderer->deviceAccess() == deviceAccess);
 
     const qtav::VideoFrame rgb =
         renderFile(argv[1], qtav::PixelFormat::RGB24, renderer);
+    std::future<bool> blockedRender;
+    {
+        auto contextGuard = deviceAccess->contextGuard();
+        blockedRender = std::async(
+            std::launch::async,
+            [&] { return renderer->render(rgb); });
+        assert(blockedRender.wait_for(std::chrono::milliseconds(50))
+            == std::future_status::timeout);
+    }
+    assert(blockedRender.wait_for(std::chrono::seconds(2))
+        == std::future_status::ready);
+    assert(blockedRender.get());
+
     auto pixels =
         readTarget(d3d.device.Get(), d3d.context.Get(), target.texture.Get());
     assert(isBlack(pixel(pixels, 8, 3, 0)));

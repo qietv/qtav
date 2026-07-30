@@ -728,37 +728,6 @@ bool targetDescription(
 
 } // namespace
 
-BorrowedD3D11Device::BorrowedD3D11Device(ID3D11Device* value) noexcept
-    : value_(value)
-{
-}
-
-ID3D11Device* BorrowedD3D11Device::get() const noexcept
-{
-    return value_;
-}
-
-BorrowedD3D11Device::operator bool() const noexcept
-{
-    return value_ != nullptr;
-}
-
-BorrowedD3D11DeviceContext::BorrowedD3D11DeviceContext(
-    ID3D11DeviceContext* value) noexcept
-    : value_(value)
-{
-}
-
-ID3D11DeviceContext* BorrowedD3D11DeviceContext::get() const noexcept
-{
-    return value_;
-}
-
-BorrowedD3D11DeviceContext::operator bool() const noexcept
-{
-    return value_ != nullptr;
-}
-
 bool D3D11RenderTarget::isValid() const noexcept
 {
     return view != nullptr;
@@ -767,11 +736,17 @@ bool D3D11RenderTarget::isValid() const noexcept
 class D3D11VideoRenderer::Impl {
 public:
     Impl(
-        BorrowedD3D11Device device,
-        BorrowedD3D11DeviceContext context,
+        std::shared_ptr<D3D11DeviceAccess> deviceAccess,
         D3D11CurrentTargetCallback currentTarget)
-        : device_(device)
-        , context_(context)
+        : deviceAccess_(std::move(deviceAccess))
+        , device_(
+              deviceAccess_
+                  ? deviceAccess_->device()
+                  : BorrowedD3D11Device {})
+        , context_(
+              deviceAccess_
+                  ? deviceAccess_->immediateContext()
+                  : BorrowedD3D11DeviceContext {})
         , currentTarget_(std::move(currentTarget))
     {
     }
@@ -982,6 +957,7 @@ public:
 
     mutable std::mutex stateMutex_;
     std::mutex renderMutex_;
+    std::shared_ptr<D3D11DeviceAccess> deviceAccess_;
     BorrowedD3D11Device device_;
     BorrowedD3D11DeviceContext context_;
     D3D11CurrentTargetCallback currentTarget_;
@@ -1003,8 +979,16 @@ D3D11VideoRenderer::D3D11VideoRenderer(
     BorrowedD3D11DeviceContext context,
     D3D11CurrentTargetCallback currentTarget)
     : impl_(std::make_unique<Impl>(
-          device,
-          context,
+          D3D11DeviceAccess::create(device, context),
+          std::move(currentTarget)))
+{
+}
+
+D3D11VideoRenderer::D3D11VideoRenderer(
+    std::shared_ptr<D3D11DeviceAccess> deviceAccess,
+    D3D11CurrentTargetCallback currentTarget)
+    : impl_(std::make_unique<Impl>(
+          std::move(deviceAccess),
           std::move(currentTarget)))
 {
 }
@@ -1158,6 +1142,8 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     bool rendered = false;
     {
         std::lock_guard<std::mutex> lock(impl_->renderMutex_);
+        auto contextGuard = impl_->deviceAccess_->contextGuard();
+        (void)contextGuard;
         const HRESULT removedReason =
             impl_->device_.get()->GetDeviceRemovedReason();
         if (detail::d3d11FailureEvent(removedReason)
@@ -1370,6 +1356,13 @@ BorrowedD3D11Device D3D11VideoRenderer::device() const noexcept
 BorrowedD3D11DeviceContext D3D11VideoRenderer::context() const noexcept
 {
     return impl_ ? impl_->context_ : BorrowedD3D11DeviceContext {};
+}
+
+std::shared_ptr<D3D11DeviceAccess>
+D3D11VideoRenderer::deviceAccess() const noexcept
+{
+    return impl_ ? impl_->deviceAccess_
+                 : std::shared_ptr<D3D11DeviceAccess> {};
 }
 
 void D3D11VideoRenderer::setCurrentTargetCallback(

@@ -58,6 +58,8 @@ mdk-sdk:
 - libswscale CPU rendering into application-owned packed image buffers;
 - D3D11 rendering of decoded software frames into an application-provided
   current render-target view;
+- shared retained D3D11 device/immediate-context access and recursive
+  synchronization through `QtAV::PlatformWindows`;
 - Metal rendering of decoded software frames into an application-provided
   current texture or drawable;
 - media and track information;
@@ -116,15 +118,21 @@ the event-driven WASAPI client, and copied PCM queue. The sink implements
 pause/flush/natural-end drain and exposes a cached `IAudioClock`-based
 device-master position plus engine and stream latency.
 
-On Windows, `D3D11VideoRenderer` borrows an `ID3D11Device`, its immediate
-context, and the render-target view returned by an application callback. It
-uploads software RGB, YUV, NV12/NV21, P010, and gray frames, performs SDR YUV
-conversion in a pixel shader, and supports resize, custom viewports, aspect
-handling, right-angle rotation, and render-target recreation. The backend
-header contains the Windows SDK types and is never included by a core public
-header. D3D11VA decode, zero-copy decoder-texture interop, and HDR output
-remain separate follow-up work. Their accepted device, lifetime, locking, and
-fallback contract is documented in [D3D11VA.md](D3D11VA.md).
+On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
+`ID3D11Device` and its immediate context. `D3D11VideoRenderer` accepts that
+shared access (or creates one from its compatibility constructor), borrows the
+render-target view returned by an application callback, and holds the shared
+recursive context guard while rendering. Applications issuing concurrent
+calls on the same immediate context must acquire
+`D3D11DeviceAccess::contextGuard()` or provide equivalent external
+serialization. The renderer uploads software RGB, YUV, NV12/NV21, P010, and
+gray frames, performs SDR YUV conversion in a pixel shader, and supports
+resize, custom viewports, aspect handling, right-angle rotation, and
+render-target recreation. Windows SDK types remain in platform/backend
+headers and never enter a core public header. D3D11VA decode, zero-copy
+decoder-texture interop, and HDR output remain separate follow-up work. Their
+accepted device, lifetime, locking, and fallback contract is documented in
+[D3D11VA.md](D3D11VA.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -163,6 +171,9 @@ are separate backend/product work.
 - callbacks may request another player state, but must not destroy the player;
 - `renderVideo()` runs synchronously on its caller and should be called from the
   thread that owns the native graphics context;
+- D3D11 renderer, decoder, interop, and application calls sharing one
+  immediate context must serialize through the same
+  `D3D11DeviceAccess::contextGuard()` or equivalent external locking;
 - `VideoRenderAPI::render()` runs synchronously inside `renderVideo()` and
   backend event callbacks may request another player state;
 - audio-sink and video-render backend event callbacks run on the thread chosen

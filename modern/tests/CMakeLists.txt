@@ -184,6 +184,29 @@ if(TARGET qtav_render_d3d11)
     )
 endif()
 
+if(TARGET qtav_platform_windows)
+    add_executable(
+        qtav_platform_windows_test
+        d3d11_device_access_test.cpp
+    )
+    target_link_libraries(
+        qtav_platform_windows_test
+        PRIVATE QtAV::PlatformWindows
+    )
+    target_compile_features(
+        qtav_platform_windows_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_platform_windows_device_access
+        COMMAND qtav_platform_windows_test
+    )
+    set_tests_properties(
+        qtav_platform_windows_device_access
+        PROPERTIES TIMEOUT 10
+    )
+endif()
+
 if(TARGET qtav_interop_cvmetal)
     enable_language(OBJCXX)
     find_library(QTAV_TEST_CVMETAL_COREVIDEO_FRAMEWORK CoreVideo)

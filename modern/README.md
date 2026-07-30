@@ -23,8 +23,8 @@ code is used.
 - compile-time `VideoRenderAPI`, `AudioSink`, and hardware-frame interop
   contracts;
 - optional libswscale CPU renderer for application-owned image buffers;
-- optional Windows D3D11 renderer for borrowed devices, immediate contexts,
-  and current render-target views;
+- optional Windows D3D11 renderer for a retained application-selected device
+  and immediate context plus borrowed current render-target views;
 - optional Metal renderer for borrowed Apple devices, command queues, and
   current render targets;
 - optional libswresample converter for negotiated interleaved PCM output;
@@ -67,8 +67,10 @@ Current backend integration boundary:
   RGB/BGR/RGBA/BGRA/ARGB or Gray8 buffers;
 - `QtAV::RenderD3D11` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders through an
-  application-owned D3D11 device, immediate context, and current render-target
-  view;
+  application-selected D3D11 device and immediate context plus the current
+  application-owned render-target view;
+- `QtAV::PlatformWindows` retains an application-selected D3D11 device and
+  its verified immediate context behind a shared recursive context guard;
 - `QtAV::RenderMetal` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders into the application's
   current Metal texture or drawable, accepts an optional hardware-frame
@@ -355,14 +357,17 @@ memory with rendering.
 ### D3D11 renderer
 
 On Windows, link `QtAV::RenderD3D11`, include
-`<qtav/d3d11_video_renderer.h>`, and pass a borrowed device, its immediate
-context, and a callback that returns the current application-owned render
-target:
+`<qtav/d3d11_video_renderer.h>`, create shared access to the selected device
+and its immediate context, and pass a callback that returns the current
+application-owned render target:
 
 ```cpp
-auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
+auto deviceAccess = qtav::D3D11DeviceAccess::create(
     qtav::BorrowedD3D11Device(device),
-    qtav::BorrowedD3D11DeviceContext(immediateContext),
+    qtav::BorrowedD3D11DeviceContext(immediateContext));
+
+auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
+    deviceAccess,
     [&] {
         return qtav::D3D11RenderTarget { currentRenderTargetView };
     });
@@ -373,14 +378,29 @@ renderer->open(config);
 player.setVideoRenderAPI(renderer);
 ```
 
-The device, immediate context, callback, and returned
-`ID3D11RenderTargetView` remain application-owned. The callback runs
-synchronously inside `render()` and is queried for every frame, so swap-chain
-resize or other surface recreation can replace the view before calling
-`configure()` with the new size. The renderer serializes its own use of the
-borrowed immediate context, but it does not preserve D3D11 pipeline state;
-applications sharing that context must restore their state after
-`renderVideo()`.
+`D3D11DeviceAccess::create()` rejects null, foreign-device, and deferred
+contexts, retains the selected device and verified immediate context, and
+provides the recursive lock shared by the renderer and future D3D11VA/interop
+backends. The older renderer constructor taking the two borrowed wrappers
+remains a convenience path and creates the same retained access internally.
+The callback and returned `ID3D11RenderTargetView` remain application-owned.
+The callback runs synchronously inside `render()` and is queried for every
+frame, so swap-chain resize or other surface recreation can replace the view
+before calling `configure()` with the new size.
+
+The renderer holds `D3D11DeviceAccess::contextGuard()` while issuing immediate
+context calls. Applications using that immediate context from another thread
+must acquire the same guard (or provide equivalent external serialization):
+
+```cpp
+{
+    auto guard = deviceAccess->contextGuard();
+    immediateContext->CopyResource(destination, source);
+}
+```
+
+The renderer does not preserve D3D11 pipeline state; applications sharing that
+context must restore their state after `renderVideo()`.
 
 The software path uploads YUV420P, YUV422P, YUV444P, NV12, NV21, P010,
 RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8 frames. It renders to single-sample
@@ -501,12 +521,12 @@ pause/flush/drain. COM and native WASAPI interfaces stay on a dedicated
 multimedia-class thread; callers can query a cached media-timeline
 `IAudioClock` position and combined engine/stream latency from any thread.
 
-`QtAV::RenderD3D11` implements the Windows software-frame renderer. Its
-backend-specific public header exposes strong non-owning wrappers for
-`ID3D11Device` and `ID3D11DeviceContext`; no Windows SDK type reaches the core
-headers. It compiles shaders for the borrowed device, uploads software-frame
-planes into per-frame shader resources, and obtains the current borrowed
-render target immediately before drawing.
+`QtAV::PlatformWindows` owns the Windows-only `D3D11DeviceAccess` helper and
+strong non-owning wrappers for `ID3D11Device` and `ID3D11DeviceContext`; no
+Windows SDK type reaches the core headers. `QtAV::RenderD3D11` retains that
+shared access, compiles shaders for its device, uploads software-frame planes
+into per-frame shader resources, and obtains the current borrowed render
+target immediately before drawing.
 
 `AudioSinkClock` fields are measured in milliseconds on the media timeline.
 `positionMilliseconds` is the sample position currently presented by the

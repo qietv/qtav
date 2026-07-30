@@ -20,7 +20,7 @@ target_include_directories(qtav_render_d3d11
 target_link_libraries(qtav_render_d3d11
     PUBLIC
         QtAV::Core
-        d3d11
+        QtAV::PlatformWindows
     PRIVATE
         d3dcompiler
         dxgi
