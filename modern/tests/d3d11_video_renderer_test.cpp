@@ -50,6 +50,132 @@ struct Target {
     ComPtr<ID3D11RenderTargetView> view;
 };
 
+class MockHardwareFrameData final : public qtav::HardwareFrameData {
+public:
+    qtav::HardwareDeviceType deviceType() const noexcept override
+    {
+        return qtav::HardwareDeviceType::D3D11;
+    }
+
+    int width() const noexcept override
+    {
+        return 8;
+    }
+
+    int height() const noexcept override
+    {
+        return 8;
+    }
+
+    qtav::PixelFormat softwareFormat() const noexcept override
+    {
+        return qtav::PixelFormat::NV12;
+    }
+
+    qtav::NativeHandle nativeHandle(
+        qtav::HardwareHandleType type) const noexcept override
+    {
+        return { type, 0, 0 };
+    }
+
+    bool isMappable(qtav::HardwareMapMode) const noexcept override
+    {
+        return false;
+    }
+
+    std::shared_ptr<qtav::HardwareFrameMapping> map(
+        qtav::HardwareMapMode) const override
+    {
+        return {};
+    }
+};
+
+class MockTextureFrame final : public qtav::D3D11TextureFrame {
+public:
+    MockTextureFrame(
+        ComPtr<ID3D11Texture2D> texture,
+        ComPtr<ID3D11ShaderResourceView> view)
+        : texture_(std::move(texture))
+        , view_(std::move(view))
+    {
+    }
+
+    int width() const noexcept override
+    {
+        return 8;
+    }
+
+    int height() const noexcept override
+    {
+        return 8;
+    }
+
+    qtav::PixelFormat format() const noexcept override
+    {
+        return qtav::PixelFormat::BGRA;
+    }
+
+    ID3D11Texture2D* texture() const noexcept override
+    {
+        return texture_.Get();
+    }
+
+    ID3D11ShaderResourceView*
+    shaderResourceView() const noexcept override
+    {
+        return view_.Get();
+    }
+
+private:
+    ComPtr<ID3D11Texture2D> texture_;
+    ComPtr<ID3D11ShaderResourceView> view_;
+};
+
+class MockHardwareFrameInterop final
+    : public qtav::D3D11HardwareFrameInterop {
+public:
+    MockHardwareFrameInterop(
+        std::shared_ptr<qtav::D3D11DeviceAccess> deviceAccess,
+        std::shared_ptr<qtav::D3D11TextureFrame> imported)
+        : deviceAccess_(std::move(deviceAccess))
+        , imported_(std::move(imported))
+    {
+    }
+
+    std::shared_ptr<qtav::D3D11DeviceAccess>
+    deviceAccess() const noexcept override
+    {
+        return deviceAccess_;
+    }
+
+    qtav::HardwareInteropCapabilities capabilities() const override
+    {
+        return {
+            { qtav::HardwareDeviceType::D3D11 },
+            qtav::HardwareDeviceType::D3D11,
+            true,
+            false,
+        };
+    }
+
+    bool supports(
+        const qtav::HardwareFrame& frame) const noexcept override
+    {
+        return frame.deviceType() == qtav::HardwareDeviceType::D3D11;
+    }
+
+    std::shared_ptr<qtav::D3D11TextureFrame> importFrame(
+        const qtav::HardwareFrame& frame) override
+    {
+        return supports(frame) ? imported_
+                               : std::shared_ptr<qtav::D3D11TextureFrame> {};
+    }
+
+private:
+    std::shared_ptr<qtav::D3D11DeviceAccess> deviceAccess_;
+    std::shared_ptr<qtav::D3D11TextureFrame> imported_;
+};
+
 DeviceResources makeDevice()
 {
     DeviceResources result;
@@ -255,6 +381,47 @@ int main(int argc, char** argv)
         borrowedDevice,
         borrowedContext);
     assert(deviceAccess);
+
+    Target importedTarget = makeTarget(d3d.device.Get(), 8, 8);
+    ComPtr<ID3D11ShaderResourceView> importedView;
+    assert(SUCCEEDED(d3d.device->CreateShaderResourceView(
+        importedTarget.texture.Get(),
+        nullptr,
+        &importedView)));
+    auto textureFrame = std::make_shared<MockTextureFrame>(
+        importedTarget.texture,
+        importedView);
+    MockHardwareFrameInterop mockInterop(deviceAccess, textureFrame);
+    const auto interopCapabilities = mockInterop.capabilities();
+    assert(interopCapabilities.zeroCopy);
+    assert(!interopCapabilities.cpuFallback);
+    assert(
+        interopCapabilities.targetDevice
+        == qtav::HardwareDeviceType::D3D11);
+    assert(interopCapabilities.sourceDevices.size() == 1);
+    assert(
+        interopCapabilities.sourceDevices.front()
+        == qtav::HardwareDeviceType::D3D11);
+    assert(mockInterop.deviceAccess() == deviceAccess);
+
+    const qtav::HardwareFrame hardwareFrame(
+        std::make_shared<MockHardwareFrameData>());
+    assert(mockInterop.supports(hardwareFrame));
+    auto importedFrame = mockInterop.importFrame(hardwareFrame);
+    assert(importedFrame == textureFrame);
+    importedTarget = {};
+    importedView.Reset();
+    textureFrame.reset();
+    assert(importedFrame->width() == 8);
+    assert(importedFrame->height() == 8);
+    assert(importedFrame->format() == qtav::PixelFormat::BGRA);
+    assert(importedFrame->texture());
+    assert(importedFrame->shaderResourceView());
+    D3D11_TEXTURE2D_DESC importedDescription {};
+    importedFrame->texture()->GetDesc(&importedDescription);
+    assert(importedDescription.Width == 8);
+    assert(importedDescription.Height == 8);
+
     auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
         deviceAccess,
         [&] {

@@ -285,7 +285,7 @@ the Qt-dependency scan remain release gates.
    supplied-device bridge in core.
 2. [x] Add `qtav_hw_d3d11va`, decoder configuration, retained texture/slice
    access, mapping, and lifecycle tests.
-3. [ ] Add decoder-independent D3D11 renderer interop interfaces.
+3. [x] Add decoder-independent D3D11 renderer interop interfaces.
 4. [ ] Add the Video Processor implementation in `qtav_interop_d3d11`.
 5. [ ] Add WARP contract tests, native zero-copy tests, console-example
    wiring, install/export validation, and final public documentation.

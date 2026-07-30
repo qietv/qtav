@@ -149,8 +149,13 @@ returning borrowed D3D11 pointers. The core `NativeHandle` now carries an
 optional subresource index, while Windows SDK and FFmpeg declarations remain
 outside installed core headers. Explicit CPU mapping, software fallback, seek,
 media replacement, stop, and retained lifetime after player shutdown are
-implemented. Zero-copy decoder-texture interop and HDR output remain separate
-follow-up work under the accepted contract in [D3D11VA.md](D3D11VA.md).
+implemented. `QtAV::RenderD3D11` now exposes decoder-independent
+`D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces for
+the next adapter layer; imported texture and shader-view pointers remain valid
+while the texture-frame object lives. Renderer consumption, zero-copy
+decoder-texture conversion, software-map fallback, and HDR output remain
+separate follow-up work under the accepted contract in
+[D3D11VA.md](D3D11VA.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

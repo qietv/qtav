@@ -733,6 +733,9 @@ bool D3D11RenderTarget::isValid() const noexcept
     return view != nullptr;
 }
 
+D3D11TextureFrame::~D3D11TextureFrame() = default;
+D3D11HardwareFrameInterop::~D3D11HardwareFrameInterop() = default;
+
 class D3D11VideoRenderer::Impl {
 public:
     Impl(

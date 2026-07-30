@@ -34,8 +34,9 @@ Continuation checkpoint:
   and the Windows D3D11 software-frame and WASAPI audio paths are complete;
   the D3D11VA device/frame/interop design and supplied-device core bridge are
   complete; the native `qtav_hw_d3d11va` decoder backend is now complete, and
-  the active next task is the decoder-independent D3D11 renderer interop
-  interface followed by its Video Processor implementation;
+  the decoder-independent D3D11 renderer interop interfaces are complete; the
+  active next task is renderer capability reporting and software-map fallback,
+  followed by the Video Processor implementation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -604,7 +605,7 @@ Completed D3D11VA hardware-decode checkpoint:
 
 Next implementation slice:
 
-1. [ ] Add decoder-independent `D3D11HardwareFrameInterop` and retained
+1. [x] Add decoder-independent `D3D11HardwareFrameInterop` and retained
    `D3D11TextureFrame` interfaces to `QtAV::RenderD3D11`.
 2. [ ] Add renderer capability reporting plus explicit enabled/disabled
    software-map fallback using mock interop tests.
@@ -612,6 +613,20 @@ Next implementation slice:
    Video Processor pass into a shader-readable BGRA8 intermediate.
 4. [ ] Add WARP contract tests, native zero-CPU-copy H.264 rendering coverage,
    example wiring, and install-consumer validation.
+
+Completed D3D11 renderer interop-contract checkpoint:
+
+- `QtAV::RenderD3D11` exposes decoder-independent
+  `D3D11HardwareFrameInterop` and `D3D11TextureFrame` interfaces without
+  depending on `QtAV::HWD3D11VA`;
+- an interop object identifies the retained `D3D11DeviceAccess` whose shared
+  recursive guard protects its immediate/video-context work;
+- an imported texture frame reports its dimensions and packed pixel format
+  and keeps its borrowed `ID3D11Texture2D` and
+  `ID3D11ShaderResourceView` valid for the texture-frame lifetime;
+- deterministic WARP coverage proves capability/source-device reporting,
+  import dispatch, shared device-access identity, and COM resource retention
+  after the original texture and view references are released.
 
 Default platform order after the contracts are stable:
 

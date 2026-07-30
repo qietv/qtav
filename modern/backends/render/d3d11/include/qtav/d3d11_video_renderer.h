@@ -25,6 +25,36 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11RenderTarget {
 
 using D3D11CurrentTargetCallback = std::function<D3D11RenderTarget()>;
 
+// A backend-specific, reference-counted view of a shader-readable D3D11
+// texture imported from a hardware video frame. The returned native objects
+// are borrowed and remain valid while this object is alive.
+class QTAV_RENDER_D3D11_EXPORT D3D11TextureFrame {
+public:
+    virtual ~D3D11TextureFrame();
+
+    virtual int width() const noexcept = 0;
+    virtual int height() const noexcept = 0;
+    virtual PixelFormat format() const noexcept = 0;
+    virtual ID3D11Texture2D* texture() const noexcept = 0;
+    virtual ID3D11ShaderResourceView*
+    shaderResourceView() const noexcept = 0;
+};
+
+// Implemented by an optional platform interop target. Import must not map or
+// copy the frame through CPU memory. The interop must use the returned device
+// access and its context guard for immediate/video-context operations.
+class QTAV_RENDER_D3D11_EXPORT D3D11HardwareFrameInterop {
+public:
+    virtual ~D3D11HardwareFrameInterop();
+
+    virtual std::shared_ptr<D3D11DeviceAccess>
+    deviceAccess() const noexcept = 0;
+    virtual HardwareInteropCapabilities capabilities() const = 0;
+    virtual bool supports(const HardwareFrame& frame) const noexcept = 0;
+    virtual std::shared_ptr<D3D11TextureFrame> importFrame(
+        const HardwareFrame& frame) = 0;
+};
+
 class QTAV_RENDER_D3D11_EXPORT D3D11VideoRenderer final
     : public VideoRenderAPI {
 public:

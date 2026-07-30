@@ -417,7 +417,17 @@ RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8 frames. It renders to single-sample
 BGRA8 or RGBA8 UNORM 2D targets, applies limited/full-range BT.601, BT.709, or
 BT.2020 YUV conversion, and supports custom viewports, Fit/Fill/Stretch, all
 right-angle rotations, resize, surface recreation, and surface/device-loss
-events. HDR transfer and D3D11VA zero-copy interop remain later Windows work.
+events.
+
+`QtAV::RenderD3D11` also defines the decoder-independent
+`D3D11HardwareFrameInterop` and `D3D11TextureFrame` contracts used by the
+pending `QtAV::InteropD3D11` backend. An interop implementation binds to the
+same retained `D3D11DeviceAccess`, performs no CPU map during `importFrame()`,
+and returns borrowed texture/SRV pointers whose COM resources remain valid
+while the returned texture-frame object is alive. The renderer does not yet
+consume that contract or advertise D3D11 hardware-frame support. HDR transfer,
+software-map fallback, and D3D11VA zero-copy rendering remain later Windows
+work.
 
 ### D3D11VA hardware decode
 
