@@ -194,10 +194,32 @@ or pace playback. Decoded planar audio therefore normally uses
 The Android harness is currently an integration checkpoint rather than a
 legacy QtAV API replacement. It proves the NDK, packaging, signing,
 connected-device logging, software decode, and the first Vulkan
-surface/swapchain presentation path. Vulkan offscreen goldens, a multi-frame
-resource ring, surface recreation, OpenGL ES coverage, AAudio output,
-MediaCodec direct-surface presentation, and optional texture interop remain
-separate backend work under the responsibility and lifecycle boundaries in
+surface/swapchain presentation path. The accepted Android/OHOS policy prefers
+Vulkan and uses a separate OpenGL ES/EGL backend when Vulkan is unavailable or
+fails fatally. Recoverable surface/swapchain errors remain within the active
+API; a fatal Vulkan renderer switches one-way to OpenGL ES without reopening
+media, and failure of both renderers leaves audio and decoded-frame callbacks
+available. Renderer selection belongs to the application/platform layer, has
+no SDL3 dependency, and remains independent of decoder and interop fallback.
+After direct-surface hardware output is stable, separate Vulkan and OpenGL ES
+native-buffer adapters are planned for both mobile platforms. Their
+zero-CPU-copy contract forbids decoded-pixel mapping, software transfer, CPU
+staging, and re-upload; it requires retained native-buffer lifetime, explicit
+producer/release synchronization, and capability-gated format support. A
+Vulkan-to-OpenGL ES switch attempts compatible GLES native import for
+subsequent frames, then follows the caller's explicit direct-surface,
+software-decode, or no-video policy instead of silently copying a hardware
+frame. Android's confirmed designs use private GPU-sampled
+`AImageReader`/`AHardwareBuffer` import for Vulkan and `SurfaceTexture` with
+`GL_TEXTURE_EXTERNAL_OES` for GLES. OHOS GLES uses `OH_NativeImage` with an
+external-OES texture. OHOS Vulkan remains conditional on adding a retained
+`OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer
+branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
+zero-CPU-copy source as-is.
+Vulkan offscreen goldens, a multi-frame resource ring, surface recreation,
+the OpenGL ES backend and selector, AAudio output, MediaCodec direct-surface
+presentation, and Vulkan/OpenGL ES texture interop remain separate backend
+work under the responsibility and lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and

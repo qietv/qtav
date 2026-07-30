@@ -356,13 +356,16 @@ Begin the Android production path after the completed Windows milestone:
    connected arm64 Android device.
 3. [~] Add the reusable Vulkan renderer engine and Android surface adapter,
    keeping window, device, and swapchain ownership outside core.
-4. [ ] Add an OpenGL ES path where it materially improves device coverage,
-   sharing shader/color/geometry logic with Vulkan where practical without
-   hiding incompatible API lifecycles.
+4. [ ] Add the OpenGL ES/EGL fallback path defined in `MOBILE.md`, sharing
+   shader/color/geometry logic with Vulkan where practical without hiding
+   incompatible API lifecycles. Validate Vulkan-unavailable, initial-failure,
+   fatal-runtime-failure, and both-backends-unavailable cases.
 5. [ ] Add AAudio output and device-clock/latency validation.
 6. [ ] Add MediaCodec hardware decode and direct-surface presentation first,
-   then add texture interop only after presentation, drop, flush, and surface
-   recreation semantics are deterministic.
+   then add the confirmed `AImageReader`/`AHardwareBuffer` Vulkan and
+   `SurfaceTexture` external-OES OpenGL ES zero-CPU-copy texture paths only
+   after presentation, drop, flush, and surface recreation semantics are
+   deterministic.
 
 ### Shared Android/OHOS mobile design checkpoint
 
@@ -392,13 +395,23 @@ Complete this checkpoint once and reuse it for both mobile production paths:
 6. [x] Create reusable device-test media and lifecycle scenarios, plus thin
    platform-specific APK/HAP launch, signing, deployment, log collection, and
    result adapters for connected-device validation from macOS.
+7. [x] Define Vulkan as the preferred Android/OHOS software renderer and
+   OpenGL ES/EGL as its required fallback. Keep recoverable surface recreation
+   within the active API, switch one-way to OpenGL ES after fatal Vulkan
+   failure, keep playback alive if both renderers fail, and leave selection in
+   the application/platform layer rather than core.
+8. [x] Define zero-CPU-copy native-buffer interop for both Vulkan and OpenGL ES:
+   no CPU map, software-frame transfer, staging copy, or re-upload; explicit
+   native-buffer lifetime and fence synchronization; capability-gated format
+   support; and independent decoder, interop, and renderer fallback policies.
 
 Accepted design and Android foundation checkpoint:
 
-- [`MOBILE.md`](MOBILE.md) fixes the shared Vulkan engine, separate
-  Android/OHOS surface adapters, direct-surface hardware-output state machine,
-  audio boundaries, reusable lifecycle scenarios, and on-device installation
-  authorization gate;
+- [`MOBILE.md`](MOBILE.md) fixes the shared Vulkan engine, the OpenGL ES
+  fallback engine and selection/recovery policy, separate Android/OHOS
+  Vulkan/EGL surface adapters, direct-surface hardware-output state machine,
+  Vulkan/OpenGL ES zero-CPU-copy interop contract, audio boundaries, reusable
+  lifecycle scenarios, and on-device installation authorization gate;
 - the Android harness pins FFmpeg 8.1.2 by checksum, NDK r28c, API 28,
   compile SDK 36, SDK CMake 4.1.2, and build-tools 37.0.0 while allowing
   explicit installed-tool overrides;
@@ -881,8 +894,10 @@ Status: complete and verified.
 - [~] Shared Vulkan renderer engine from the mobile design checkpoint.
 - [~] Android Vulkan surface/swapchain adapter using application-owned native
   resources.
-- [ ] OpenGL ES renderer or adapter when required for the supported-device
-  matrix.
+- [ ] Shared OpenGL ES 3.x renderer plus Android EGL/window adapter as the
+  required Vulkan fallback, without an SDL3 dependency.
+- [ ] Application/platform renderer selector implementing the accepted
+  startup, recovery, fatal-error, one-way fallback, and no-renderer behavior.
 - [~] Software YUV/NV12/P010/RGB upload, structured color conversion, viewport,
   aspect ratio, rotation, resize, redraw, and surface recreation.
 
@@ -895,19 +910,46 @@ Status: complete and verified.
 - [ ] `qtav_hw_mediacodec` with explicit wrapper-decoder selection and
   application-supplied surface/device lifetime.
 - [ ] Direct-surface presentation with explicit present/drop behavior before
-  optional SurfaceTexture/AHardwareBuffer/Vulkan texture interop.
+  texture interop.
+- [ ] Android Vulkan interop using an application-owned private,
+  GPU-sampled `AImageReader`: supply its `ANativeWindow` to MediaCodec,
+  correlate codec and acquired-image timestamps, import the retained
+  `AHardwareBuffer` through
+  `VK_ANDROID_external_memory_android_hardware_buffer`, apply
+  YCbCr/external-format capability checks, bridge acquire/release fences, and
+  return the release fence through asynchronous `AImage` deletion without
+  `AHardwareBuffer_lock*()` or a staging upload.
+- [ ] Android MediaCodec OpenGL ES interop using a `SurfaceTexture` producer
+  and `GL_TEXTURE_EXTERNAL_OES` as the primary path, with explicit
+  timestamp/generation and current-image lifetime handling. Keep private
+  `AImageReader` plus `AHardwareBuffer`/`EGLImage` import as a
+  capability-gated alternative; neither path may map or re-upload decoded
+  pixels.
+- [ ] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
+  interop for subsequent frames; otherwise follow an explicit direct-surface,
+  software-decode, or no-video policy without implicit hardware-frame mapping.
 - [ ] Software fallback independent of renderer mapping/interop fallback.
 
 Acceptance:
 
 - a macOS-hosted build installs and runs on at least one connected arm64
   Android device;
-- software decode renders through Vulkan or OpenGL ES and AAudio produces
-  synchronized audible output;
+- software decode prefers Vulkan, falls back to OpenGL ES for unavailable or
+  fatally failed Vulkan, and AAudio produces synchronized audible output;
+- connected-device or deterministic adapter tests cover initial fallback,
+  recoverable Vulkan recreation without an API switch, fatal one-way fallback
+  without media reopen, and the both-renderers-unavailable error path;
 - MediaCodec H.264 and HEVC paths cover pause/resume, seek, media replacement,
   stop, background/foreground transition, surface recreation, and shutdown;
 - direct-surface hardware output is verified before any texture-interoperable
   path is described as complete;
+- on capable devices, H.264 and HEVC native frames render through both Vulkan
+  and OpenGL ES with zero CPU map/transfer/upload calls, correct fence ordering,
+  bounded retained buffers, color/format validation, and lifecycle coverage;
+- pixel-validation tests may read back the final render target, but decoded
+  source map, transfer, staging-copy, and re-upload counters remain zero;
+- an unsupported Vulkan or OpenGL ES import capability is reported explicitly
+  as unavailable or skipped, not counted as zero-CPU-copy success;
 - Android SDK types remain outside core public headers.
 
 ## Milestone 7 — OHOS production path
@@ -941,6 +983,9 @@ Target clarification gate:
   adapter as a separate target or platform helper.
 - [ ] Reuse OpenGL ES renderer internals where compatible, with a separate OHOS
   EGL/window adapter and explicit capability checks.
+- [ ] Reuse the Android-proven renderer selector and one-way Vulkan-to-OpenGL
+  ES policy while keeping OHOS window, EGL, and error classification in its
+  own adapter.
 - [ ] Validate software YUV/NV12/P010/RGB upload, viewport, aspect ratio,
   rotation, resize, redraw, surface loss/recreation, SDR, and supported HDR
   output behavior on a real device.
@@ -955,9 +1000,25 @@ Target clarification gate:
 - [ ] Reuse the shared surface-backed presentation contract for playback-clock
   scheduling, present/drop, outstanding-buffer bounds, flush, stop, and surface
   recreation.
-- [ ] Implement direct `OHNativeWindow` presentation first; investigate
-  NativeBuffer/Vulkan texture interop only after direct presentation is stable
-  and the target device exposes the required supported APIs.
+- [ ] Implement direct `OHNativeWindow` presentation first.
+- [ ] Add the confirmed OHOS OpenGL ES path: supply the `OHNativeWindow`
+  produced by `OH_NativeImage` to OHCodec surface output, update the surface
+  image, and sample its bound `GL_TEXTURE_EXTERNAL_OES` texture while
+  enforcing the selected SDK's token, generation, and image-lifetime rules.
+- [ ] Before claiming OHOS Vulkan zero-CPU-copy interop, add a backend or
+  narrowly scoped FFmpeg bridge that exposes and retains the decoded
+  `OH_AVBuffer`/`OH_NativeBuffer` through GPU completion. The current FFmpeg 8
+  OHCodec buffer branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`
+  and is therefore disallowed; its surface branch exposes only present/drop
+  tokens, not a Vulkan-importable native buffer.
+- [ ] After that bridge exists, add the OHOS Vulkan adapter using the target
+  SDK's native-buffer/external-memory path and release the codec output only
+  after GPU completion. Record exact format, lifetime, protected-content, and
+  fence capabilities on the target device; keep the feature unavailable when
+  any required capability is absent.
+- [ ] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
+  interop for subsequent frames; otherwise follow an explicit direct-surface,
+  software-decode, or no-video policy without implicit hardware-frame mapping.
 - [ ] Keep software decode fallback independent of Vulkan/OpenGL ES interop
   fallback.
 
@@ -965,10 +1026,21 @@ Acceptance:
 
 - a macOS-hosted build installs and runs on the recorded connected arm64 OHOS
   target;
-- software decode renders through Vulkan or OpenGL ES and OHAudio produces
-  synchronized audible output;
+- software decode prefers Vulkan, falls back to OpenGL ES for unavailable or
+  fatally failed Vulkan, and OHAudio produces synchronized audible output;
+- connected-device or deterministic adapter tests cover initial fallback,
+  recoverable Vulkan recreation without an API switch, fatal one-way fallback
+  without media reopen, and the both-renderers-unavailable error path;
 - OHCodec H.264 and HEVC paths cover pause/resume, seek, media replacement,
   stop, background/foreground transition, surface recreation, and shutdown;
+- on a capable target, H.264 and HEVC native frames render through both Vulkan
+  and OpenGL ES with zero CPU map/transfer/upload calls, correct fence ordering,
+  bounded retained buffers, color/format validation, and lifecycle coverage;
+- the OHOS Vulkan result specifically proves that the active decode path did
+  not call `OH_AVBuffer_GetAddr()` or `av_image_copy2()`; final-render-target
+  readback for pixel validation is permitted;
+- unsupported native-buffer import capability is reported explicitly as
+  unavailable or skipped, not counted as zero-CPU-copy success;
 - Android/OHOS share renderer engines and deterministic tests without sharing
   platform SDK types or incorrectly treating their native lifecycles as ABI
   compatible;

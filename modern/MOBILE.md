@@ -10,17 +10,24 @@ native application, window-system, audio, or codec ABI.
 The reusable pieces are compile-time C++ targets in this repository:
 
 - `qtav_render_vulkan` is the platform-neutral Vulkan renderer engine;
+- `qtav_render_opengl` is the planned platform-neutral OpenGL ES renderer
+  engine and the required mobile fallback for software-frame presentation;
 - Android surface and swapchain integration belongs under
   `backends/render/vulkan/android/` and small Android lifecycle helpers belong
   under `platform/android/`;
+- Android EGL context and surface integration belongs under
+  `backends/render/opengl/android/`;
 - OHOS surface and swapchain integration belongs under
   `backends/render/vulkan/ohos/` and small OHOS lifecycle helpers belong under
   `platform/ohos/`;
+- OHOS EGL context and surface integration belongs under
+  `backends/render/opengl/ohos/`;
 - `qtav_audio_aaudio` and a future OHOS OHAudio target are separate audio
   backends;
 - `qtav_hw_mediacodec` and a future OHCodec target are separate hardware
   decoder backends;
-- optional texture import remains separate from decoding and final rendering.
+- Vulkan and OpenGL ES native-buffer import are separate, optional interop
+  targets; texture import remains separate from decoding and final rendering.
 
 No Android or OHOS SDK declaration may enter an installed core header.
 Backend-specific public headers may expose strong native types when needed,
@@ -65,6 +72,73 @@ staging layout, capability decisions, and golden pixel vectors are shared
 between Android, OHOS, and later Linux coverage. Deterministic engine tests use
 offscreen images and do not require a window system.
 
+## OpenGL ES fallback renderer
+
+Android and OHOS use Vulkan as the preferred software-frame renderer and
+OpenGL ES through EGL as the required fallback. The OpenGL ES engine implements
+the same `VideoRenderAPI` behavior for supported software RGB, planar YUV,
+NV12/NV21, and P010 inputs. It reuses color-conversion constants, shader input
+definitions, geometry, capability rules, and golden vectors where their
+semantics match Vulkan, while keeping shaders, upload resources,
+synchronization, and lifetime rules native to OpenGL ES.
+
+`qtav_render_opengl` contains reusable OpenGL ES rendering logic.
+Android and OHOS have separate EGL/window adapters because `ANativeWindow`,
+`OHNativeWindow`, XComponent, context ownership, surface replacement, and
+thread-affinity rules are not ABI-compatible. Each adapter owns its EGL
+display, context, surface, and recreation state while retaining or borrowing
+the current native window according to its platform contract. Neither adapter
+enters the core target or exposes its SDK types through core public headers.
+
+The baseline is OpenGL ES 3.x with runtime capability checks. Formats or output
+features that require unavailable texture formats, precision, extensions, or
+HDR surface support are reported explicitly and use a documented lower-quality
+conversion where one exists; they are not silently claimed as native support.
+SDL3 is not part of the renderer fallback contract. An application may use
+SDL3 in its own shell, but QtAVCore does not require SDL to select, create, or
+recover either mobile renderer.
+
+## Renderer selection and fallback
+
+Renderer selection belongs to the application or thin platform integration
+layer because that layer owns the activity, native window, and graphics
+devices. Core does not silently create a second graphics API. The shared policy
+for Android and OHOS is:
+
+1. Prefer Vulkan for a new renderer session. Before publishing a Vulkan
+   renderer, verify the loader/API version, required instance and device
+   extensions, queue and presentation support, surface formats, and swapchain
+   creation.
+2. Select OpenGL ES when Vulkan is unavailable, required capabilities are
+   missing, device selection fails, or the first surface/swapchain generation
+   cannot be created. Record the selected API and fallback reason in device
+   facts and emit an observable renderer detail event.
+3. Treat window replacement, an out-of-date or suboptimal swapchain, and
+   ordinary surface loss as recoverable Vulkan lifecycle events. Suspend
+   presentation, invalidate the old target generation, wait for retained
+   in-flight resources as required, and attempt bounded recreation before
+   changing APIs.
+4. Treat device loss, unrecoverable queue submission or presentation failure,
+   and repeated recreation failure for a valid native-window generation as
+   fatal to the Vulkan renderer. Quiesce and destroy that renderer, invalidate
+   its generation, emit the failure reason, and create the OpenGL ES renderer
+   against the current window without reopening the media.
+5. Do not automatically switch back to Vulkan during the same renderer
+   session. A new application-led renderer session may probe Vulkan again.
+   This prevents backend oscillation after a driver or device failure.
+6. If EGL/OpenGL ES context or surface loss is recoverable, recreate that
+   backend first. If OpenGL ES initialization or bounded recovery also fails,
+   report video presentation as unavailable; playback, audio output, and
+   decoded-frame callbacks remain usable.
+
+Fallback transfers no live Vulkan or EGL resource between APIs. Copied
+`VideoFrame` values retain software-frame data across the transition, while
+old renderer generations reject late redraw or completion work. Renderer
+selection, hardware-decoder selection, direct-surface presentation, and
+hardware-frame interop are independent policies: a Vulkan failure does not by
+itself reopen the decoder, and an interop failure must not be disguised as a
+graphics-API fallback.
+
 ## Platform surface adapters
 
 Android and OHOS use separate adapters because their window ownership and
@@ -91,10 +165,10 @@ uses an independent implementation and OHOS-specific lifecycle rules. Neither
 adapter pretends that `ANativeWindow`, `OHNativeWindow`, EGL objects, or their
 callbacks are interchangeable.
 
-An OpenGL ES engine may reuse color constants, shader inputs, geometry, and
-golden vectors. EGL context, surface, thread affinity, and loss/recreation
-remain API- and platform-specific rather than hidden behind a false Vulkan/EGL
-common lifecycle.
+The OpenGL ES engine reuses only the portable rendering inputs described
+above. EGL context, surface, thread affinity, and loss/recreation remain API-
+and platform-specific rather than hidden behind a false Vulkan/EGL common
+lifecycle.
 
 ## Surface-backed hardware decode
 
@@ -121,9 +195,110 @@ backends:
    retained is represented as a presentation token, not a fake texture
    handle.
 
-Direct-surface H.264 and HEVC presentation is implemented and validated before
-SurfaceTexture, `AHardwareBuffer`, NativeBuffer, or Vulkan texture import is
-claimed. Decoder fallback and renderer/interop fallback remain independent.
+Direct-surface H.264 and HEVC presentation must be implemented and validated
+before `SurfaceTexture`, `AHardwareBuffer`, `OH_NativeBuffer`, or graphics
+texture import is claimed. Decoder fallback and renderer/interop fallback
+remain independent.
+
+## Zero-CPU-copy texture interop
+
+Direct-surface presentation is the first hardware-output milestone because it
+can avoid CPU access without requiring a shader-readable decoder frame. It
+does not prove that a decoded image can participate in QtAVCore color,
+geometry, composition, or post-processing passes. Texture interop is a later,
+separate milestone for both Vulkan and OpenGL ES.
+
+For this project, a mobile path is described as **zero-CPU-copy** only when no
+decoded pixel is mapped to CPU memory, transferred to a software
+`VideoFrame`, copied into a CPU staging buffer, or uploaded again by the
+renderer. Retaining or passing an opaque native-buffer handle, importing it
+into a graphics API, waiting on its producer fence, sampling it in a GPU
+conversion pass, and presenting it are allowed. This definition does not claim
+that a codec, driver, or system compositor performs no internal hardware copy.
+Tests and status output use the precise `zero-CPU-copy` or `zero-CPU-map`
+wording rather than an unqualified end-to-end zero-copy claim.
+
+The shared interop contract requires:
+
+- a reference-counted hardware frame or presentation object that retains the
+  native buffer until all GPU consumers complete;
+- source device, surface generation, dimensions, native format, range, color
+  space, HDR metadata, and protected-content state validation before import;
+- explicit producer-to-renderer and renderer-to-release synchronization using
+  the platform's supported fence or semaphore mechanism. GPU-native waiting is
+  the normal performance target; a CPU fence wait is a latency defect but does
+  not by itself violate the zero-CPU-copy definition because it does not map or
+  copy decoded pixels;
+- capability reporting per graphics API and per format, including NV12-like
+  8-bit output and P010/10-bit output where the device exposes them;
+- a same-device or explicitly shareable-device rule, with foreign or stale
+  resources rejected before graphics-context access;
+- bounded imported-frame caching keyed by native-buffer identity and
+  generation, with deterministic retirement after GPU completion;
+- no implicit CPU mapping. An optional mapping/copy path, if added for
+  diagnostics, is disabled by default, emits an observable fallback event,
+  and remains independent of hardware-decoder and graphics-API fallback.
+
+The confirmed Android Vulkan design uses an application-owned `AImageReader`
+created for private, GPU-sampled images. Its `ANativeWindow` is supplied to
+MediaCodec, and a decoded presentation token is released into that producer.
+The consumer acquires an `AImage` and acquire fence asynchronously, obtains
+the retained `AHardwareBuffer`, imports supported memory with
+`VK_ANDROID_external_memory_android_hardware_buffer`, and uses native
+YCbCr/external-format sampling where required. After the last GPU consumer,
+the release fence is returned through asynchronous image deletion. The
+adapter correlates the codec presentation timestamp with the acquired image
+timestamp and never calls `AHardwareBuffer_lock*()`.
+
+The confirmed Android OpenGL ES design uses a MediaCodec `Surface` backed by
+`SurfaceTexture` as its primary path. `updateTexImage()` exposes the current
+decoded image through `GL_TEXTURE_EXTERNAL_OES`; timestamp/generation
+correlation and the single-current-image lifetime are explicit parts of the
+adapter. A private `AImageReader` plus `AHardwareBuffer`/`EGLImage` import is
+an optional alternative when all required EGL, GL, format, and fence
+capabilities are present. Neither route reads decoded pixels through CPU
+memory. P010, HDR, and formats that cannot be sampled with the required color
+control remain capability-gated rather than silently converted on the CPU.
+
+The confirmed OHOS OpenGL ES design supplies the `OHNativeWindow` produced by
+`OH_NativeImage` to OHCodec surface output, updates the surface image, and
+samples its bound `GL_TEXTURE_EXTERNAL_OES` texture. The adapter retains the
+corresponding codec presentation token and native-image generation until the
+consumer/release rules of the selected SDK permit reuse. This is a separate
+OHOS implementation; it does not reuse Android handles or ABI assumptions.
+
+OHOS Vulkan is conditionally feasible, not yet a direct consequence of the
+current FFmpeg 8 OHCodec wrapper. OHOS exposes native-buffer Vulkan external
+memory, but the wrapper's buffer-output branch currently obtains a CPU address
+with `OH_AVBuffer_GetAddr()` and copies with `av_image_copy2()`. Before Vulkan
+interop can be called zero-CPU-copy, a backend or narrowly scoped FFmpeg bridge
+must instead expose and retain the decoded `OH_AVBuffer`/`OH_NativeBuffer`
+until GPU completion, import it through the target SDK's OHOS Vulkan external
+memory path, and then call `OH_VideoDecoder_FreeOutputBuffer()` without either
+CPU operation. The current surface-output wrapper provides present/drop
+tokens suitable for direct presentation and the `OH_NativeImage` GLES path,
+but it does not expose a Vulkan-importable native buffer. The exact bridge,
+format, protected-content, lifetime, and fence APIs remain target-SDK/device
+gates.
+
+When the active renderer changes from Vulkan to OpenGL ES, the platform layer
+first attempts the OpenGL ES interop path for newly decoded native buffers. If
+that path is unavailable, it follows the caller's explicit policy: reconfigure
+for direct-surface presentation, reopen video in software, or report video
+presentation unavailable. It never maps and uploads a hardware frame merely
+because the graphics API changed. The reverse transition is not attempted
+during the same renderer session.
+
+Seek, loop, stop, media replacement, decoder flush, surface replacement, and
+renderer fallback advance a generation and reject late native buffers. Device
+tests must prove zero calls to CPU mapping/transfer hooks, correct producer and
+release fence ordering, bounded outstanding buffers, retained lifetime through
+asynchronous GPU completion, and clean failure or explicit fallback for
+unsupported formats and protected content. Direct-surface validation remains
+a prerequisite; a capability-gated texture test that did not exercise a
+supported native import is reported as skipped, not passed. A test may read
+back the final render target to validate pixels, but decoded-source map,
+transfer, staging-copy, and re-upload counters must remain zero.
 
 ## Audio boundaries
 
@@ -140,6 +315,14 @@ API or device results demonstrate that it is required.
 Shared generated media and lifecycle scenarios cover:
 
 - software audio/video decode and end-of-media;
+- Vulkan-preferred startup and forced OpenGL ES selection when Vulkan is
+  unavailable, rejected by capability checks, or fails initial surface setup;
+- recoverable Vulkan surface/swapchain recreation without an API switch;
+- fatal Vulkan failure followed by one-way OpenGL ES fallback without media
+  reopen, plus explicit failure when neither renderer is usable;
+- capability-gated MediaCodec/OHCodec native-buffer import through Vulkan and
+  OpenGL ES with zero CPU map/transfer calls, retained lifetime, fence
+  ordering, format/color validation, and explicit unsupported-path results;
 - pause/resume and monotonic position;
 - seek and loop flush;
 - media replacement and explicit stop;

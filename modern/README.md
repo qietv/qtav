@@ -42,6 +42,9 @@ code is used.
   application-selected device/queue and current-image resources;
 - optional Android Vulkan surface adapter that retains the current
   `ANativeWindow` generation and owns its surface/swapchain synchronization;
+- an accepted Android/OHOS mobile rendering policy that prefers Vulkan and
+  uses a separate OpenGL ES/EGL backend after Vulkan is unavailable or fails
+  fatally, while keeping recoverable surface recreation within the active API;
 - a reproducible macOS-to-Android arm64 build and connected-device
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
   decoding and Vulkan presentation;
@@ -106,6 +109,35 @@ Current backend integration boundary:
   application owns the Vulkan instance, device, queue, and NativeActivity;
 - no Linux native backend, Android audio sink, or Android hardware decoder has
   been implemented yet.
+
+Mobile renderer selection remains in the application or thin platform layer
+that owns the native window and graphics devices. A new renderer session
+prefers Vulkan and selects the planned OpenGL ES 3.x/EGL backend when Vulkan
+is unavailable, lacks required capabilities, or cannot create its initial
+surface generation. Recoverable Vulkan surface/swapchain events recreate
+Vulkan in place; device loss, unrecoverable submission/presentation failure,
+or repeated recreation failure causes a one-way switch to OpenGL ES without
+reopening the media. If both APIs fail, video presentation reports an error
+while playback, audio, and decoded-frame callbacks remain available. Decoder,
+direct-surface, interop, and renderer fallback policies remain independent.
+The accepted design is specified in [`MOBILE.md`](MOBILE.md); the OpenGL ES
+backend and selector are not implemented yet and do not require SDL3.
+
+The same design plans separate zero-CPU-copy native-buffer interop for Vulkan
+and OpenGL ES after direct-surface hardware presentation is stable. On
+Android, Vulkan consumes a private GPU-sampled `AImageReader` image by
+importing its retained `AHardwareBuffer` and acquire/release fences; OpenGL ES
+primarily consumes MediaCodec `SurfaceTexture` output through
+`GL_TEXTURE_EXTERNAL_OES`, with `AHardwareBuffer`/`EGLImage` as a
+capability-gated alternative. On OHOS, the confirmed GLES path uses
+`OH_NativeImage` plus an external-OES texture. OHOS Vulkan additionally needs
+a retained `OH_AVBuffer`/`OH_NativeBuffer` bridge because the current FFmpeg 8
+OHCodec buffer branch performs `OH_AVBuffer_GetAddr()` plus
+`av_image_copy2()` and therefore cannot satisfy this contract as-is. A
+zero-CPU-copy claim requires zero decoded-pixel map, software transfer, CPU
+staging, and re-upload calls plus verified native-buffer lifetime and fence
+ordering. Unsupported imports are reported rather than silently mapped, and a
+Vulkan-to-OpenGL ES renderer switch does not itself authorize a CPU copy.
 
 ## Build
 
