@@ -179,6 +179,7 @@ void testSeekAndMediaReplacement(const char* media)
 
 void testLoopReanchorsDeviceClock(const char* media)
 {
+    constexpr int repeatCount = 1;
     auto sink = std::make_shared<qtav::test::SimulatedAudioSink>(
         qtav::test::SimulatedAudioSinkConfig {
             {},
@@ -193,7 +194,7 @@ void testLoopReanchorsDeviceClock(const char* media)
     qtav::Player player;
     player.setAudioSink(sink);
     player.setRange(200, 600);
-    player.setLoop(1);
+    player.setLoop(repeatCount);
     player.setMedia(media);
     player.setState(qtav::State::Playing);
 
@@ -203,7 +204,7 @@ void testLoopReanchorsDeviceClock(const char* media)
     assert(player.waitFor(qtav::State::Stopped, 5'000));
     const auto state = sink->snapshot();
     assert(state.flushCount >= 1);
-    assert(state.drainCount == 1);
+    assert(state.drainCount == repeatCount + 1);
     assert(state.writeCount > 2);
     assert(std::adjacent_find(
                state.writeTimestamps.begin(),
@@ -232,6 +233,11 @@ void testInvalidDeviceClockFallsBackToMonotonic(const char* media)
     player
         .onVideoFrame([&](const qtav::VideoFrame&, int) {
             ++videoFrames;
+        })
+        .setRenderCallback([sink](void*) {
+            assert(sink->waitFor([](const Snapshot& state) {
+                return state.writeCount >= 1;
+            }));
         })
         .setAudioSink(sink);
     player.setPlaybackRate(20.0F);

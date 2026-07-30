@@ -59,6 +59,17 @@ public:
         const qtav::AudioFormat& decodedFormat) override
     {
         assert(decodedFormat.isValid());
+        {
+            std::unique_lock<std::mutex> lock(blockedOpenMutex_);
+            if (blockNextOpen_) {
+                blockNextOpen_ = false;
+                blockedOpenEntered_ = true;
+                blockedOpenChanged_.notify_all();
+                blockedOpenChanged_.wait(
+                    lock,
+                    [&] { return releaseBlockedOpen_; });
+            }
+        }
         open_.store(true);
         paused_.store(false);
         clockPosition_.store(0);
@@ -165,6 +176,33 @@ public:
         reportUnderrun_ = true;
     }
 
+    void blockNextOpen()
+    {
+        std::lock_guard<std::mutex> lock(blockedOpenMutex_);
+        blockNextOpen_ = true;
+        blockedOpenEntered_ = false;
+        releaseBlockedOpen_ = false;
+    }
+
+    bool waitForBlockedOpen(
+        std::chrono::milliseconds timeout = std::chrono::seconds(5))
+    {
+        std::unique_lock<std::mutex> lock(blockedOpenMutex_);
+        return blockedOpenChanged_.wait_for(
+            lock,
+            timeout,
+            [&] { return blockedOpenEntered_; });
+    }
+
+    void releaseBlockedOpen()
+    {
+        {
+            std::lock_guard<std::mutex> lock(blockedOpenMutex_);
+            releaseBlockedOpen_ = true;
+        }
+        blockedOpenChanged_.notify_all();
+    }
+
     void blockNextWrite()
     {
         std::lock_guard<std::mutex> lock(blockedWriteMutex_);
@@ -190,6 +228,21 @@ public:
             releaseBlockedWrite_ = true;
         }
         blockedWriteChanged_.notify_all();
+    }
+
+    void reportUnderrun()
+    {
+        EventCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = callback_;
+        }
+        if (callback) {
+            callback({
+                qtav::AudioSinkEventType::Underrun,
+                "deterministic test underrun",
+            });
+        }
     }
 
     bool waitFor(
@@ -246,6 +299,11 @@ private:
     bool requiresConversion_ = false;
     bool blockFirstWrite_ = false;
     bool simulateQueuedClock_ = false;
+    std::mutex blockedOpenMutex_;
+    std::condition_variable blockedOpenChanged_;
+    bool blockNextOpen_ = false;
+    bool blockedOpenEntered_ = false;
+    bool releaseBlockedOpen_ = false;
     std::atomic<bool> firstWriteSeen_ { false };
     std::mutex firstWriteMutex_;
     std::condition_variable firstWriteChanged_;
@@ -340,11 +398,17 @@ void testLifecycleAndClock(const char* media)
     const int closesBeforeReplacement = sink->closeCount();
     const int flushesBeforeReplacement = sink->flushCount();
     eventPhase.store(2);
-    sink->reportUnderrunOnNextWrite();
+    std::thread replacementEvent([sink] { sink->reportUnderrun(); });
+    replacementEvent.join();
+    assert(eventPhase.load() == 3);
     player.setState(qtav::State::Playing);
 
-    assert(sink->waitFor(
-        [&] { return sink->openCount() > opensBeforeReplacement; }));
+    assert(sink->waitFor([&] {
+        return sink->openCount() > opensBeforeReplacement
+            && sink->closeCount() > closesBeforeReplacement
+            && sink->flushCount() > flushesBeforeReplacement
+            && sink->resumeCount() >= 2;
+    }));
     assert(sink->closeCount() > closesBeforeReplacement);
     assert(sink->flushCount() > flushesBeforeReplacement);
     assert(sink->resumeCount() >= 2);
@@ -391,6 +455,26 @@ void testShutdownClosesSink(const char* media)
     assert(sink->closeCount() == 1);
 }
 
+void testStopClosesInFlightSinkOpen(const char* media)
+{
+    auto sink = std::make_shared<DeterministicAudioSink>();
+    sink->blockNextOpen();
+
+    qtav::Player player;
+    player.setAudioSink(sink);
+    player.setMedia(media);
+    player.setState(qtav::State::Playing);
+
+    require(sink->waitForBlockedOpen());
+    player.setState(qtav::State::Stopped);
+    sink->releaseBlockedOpen();
+
+    require(player.waitFor(qtav::State::Stopped, 5'000));
+    require(sink->waitFor([&] {
+        return sink->openCount() == 1 && sink->closeCount() == 1;
+    }));
+}
+
 void testUnsupportedConversionKeepsFrameCallback(const char* media)
 {
     auto sink = std::make_shared<DeterministicAudioSink>(true);
@@ -398,11 +482,15 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
     std::mutex mutex;
     std::condition_variable changed;
     bool formatEvent = false;
-    std::atomic<int> audioFrames { 0 };
+    int audioFrames = 0;
 
     player
-        .onAudioFrame([&](const qtav::AudioFrame&, int) {
-            ++audioFrames;
+        .onAudioFrame([&](const qtav::AudioFrame& frame, int) {
+            assert(frame);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++audioFrames;
+            }
             changed.notify_all();
         })
         .onEvent([&](const qtav::MediaEvent& event) {
@@ -425,11 +513,15 @@ void testUnsupportedConversionKeepsFrameCallback(const char* media)
         assert(changed.wait_for(
             lock,
             std::chrono::seconds(5),
-            [&] { return formatEvent && audioFrames.load() >= 1; }));
+            [&] { return formatEvent && audioFrames >= 1; }));
     }
     player.setState(qtav::State::Stopped);
     assert(player.waitFor(qtav::State::Stopped, 5'000));
-    assert(audioFrames.load() >= 1);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        assert(formatEvent);
+        assert(audioFrames >= 1);
+    }
     assert(sink->openCount() == 1);
     assert(sink->closeCount() == 1);
     assert(sink->writeCount() == 0);
@@ -608,6 +700,7 @@ int main(int argc, char** argv)
     assert(argc == 2);
     testLifecycleAndClock(argv[1]);
     testShutdownClosesSink(argv[1]);
+    testStopClosesInFlightSinkOpen(argv[1]);
     testUnsupportedConversionKeepsFrameCallback(argv[1]);
     testUiAndRenderIsolation(argv[1]);
     testPlayingSeekWaitsForDeviceClock(argv[1]);

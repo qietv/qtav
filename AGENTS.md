@@ -174,6 +174,9 @@ Implemented under `modern/`:
   geometry shaders, explicit SDR/HDR10/extended-linear output color spaces,
   plus an Android `ANativeWindow` adapter with native HDR swapchain selection
   and optional `VK_EXT_hdr_metadata` submission;
+- platform-neutral OpenGL ES 3.x software-frame rendering for
+  YUV/NV12/P010/RGB families with structured SDR color and geometry handling,
+  plus an Android EGL/`ANativeWindow` adapter for the required SDR fallback;
 - structured video color-space/HDR10 metadata and Metal
   SDR/extended-linear output;
 - libswresample conversion to negotiated interleaved PCM;
@@ -185,8 +188,9 @@ Implemented under `modern/`:
 Known intentional limitations:
 
 - no native audio-device sink outside macOS and Windows yet;
-- no OpenGL renderer yet; the Vulkan software path is validated on Android but
-  still needs OHOS and Linux adapters/device coverage;
+- no automatic Vulkan-to-OpenGL ES selector yet; both software engines and
+  their Android adapters are validated, while OHOS and Linux adapters/device
+  coverage remain;
 - no Linux or Android hardware decoder or GPU zero-copy interop yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
@@ -240,11 +244,14 @@ development host; explicit leak detection aborts as unsupported.
 
 Last verified baseline:
 
+- current macOS recheck builds successfully and passes 27/27 CTest after the
+  scheduling-isolation audio tests were updated to wait explicitly for frame
+  callbacks and to expect one sink drain per completed loop segment;
 - static build: passed;
 - shared build: passed;
-- CTest: 24/24 passed;
-- ASan/UBSan: 24/24 passed;
-- all-backends-disabled CTest: 8/8 passed;
+- CTest: 27/27 passed;
+- ASan/UBSan: 27/27 passed;
+- all-backends-disabled macOS CTest: 10/10 passed;
 - install plus external `find_package(QtAVCore)` consumption of
   `QtAV::Core`, `QtAV::RenderCPU`, `QtAV::RenderMetal`,
   `QtAV::AudioResample`, `QtAV::AudioFile`, `QtAV::AudioCoreAudio`,
@@ -264,6 +271,11 @@ Last verified baseline:
   conversion, native 10-bit PQ/HLG output, HLG-to-PQ conversion, FP16
   extended-linear/BT.2020-linear output, HDR luminance-metadata selection,
   viewport, rotation, and target recreation.
+- Android OpenGL ES 3.2 fallback build, package export, external CMake
+  consumption, offscreen readback, and connected Adreno 830 device
+  presentation: passed for YUV420/422/444, NV12/NV21, P010,
+  RGB/BGR/RGBA/BGRA/ARGB, Gray8, viewport, rotation, target-generation
+  replacement, and real-window P010/PQ-to-SDR presentation.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device
@@ -272,8 +284,8 @@ Last verified baseline:
 - Windows static/shared install plus external `QtAV::RenderD3D11`,
   `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`, and `QtAV::AudioWASAPI`
   CMake consumption: passed.
-- current Windows static/shared Release CTest after Advanced Color
-  implementation: 33/33 passed with Windows HDR disabled and enabled,
+- current Windows static/shared Release CTest after the high-level D3D11
+  composition output: 34/34 passed with Windows HDR disabled and enabled,
   including native FP16/RGB10 flip-model output, PQ/BT.2020 Main10
   HDR-preserving zero-CPU-map readback, and active-HDR validation on a
   PHL 27B1U7903.

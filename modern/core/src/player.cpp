@@ -165,9 +165,21 @@ public:
         quitting_.store(true, std::memory_order_release);
         interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
         presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
+        // Pair shutdown with each condition variable's wait mutex so a waiter
+        // cannot observe the old predicate and go to sleep after notification.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+        }
         controlChanged_.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        }
         audioQueueChanged_.notify_all();
         audioQueueSpace_.notify_all();
+        audioQueueDrained_.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(presentationMutex_);
+        }
         presentationChanged_.notify_all();
         presentationDrained_.notify_all();
         {
@@ -764,7 +776,8 @@ private:
                                 presentationGeneration_.load(
                                     std::memory_order_acquire),
                                 media_.video.valid()
-                                    && media_.audio.valid());
+                                    && media_.audio.valid(),
+                                false);
                         } else {
                             resetClockLocked(currentPosition_);
                         }
@@ -962,7 +975,8 @@ private:
                     position,
                     presentationGeneration_.load(
                         std::memory_order_acquire),
-                    media_.video.valid() && media_.audio.valid());
+                    media_.video.valid() && media_.audio.valid(),
+                    false);
             }
         }
         publishState(requested);
@@ -1217,7 +1231,8 @@ private:
                     targetMs,
                     presentationGeneration_.load(
                         std::memory_order_acquire),
-                    media_.video.valid() && media_.audio.valid());
+                    media_.video.valid() && media_.audio.valid(),
+                    audioSinkOpen_ && audioSinkHasClock_);
             }
         }
         if (waitForData) {
@@ -1250,6 +1265,7 @@ private:
                 waitingForOutput_ = false;
                 outputWaitPrimed_ = false;
                 outputWaitGeneration_ = 0;
+                outputWaitRequiresDeviceClock_ = false;
                 if (!superseded) {
                     currentPosition_ = previousPosition;
                     resetClockLocked(previousPosition);
@@ -1492,7 +1508,8 @@ private:
     PresentationWaitResult waitUntilPresentation(
         std::int64_t timestampMs,
         std::uint64_t generation,
-        bool yieldToEarlierItem = true)
+        bool yieldToEarlierItem = true,
+        bool claimOutputPrime = true)
     {
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
@@ -1547,7 +1564,9 @@ private:
                 }
             }
             if (waitingForOutput_ && !outputWaitPrimed_) {
-                outputWaitPrimed_ = true;
+                if (claimOutputPrime) {
+                    outputWaitPrimed_ = true;
+                }
                 return PresentationWaitResult::Ready;
             }
             const auto delta = timestampMs - current;
@@ -1739,7 +1758,9 @@ private:
                     accepted =
                         waitUntilPresentation(
                             queued.frame.timestamp(),
-                            queued.generation)
+                            queued.generation,
+                            true,
+                            false)
                         == PresentationWaitResult::Ready;
                 }
             }
@@ -1970,6 +1991,7 @@ private:
             waitingForOutput_ = false;
             outputWaitPrimed_ = false;
             outputWaitGeneration_ = 0;
+            outputWaitRequiresDeviceClock_ = false;
             videoPrerollPending_ = false;
             videoPrerollGeneration_ = 0;
             videoPrerollFrameCount_ = 0;
@@ -1996,7 +2018,11 @@ private:
                 || seekRequest_) {
                 return;
             }
-            primeOutputWaitLocked(position, generation, false);
+            primeOutputWaitLocked(
+                position,
+                generation,
+                false,
+                audioSinkOpen_ && audioSinkHasClock_);
             publishBuffering = status_ == MediaStatus::Loaded;
         }
         if (publishBuffering) {
@@ -2009,13 +2035,15 @@ private:
     void primeOutputWaitLocked(
         std::int64_t position,
         std::uint64_t generation,
-        bool waitForVideo)
+        bool waitForVideo,
+        bool requireDeviceClock)
     {
         currentPosition_ = clampPositionLocked(position);
         resetClockLocked(currentPosition_);
         waitingForOutput_ = true;
         outputWaitPrimed_ = false;
         outputWaitGeneration_ = generation;
+        outputWaitRequiresDeviceClock_ = requireDeviceClock;
         videoPrerollPending_ = waitForVideo;
         videoPrerollGeneration_ = waitForVideo ? generation : 0;
         videoPrerollFrameCount_ = 0;
@@ -2089,6 +2117,7 @@ private:
             waitingForOutput_ = false;
             outputWaitPrimed_ = false;
             outputWaitGeneration_ = 0;
+            outputWaitRequiresDeviceClock_ = false;
             videoPrerollPending_ = false;
             videoPrerollGeneration_ = 0;
             videoPrerollFrameCount_ = 0;
@@ -2195,6 +2224,17 @@ private:
         }
         if (validPosition) {
             resumeClockAfterOutput(generation, *validPosition);
+        } else if (submittedUntil > 0) {
+            bool useFallbackClock = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                useFallbackClock = waitingForOutput_
+                    && outputWaitGeneration_ == generation
+                    && !outputWaitRequiresDeviceClock_;
+            }
+            if (useFallbackClock) {
+                resumeClockAfterOutput(generation, submittedUntil);
+            }
         }
         controlChanged_.notify_all();
         presentationChanged_.notify_all();
@@ -2429,7 +2469,11 @@ private:
                 stillActive = activeAudioSink_ == sink
                     && activeAudioFrameConverter_ == converter
                     && appliedAudioSinkSerial_ == serial
-                    && audioSinkSerial_ == serial;
+                    && audioSinkSerial_ == serial
+                    && requestedState_ == State::Playing
+                    && generation
+                        == presentationGeneration_.load(
+                            std::memory_order_acquire);
                 if (stillActive) {
                     audioSinkOpenAttempted_ = true;
                     audioSinkOpen_ = formatSupported;
@@ -3032,6 +3076,7 @@ private:
     bool waitingForOutput_ = false;
     bool outputWaitPrimed_ = false;
     std::uint64_t outputWaitGeneration_ = 0;
+    bool outputWaitRequiresDeviceClock_ = false;
     bool videoPrerollPending_ = false;
     std::uint64_t videoPrerollGeneration_ = 0;
     std::size_t videoPrerollFrameCount_ = 0;

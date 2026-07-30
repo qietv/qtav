@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+#include <qtav/android_opengl_video_renderer.h>
 #include <qtav/android_vulkan_video_renderer.h>
 #include <qtav/player.h>
 
+#include "opengl_video_renderer_test_support.h"
 #include "vulkan_video_renderer_test_support.h"
 
 #include <android/asset_manager.h>
@@ -20,6 +22,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -382,6 +385,11 @@ struct TestState {
         if (renderer) {
             renderer->close();
         }
+        std::lock_guard<std::mutex> lock(windowMutex);
+        if (activeWindow) {
+            ANativeWindow_release(activeWindow);
+            activeWindow = nullptr;
+        }
     }
 
     void fail(const std::string& detail)
@@ -405,9 +413,13 @@ struct TestState {
             + " audio_frames=" + std::to_string(audioFrames.load())
             + " surface_recreations="
             + std::to_string(surfaceRecreations.load())
+            + " gles_fallback="
+            + (openGlFallbackPassed.load() ? "pass" : "fail")
+            + " gles_offscreen="
+            + (openGlOffscreenPassed.load() ? "pass" : "fail")
             + " offscreen=" + (offscreenPassed.load() ? "pass" : "fail")
             + " hdr=pq,hlg native_hdr="
-            + (renderer && renderer->hdrOutputActive() ? "pass" : "fail")
+            + (nativeHdrOutputPassed.load() ? "pass" : "fail")
             + " hdr_source="
             + (nativeHdrFramePresented.load() ? "pass" : "fail")
             + " hdr_metadata="
@@ -447,8 +459,12 @@ struct TestState {
                             fail("the Android surface was not recreated");
                         } else if (!offscreenPassed.load()) {
                             fail("the Vulkan offscreen checks did not pass");
+                        } else if (!openGlOffscreenPassed.load()) {
+                            fail("the OpenGL ES offscreen checks did not pass");
                         } else if (!nativeHdrFramePresented.load()) {
                             fail("the native HDR source frame was not presented");
+                        } else if (!runOpenGlFallbackCheck()) {
+                            return false;
                         } else {
                             pass();
                         }
@@ -470,9 +486,21 @@ struct TestState {
                         return;
                     }
                     offscreenPassed = true;
+                    if (!qtav::test::runOpenGLOffscreenRendererChecks(
+                            frame,
+                            qtav::test::makeVulkanHdrTestFrame(),
+                            error)) {
+                        fail("OpenGL ES offscreen check: " + error);
+                        return;
+                    }
+                    openGlOffscreenPassed = true;
                     player.setState(qtav::State::Paused);
                     logInfo(
                         "QTAV_ANDROID_TEST: OFFSCREEN_PASS hdr=pq,hlg");
+                    logInfo(
+                        "QTAV_ANDROID_TEST: GLES_OFFSCREEN_PASS "
+                        "formats=yuv,nv12,p010,rgb "
+                        "geometry=viewport,rotation,recreation");
                 }
                 ++videoFrames;
             })
@@ -491,6 +519,16 @@ struct TestState {
     {
         if (finished.load()) {
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(windowMutex);
+            if (activeWindow) {
+                ANativeWindow_release(activeWindow);
+            }
+            activeWindow = window;
+            if (activeWindow) {
+                ANativeWindow_acquire(activeWindow);
+            }
         }
         if (started.load()) {
             if (!renderer || !renderer->setWindow(window)) {
@@ -529,6 +567,7 @@ struct TestState {
             fail("the Android Vulkan adapter did not activate native HDR");
             return;
         }
+        nativeHdrOutputPassed = true;
         const VkSurfaceFormatKHR surfaceFormat = renderer->surfaceFormat();
         logInfo(
             "QTAV_ANDROID_TEST: HDR_SWAPCHAIN format="
@@ -579,7 +618,78 @@ struct TestState {
         if (renderer) {
             renderer->setWindow(nullptr);
         }
+        {
+            std::lock_guard<std::mutex> lock(windowMutex);
+            if (activeWindow) {
+                ANativeWindow_release(activeWindow);
+                activeWindow = nullptr;
+            }
+        }
         logInfo("QTAV_ANDROID_TEST: SURFACE_REMOVED");
+    }
+
+    bool runOpenGlFallbackCheck()
+    {
+        ANativeWindow* window = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(windowMutex);
+            window = activeWindow;
+            if (window) {
+                ANativeWindow_acquire(window);
+            }
+        }
+        if (!window) {
+            fail(
+                "no active Android window for the OpenGL ES fallback check");
+            return false;
+        }
+
+        player.setVideoRenderAPI({});
+        if (renderer) {
+            renderer->close();
+        }
+
+        std::string openGlError;
+        auto openGlRenderer =
+            std::make_shared<qtav::AndroidOpenGLVideoRenderer>();
+        openGlRenderer->setEventCallback(
+            [&openGlError](const qtav::VideoRenderEvent& event) {
+                if (event.type !=
+                    qtav::VideoRenderEventType::RedrawRequested) {
+                    openGlError = event.detail;
+                }
+            });
+        bool succeeded = openGlRenderer->setWindow(window);
+        qtav::VideoRenderConfig openGlConfig;
+        if (succeeded) {
+            openGlConfig.surfaceSize =
+                openGlRenderer->surfaceSize();
+            openGlConfig.aspectRatio =
+                qtav::VideoAspectRatioMode::Fit;
+            succeeded = openGlRenderer->open(openGlConfig);
+        }
+        const qtav::VideoFrame openGlFrame =
+            qtav::test::makeVulkanHdrTestFrame();
+        if (succeeded) {
+            succeeded = openGlFrame
+                && openGlRenderer->render(openGlFrame);
+        }
+        const std::uint64_t generation =
+            openGlRenderer->surfaceGeneration();
+        openGlRenderer->close();
+        ANativeWindow_release(window);
+        if (!succeeded) {
+            fail(
+                "could not render the OpenGL ES fallback frame: "
+                + openGlError);
+            return false;
+        }
+        openGlFallbackPassed = true;
+        logInfo(
+            "QTAV_ANDROID_TEST: GLES_FALLBACK_PASS "
+            "version=3 sdr_tonemap=p010,pq generation="
+            + std::to_string(generation));
+        return true;
     }
 
     ANativeActivity* activity = nullptr;
@@ -592,9 +702,14 @@ struct TestState {
     std::atomic<int> surfaceRecreations { 0 };
     std::atomic<bool> offscreenChecked { false };
     std::atomic<bool> offscreenPassed { false };
+    std::atomic<bool> openGlOffscreenPassed { false };
+    std::atomic<bool> openGlFallbackPassed { false };
     std::atomic<bool> nativeHdrFramePresented { false };
+    std::atomic<bool> nativeHdrOutputPassed { false };
     std::atomic<bool> finished { false };
     std::atomic<bool> started { false };
+    std::mutex windowMutex;
+    ANativeWindow* activeWindow = nullptr;
     // Destroyed first so its worker is joined before borrowed Vulkan objects.
     qtav::Player player;
 };

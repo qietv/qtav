@@ -53,12 +53,15 @@ code is used.
 - optional Android Vulkan surface adapter that retains the current
   `ANativeWindow` generation, selects a supported SDR/native-HDR swapchain,
   publishes its output color space, and owns surface/swapchain synchronization;
+- optional platform-neutral OpenGL ES 3.x software-frame renderer plus an
+  Android EGL adapter that owns its display, context, window surface, and
+  surface generation as the mobile SDR fallback;
 - an accepted Android/OHOS mobile rendering policy that prefers Vulkan and
   uses a separate OpenGL ES/EGL backend after Vulkan is unavailable or fails
   fatally, while keeping recoverable surface recreation within the active API;
 - a reproducible macOS-to-Android arm64 build and connected-device
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
-  decoding and Vulkan presentation;
+  decoding, Vulkan presentation, and OpenGL ES/EGL SDR fallback validation;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -73,9 +76,10 @@ Current backend integration boundary:
 - `AudioSink` is connected through `Player::setAudioSink()`, follows playback
   lifecycle changes, and supplies the playback master when its device clock is
   supported and valid; decoded PCM crosses a bounded queue to a dedicated
-  audio-output worker, queued audio is drained before close at natural end,
-  and seek/underrun buffering freezes `position()` until the device clock
-  re-anchors (or callback-only output is actually delivered);
+  audio-output worker; queued audio is drained at completed playback segments,
+  including loop boundaries, and before final close; seek/underrun buffering
+  freezes `position()` until the device clock re-anchors (or callback-only
+  output is actually delivered);
 - `AudioFrameConverter` is connected through
   `Player::setAudioFrameConverter()` when a sink negotiates different PCM;
   `QtAV::AudioResample` supplies the portable libswresample implementation;
@@ -131,12 +135,20 @@ Current backend integration boundary:
   native HDR format/color-space pairs when available, and submits HDR10 static
   metadata when the application enabled `VK_EXT_hdr_metadata`; the application
   owns the Vulkan instance, device, queue, and NativeActivity;
+- `QtAV::RenderOpenGL` uploads the same software YUV420/422/444, NV12/NV21,
+  P010, RGB/BGR/RGBA/BGRA/ARGB, and Gray8 families into OpenGL ES textures,
+  applies the structured SDR/HDR-to-SDR color path plus the common
+  viewport/aspect/rotation contract, and draws into a caller-supplied current
+  framebuffer;
+- `QtAV::RenderOpenGLAndroid` retains the current `ANativeWindow` generation
+  and owns its EGL display, OpenGL ES 3.x context, window surface, and swap,
+  while keeping Android and EGL types outside core public headers;
 - no Linux native backend, Android audio sink, or Android hardware decoder has
   been implemented yet.
 
 Mobile renderer selection remains in the application or thin platform layer
 that owns the native window and graphics devices. A new renderer session
-prefers Vulkan and selects the planned OpenGL ES 3.x/EGL backend when Vulkan
+prefers Vulkan and selects the OpenGL ES 3.x/EGL backend when Vulkan
 is unavailable, lacks required capabilities, or cannot create its initial
 surface generation. Recoverable Vulkan surface/swapchain events recreate
 Vulkan in place; device loss, unrecoverable submission/presentation failure,
@@ -144,8 +156,9 @@ or repeated recreation failure causes a one-way switch to OpenGL ES without
 reopening the media. If both APIs fail, video presentation reports an error
 while playback, audio, and decoded-frame callbacks remain available. Decoder,
 direct-surface, interop, and renderer fallback policies remain independent.
-The accepted design is specified in [`MOBILE.md`](MOBILE.md); the OpenGL ES
-backend and selector are not implemented yet and do not require SDL3.
+The accepted design is specified in [`MOBILE.md`](MOBILE.md). The OpenGL ES
+engine and Android EGL adapter are implemented without SDL3; the automatic
+startup/recovery/fatal-error selector is the next Android rendering task.
 
 The same design plans separate zero-CPU-copy native-buffer interop for Vulkan
 and OpenGL ES after direct-surface hardware presentation is stable. On
@@ -195,6 +208,8 @@ clear error. Current switches are:
 - output: `QTAV_OUTPUT_D3D11`.
 
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
+`QTAV_RENDER_OPENGL=AUTO` builds the OpenGL ES renderer when GLES 3 headers
+and libraries are available and adds the Android EGL adapter on Android,
 `QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader and
 `glslc` are available (the Android harness requires it explicitly),
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
@@ -265,8 +280,9 @@ decodes and presents 180 MPEG-4 video frames through an Adreno 830 Vulkan
 `VK_EXT_hdr_metadata`, and recreates the HDR surface/swapchain across a
 background/foreground transition.
 
-This is a toolchain, packaging, software-decode, and Vulkan-rendering
-checkpoint. The renderer uses a bounded three-frame resource ring and retains
+This is a toolchain, packaging, software-decode, Vulkan-rendering, and
+OpenGL ES fallback checkpoint. The Vulkan renderer uses a bounded three-frame
+resource ring and retains
 each source frame until its fence completes. Platform-neutral offscreen
 readback goldens run in the Android harness and cover YUV color conversion,
 limited/full range, BT.601/BT.709 matrices, viewport, rotation, target
@@ -278,9 +294,13 @@ above reference white. The real-device harness requires an HDR swapchain,
 records its format/color space, requires the Android compositor to report an
 active HDR layer, presents a synthetic P010/BT.2020/PQ frame with mastering
 and MaxCLL metadata, and verifies that the swapchain survives surface
-recreation. It does not yet provide the required OpenGL ES/EGL fallback and
-selector, an AAudio sink, or a MediaCodec backend. Their accepted shared
-Android/OHOS
+recreation. The same device run now compiles the OpenGL ES 3 shaders, validates
+offscreen uploads for YUV420/422/444, NV12/NV21, P010, RGB/BGR,
+RGBA/BGRA/ARGB, and Gray8, checks viewport, rotation, and target-generation
+replacement, and presents a P010/PQ-to-SDR frame through the real Android EGL
+window adapter after the Vulkan lifecycle completes. It does not yet provide
+the automatic renderer selector, an AAudio sink, or a MediaCodec backend.
+Their accepted shared Android/OHOS
 responsibility and lifecycle design is documented in [`MOBILE.md`](MOBILE.md).
 
 ## API shape
@@ -565,6 +585,45 @@ device and reports that fact in `BorrowedAndroidVulkanContext`, the adapter
 submits frame-derived mastering-display and content-light metadata before
 presentation. `surfaceFormat()` and `hdrOutputActive()` expose the selected
 contract for diagnostics and tests.
+
+### OpenGL ES renderer and Android EGL adapter
+
+Link `QtAV::RenderOpenGLAndroid` for the Android SDR fallback. The adapter
+owns its EGL display, OpenGL ES 3.x context, window surface, and swap
+operations while retaining only the active `ANativeWindow` generation:
+
+```cpp
+#include <qtav/android_opengl_video_renderer.h>
+
+auto renderer =
+    std::make_shared<qtav::AndroidOpenGLVideoRenderer>();
+renderer->setWindow(nativeWindow);
+
+qtav::VideoRenderConfig config;
+config.surfaceSize = renderer->surfaceSize();
+config.aspectRatio = qtav::VideoAspectRatioMode::Fit;
+renderer->open(config);
+player.setVideoRenderAPI(renderer);
+```
+
+Passing `nullptr` to `setWindow()` invalidates the active EGL surface; a later
+window recreates it and reconfigures the still-open renderer generation.
+`render()` makes the owned context current for the call, presents with
+`eglSwapBuffers()`, and then releases it from the calling thread. The adapter
+does not create or select Vulkan and is not itself the Vulkan-to-OpenGL ES
+policy layer.
+
+`QtAV::RenderOpenGL` is the reusable engine for applications or future
+platform adapters that already own an OpenGL ES 3.x context. Its
+`OpenGLCurrentTargetCallback` returns the current framebuffer number, size,
+and generation; framebuffer zero is the default framebuffer. The context must
+be current for `open()`, `render()`, and `close()`. The engine accepts
+YUV420/422/444, NV12/NV21, little-endian P010, RGB/BGR,
+RGBA/BGRA/ARGB, and Gray8 software frames. It applies structured
+range/matrix/transfer/primaries metadata, Fit/Fill/Stretch, custom viewports,
+and all right-angle rotations. The current baseline writes SDR sRGB-coded
+output and tone-maps PQ/HLG input; it does not claim native HDR EGL output or
+hardware-frame interop.
 
 ### D3D11 composition output
 
@@ -922,13 +981,15 @@ belong in a backend's public header.
 negotiated device format returned by it. It defines close, pause, flush, write,
 drain, event, latency, and device-clock operations. `write()` consumes a
 synchronous non-owning `AudioBufferView` in the negotiated device format.
-`drain()` waits until accepted buffers have been presented and is called at
-natural end before `close()`; its default implementation is a no-op for
-synchronous or non-queuing sinks. The `audioBufferView()` helper creates a view
-when no conversion is required. `Player` opens an injected
+`drain()` waits until accepted buffers have been presented and is called after
+each completed playback segment, including a loop boundary, and before
+`close()` at final natural end; its default implementation is a no-op for
+synchronous or non-queuing sinks. The `audioBufferView()` helper creates a
+view when no conversion is required. `Player` opens an injected
 `AudioFrameConverter` when the negotiated format differs, resets it on
-flush/seek, drains the converter and sink at natural end, and closes them.
-Without an injected converter, a different device format reports
+flush/seek, drains the converter and sink at each completed segment, and closes
+them at final natural end. Without an injected converter, a different device
+format reports
 `audio.sink.format` while `onAudioFrame()` continues normally.
 
 `QtAV::AudioResample` implements `SwresampleAudioConverter`. It converts sample
@@ -993,9 +1054,14 @@ lock is immediately available; a blocking backend write is never allowed to
 stall video scheduling. Repeated device samples are monotonically extrapolated,
 bounded by submitted audio, and published as a generation-checked cache, so
 `Player::position()` never waits for a sink write or calls into a platform
-backend. Sink lifecycle and natural-end `drain()` run on the playback worker,
+backend. Sink lifecycle and segment-end `drain()` run on the playback worker,
 serialized with writes and without the player mutex held; `drain()` may block
-until the backend queue is presented.
+until the backend queue is presented. Shutdown synchronizes the quitting
+predicate with each worker condition-variable mutex before notification so
+worker joins cannot lose the wake-up. On initial playback, a clock-capable sink
+whose first sample is invalid falls back after the first delivered buffer;
+playing seek and underrun recovery continue waiting for a valid post-flush
+device-clock sample.
 
 `HardwareDecodeConfig` is copied by `Player` and applied the next time the
 video decoder opens. Changing it while media is loaded interrupts the current

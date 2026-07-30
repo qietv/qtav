@@ -72,6 +72,9 @@ already own a graphics context or require multiple/custom render targets:
 - optional platform-neutral `QtAV::RenderVulkan` software-frame rendering and
   Android `QtAV::RenderVulkanAndroid` surface/swapchain adaptation using
   application-owned Vulkan context objects and NativeActivity lifecycle;
+- optional platform-neutral `QtAV::RenderOpenGL` OpenGL ES 3.x software-frame
+  rendering and Android `QtAV::RenderOpenGLAndroid` EGL/window adaptation for
+  the SDR mobile fallback;
 - multiple video renderer instances keyed by an application opaque pointer;
 - libswscale CPU rendering into application-owned packed image buffers;
 - D3D11 rendering of decoded software frames into an application-provided
@@ -85,8 +88,8 @@ already own a graphics context or require multiple/custom render targets:
 - interruptible FFmpeg I/O when media changes or playback stops;
 - standalone static/shared CMake builds and installable package metadata;
 - a macOS-hosted Android arm64 cross-build and NativeActivity
-  connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode plus
-  Vulkan presentation without Qt.
+  connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode,
+  Vulkan presentation, and the OpenGL ES/EGL SDR fallback without Qt.
 
 The `VideoRenderAPI` and `AudioSink` contracts are connected to `Player`.
 The default decode path remains software-only. Applications can pass the
@@ -127,10 +130,11 @@ the narrower BT.709/sRGB gamut and is not the full HDR10/BT.2020 path.
 `AudioSink` can use an injected `AudioFrameConverter` when decoded and device
 PCM formats differ. Applications link `QtAV::AudioResample` and pass a
 `SwresampleAudioConverter` through `Player::setAudioFrameConverter()`.
-`AudioSink::drain()` is called at natural end after the converter is drained
-and before the sink is closed; the default implementation is a no-op for
-existing synchronous or non-queuing sinks. The CPU renderer currently supports
-full-surface `Stretch` rendering with no rotation. The Apple-only
+`AudioSink::drain()` is called after each completed playback segment, including
+a loop boundary, after the converter is drained and before the final sink
+close; the default implementation is a no-op for existing synchronous or
+non-queuing sinks. The CPU renderer currently supports full-surface `Stretch`
+rendering with no rotation. The Apple-only
 Objective-C++ Metal renderer supports Fit, Fill, Stretch, custom viewports,
 resize, and all right-angle rotations for software YUV, NV12/NV21, P010, and
 RGB-family frames. Its strongly typed device and command queue are borrowed,
@@ -221,7 +225,8 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - remaining platform audio device implementations (ALSA/PulseAudio, AAudio);
-- OpenGL renderer implementations plus Vulkan OHOS and Linux validation;
+- the mobile Vulkan/OpenGL ES renderer selector, the OHOS EGL adapter, and
+  Vulkan OHOS/Linux validation;
 - remaining hardware decoders and Linux/Android GPU zero-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
@@ -266,7 +271,10 @@ borrowed device was created with `VK_EXT_hdr_metadata`. The recorded
 Adreno 830 device passes a required HDR10/PQ swapchain run across
 background/foreground surface recreation, while Android reports the presented
 layer as HDR and a synthetic metadata-bearing P010/BT.2020/PQ frame exercises
-the complete source-to-present path. The OpenGL ES backend and selector,
+the complete source-to-present path. The OpenGL ES 3.x engine and Android EGL
+adapter now cover the advertised software formats, common geometry, SDR color
+conversion, P010/PQ-to-SDR output, offscreen readback, and a real
+`ANativeWindow`; the automatic selector,
 AAudio output, MediaCodec direct-surface presentation, Vulkan/OpenGL ES texture
 interop, and Vulkan validation on OHOS and Linux remain separate backend work
 under the responsibility and lifecycle boundaries in
@@ -302,6 +310,9 @@ are separate backend/product work.
   valid post-flush clock sample before playback time resumes, while
   callback-only playback resumes after the first new-generation item is
   delivered;
+- initial playback still falls back to the monotonic clock after the first
+  delivered buffer when a clock-capable sink has not yet produced a valid
+  device-clock sample;
 - an audio-device underrun re-enters `Buffering`, freezes the fallback clock,
   and leaves it frozen until output re-anchors instead of letting wall time
   advance without sound or video;
@@ -326,9 +337,14 @@ are separate backend/product work.
   there without the player mutex held and cannot be blocked by application
   rendering; presentation performs only a non-blocking opportunistic clock
   refresh and otherwise uses the cached sample;
-- audio-sink/converter lifecycle and natural-end drain calls run on the
+- audio-sink/converter lifecycle and segment-end drain calls run on the
   playback worker, serialized with audio-output calls; `drain()` may block
   until queued audio is presented;
+- player shutdown synchronizes its quitting predicate with each worker
+  condition-variable mutex before notification, preventing a worker from
+  sleeping after the final wake-up;
+- a sink open that finishes after stop, seek, or media replacement is treated
+  as stale and closed before it can become the active output;
 - `Player::position()` reads a generation-checked cached device-clock snapshot
   and never calls a sink or waits behind a sink write;
 - changing `HardwareDecodeConfig` while media is open interrupts and
