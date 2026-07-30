@@ -29,6 +29,9 @@ completed.
 - `modern/` must not include or link Qt.
 - `modern/` requires FFmpeg 8.0 or newer. Do not add compatibility branches
   for FFmpeg 5–7.
+- Source and text files must use UTF-8 without a byte-order mark (BOM).
+- Repository text files must use LF line endings; do not commit CRLF or mixed
+  line endings.
 - Public QtAVCore headers must not expose Qt or FFmpeg types.
 - Use standard C++17 or newer, RAII, PIMPL, standard threading, and
   reference-counted frame lifetime.

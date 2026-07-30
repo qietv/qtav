@@ -96,7 +96,7 @@ namespace QtAV
         void cleanupTextureObject();
         void cleanupTextureSampler();
         void updateUniformBuffer(uint32_t currentImage);
-        uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);     // ²éÕÒÂú×ãÖ¸¶¨ÀàĞÍµÄÄÚ´æË÷Òı
+        uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);     // æŸ¥æ‰¾æ»¡è¶³æŒ‡å®šç±»å‹çš„å†…å­˜ç´¢å¼•
         void createBuffer(
             VkDeviceSize size,
             VkBufferUsageFlags usage,
@@ -125,27 +125,27 @@ namespace QtAV
         QVulkanInstance* m_vulkanInstance = nullptr;
         QVulkanFunctions* m_vulkanFunctions = nullptr;
         QVulkanDeviceFunctions* m_vulkanDeviceFunctions = nullptr;
-        VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;                 // ÎïÀíÉè±¸
-        VkDevice m_device = VK_NULL_HANDLE;									// Âß¼­Éè±¸
-        int m_swapChainImageCount = 0;										// ½»»»Á´ÖĞÍ¼ÏñµÄÊıÁ¿
-        QSize m_swapChainImageSize = { 0, 0 };								// ½»»»Á´ÖĞÍ¼ÏñµÄ´óĞ¡
-        VkRenderPass m_renderPass = VK_NULL_HANDLE;							// äÖÈ¾Í¨µÀ
-        VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;                 // ¹ÜÏß²¼¾Ö
-        VkPipeline m_graphicsPipeline = VK_NULL_HANDLE;                     // Í¼ĞÎ¹ÜÏß
-        VkBuffer m_vertexBuffer = VK_NULL_HANDLE;                           // ¶¥µã»º³å
-        VkDeviceMemory m_vertexBufferMemory = VK_NULL_HANDLE;               // ¶¥µã»º³åÄÚ´æ
-        VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;       // ÃèÊö·û
+        VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;                 // ç‰©ç†è®¾å¤‡
+        VkDevice m_device = VK_NULL_HANDLE;									// é€»è¾‘è®¾å¤‡
+        int m_swapChainImageCount = 0;										// äº¤æ¢é“¾ä¸­å›¾åƒçš„æ•°é‡
+        QSize m_swapChainImageSize = { 0, 0 };								// äº¤æ¢é“¾ä¸­å›¾åƒçš„å¤§å°
+        VkRenderPass m_renderPass = VK_NULL_HANDLE;							// æ¸²æŸ“é€šé“
+        VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;                 // ç®¡çº¿å¸ƒå±€
+        VkPipeline m_graphicsPipeline = VK_NULL_HANDLE;                     // å›¾å½¢ç®¡çº¿
+        VkBuffer m_vertexBuffer = VK_NULL_HANDLE;                           // é¡¶ç‚¹ç¼“å†²
+        VkDeviceMemory m_vertexBufferMemory = VK_NULL_HANDLE;               // é¡¶ç‚¹ç¼“å†²å†…å­˜
+        VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;       // æè¿°ç¬¦
         std::vector<VkBuffer> m_uniformBuffers;
         std::vector<VkDeviceMemory> m_uniformBuffersMemory;
-        VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;                 // ÃèÊö·û³Ø
+        VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;                 // æè¿°ç¬¦æ± 
         std::vector<VkDescriptorSet> m_descriptorSets;
         std::vector<TextureObject> m_yTextureObjects;
         std::vector<TextureObject> m_uTextureObjects;
         std::vector<TextureObject> m_vTextureObjects;
         VkSampler m_textureSampler = VK_NULL_HANDLE;
         VideoFrame m_currentFrame;
-        std::mutex m_frameMutex;                                            // »¥³âËø£¬±£»¤VideoFrame
-        std::mutex m_uboObjMutex;                                           // »¥³âËø£¬±£»¤uboObj
+        std::mutex m_frameMutex;                                            // äº’æ–¥é”ï¼Œä¿æŠ¤VideoFrame
+        std::mutex m_uboObjMutex;                                           // äº’æ–¥é”ï¼Œä¿æŠ¤uboObj
         UniformBufferObject m_uboObj;
         std::vector<bool> m_uboUploaded;
     };
@@ -154,21 +154,21 @@ namespace QtAV
         QVector2D pos;
         QVector2D texCoord;
 
-        // »ñÈ¡¶¥µã°ó¶¨ÃèÊö
+        // è·å–é¡¶ç‚¹ç»‘å®šæè¿°
         static VkVertexInputBindingDescription getBindingDescription() {
             VkVertexInputBindingDescription bindingDescription{};
-            bindingDescription.binding = 0;                                         // °ó¶¨Ë÷Òı
-            bindingDescription.stride = sizeof(Vertex);                             // Ã¿¸ö¶¥µãµÄ×Ö½Ú´óĞ¡
-            bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;             // Ã¿¸ö¶¥µã¸üĞÂÒ»´ÎÊı¾İ
+            bindingDescription.binding = 0;                                         // ç»‘å®šç´¢å¼•
+            bindingDescription.stride = sizeof(Vertex);                             // æ¯ä¸ªé¡¶ç‚¹çš„å­—èŠ‚å¤§å°
+            bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;             // æ¯ä¸ªé¡¶ç‚¹æ›´æ–°ä¸€æ¬¡æ•°æ®
 
             return bindingDescription;
         }
 
-        // »ñÈ¡¶¥µãÊôĞÔÃèÊö
+        // è·å–é¡¶ç‚¹å±æ€§æè¿°
         static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
             std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
 
-            // Î»ÖÃÊôĞÔ£¨location 0£©£º2¸ö32Î»¸¡µãÊı£¨R32G32_SFLOAT£©
+            // ä½ç½®å±æ€§ï¼ˆlocation 0ï¼‰ï¼š2ä¸ª32ä½æµ®ç‚¹æ•°ï¼ˆR32G32_SFLOATï¼‰
             attributeDescriptions[0].binding = 0;
             attributeDescriptions[0].location = 0;
             attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;

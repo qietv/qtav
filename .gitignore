@@ -12,6 +12,8 @@ contrib/include
 # Hidden files are ignored by default with exceptions
 .*
 !/.gitignore
+!/.gitattributes
+!/.editorconfig
 !/.github
 !/.gitmodules
 !/.qmake.conf

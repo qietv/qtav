@@ -28,16 +28,16 @@ Debug: vo: d2d
 instance = 00697B88
 Debug: Resize bitmap to 0 x 0
 Debug: QtAV 1.1.10(Mar 14 2013, 12:03:58)
-»ùÓÚ Qt ºÍ FFmpeg µÄÒôÊÓÆµ²¥·Å¿â.
+åŸºäº Qt å’Œ FFmpeg çš„éŸ³è§†é¢‘æ’­æ”¾åº“.
 Distributed under the terms of LGPLv2.1 or later.
 Copyright (C) 2012-2013 Wang Bin (aka. Lucas Wang) wbsecg1@gmail.com
-ÉÏº£´óÑ§£¬ÖĞ¹úÉÏº£
+ä¸Šæµ·å¤§å­¦ï¼Œä¸­å›½ä¸Šæµ·
 https://github.com/wang-bin/QtAV
 https://sourceforge.net/projects/qtav
-Debug: audio device 2: MME: Microsoft ÉùÒôÓ³ÉäÆ÷ - Output
-Debug: audio device 3: MME: ÑïÉùÆ÷/¶ú»ú (SigmaTel High Defi
-Debug: audio device 4: MME: Êı×ÖÊä³öÉè±¸ (SPDIF Êä³ö) (Sigm
-Debug: audio device: ÑïÉùÆ÷/¶ú»ú (SigmaTel High Defi
+Debug: audio device 2: MME: Microsoft å£°éŸ³æ˜ å°„å™¨ - Output
+Debug: audio device 3: MME: æ‰¬å£°å™¨/è€³æœº (SigmaTel High Defi
+Debug: audio device 4: MME: æ•°å­—è¾“å‡ºè®¾å¤‡ (SPDIF è¾“å‡º) (Sigm
+Debug: audio device: æ‰¬å£°å™¨/è€³æœº (SigmaTel High Defi
 instance = 00698E68
 Debug: setCapture 0x1e02c50
 Debug: setOSDFilter 0x0
