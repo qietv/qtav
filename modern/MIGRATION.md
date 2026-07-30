@@ -152,9 +152,11 @@ media replacement, stop, and retained lifetime after player shutdown are
 implemented. `QtAV::RenderD3D11` now exposes decoder-independent
 `D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces for
 the next adapter layer; imported texture and shader-view pointers remain valid
-while the texture-frame object lives. Renderer consumption, zero-copy
-decoder-texture conversion, software-map fallback, and HDR output remain
-separate follow-up work under the accepted contract in
+while the texture-frame object lives. The renderer now consumes compatible
+same-device interop results, reports their hardware-device capabilities, and
+offers an explicit, disabled-by-default software mapping fallback through
+`setAllowSoftwareMappingFallback()`. Zero-copy decoder-texture conversion and
+HDR output remain separate follow-up work under the accepted contract in
 [D3D11VA.md](D3D11VA.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output

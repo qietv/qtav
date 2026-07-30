@@ -269,16 +269,17 @@ bool createPlaneView(
     return true;
 }
 
+template <typename Frame>
 bool createPackedView(
     ID3D11Device* device,
-    const VideoFrame& frame,
+    const Frame& frame,
     ComPtr<ID3D11ShaderResourceView>& view,
     std::string& error)
 {
     const int width = frame.width();
     const int height = frame.height();
     std::size_t size = 0;
-    if (!frame.data() || frame.lineSize() == 0
+    if (!frame.data(0) || frame.lineSize(0) == 0
         || !checkedSize(width, height, 4, size)) {
         error = "The D3D11 renderer received an invalid packed frame";
         return false;
@@ -299,9 +300,9 @@ bool createPackedView(
         error = "The D3D11 renderer does not support this packed format";
         return false;
     }
-    const std::int64_t strideMagnitude = frame.lineSize() < 0
-        ? -static_cast<std::int64_t>(frame.lineSize())
-        : static_cast<std::int64_t>(frame.lineSize());
+    const std::int64_t strideMagnitude = frame.lineSize(0) < 0
+        ? -static_cast<std::int64_t>(frame.lineSize(0))
+        : static_cast<std::int64_t>(frame.lineSize(0));
     if (strideMagnitude
         < static_cast<std::int64_t>(width) * sourceBytes) {
         error = "The packed software frame stride is too small";
@@ -310,8 +311,8 @@ bool createPackedView(
 
     std::vector<std::uint8_t> rgba(size);
     for (int y = 0; y < height; ++y) {
-        const auto* source = frame.data()
-            + static_cast<std::ptrdiff_t>(y) * frame.lineSize();
+        const auto* source = frame.data(0)
+            + static_cast<std::ptrdiff_t>(y) * frame.lineSize(0);
         auto* destination = rgba.data()
             + static_cast<std::size_t>(y * width) * 4;
         for (int x = 0; x < width; ++x) {
@@ -363,13 +364,14 @@ bool createPackedView(
 }
 
 void setYuvMatrix(
-    const VideoFrame& frame,
+    int width,
+    int height,
+    VideoColorSpace color,
     bool p010,
     ColorParameters& parameters)
 {
     double kr = 0.2126;
     double kb = 0.0722;
-    const VideoColorSpace color = frame.colorSpaceInfo();
     switch (color.matrix) {
     case ColorMatrix::BT470BG:
     case ColorMatrix::SMPTE170M:
@@ -386,7 +388,7 @@ void setYuvMatrix(
         kb = 0.0593;
         break;
     case ColorMatrix::Unknown:
-        if (frame.width() <= 1024 && frame.height() <= 576) {
+        if (width <= 1024 && height <= 576) {
             kr = 0.2990;
             kb = 0.1140;
         }
@@ -439,18 +441,14 @@ void setYuvMatrix(
     parameters.row2 = row(bCb, 0.0);
 }
 
-bool uploadFrame(
+template <typename Frame>
+bool uploadSoftwareFrame(
     ID3D11Device* device,
-    const VideoFrame& frame,
+    const Frame& frame,
+    VideoColorSpace color,
     UploadedFrame& uploaded,
     std::string& error)
 {
-    if (!frame || frame.hasHardwareFrame()) {
-        error =
-            "The D3D11 software renderer requires a valid software video frame";
-        return false;
-    }
-
     const int width = frame.width();
     const int height = frame.height();
     const int chromaWidth = (width + 1) / 2;
@@ -517,7 +515,7 @@ bool uploadFrame(
                 error)) {
             return false;
         }
-        setYuvMatrix(frame, false, uploaded.color);
+        setYuvMatrix(width, height, color, false, uploaded.color);
         return true;
     }
     case PixelFormat::NV12:
@@ -546,7 +544,7 @@ bool uploadFrame(
                 error)) {
             return false;
         }
-        setYuvMatrix(frame, false, uploaded.color);
+        setYuvMatrix(width, height, color, false, uploaded.color);
         return true;
     case PixelFormat::P010:
         uploaded.color.sourceType = 3;
@@ -572,12 +570,109 @@ bool uploadFrame(
                 error)) {
             return false;
         }
-        setYuvMatrix(frame, true, uploaded.color);
+        setYuvMatrix(width, height, color, true, uploaded.color);
         return true;
     default:
         error = "The D3D11 renderer does not support this software pixel format";
         return false;
     }
+}
+
+bool uploadFrame(
+    ID3D11Device* device,
+    const VideoFrame& frame,
+    UploadedFrame& uploaded,
+    std::string& error)
+{
+    if (!frame || frame.hasHardwareFrame()) {
+        error =
+            "The D3D11 software renderer requires a valid software video frame";
+        return false;
+    }
+    return uploadSoftwareFrame(
+        device,
+        frame,
+        frame.colorSpaceInfo(),
+        uploaded,
+        error);
+}
+
+bool uploadMappedFrame(
+    ID3D11Device* device,
+    const HardwareFrameMapping& frame,
+    int expectedWidth,
+    int expectedHeight,
+    VideoColorSpace color,
+    UploadedFrame& uploaded,
+    std::string& error)
+{
+    if (frame.width() != expectedWidth
+        || frame.height() != expectedHeight) {
+        error =
+            "The mapped D3D11 hardware frame dimensions do not match its source";
+        return false;
+    }
+    return uploadSoftwareFrame(
+        device,
+        frame,
+        color,
+        uploaded,
+        error);
+}
+
+bool importTextureFrame(
+    ID3D11Device* device,
+    const VideoFrame& source,
+    const D3D11TextureFrame& imported,
+    UploadedFrame& uploaded,
+    std::string& error)
+{
+    if (imported.width() != source.width()
+        || imported.height() != source.height()
+        || (imported.format() != PixelFormat::BGRA
+            && imported.format() != PixelFormat::RGBA)
+        || !imported.texture()
+        || !imported.shaderResourceView()) {
+        error =
+            "The imported D3D11 texture frame has invalid dimensions, format, or resources";
+        return false;
+    }
+
+    ComPtr<ID3D11Device> textureDevice;
+    imported.texture()->GetDevice(&textureDevice);
+    ComPtr<ID3D11Resource> viewResource;
+    imported.shaderResourceView()->GetResource(&viewResource);
+    if (textureDevice.Get() != device
+        || viewResource.Get() != imported.texture()) {
+        error =
+            "The imported D3D11 texture frame belongs to another device or resource";
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC textureDescription {};
+    imported.texture()->GetDesc(&textureDescription);
+    D3D11_SHADER_RESOURCE_VIEW_DESC viewDescription {};
+    imported.shaderResourceView()->GetDesc(&viewDescription);
+    const bool bgra = imported.format() == PixelFormat::BGRA;
+    const DXGI_FORMAT expectedFormat = bgra
+        ? DXGI_FORMAT_B8G8R8A8_UNORM
+        : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (textureDescription.Width != static_cast<UINT>(source.width())
+        || textureDescription.Height != static_cast<UINT>(source.height())
+        || textureDescription.ArraySize != 1
+        || textureDescription.SampleDesc.Count != 1
+        || textureDescription.Format != expectedFormat
+        || viewDescription.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D
+        || (viewDescription.Format != DXGI_FORMAT_UNKNOWN
+            && viewDescription.Format != expectedFormat)) {
+        error =
+            "The imported D3D11 texture or shader view description is unsupported";
+        return false;
+    }
+
+    uploaded.views[0] = imported.shaderResourceView();
+    uploaded.color.sourceType = 0;
+    return true;
 }
 
 std::array<float, 2> rotatedCoordinate(
@@ -964,8 +1059,10 @@ public:
     BorrowedD3D11Device device_;
     BorrowedD3D11DeviceContext context_;
     D3D11CurrentTargetCallback currentTarget_;
+    std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop_;
     EventCallback eventCallback_;
     VideoRenderConfig config_;
+    bool allowSoftwareMappingFallback_ = false;
     bool open_ = false;
 
     ComPtr<ID3D11VertexShader> vertexShader_;
@@ -1019,6 +1116,16 @@ VideoRenderCapabilities D3D11VideoRenderer::capabilities() const
         PixelFormat::ARGB,
         PixelFormat::Gray8,
     };
+    std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop;
+    if (impl_) {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        hardwareInterop = impl_->hardwareInterop_;
+    }
+    if (hardwareInterop
+        && hardwareInterop->deviceAccess() == impl_->deviceAccess_) {
+        result.hardwareDevices =
+            hardwareInterop->capabilities().sourceDevices;
+    }
     result.customViewport = true;
     result.rotation = true;
     return result;
@@ -1057,6 +1164,12 @@ bool D3D11VideoRenderer::open(const VideoRenderConfig& config)
         if (error.empty() && !impl_->currentTarget_) {
             error =
                 "The D3D11 renderer requires a current-target callback";
+        } else if (
+            error.empty() && impl_->hardwareInterop_
+            && impl_->hardwareInterop_->deviceAccess()
+                != impl_->deviceAccess_) {
+            error =
+                "The D3D11 hardware interop belongs to another device access";
         }
     }
     if (!error.empty()) {
@@ -1116,6 +1229,8 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
     VideoRenderConfig config;
     D3D11CurrentTargetCallback currentTarget;
+    std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop;
+    bool allowSoftwareMappingFallback = false;
     {
         std::lock_guard<std::mutex> lock(impl_->stateMutex_);
         if (!impl_->open_) {
@@ -1123,6 +1238,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         } else {
             config = impl_->config_;
             currentTarget = impl_->currentTarget_;
+            hardwareInterop = impl_->hardwareInterop_;
+            allowSoftwareMappingFallback =
+                impl_->allowSoftwareMappingFallback_;
         }
     }
     if (!currentTarget) {
@@ -1141,6 +1259,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     }
 
     std::string error;
+    std::string fallbackDetail;
     VideoRenderEventType errorType = VideoRenderEventType::Error;
     bool rendered = false;
     {
@@ -1179,12 +1298,64 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         }
 
         UploadedFrame uploaded;
-        if (error.empty()
+        std::shared_ptr<D3D11TextureFrame> textureFrame;
+        std::shared_ptr<HardwareFrameMapping> mappedFrame;
+        if (error.empty() && frame.hasHardwareFrame()) {
+            const HardwareFrame hardwareFrame = frame.hardwareFrame();
+            const bool compatibleInterop =
+                hardwareInterop
+                && hardwareInterop->deviceAccess()
+                    == impl_->deviceAccess_
+                && hardwareInterop->supports(hardwareFrame);
+            if (compatibleInterop) {
+                textureFrame = hardwareInterop->importFrame(hardwareFrame);
+                if (textureFrame) {
+                    if (!importTextureFrame(
+                            impl_->device_.get(),
+                            frame,
+                            *textureFrame,
+                            uploaded,
+                            error)) {
+                        textureFrame.reset();
+                    }
+                } else {
+                    error = "D3D11 hardware-frame import failed";
+                }
+            } else {
+                error =
+                    "The D3D11 renderer has no compatible interop for this hardware frame";
+            }
+
+            if (!error.empty() && allowSoftwareMappingFallback) {
+                fallbackDetail = error
+                    + "; using explicit software-mapping fallback";
+                error.clear();
+                if (!hardwareFrame.isMappable(HardwareMapMode::Read)
+                    || !(mappedFrame =
+                        hardwareFrame.map(HardwareMapMode::Read))) {
+                    error =
+                        "The D3D11 hardware frame could not be mapped for software fallback";
+                } else if (!uploadMappedFrame(
+                               impl_->device_.get(),
+                               *mappedFrame,
+                               frame.width(),
+                               frame.height(),
+                               frame.colorSpaceInfo(),
+                               uploaded,
+                               error)) {
+                    mappedFrame.reset();
+                }
+            }
+        } else if (
+            error.empty()
             && !uploadFrame(
                 impl_->device_.get(),
                 frame,
                 uploaded,
                 error)) {
+            // The common error classification below handles this failure.
+        }
+        if (!error.empty()) {
             const HRESULT uploadReason =
                 impl_->device_.get()->GetDeviceRemovedReason();
             errorType = detail::d3d11FailureEvent(uploadReason);
@@ -1334,6 +1505,10 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
     if (!rendered) {
         impl_->notify(errorType, std::move(error));
+    } else if (!fallbackDetail.empty()) {
+        impl_->notify(
+            VideoRenderEventType::Error,
+            std::move(fallbackDetail));
     }
     return rendered;
 }
@@ -1383,6 +1558,52 @@ void D3D11VideoRenderer::setCurrentTargetCallback(
     if (requestRedraw) {
         impl_->notify(VideoRenderEventType::RedrawRequested, {});
     }
+}
+
+void D3D11VideoRenderer::setHardwareFrameInterop(
+    std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop)
+{
+    if (!impl_) {
+        return;
+    }
+    bool requestRedraw = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        impl_->hardwareInterop_ = std::move(hardwareInterop);
+        requestRedraw = impl_->open_;
+    }
+    if (requestRedraw) {
+        impl_->notify(VideoRenderEventType::RedrawRequested, {});
+    }
+}
+
+std::shared_ptr<D3D11HardwareFrameInterop>
+D3D11VideoRenderer::hardwareFrameInterop() const noexcept
+{
+    if (!impl_) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    return impl_->hardwareInterop_;
+}
+
+void D3D11VideoRenderer::setAllowSoftwareMappingFallback(
+    bool allow) noexcept
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    impl_->allowSoftwareMappingFallback_ = allow;
+}
+
+bool D3D11VideoRenderer::allowSoftwareMappingFallback() const noexcept
+{
+    if (!impl_) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    return impl_->allowSoftwareMappingFallback_;
 }
 
 } // namespace qtav

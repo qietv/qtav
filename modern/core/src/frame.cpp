@@ -423,6 +423,24 @@ struct VideoFrame::Storage {
         }
     }
 
+    Storage(
+        HardwareFrame source,
+        std::int64_t timestamp,
+        std::int64_t duration)
+        : frame(av_frame_alloc())
+        , hardwareFrame(std::move(source))
+        , timestampMs(timestamp)
+        , durationMs(duration)
+    {
+        if (!frame || !hardwareFrame) {
+            av_frame_free(&frame);
+            return;
+        }
+        frame->width = hardwareFrame.width();
+        frame->height = hardwareFrame.height();
+        frame->format = AV_PIX_FMT_NONE;
+    }
+
     ~Storage()
     {
         av_frame_free(&frame);
@@ -780,6 +798,18 @@ AudioFrame detail::FrameFactory::audio(
     auto storage =
         std::make_shared<AudioFrame::Storage>(frame, timestampMs, durationMs);
     return storage->frame ? AudioFrame(std::move(storage)) : AudioFrame {};
+}
+
+VideoFrame detail::FrameFactory::hardware(
+    HardwareFrame frame,
+    std::int64_t timestampMs,
+    std::int64_t durationMs)
+{
+    auto storage = std::make_shared<VideoFrame::Storage>(
+        std::move(frame),
+        timestampMs,
+        durationMs);
+    return storage->frame ? VideoFrame(std::move(storage)) : VideoFrame {};
 }
 
 } // namespace qtav

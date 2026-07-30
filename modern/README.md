@@ -424,10 +424,21 @@ events.
 pending `QtAV::InteropD3D11` backend. An interop implementation binds to the
 same retained `D3D11DeviceAccess`, performs no CPU map during `importFrame()`,
 and returns borrowed texture/SRV pointers whose COM resources remain valid
-while the returned texture-frame object is alive. The renderer does not yet
-consume that contract or advertise D3D11 hardware-frame support. HDR transfer,
-software-map fallback, and D3D11VA zero-copy rendering remain later Windows
-work.
+while the returned texture-frame object is alive. Bind it with
+`setHardwareFrameInterop()`; the renderer advertises the interop's source
+hardware devices only when both objects use the same `D3D11DeviceAccess`.
+Imported BGRA8 or RGBA8 texture frames are sampled directly by the final
+viewport/aspect/rotation pass.
+
+Hardware-frame import and decoder fallback are independent policies. The
+renderer does not map a hardware frame by default. Applications may explicitly
+enable `setAllowSoftwareMappingFallback(true)` to call
+`HardwareFrame::map(Read)` and use the existing software upload path when
+interop is unavailable or import fails. A successful mapped fallback emits an
+error/detail event containing `software-mapping fallback` so the CPU transfer
+is observable; a disabled or failed mapping makes `render()` fail. The
+production `QtAV::InteropD3D11` Video Processor implementation, D3D11VA
+zero-copy rendering, and HDR transfer remain later Windows work.
 
 ### D3D11VA hardware decode
 

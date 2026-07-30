@@ -9,7 +9,7 @@ struct AVFrame;
 
 namespace qtav::detail {
 
-struct FrameFactory {
+struct QTAV_CORE_EXPORT FrameFactory {
     static VideoFrame video(
         const AVFrame* frame,
         std::int64_t timestampMs,
@@ -20,6 +20,10 @@ struct FrameFactory {
         const AVFrame* frame,
         std::int64_t timestampMs,
         std::int64_t durationMs);
+    static VideoFrame hardware(
+        HardwareFrame frame,
+        std::int64_t timestampMs = 0,
+        std::int64_t durationMs = 0);
 };
 
 } // namespace qtav::detail

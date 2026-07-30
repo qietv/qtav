@@ -204,6 +204,7 @@ if(TARGET qtav_render_d3d11)
         qtav_render_d3d11_test
         PRIVATE
             "${PROJECT_SOURCE_DIR}/backends/render/d3d11/src"
+            "${PROJECT_SOURCE_DIR}/core/src"
     )
 endif()
 

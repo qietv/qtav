@@ -15,6 +15,7 @@
 #include <qtav/player.h>
 
 #include "d3d11_video_renderer_p.h"
+#include "frame_internal.h"
 
 #include <algorithm>
 #include <cassert>
@@ -26,6 +27,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -50,8 +52,76 @@ struct Target {
     ComPtr<ID3D11RenderTargetView> view;
 };
 
+class MockMapping final : public qtav::HardwareFrameMapping {
+public:
+    MockMapping()
+        : pixels_(64)
+    {
+        for (int y = 0; y < 8; ++y) {
+            for (int x = 0; x < 8; ++x) {
+                auto& value = pixels_[static_cast<std::size_t>(y * 8 + x)];
+                value = x < 4
+                    ? Pixel { 0, 0, 255, 255 }
+                    : Pixel { 255, 0, 0, 255 };
+            }
+        }
+    }
+
+    int width() const noexcept override
+    {
+        return 8;
+    }
+
+    int height() const noexcept override
+    {
+        return 8;
+    }
+
+    qtav::PixelFormat format() const noexcept override
+    {
+        return qtav::PixelFormat::BGRA;
+    }
+
+    int planeCount() const noexcept override
+    {
+        return 1;
+    }
+
+    const std::uint8_t* data(int plane) const noexcept override
+    {
+        return plane == 0
+            ? reinterpret_cast<const std::uint8_t*>(pixels_.data())
+            : nullptr;
+    }
+
+    std::uint8_t* writableData(int plane) noexcept override
+    {
+        return plane == 0
+            ? reinterpret_cast<std::uint8_t*>(pixels_.data())
+            : nullptr;
+    }
+
+    int lineSize(int plane) const noexcept override
+    {
+        return plane == 0 ? 8 * static_cast<int>(sizeof(Pixel)) : 0;
+    }
+
+private:
+    std::vector<Pixel> pixels_;
+};
+
 class MockHardwareFrameData final : public qtav::HardwareFrameData {
 public:
+    explicit MockHardwareFrameData(
+        std::shared_ptr<qtav::HardwareFrameMapping> mapping = {},
+        int* mapCalls = nullptr,
+        bool mappable = false)
+        : mapping_(std::move(mapping))
+        , mapCalls_(mapCalls)
+        , mappable_(mappable)
+    {
+    }
+
     qtav::HardwareDeviceType deviceType() const noexcept override
     {
         return qtav::HardwareDeviceType::D3D11;
@@ -78,16 +148,24 @@ public:
         return { type, 0, 0 };
     }
 
-    bool isMappable(qtav::HardwareMapMode) const noexcept override
+    bool isMappable(qtav::HardwareMapMode mode) const noexcept override
     {
-        return false;
+        return mappable_ && mode == qtav::HardwareMapMode::Read;
     }
 
     std::shared_ptr<qtav::HardwareFrameMapping> map(
-        qtav::HardwareMapMode) const override
+        qtav::HardwareMapMode mode) const override
     {
-        return {};
+        if (mapCalls_) {
+            ++*mapCalls_;
+        }
+        return isMappable(mode) ? mapping_ : nullptr;
     }
+
+private:
+    std::shared_ptr<qtav::HardwareFrameMapping> mapping_;
+    int* mapCalls_ = nullptr;
+    bool mappable_ = false;
 };
 
 class MockTextureFrame final : public qtav::D3D11TextureFrame {
@@ -167,13 +245,27 @@ public:
     std::shared_ptr<qtav::D3D11TextureFrame> importFrame(
         const qtav::HardwareFrame& frame) override
     {
-        return supports(frame) ? imported_
-                               : std::shared_ptr<qtav::D3D11TextureFrame> {};
+        ++importCalls_;
+        return supports(frame) && importSucceeds_
+            ? imported_
+            : std::shared_ptr<qtav::D3D11TextureFrame> {};
+    }
+
+    void setImportSucceeds(bool succeeds) noexcept
+    {
+        importSucceeds_ = succeeds;
+    }
+
+    int importCalls() const noexcept
+    {
+        return importCalls_;
     }
 
 private:
     std::shared_ptr<qtav::D3D11DeviceAccess> deviceAccess_;
     std::shared_ptr<qtav::D3D11TextureFrame> imported_;
+    bool importSucceeds_ = true;
+    int importCalls_ = 0;
 };
 
 DeviceResources makeDevice()
@@ -383,6 +475,21 @@ int main(int argc, char** argv)
     assert(deviceAccess);
 
     Target importedTarget = makeTarget(d3d.device.Get(), 8, 8);
+    std::vector<Pixel> importedPixels(64);
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            importedPixels[static_cast<std::size_t>(y * 8 + x)] =
+                x < 4 ? Pixel { 0, 0, 255, 255 }
+                      : Pixel { 255, 0, 0, 255 };
+        }
+    }
+    d3d.context->UpdateSubresource(
+        importedTarget.texture.Get(),
+        0,
+        nullptr,
+        importedPixels.data(),
+        8 * static_cast<UINT>(sizeof(Pixel)),
+        0);
     ComPtr<ID3D11ShaderResourceView> importedView;
     assert(SUCCEEDED(d3d.device->CreateShaderResourceView(
         importedTarget.texture.Get(),
@@ -391,8 +498,10 @@ int main(int argc, char** argv)
     auto textureFrame = std::make_shared<MockTextureFrame>(
         importedTarget.texture,
         importedView);
-    MockHardwareFrameInterop mockInterop(deviceAccess, textureFrame);
-    const auto interopCapabilities = mockInterop.capabilities();
+    auto mockInterop = std::make_shared<MockHardwareFrameInterop>(
+        deviceAccess,
+        textureFrame);
+    const auto interopCapabilities = mockInterop->capabilities();
     assert(interopCapabilities.zeroCopy);
     assert(!interopCapabilities.cpuFallback);
     assert(
@@ -402,12 +511,12 @@ int main(int argc, char** argv)
     assert(
         interopCapabilities.sourceDevices.front()
         == qtav::HardwareDeviceType::D3D11);
-    assert(mockInterop.deviceAccess() == deviceAccess);
+    assert(mockInterop->deviceAccess() == deviceAccess);
 
     const qtav::HardwareFrame hardwareFrame(
         std::make_shared<MockHardwareFrameData>());
-    assert(mockInterop.supports(hardwareFrame));
-    auto importedFrame = mockInterop.importFrame(hardwareFrame);
+    assert(mockInterop->supports(hardwareFrame));
+    auto importedFrame = mockInterop->importFrame(hardwareFrame);
     assert(importedFrame == textureFrame);
     importedTarget = {};
     importedView.Reset();
@@ -443,13 +552,21 @@ int main(int argc, char** argv)
                capabilities.softwareFormats.end(),
                qtav::PixelFormat::P010)
         != capabilities.softwareFormats.end());
+    assert(capabilities.hardwareDevices.empty());
+    assert(!renderer->hardwareFrameInterop());
+    assert(!renderer->allowSoftwareMappingFallback());
 
     int errors = 0;
     int surfacesLost = 0;
     int redraws = 0;
+    bool softwareFallbackReported = false;
     renderer->setEventCallback([&](const qtav::VideoRenderEvent& event) {
         if (event.type == qtav::VideoRenderEventType::Error) {
             ++errors;
+            softwareFallbackReported =
+                softwareFallbackReported
+                || event.detail.find("software-mapping fallback")
+                    != std::string::npos;
         } else if (event.type == qtav::VideoRenderEventType::SurfaceLost) {
             ++surfacesLost;
         } else if (
@@ -471,6 +588,64 @@ int main(int argc, char** argv)
     assert(renderer->context().get() == d3d.context.Get());
     assert(renderer->deviceAccess() == deviceAccess);
 
+    int mapCalls = 0;
+    const auto mappedPixels = std::make_shared<MockMapping>();
+    const qtav::HardwareFrame renderHardware(
+        std::make_shared<MockHardwareFrameData>(
+            mappedPixels,
+            &mapCalls,
+            true));
+    const qtav::VideoFrame hardwareVideo =
+        qtav::detail::FrameFactory::hardware(renderHardware);
+    assert(hardwareVideo);
+    assert(hardwareVideo.hasHardwareFrame());
+
+    const int importsBeforeRender = mockInterop->importCalls();
+    renderer->setHardwareFrameInterop(mockInterop);
+    assert(renderer->hardwareFrameInterop() == mockInterop);
+    const auto hardwareCapabilities = renderer->capabilities();
+    assert(hardwareCapabilities.hardwareDevices.size() == 1);
+    assert(
+        hardwareCapabilities.hardwareDevices.front()
+        == qtav::HardwareDeviceType::D3D11);
+    assert(renderer->render(hardwareVideo));
+    assert(mockInterop->importCalls() == importsBeforeRender + 1);
+    assert(mapCalls == 0);
+    auto pixels =
+        readTarget(d3d.device.Get(), d3d.context.Get(), target.texture.Get());
+    assert(isRed(pixel(pixels, 8, 1, 3)));
+    assert(isBlue(pixel(pixels, 8, 6, 3)));
+
+    mockInterop->setImportSucceeds(false);
+    assert(!renderer->render(hardwareVideo));
+    assert(mapCalls == 0);
+
+    renderer->setAllowSoftwareMappingFallback(true);
+    assert(renderer->allowSoftwareMappingFallback());
+    assert(renderer->render(hardwareVideo));
+    assert(mapCalls == 1);
+    assert(softwareFallbackReported);
+    pixels =
+        readTarget(d3d.device.Get(), d3d.context.Get(), target.texture.Get());
+    assert(isRed(pixel(pixels, 8, 1, 3)));
+    assert(isBlue(pixel(pixels, 8, 6, 3)));
+
+    int failedMapCalls = 0;
+    const qtav::VideoFrame unmappableVideo =
+        qtav::detail::FrameFactory::hardware(qtav::HardwareFrame(
+            std::make_shared<MockHardwareFrameData>(
+                nullptr,
+                &failedMapCalls,
+                true)));
+    assert(!renderer->render(unmappableVideo));
+    assert(failedMapCalls == 1);
+
+    renderer->setAllowSoftwareMappingFallback(false);
+    renderer->setHardwareFrameInterop({});
+    assert(renderer->capabilities().hardwareDevices.empty());
+    errors = 0;
+    redraws = 0;
+
     const qtav::VideoFrame rgb =
         renderFile(argv[1], qtav::PixelFormat::RGB24, renderer);
     std::future<bool> blockedRender;
@@ -486,7 +661,7 @@ int main(int argc, char** argv)
         == std::future_status::ready);
     assert(blockedRender.get());
 
-    auto pixels =
+    pixels =
         readTarget(d3d.device.Get(), d3d.context.Get(), target.texture.Get());
     assert(isBlack(pixel(pixels, 8, 3, 0)));
     assert(isRed(pixel(pixels, 8, 1, 3)));
@@ -576,11 +751,11 @@ int main(int argc, char** argv)
     Target localTarget = std::move(target);
     target = std::move(foreignTarget);
     assert(!renderer->render(rgb));
-    assert(errors == 2);
+    assert(errors == 1);
     target = std::move(localTarget);
 
     renderer->close();
     assert(!renderer->render(rgb));
-    assert(errors == 3);
+    assert(errors == 2);
     return 0;
 }

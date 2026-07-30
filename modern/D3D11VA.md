@@ -214,7 +214,7 @@ There are two distinct fallback decisions:
 - `HardwareDecodeConfig::allowSoftwareFallback` controls reopening/continuing
   with FFmpeg software decoding when D3D11VA device creation, codec capability,
   pixel-format negotiation, or decoder initialization fails.
-- `D3D11HardwareFrameInterop` has a separate
+- `D3D11VideoRenderer` has a separate, disabled-by-default
   `allowSoftwareMappingFallback` option. When import is unsupported or the
   source belongs to another healthy device, the renderer may call
   `HardwareFrame::map(Read)` and feed the result to its existing software
@@ -286,8 +286,10 @@ the Qt-dependency scan remain release gates.
 2. [x] Add `qtav_hw_d3d11va`, decoder configuration, retained texture/slice
    access, mapping, and lifecycle tests.
 3. [x] Add decoder-independent D3D11 renderer interop interfaces.
-4. [ ] Add the Video Processor implementation in `qtav_interop_d3d11`.
-5. [ ] Add WARP contract tests, native zero-copy tests, console-example
+4. [x] Add renderer capability reporting, texture-frame consumption, and
+   explicit software-map fallback with mock WARP tests.
+5. [ ] Add the Video Processor implementation in `qtav_interop_d3d11`.
+6. [ ] Add WARP contract tests, native zero-copy tests, console-example
    wiring, install/export validation, and final public documentation.
 
 ## Source and license boundary

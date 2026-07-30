@@ -83,6 +83,12 @@ public:
     BorrowedD3D11DeviceContext context() const noexcept;
     std::shared_ptr<D3D11DeviceAccess> deviceAccess() const noexcept;
     void setCurrentTargetCallback(D3D11CurrentTargetCallback callback);
+    void setHardwareFrameInterop(
+        std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop);
+    std::shared_ptr<D3D11HardwareFrameInterop>
+    hardwareFrameInterop() const noexcept;
+    void setAllowSoftwareMappingFallback(bool allow) noexcept;
+    bool allowSoftwareMappingFallback() const noexcept;
 
 private:
     class Impl;

@@ -34,9 +34,9 @@ Continuation checkpoint:
   and the Windows D3D11 software-frame and WASAPI audio paths are complete;
   the D3D11VA device/frame/interop design and supplied-device core bridge are
   complete; the native `qtav_hw_d3d11va` decoder backend is now complete, and
-  the decoder-independent D3D11 renderer interop interfaces are complete; the
-  active next task is renderer capability reporting and software-map fallback,
-  followed by the Video Processor implementation;
+  the decoder-independent D3D11 renderer interop interfaces, capability
+  reporting, texture consumption, and explicit software-map fallback are
+  complete; the active next task is the Video Processor implementation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -104,7 +104,7 @@ Current implementation:
 Current verification:
 
 - static and shared builds pass 27/27 CTest tests on Windows after adding the
-  D3D11VA contract and native lifecycle coverage;
+  D3D11VA lifecycle and mock renderer interop/fallback coverage;
 - ASan/UBSan passes the prior 24/24 macOS-applicable tests with leak detection
   disabled;
 - the all-backends-disabled build passes 11/11 tests, including the Windows
@@ -122,9 +122,10 @@ Current verification:
 - MPEG-4/AAC, AC-3, E-AC-3, and TrueHD decode tests pass.
 - on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, the static Release
   build passes 27/27 CTest tests, including the supplied hardware-device
-  bridge, deterministic WARP D3D11 rendering, WASAPI device lifecycle,
-  Player-driven WASAPI playback, and native H.264 D3D11VA decode with mapping,
-  seek, media replacement, stop, and retained-frame shutdown lifetime;
+  bridge, deterministic WARP D3D11 software/imported/mapped rendering, WASAPI
+  device lifecycle, Player-driven WASAPI playback, and native H.264 D3D11VA
+  decode with mapping, seek, media replacement, stop, and retained-frame
+  shutdown lifetime;
 - Windows multi-config FFmpeg imports select matching Debug/Release libraries,
   and project DLLs, tests, and examples share a runnable `bin/<Config>`
   directory;
@@ -607,7 +608,7 @@ Next implementation slice:
 
 1. [x] Add decoder-independent `D3D11HardwareFrameInterop` and retained
    `D3D11TextureFrame` interfaces to `QtAV::RenderD3D11`.
-2. [ ] Add renderer capability reporting plus explicit enabled/disabled
+2. [x] Add renderer capability reporting plus explicit enabled/disabled
    software-map fallback using mock interop tests.
 3. [ ] Implement `QtAV::InteropD3D11` with same-device validation and a D3D11
    Video Processor pass into a shader-readable BGRA8 intermediate.
@@ -627,6 +628,18 @@ Completed D3D11 renderer interop-contract checkpoint:
 - deterministic WARP coverage proves capability/source-device reporting,
   import dispatch, shared device-access identity, and COM resource retention
   after the original texture and view references are released.
+
+Completed D3D11 renderer interop-consumption checkpoint:
+
+- `D3D11VideoRenderer` advertises hardware devices only while a compatible
+  interop object using the same retained `D3D11DeviceAccess` is installed;
+- imported BGRA8/RGBA8 shader-readable texture frames feed the existing final
+  viewport, aspect-ratio, rotation, and render-target pass without CPU mapping;
+- software mapping is disabled by default and can be explicitly enabled
+  independently of decoder fallback; successful use emits an observable
+  detail event, while disabled or failed mapping makes rendering fail;
+- mock WARP tests cover direct import with zero map calls, capability changes,
+  enabled/disabled mapping fallback, mapped pixel output, and mapping failure.
 
 Default platform order after the contracts are stable:
 
