@@ -38,9 +38,13 @@ code is used.
   `CVPixelBuffer` frames and explicit software fallback;
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
   VideoToolbox-frame rendering through Metal;
+- optional platform-neutral Vulkan software-frame renderer using borrowed
+  application-selected device/queue and current-image resources;
+- optional Android Vulkan surface adapter that retains the current
+  `ANativeWindow` generation and owns its surface/swapchain synchronization;
 - a reproducible macOS-to-Android arm64 build and connected-device
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
-  decoding;
+  decoding and Vulkan presentation;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -94,7 +98,14 @@ Current backend integration boundary:
 - `QtAV::InteropCVMetal` imports supported VideoToolbox `CVPixelBuffer` planes
   as retained Metal textures without mapping or copying through CPU memory,
   preserving whether the native pixel buffer is limited or full range;
-- no Linux or Android native backend has been implemented yet.
+- `QtAV::RenderVulkan` packs supported software planes into a Vulkan storage
+  buffer and draws through an application-supplied current image, applying
+  structured color metadata and the common viewport/aspect/rotation contract;
+- `QtAV::RenderVulkanAndroid` owns Android surface, swapchain, image-view, and
+  acquire/present resources for a retained active `ANativeWindow`, while the
+  application owns the Vulkan instance, device, queue, and NativeActivity;
+- no Linux native backend, Android audio sink, or Android hardware decoder has
+  been implemented yet.
 
 ## Build
 
@@ -127,6 +138,8 @@ clear error. Current switches are:
   `QTAV_INTEROP_VAAPI`.
 
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
+`QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader and
+`glslc` are available (the Android harness requires it explicitly),
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
 `QTAV_RENDER_METAL=AUTO` builds the native renderer on Apple hosts with Metal,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
@@ -140,9 +153,8 @@ VideoToolbox/Metal interop target when the Metal renderer and CoreVideo are
 available. `QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
 selection and native-frame access target. `QTAV_INTEROP_D3D11=AUTO` builds the
 Windows Video Processor adapter when the D3D11 renderer and D3D11VA decoder
-targets are available. Other backend implementations are not present yet, so
-their `AUTO` behavior is to remain disabled and explicitly requesting one with
-`ON` is an error.
+targets are available. Backend implementations not otherwise described remain
+disabled under `AUTO`, and explicitly requesting one with `ON` is an error.
 
 Run the headless example:
 
@@ -187,12 +199,16 @@ device script requires exactly one authorized device, records ABI/API and
 Vulkan facts, installs once, launches the generated-media playback test, and
 collects its pass/fail log. If installation or replacement fails because the
 device may be waiting for user authorization, stop and approve the prompt
-manually before retrying. The first Android 16/arm64 device run decoded 30
-MPEG-4 video frames and 47 PCM audio frames successfully.
+manually before retrying. The Vulkan-enabled Android 16/arm64 device run
+decoded 30 MPEG-4 video frames, submitted/presented all 30 through an Adreno
+830 Vulkan 1.3.284 swapchain, and decoded 47 PCM audio frames successfully.
 
-This is a toolchain, packaging, and software-decode checkpoint. It does not yet
-provide an Android renderer, AAudio sink, or MediaCodec backend. Their accepted
-shared Android/OHOS responsibility and lifecycle design is documented in
+This is a toolchain, packaging, software-decode, and initial Vulkan-rendering
+checkpoint. The renderer currently serializes one retained frame at a time;
+platform-neutral offscreen pixel goldens, a bounded multi-frame resource ring,
+and Android surface-recreation scenarios remain. It does not yet provide an
+AAudio sink or MediaCodec backend. Their accepted shared Android/OHOS
+responsibility and lifecycle design is documented in
 [`MOBILE.md`](MOBILE.md).
 
 ## API shape
@@ -406,6 +422,40 @@ Packed RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8 are supported as destination
 formats. `setTarget()` and `render()` are synchronized internally, but the
 application remains responsible for coordinating its own reads of the pixel
 memory with rendering.
+
+### Vulkan renderer and Android surface adapter
+
+Link `QtAV::RenderVulkan` and construct the engine with an
+application-selected physical device, logical device, graphics queue, and
+queue-family index. The application supplies the current image/view, extent,
+format, wait/signal semaphores, final layout, and surface generation through
+`VulkanCurrentTargetCallback`. These Vulkan objects remain borrowed and must
+survive the submission fence.
+
+On Android, `QtAV::RenderVulkanAndroid` implements that target protocol and
+the `VideoRenderAPI` facade together. The application creates a Vulkan
+instance/device/graphics-present queue, then publishes the current
+`ANativeWindow`:
+
+```cpp
+auto renderer =
+    std::make_shared<qtav::AndroidVulkanVideoRenderer>(
+        qtav::BorrowedAndroidVulkanContext {
+            instance,
+            { physicalDevice, device, queue, queueFamilyIndex },
+        });
+renderer->setWindow(nativeWindow);
+
+qtav::VideoRenderConfig config;
+config.surfaceSize = renderer->surfaceSize();
+renderer->open(config);
+player.setVideoRenderAPI(renderer);
+```
+
+The adapter acquires its own window reference and owns the associated
+`VkSurfaceKHR`, swapchain, image views, and acquire/present semaphores. Passing
+`nullptr` to `setWindow()` invalidates that generation. The Vulkan instance,
+device, and queue remain application-owned and must outlive the renderer.
 
 ### D3D11 renderer
 

@@ -8,6 +8,9 @@ find_dependency(
     FFmpeg
     COMPONENTS @QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS@
 )
+if(@QTAV_CORE_PACKAGE_NEEDS_VULKAN@)
+    find_dependency(Vulkan)
+endif()
 if(NOT DEFINED FFmpeg_avcodec_VERSION_MAJOR
    OR FFmpeg_avcodec_VERSION_MAJOR STREQUAL "")
     set(QtAVCore_FOUND FALSE)

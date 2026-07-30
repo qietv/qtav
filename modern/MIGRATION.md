@@ -57,6 +57,9 @@ mdk-sdk:
   reference-counted `CVPixelBuffer` frames and explicit software fallback;
 - optional `QtAV::InteropCVMetal` import of limited/full-range VideoToolbox
   NV12/P010 pixel-buffer planes into Metal textures without a CPU map or copy;
+- optional platform-neutral `QtAV::RenderVulkan` software-frame rendering and
+  Android `QtAV::RenderVulkanAndroid` surface/swapchain adaptation using
+  application-owned Vulkan context objects and NativeActivity lifecycle;
 - multiple video renderer instances keyed by an application opaque pointer;
 - libswscale CPU rendering into application-owned packed image buffers;
 - D3D11 rendering of decoded software frames into an application-provided
@@ -69,8 +72,8 @@ mdk-sdk:
 - interruptible FFmpeg I/O when media changes or playback stops;
 - standalone static/shared CMake builds and installable package metadata;
 - a macOS-hosted Android arm64 cross-build and NativeActivity
-  connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode
-  without Qt.
+  connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode plus
+  Vulkan presentation without Qt.
 
 The `VideoRenderAPI` and `AudioSink` contracts are connected to `Player`.
 The default decode path remains software-only. Applications can pass the
@@ -179,7 +182,8 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - remaining platform audio device implementations (ALSA/PulseAudio, AAudio);
-- OpenGL and Vulkan renderer implementations;
+- OpenGL renderer implementations and remaining Vulkan offscreen, multi-frame,
+  surface-recreation, OHOS, and Linux validation;
 - remaining hardware decoders and Linux/Android GPU zero-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
@@ -189,10 +193,12 @@ or pace playback. Decoded planar audio therefore normally uses
 
 The Android harness is currently an integration checkpoint rather than a
 legacy QtAV API replacement. It proves the NDK, packaging, signing,
-connected-device logging, and software decode path. Android Vulkan/OpenGL ES
-rendering, AAudio output, MediaCodec direct-surface presentation, and optional
-texture interop remain separate backend work under the responsibility and
-lifecycle boundaries in [`MOBILE.md`](MOBILE.md).
+connected-device logging, software decode, and the first Vulkan
+surface/swapchain presentation path. Vulkan offscreen goldens, a multi-frame
+resource ring, surface recreation, OpenGL ES coverage, AAudio output,
+MediaCodec direct-surface presentation, and optional texture interop remain
+separate backend work under the responsibility and lifecycle boundaries in
+[`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and
 reference-counted planes. A platform audio sink should convert/resample only

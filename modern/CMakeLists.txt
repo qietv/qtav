@@ -44,11 +44,15 @@ if(QTAV_CORE_INSTALL)
     include(GNUInstallDirs)
 
     set(QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS avformat avcodec avutil)
+    set(QTAV_CORE_PACKAGE_NEEDS_VULKAN FALSE)
     if(TARGET qtav_render_cpu)
         list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS swscale)
     endif()
     if(TARGET qtav_audio_resample)
         list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS swresample)
+    endif()
+    if(TARGET qtav_render_vulkan)
+        set(QTAV_CORE_PACKAGE_NEEDS_VULKAN TRUE)
     endif()
 
     install(

@@ -165,6 +165,8 @@ Implemented under `modern/`:
 - CoreAudio device output with playback clock and latency reporting;
 - VideoToolbox hardware decoding into retained `CVPixelBuffer` frames;
 - zero-copy VideoToolbox/CVMetal plane import and Metal rendering;
+- platform-neutral Vulkan software-frame rendering with structured color and
+  geometry shaders, plus an Android `ANativeWindow` surface/swapchain adapter;
 - structured video color-space/HDR10 metadata and Metal
   SDR/extended-linear output;
 - libswresample conversion to negotiated interleaved PCM;
@@ -176,7 +178,9 @@ Implemented under `modern/`:
 Known intentional limitations:
 
 - no native audio-device sink outside macOS and Windows yet;
-- no OpenGL or Vulkan renderer yet;
+- no OpenGL renderer yet; Vulkan still needs offscreen goldens, a multi-frame
+  in-flight ring, and surface-recreation coverage beyond its Android device
+  checkpoint;
 - no Linux or Android hardware decoder or GPU zero-copy interop yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
@@ -244,6 +248,9 @@ Last verified baseline:
   system libraries only; no Qt dependency;
 - MPEG-4/AAC generated-media playback: passed;
 - AC-3, E-AC-3, and TrueHD audio-only decoding: passed.
+- Android arm64 FFmpeg 8.1.2/QtAVCore/Vulkan build, APK packaging, and
+  connected Adreno 830 device playback: passed with 30 decoded and
+  Vulkan-presented video frames plus 47 decoded audio frames.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device

@@ -52,6 +52,14 @@ presentation semaphore for one render. A target generation changes whenever a
 surface or swapchain is recreated; stale generation resources are retired only
 after their fences complete.
 
+The first implemented checkpoint lives in `backends/render/vulkan/`. It
+supports every planned software pixel family through a storage-buffer shader,
+applies the structured SDR/HDR color inputs plus viewport/aspect/rotation
+geometry, and retains one source frame behind a submission fence. The
+serialized one-frame bound is intentional for initial connected-device
+validation; it must become a small bounded in-flight ring after deterministic
+offscreen pixel tests are added.
+
 Shader input structures, color conversion constants, geometry generation,
 staging layout, capability decisions, and golden pixel vectors are shared
 between Android, OHOS, and later Linux coverage. Deterministic engine tests use
@@ -68,6 +76,14 @@ window only for the active surface generation, borrows the application-selected
 Vulkan instance/device/queue, and owns its `VkSurfaceKHR`, swapchain, image
 views, acquire/present synchronization, and recreation state. Window
 replacement invalidates the old generation before a new one is published.
+
+The Android adapter checkpoint is implemented as
+`QtAV::RenderVulkanAndroid`. It retains the active `ANativeWindow` and owns its
+surface, swapchain, image views, and acquire/present semaphores while borrowing
+the application-created instance/device/queue. The NativeActivity harness has
+presented 30 decoded YUV420P frames on the recorded Adreno 830 device. Explicit
+background/foreground and replacement-window validation remains before this
+adapter is complete.
 
 The OHOS application owns ArkUI/XComponent state and the current
 `OHNativeWindow`. Its adapter follows the same renderer-target protocol but

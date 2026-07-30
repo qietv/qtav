@@ -3,7 +3,8 @@
 This harness proves the first Android production-path slice without Qt or a
 Gradle dependency. It cross-builds a pinned minimal FFmpeg 8.1.2 configuration
 and QtAVCore for `arm64-v8a`, packages a platform `NativeActivity`, and checks
-software MPEG-4 plus PCM decode on one connected device.
+software MPEG-4 plus PCM decode and Vulkan swapchain presentation on one
+connected device.
 
 Requirements:
 
@@ -13,6 +14,7 @@ Requirements:
 - NDK `28.2.13676358`, platform 36, and build-tools 37.0.0 by default;
 - SDK CMake 4.1.2/Ninja and Android Studio's bundled JBR;
 - CMake, Ninja, curl, and host FFmpeg;
+- the NDK `glslc` shader compiler and an Android Vulkan device;
 - exactly one authorized arm64 Android device for deployment.
 
 Build:
@@ -38,3 +40,9 @@ The deployment script runs one non-streaming `adb install` command. If
 installation or replacement fails and the device may be waiting for
 authorization, stop and approve the prompt manually on the device before
 asking to retry.
+
+The application creates its own Vulkan instance, logical device, and
+graphics/present queue. `QtAV::RenderVulkanAndroid` retains the current
+`ANativeWindow` and owns only its surface/swapchain generation. A successful
+result reports decoded video frames, Vulkan-rendered frames, and decoded audio
+frames. The first Adreno 830 run reported 30, 30, and 47 respectively.

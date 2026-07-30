@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+#pragma once
+
+#if !defined(__ANDROID__)
+#  error "qtav/android_vulkan_video_renderer.h is Android-only"
+#endif
+
+#include <android/native_window.h>
+#include <vulkan/vulkan.h>
+
+#include <memory>
+
+#include <qtav/android_vulkan_export.h>
+#include <qtav/vulkan_video_renderer.h>
+
+namespace qtav {
+
+struct QTAV_RENDER_VULKAN_ANDROID_EXPORT
+BorrowedAndroidVulkanContext {
+    VkInstance instance = VK_NULL_HANDLE;
+    BorrowedVulkanDevice device;
+
+    bool isValid() const noexcept;
+};
+
+// Android owns the NativeActivity and publishes its current ANativeWindow.
+// This adapter retains the active window generation and owns only the
+// VkSurfaceKHR, swapchain, image views, and acquire/present synchronization.
+// The Vulkan instance, physical/logical device, and queue remain borrowed.
+class QTAV_RENDER_VULKAN_ANDROID_EXPORT
+AndroidVulkanVideoRenderer final : public VideoRenderAPI {
+public:
+    explicit AndroidVulkanVideoRenderer(
+        BorrowedAndroidVulkanContext context);
+    ~AndroidVulkanVideoRenderer() override;
+
+    AndroidVulkanVideoRenderer(AndroidVulkanVideoRenderer&&) noexcept;
+    AndroidVulkanVideoRenderer& operator=(
+        AndroidVulkanVideoRenderer&&) noexcept;
+    AndroidVulkanVideoRenderer(const AndroidVulkanVideoRenderer&) = delete;
+    AndroidVulkanVideoRenderer& operator=(
+        const AndroidVulkanVideoRenderer&) = delete;
+
+    VideoRenderCapabilities capabilities() const override;
+    void setEventCallback(EventCallback callback) override;
+    bool open(const VideoRenderConfig& config) override;
+    bool configure(const VideoRenderConfig& config) override;
+    bool render(const VideoFrame& frame) override;
+    void close() noexcept override;
+
+    // The adapter acquires its own ANativeWindow reference. Passing nullptr
+    // invalidates the current surface generation.
+    bool setWindow(ANativeWindow* window);
+    VideoSize surfaceSize() const noexcept;
+    BorrowedAndroidVulkanContext context() const noexcept;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace qtav
