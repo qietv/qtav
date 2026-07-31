@@ -67,11 +67,18 @@ qtav_compile_vulkan_shader(
     shaders/video.vert vertex video_vert_spv QTAV_VULKAN_VERTEX_INCLUDE)
 qtav_compile_vulkan_shader(
     shaders/video.frag fragment video_frag_spv QTAV_VULKAN_FRAGMENT_INCLUDE)
+qtav_compile_vulkan_shader(
+    shaders/video_external.frag
+    fragment
+    video_external_frag_spv
+    QTAV_VULKAN_EXTERNAL_FRAGMENT_INCLUDE
+)
 
 add_library(qtav_render_vulkan
     src/vulkan_video_renderer.cpp
     "${QTAV_VULKAN_VERTEX_INCLUDE}"
     "${QTAV_VULKAN_FRAGMENT_INCLUDE}"
+    "${QTAV_VULKAN_EXTERNAL_FRAGMENT_INCLUDE}"
 )
 add_library(QtAV::RenderVulkan ALIAS qtav_render_vulkan)
 

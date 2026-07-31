@@ -108,7 +108,11 @@ Continuation checkpoint:
   single-decision present/drop output tokens; the connected harness covers
   seek/flush, media replacement, explicit stop, surface loss/reopen,
   stale-generation rejection, retained decoder lifetime, and shutdown without
-  mapping decoded pixels;
+  mapping decoded pixels; `QtAV::InteropMediaCodecVulkan` now adds a private
+  GPU-sampled `AImageReader` producer, timestamp-correlated
+  `AHardwareBuffer`/external-format import, Vulkan YCbCr sampling, explicit
+  foreign-queue and sync-fd release fencing, and aligned-allocation cropping
+  without decoded-pixel mapping, staging, transfer, or re-upload;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -142,6 +146,7 @@ Current public entry points:
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/hwaccel/mediacodec/include/qtav/mediacodec_hardware_decoder.h`
+- `modern/backends/interop/mediacodec_vulkan/include/qtav/mediacodec_vulkan_interop.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
 - `modern/backends/interop/d3d11/include/qtav/d3d11_frame_interop.h`
 - `modern/MOBILE.md`
@@ -171,6 +176,7 @@ Current implementation:
 - `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/hwaccel/mediacodec/src/mediacodec_hardware_decoder.cpp`
+- `modern/backends/interop/mediacodec_vulkan/src/mediacodec_vulkan_interop.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
 - `modern/backends/interop/d3d11/src/d3d11_frame_interop.cpp`
 - `modern/backends/output/d3d11/src/d3d11_video_output.cpp`
@@ -330,10 +336,21 @@ Current verification:
   and completed NativeActivity shutdown without a crash or decoded-pixel map;
 - Android install plus external CMake consumption of
   `QtAV::RenderMobile`, `QtAV::RenderOpenGLAndroid`,
-  `QtAV::RenderOpenGL`, `QtAV::AudioAAudio`, and `QtAV::HWMediaCodec` passes;
+  `QtAV::RenderOpenGL`, `QtAV::AudioAAudio`, `QtAV::HWMediaCodec`, and
+  `QtAV::InteropMediaCodecVulkan` passes;
   the exported static targets use logical
-  `nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk` link names and
-  contain no producer NDK or host path.
+  `nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk`/`vulkan` link
+  names and contain no producer NDK or host path;
+- the Android MediaCodec/Vulkan checkpoint cross-builds
+  `QtAV::InteropMediaCodecVulkan` and enables Android hardware-buffer external
+  memory, external semaphore fd, sampler YCbCr conversion, and the foreign
+  queue family on the application-owned device. The Android 16/Adreno 830 run
+  rendered both H.264 and HEVC from private `AImageReader` surfaces, importing
+  89 external-format `AHardwareBuffer` images per codec and returning 89
+  release sync fds per codec. The maximum pending image count was one and the
+  decoded-source CPU-map, software-transfer, staging-copy, and renderer-upload
+  counters all remained zero; 160x90 decoded crops were sampled correctly
+  from the device's aligned 160x96 native allocations.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -590,15 +607,16 @@ passed 34/34.
 9. [x] Add MediaCodec H.264/HEVC hardware decode and direct-surface
    presentation with deterministic present/drop, seek/flush, stop, media
    replacement, surface recreation, stale-generation rejection, and shutdown.
-10. [ ] Add the confirmed private, GPU-sampled
+10. [x] Add the confirmed private, GPU-sampled
     `AImageReader`/`AHardwareBuffer` Vulkan zero-CPU-copy texture path.
 11. [ ] Add the confirmed `SurfaceTexture` external-OES OpenGL ES
     zero-CPU-copy texture path, then connect explicit renderer-fallback policy.
 
 The first unchecked item, and therefore the next implementation task, is the
-Android `AImageReader`/`AHardwareBuffer` Vulkan interop path. MediaCodec
-direct-surface behavior is now the validated baseline; texture interop must
-retain its separate format, lifetime, fence, and zero-CPU-copy proofs.
+Android `SurfaceTexture` external-OES OpenGL ES zero-CPU-copy texture path,
+followed by its explicit renderer-fallback policy. The completed Vulkan path
+remains a separate backend and does not authorize CPU mapping when Vulkan is
+unavailable.
 
 ### Shared Android/OHOS mobile design checkpoint
 
@@ -824,6 +842,39 @@ Completed Android MediaCodec direct-surface checkpoint:
 - Android cross-build, APK signing, install/export metadata, and external
   `find_package(QtAVCore)` consumption include `QtAV::HWMediaCodec` and its
   logical `android`/`mediandk` dependencies.
+
+Completed Android MediaCodec/Vulkan interop checkpoint:
+
+- `QtAV::InteropMediaCodecVulkan` is an independent Android target under
+  `QTAV_INTEROP_MEDIACODEC_VULKAN=AUTO/ON/OFF`; it depends on
+  `QtAV::HWMediaCodec` and `QtAV::RenderVulkan` without combining decoder,
+  renderer, and platform-window ownership;
+- `MediaCodecVulkanInterop` owns a private `AIMAGE_FORMAT_PRIVATE`
+  `AImageReader` created with `AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE`, gives
+  its versioned producer window to the MediaCodec backend, and correlates the
+  codec token timestamp with the asynchronously acquired `AImage` timestamp;
+- supported retained `AHardwareBuffer` images are imported through
+  `VK_ANDROID_external_memory_android_hardware_buffer`, external-format
+  sampler YCbCr conversion, and foreign-queue ownership barriers. The Vulkan
+  renderer accepts the imported image as a combined sampler, applies the same
+  color/geometry/output path, and uses the `AImage` crop rectangle when the
+  native allocation has padded dimensions;
+- acquire sync fds are imported as temporary Vulkan semaphores when the
+  producer supplies them. Every submitted image signals an exportable release
+  semaphore whose sync fd is returned through `AImage_deleteAsync()`; the
+  imported image, buffer, conversion resources, and codec output stay retained
+  through GPU submission completion;
+- timestamp queues and acquired images are bounded by the reader's configured
+  image count; stale and unsupported inputs are rejected without
+  `AHardwareBuffer_lock*()`, software-frame transfer, CPU staging, or renderer
+  upload;
+- the connected Android 16/Adreno 830 harness requires the four Vulkan
+  capabilities, decodes generated H.264 and HEVC, and records 89
+  external-format imports plus 89 returned release fences for each codec with
+  a maximum pending depth of one and all four CPU-copy counters at zero;
+- Android static/shared arm64 cross-builds pass; static install/export and
+  external `find_package(QtAVCore)` consumption of
+  `QtAV::InteropMediaCodecVulkan` pass.
 
 Completed Metal software-frame checkpoint:
 
@@ -1331,7 +1382,7 @@ Status: complete; resume Milestone 6 from its first unchecked item.
   application-supplied surface/device lifetime.
 - [x] Direct-surface presentation with explicit present/drop behavior before
   texture interop.
-- [ ] Android Vulkan interop using an application-owned private,
+- [x] Android Vulkan interop using an application-owned private,
   GPU-sampled `AImageReader`: supply its `ANativeWindow` to MediaCodec,
   correlate codec and acquired-image timestamps, import the retained
   `AHardwareBuffer` through

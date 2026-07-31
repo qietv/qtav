@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "video_frag_spv.inc"
+#include "video_external_frag_spv.inc"
 #include "video_vert_spv.inc"
 
 namespace qtav {
@@ -71,9 +72,10 @@ struct alignas(16) ShaderParameters {
     std::array<std::uint32_t, 4> viewport {};
     std::array<std::uint32_t, 4> presentation {};
     std::array<float, 4> luminance {};
+    std::array<float, 4> normalizedSourceRect {};
 };
 
-static_assert(sizeof(ShaderParameters) == 112);
+static_assert(sizeof(ShaderParameters) == 128);
 
 struct PackedFrame {
     std::vector<std::uint8_t> bytes;
@@ -99,6 +101,16 @@ bool supportedConfig(const VideoRenderConfig& config) noexcept
         && config.deviceOwnership == NativeResourceOwnership::Borrowed
         && config.contextOwnership == NativeResourceOwnership::Borrowed
         && config.surfaceOwnership == NativeResourceOwnership::Borrowed;
+}
+
+bool sameDeviceContext(
+    const BorrowedVulkanDevice& left,
+    const BorrowedVulkanDevice& right) noexcept
+{
+    return left.physicalDevice == right.physicalDevice
+        && left.device == right.device
+        && left.queue == right.queue
+        && left.queueFamilyIndex == right.queueFamilyIndex;
 }
 
 VideoViewport effectiveViewport(const VideoRenderConfig& config) noexcept
@@ -352,6 +364,53 @@ float maximumLuminance(const VideoFrame& frame) noexcept
     return frame.colorSpaceInfo().isHdr() ? 1000.0F : 100.0F;
 }
 
+ShaderParameters shaderParameters(
+    const VideoFrame& frame,
+    const VideoRenderConfig& config,
+    const VulkanRenderTarget& target) noexcept
+{
+    ShaderParameters result;
+    result.source = {
+        static_cast<std::uint32_t>(frame.width()),
+        static_cast<std::uint32_t>(frame.height()),
+        0,
+        static_cast<std::uint32_t>(shaderOutputColorSpace(target)),
+    };
+    const VideoViewport viewport = effectiveViewport(config);
+    const VideoColorSpace color = frame.colorSpaceInfo();
+    result.surface = {
+        static_cast<std::uint32_t>(config.surfaceSize.width),
+        static_cast<std::uint32_t>(config.surfaceSize.height),
+        static_cast<std::uint32_t>(shaderColorTransfer(color.transfer)),
+        static_cast<std::uint32_t>(shaderColorPrimaries(color.primaries)),
+    };
+    result.viewport = {
+        static_cast<std::uint32_t>(viewport.x),
+        static_cast<std::uint32_t>(viewport.y),
+        static_cast<std::uint32_t>(viewport.width),
+        static_cast<std::uint32_t>(viewport.height),
+    };
+    result.presentation = {
+        static_cast<std::uint32_t>(config.rotation),
+        static_cast<std::uint32_t>(config.aspectRatio),
+        static_cast<std::uint32_t>(shaderColorMatrix(color.matrix)),
+        color.range == ColorRange::Full ? 1U : 0U,
+    };
+    result.luminance = {
+        100.0F,
+        maximumLuminance(frame),
+        0.0F,
+        0.0F,
+    };
+    result.normalizedSourceRect = {
+        0.0F,
+        0.0F,
+        1.0F,
+        1.0F,
+    };
+    return result;
+}
+
 bool packFrame(
     const VideoFrame& frame,
     const VideoRenderConfig& config,
@@ -381,38 +440,8 @@ bool packFrame(
         return false;
     }
 
-    result.parameters.source = {
-        static_cast<std::uint32_t>(frame.width()),
-        static_cast<std::uint32_t>(frame.height()),
-        static_cast<std::uint32_t>(format),
-        static_cast<std::uint32_t>(shaderOutputColorSpace(target)),
-    };
-    const VideoViewport viewport = effectiveViewport(config);
-    const VideoColorSpace color = frame.colorSpaceInfo();
-    result.parameters.surface = {
-        static_cast<std::uint32_t>(config.surfaceSize.width),
-        static_cast<std::uint32_t>(config.surfaceSize.height),
-        static_cast<std::uint32_t>(shaderColorTransfer(color.transfer)),
-        static_cast<std::uint32_t>(shaderColorPrimaries(color.primaries)),
-    };
-    result.parameters.viewport = {
-        static_cast<std::uint32_t>(viewport.x),
-        static_cast<std::uint32_t>(viewport.y),
-        static_cast<std::uint32_t>(viewport.width),
-        static_cast<std::uint32_t>(viewport.height),
-    };
-    result.parameters.presentation = {
-        static_cast<std::uint32_t>(config.rotation),
-        static_cast<std::uint32_t>(config.aspectRatio),
-        static_cast<std::uint32_t>(shaderColorMatrix(color.matrix)),
-        color.range == ColorRange::Full ? 1U : 0U,
-    };
-    result.parameters.luminance = {
-        100.0F,
-        maximumLuminance(frame),
-        0.0F,
-        0.0F,
-    };
+    result.parameters = shaderParameters(frame, config, target);
+    result.parameters.source[2] = static_cast<std::uint32_t>(format);
 
     for (int plane = 0; plane < planeCount; ++plane) {
         const int width =
@@ -467,6 +496,31 @@ std::string resultError(const char* operation, VkResult result)
         + " (" + std::to_string(static_cast<int>(result)) + ')';
 }
 
+class RendererEventState final {
+public:
+    void set(VideoRenderAPI::EventCallback callback)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback_ = std::move(callback);
+    }
+
+    void notify(VideoRenderEventType type, std::string detail)
+    {
+        VideoRenderAPI::EventCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = callback_;
+        }
+        if (callback) {
+            callback({ type, std::move(detail) });
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    VideoRenderAPI::EventCallback callback_;
+};
+
 } // namespace
 
 bool BorrowedVulkanDevice::isValid() const noexcept
@@ -497,6 +551,44 @@ bool vulkanColorSpaceIsHdr(VkColorSpaceKHR colorSpace) noexcept
         || colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT
         || colorSpace == VK_COLOR_SPACE_HDR10_HLG_EXT;
 }
+
+VulkanTextureFrame::~VulkanTextureFrame() = default;
+
+bool VulkanNormalizedSourceRect::isValid() const noexcept
+{
+    return left >= 0.0F && top >= 0.0F
+        && right <= 1.0F && bottom <= 1.0F
+        && right > left && bottom > top;
+}
+
+VkImageLayout VulkanTextureFrame::initialLayout() const noexcept
+{
+    return VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+VkImageLayout VulkanTextureFrame::sampledLayout() const noexcept
+{
+    return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+VkImageLayout VulkanTextureFrame::releaseLayout() const noexcept
+{
+    return VK_IMAGE_LAYOUT_GENERAL;
+}
+
+std::uint32_t
+VulkanTextureFrame::sourceQueueFamilyIndex() const noexcept
+{
+    return VK_QUEUE_FAMILY_FOREIGN_EXT;
+}
+
+VulkanNormalizedSourceRect
+VulkanTextureFrame::normalizedSourceRect() const noexcept
+{
+    return {};
+}
+
+VulkanHardwareFrameInterop::~VulkanHardwareFrameInterop() = default;
 
 VkSurfaceFormatKHR selectVulkanSurfaceFormat(
     const VkSurfaceFormatKHR* formats,
@@ -603,31 +695,53 @@ public:
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
         VideoFrame retainedFrame;
+        std::shared_ptr<VulkanTextureFrame> importedFrame;
+        bool hardware = false;
         bool submissionPending = false;
     };
 
     Impl(
         BorrowedVulkanDevice device,
-        VulkanCurrentTargetCallback currentTarget)
+        VulkanCurrentTargetCallback currentTarget,
+        std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop)
         : device_(device)
         , currentTarget_(std::move(currentTarget))
+        , hardwareInterop_(std::move(hardwareInterop))
+        , eventState_(std::make_shared<RendererEventState>())
     {
+        connectHardwareInterop();
     }
 
     ~Impl()
     {
+        if (eventState_) {
+            eventState_->set({});
+        }
+        if (hardwareInterop_) {
+            hardwareInterop_->setFrameAvailableCallback({});
+        }
         close();
+    }
+
+    void connectHardwareInterop()
+    {
+        if (!hardwareInterop_ || !eventState_) {
+            return;
+        }
+        std::weak_ptr<RendererEventState> weak = eventState_;
+        hardwareInterop_->setFrameAvailableCallback([weak] {
+            if (const auto state = weak.lock()) {
+                state->notify(
+                    VideoRenderEventType::RedrawRequested,
+                    {});
+            }
+        });
     }
 
     void notify(VideoRenderEventType type, std::string detail)
     {
-        EventCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            callback = eventCallback_;
-        }
-        if (callback) {
-            callback({ type, std::move(detail) });
+        if (eventState_) {
+            eventState_->notify(type, std::move(detail));
         }
     }
 
@@ -729,6 +843,8 @@ public:
             frame.descriptorSet = VK_NULL_HANDLE;
             frame.framebuffer = VK_NULL_HANDLE;
             frame.retainedFrame = {};
+            frame.importedFrame.reset();
+            frame.hardware = false;
             frame.submissionPending = false;
             return;
         }
@@ -770,6 +886,8 @@ public:
         frame.descriptorSet = VK_NULL_HANDLE;
         frame.framebuffer = VK_NULL_HANDLE;
         frame.retainedFrame = {};
+        frame.importedFrame.reset();
+        frame.hardware = false;
         frame.submissionPending = false;
     }
 
@@ -820,6 +938,45 @@ public:
         renderPass_ = VK_NULL_HANDLE;
         pipelineFormat_ = VK_FORMAT_UNDEFINED;
         pipelineFinalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    void destroyHardwarePipeline() noexcept
+    {
+        if (!device_.device) {
+            return;
+        }
+        if (hardwarePipeline_) {
+            vkDestroyPipeline(
+                device_.device,
+                hardwarePipeline_,
+                nullptr);
+        }
+        if (hardwareRenderPass_) {
+            vkDestroyRenderPass(
+                device_.device,
+                hardwareRenderPass_,
+                nullptr);
+        }
+        if (hardwarePipelineLayout_) {
+            vkDestroyPipelineLayout(
+                device_.device,
+                hardwarePipelineLayout_,
+                nullptr);
+        }
+        if (hardwareDescriptorSetLayout_) {
+            vkDestroyDescriptorSetLayout(
+                device_.device,
+                hardwareDescriptorSetLayout_,
+                nullptr);
+        }
+        hardwareDescriptorSetLayout_ = VK_NULL_HANDLE;
+        hardwarePipelineLayout_ = VK_NULL_HANDLE;
+        hardwareRenderPass_ = VK_NULL_HANDLE;
+        hardwarePipeline_ = VK_NULL_HANDLE;
+        hardwarePipelineFormat_ = VK_FORMAT_UNDEFINED;
+        hardwarePipelineFinalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+        hardwarePipelineSampler_ = VK_NULL_HANDLE;
+        hardwarePipelineSamplerOwner_.reset();
     }
 
     bool createCommon(std::string& error)
@@ -914,20 +1071,16 @@ public:
         return true;
     }
 
-    bool createPipeline(
+    bool createGraphicsPipeline(
         VkFormat format,
         VkImageLayout finalLayout,
+        VkPipelineLayout pipelineLayout,
+        const unsigned char* fragmentBytes,
+        std::size_t fragmentSize,
+        VkRenderPass& renderPass,
+        VkPipeline& pipeline,
         std::string& error)
     {
-        if (pipeline_ && pipelineFormat_ == format
-            && pipelineFinalLayout_ == finalLayout) {
-            return true;
-        }
-        if (!waitForAllSubmissions(error)) {
-            return false;
-        }
-        destroyPipeline();
-
         VkAttachmentDescription attachment {};
         attachment.format = format;
         attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -967,7 +1120,7 @@ public:
             device_.device,
             &renderPassInfo,
             nullptr,
-            &renderPass_);
+            &renderPass);
         if (result != VK_SUCCESS) {
             error = resultError("vkCreateRenderPass", result);
             return false;
@@ -997,8 +1150,8 @@ public:
             vertex);
         if (result == VK_SUCCESS) {
             result = createShader(
-                video_frag_spv,
-                sizeof(video_frag_spv),
+                fragmentBytes,
+                fragmentSize,
                 fragment);
         }
         if (result != VK_SUCCESS) {
@@ -1078,23 +1231,138 @@ public:
         pipelineInfo.pMultisampleState = &multisample;
         pipelineInfo.pColorBlendState = &blend;
         pipelineInfo.pDynamicState = &dynamic;
-        pipelineInfo.layout = pipelineLayout_;
-        pipelineInfo.renderPass = renderPass_;
+        pipelineInfo.layout = pipelineLayout;
+        pipelineInfo.renderPass = renderPass;
         result = vkCreateGraphicsPipelines(
             device_.device,
             VK_NULL_HANDLE,
             1,
             &pipelineInfo,
             nullptr,
-            &pipeline_);
+            &pipeline);
         vkDestroyShaderModule(device_.device, fragment, nullptr);
         vkDestroyShaderModule(device_.device, vertex, nullptr);
         if (result != VK_SUCCESS) {
             error = resultError("vkCreateGraphicsPipelines", result);
             return false;
         }
+        return true;
+    }
+
+    bool createPipeline(
+        VkFormat format,
+        VkImageLayout finalLayout,
+        std::string& error)
+    {
+        if (pipeline_ && pipelineFormat_ == format
+            && pipelineFinalLayout_ == finalLayout) {
+            return true;
+        }
+        if (!waitForAllSubmissions(error)) {
+            return false;
+        }
+        destroyPipeline();
+        if (!createGraphicsPipeline(
+                format,
+                finalLayout,
+                pipelineLayout_,
+                video_frag_spv,
+                sizeof(video_frag_spv),
+                renderPass_,
+                pipeline_,
+                error)) {
+            return false;
+        }
         pipelineFormat_ = format;
         pipelineFinalLayout_ = finalLayout;
+        return true;
+    }
+
+    bool createHardwarePipeline(
+        VkFormat format,
+        VkImageLayout finalLayout,
+        const std::shared_ptr<VulkanTextureFrame>& importedFrame,
+        std::string& error)
+    {
+        const VkSampler sampler =
+            importedFrame ? importedFrame->sampler() : VK_NULL_HANDLE;
+        if (hardwarePipeline_ && hardwarePipelineFormat_ == format
+            && hardwarePipelineFinalLayout_ == finalLayout
+            && hardwarePipelineSampler_ == sampler) {
+            return true;
+        }
+        if (!sampler) {
+            error =
+                "The imported Vulkan frame has no YCbCr conversion sampler";
+            return false;
+        }
+        if (!waitForAllSubmissions(error)) {
+            return false;
+        }
+        destroyHardwarePipeline();
+
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings {};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType =
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[0].pImmutableSamplers = &sampler;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo descriptorInfo {
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        };
+        descriptorInfo.bindingCount =
+            static_cast<std::uint32_t>(bindings.size());
+        descriptorInfo.pBindings = bindings.data();
+        VkResult result = vkCreateDescriptorSetLayout(
+            device_.device,
+            &descriptorInfo,
+            nullptr,
+            &hardwareDescriptorSetLayout_);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkCreateDescriptorSetLayout(hardware)",
+                result);
+            return false;
+        }
+        VkPipelineLayoutCreateInfo layoutInfo {
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        };
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &hardwareDescriptorSetLayout_;
+        result = vkCreatePipelineLayout(
+            device_.device,
+            &layoutInfo,
+            nullptr,
+            &hardwarePipelineLayout_);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkCreatePipelineLayout(hardware)",
+                result);
+            return false;
+        }
+        if (!createGraphicsPipeline(
+                format,
+                finalLayout,
+                hardwarePipelineLayout_,
+                video_external_frag_spv,
+                sizeof(video_external_frag_spv),
+                hardwareRenderPass_,
+                hardwarePipeline_,
+                error)) {
+            return false;
+        }
+        hardwarePipelineFormat_ = format;
+        hardwarePipelineFinalLayout_ = finalLayout;
+        hardwarePipelineSampler_ = sampler;
+        // An external-format YCbCr sampler must remain alive for the lifetime
+        // of the descriptor-set layout that embeds it as an immutable
+        // sampler. Retaining one imported frame also retains that sampler.
+        hardwarePipelineSamplerOwner_ = importedFrame;
         return true;
     }
 
@@ -1215,6 +1483,135 @@ public:
         return true;
     }
 
+    bool prepareHardwareFrame(
+        const ShaderParameters& parameters,
+        const VulkanRenderTarget& target,
+        const VideoFrame& retainedFrame,
+        std::shared_ptr<VulkanTextureFrame> importedFrame,
+        FrameResources& frame,
+        std::string& error)
+    {
+        destroyFrameResources(frame);
+        if (!importedFrame
+            || !importedFrame->image()
+            || !importedFrame->imageView()
+            || !importedFrame->sampler()
+            || !importedFrame->releaseSemaphore()) {
+            error =
+                "The Vulkan hardware interop returned incomplete image resources";
+            return false;
+        }
+        if (!createBuffer(
+                sizeof(parameters),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                &parameters,
+                frame.parameterBuffer,
+                frame.parameterMemory,
+                error)) {
+            return false;
+        }
+
+        const std::array<VkDescriptorPoolSize, 2> poolSizes {
+            VkDescriptorPoolSize {
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                1,
+            },
+            VkDescriptorPoolSize {
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                1,
+            },
+        };
+        VkDescriptorPoolCreateInfo poolInfo {
+            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        };
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount =
+            static_cast<std::uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        VkResult result = vkCreateDescriptorPool(
+            device_.device,
+            &poolInfo,
+            nullptr,
+            &frame.descriptorPool);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkCreateDescriptorPool(hardware)",
+                result);
+            return false;
+        }
+        VkDescriptorSetAllocateInfo descriptorInfo {
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        };
+        descriptorInfo.descriptorPool = frame.descriptorPool;
+        descriptorInfo.descriptorSetCount = 1;
+        descriptorInfo.pSetLayouts = &hardwareDescriptorSetLayout_;
+        result = vkAllocateDescriptorSets(
+            device_.device,
+            &descriptorInfo,
+            &frame.descriptorSet);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkAllocateDescriptorSets(hardware)",
+                result);
+            return false;
+        }
+        const VkDescriptorImageInfo imageInfo {
+            importedFrame->sampler(),
+            importedFrame->imageView(),
+            importedFrame->sampledLayout(),
+        };
+        const VkDescriptorBufferInfo parameterInfo {
+            frame.parameterBuffer,
+            0,
+            sizeof(parameters),
+        };
+        std::array<VkWriteDescriptorSet, 2> writes {};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = frame.descriptorSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType =
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].pImageInfo = &imageInfo;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = frame.descriptorSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[1].pBufferInfo = &parameterInfo;
+        vkUpdateDescriptorSets(
+            device_.device,
+            static_cast<std::uint32_t>(writes.size()),
+            writes.data(),
+            0,
+            nullptr);
+
+        VkFramebufferCreateInfo framebufferInfo {
+            VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        };
+        framebufferInfo.renderPass = hardwareRenderPass_;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = &target.imageView;
+        framebufferInfo.width = target.extent.width;
+        framebufferInfo.height = target.extent.height;
+        framebufferInfo.layers = 1;
+        result = vkCreateFramebuffer(
+            device_.device,
+            &framebufferInfo,
+            nullptr,
+            &frame.framebuffer);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkCreateFramebuffer(hardware)",
+                result);
+            return false;
+        }
+        frame.retainedFrame = retainedFrame;
+        frame.importedFrame = std::move(importedFrame);
+        frame.hardware = true;
+        return true;
+    }
+
     bool submit(
         const VulkanRenderTarget& target,
         FrameResources& frame,
@@ -1236,11 +1633,43 @@ public:
             error = resultError("vkBeginCommandBuffer", result);
             return false;
         }
+        if (frame.hardware && frame.importedFrame) {
+            VkImageMemoryBarrier acquire {
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            };
+            acquire.srcAccessMask = 0;
+            acquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            acquire.oldLayout =
+                frame.importedFrame->initialLayout();
+            acquire.newLayout =
+                frame.importedFrame->sampledLayout();
+            acquire.srcQueueFamilyIndex =
+                frame.importedFrame->sourceQueueFamilyIndex();
+            acquire.dstQueueFamilyIndex =
+                device_.queueFamilyIndex;
+            acquire.image = frame.importedFrame->image();
+            acquire.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            acquire.subresourceRange.levelCount = 1;
+            acquire.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(
+                frame.commandBuffer,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0,
+                nullptr,
+                0,
+                nullptr,
+                1,
+                &acquire);
+        }
         const VkClearValue clear { { { 0.0F, 0.0F, 0.0F, 1.0F } } };
         VkRenderPassBeginInfo passInfo {
             VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         };
-        passInfo.renderPass = renderPass_;
+        passInfo.renderPass =
+            frame.hardware ? hardwareRenderPass_ : renderPass_;
         passInfo.framebuffer = frame.framebuffer;
         passInfo.renderArea.extent = target.extent;
         passInfo.clearValueCount = 1;
@@ -1252,11 +1681,13 @@ public:
         vkCmdBindPipeline(
             frame.commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline_);
+            frame.hardware ? hardwarePipeline_ : pipeline_);
         vkCmdBindDescriptorSets(
             frame.commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipelineLayout_,
+            frame.hardware
+                ? hardwarePipelineLayout_
+                : pipelineLayout_,
             0,
             1,
             &frame.descriptorSet,
@@ -1275,6 +1706,37 @@ public:
         vkCmdSetScissor(frame.commandBuffer, 0, 1, &scissor);
         vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
         vkCmdEndRenderPass(frame.commandBuffer);
+        if (frame.hardware && frame.importedFrame) {
+            VkImageMemoryBarrier release {
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            };
+            release.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            release.dstAccessMask = 0;
+            release.oldLayout =
+                frame.importedFrame->sampledLayout();
+            release.newLayout =
+                frame.importedFrame->releaseLayout();
+            release.srcQueueFamilyIndex =
+                device_.queueFamilyIndex;
+            release.dstQueueFamilyIndex =
+                frame.importedFrame->sourceQueueFamilyIndex();
+            release.image = frame.importedFrame->image();
+            release.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            release.subresourceRange.levelCount = 1;
+            release.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(
+                frame.commandBuffer,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0,
+                0,
+                nullptr,
+                0,
+                nullptr,
+                1,
+                &release);
+        }
         result = vkEndCommandBuffer(frame.commandBuffer);
         if (result != VK_SUCCESS) {
             error = resultError("vkEndCommandBuffer", result);
@@ -1290,17 +1752,42 @@ public:
             return false;
         }
         VkSubmitInfo submitInfo { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        std::array<VkSemaphore, 2> waitSemaphores {};
+        std::array<VkPipelineStageFlags, 2> waitStages {};
+        std::uint32_t waitCount = 0;
         if (target.waitSemaphore) {
-            submitInfo.waitSemaphoreCount = 1;
-            submitInfo.pWaitSemaphores = &target.waitSemaphore;
-            submitInfo.pWaitDstStageMask = &target.waitStage;
+            waitSemaphores[waitCount] = target.waitSemaphore;
+            waitStages[waitCount] = target.waitStage;
+            ++waitCount;
         }
+        if (frame.hardware && frame.importedFrame
+            && frame.importedFrame->acquireSemaphore()) {
+            waitSemaphores[waitCount] =
+                frame.importedFrame->acquireSemaphore();
+            waitStages[waitCount] =
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            ++waitCount;
+        }
+        submitInfo.waitSemaphoreCount = waitCount;
+        submitInfo.pWaitSemaphores =
+            waitCount ? waitSemaphores.data() : nullptr;
+        submitInfo.pWaitDstStageMask =
+            waitCount ? waitStages.data() : nullptr;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &frame.commandBuffer;
+        std::array<VkSemaphore, 2> signalSemaphores {};
+        std::uint32_t signalCount = 0;
         if (target.signalSemaphore) {
-            submitInfo.signalSemaphoreCount = 1;
-            submitInfo.pSignalSemaphores = &target.signalSemaphore;
+            signalSemaphores[signalCount++] =
+                target.signalSemaphore;
         }
+        if (frame.hardware && frame.importedFrame) {
+            signalSemaphores[signalCount++] =
+                frame.importedFrame->releaseSemaphore();
+        }
+        submitInfo.signalSemaphoreCount = signalCount;
+        submitInfo.pSignalSemaphores =
+            signalCount ? signalSemaphores.data() : nullptr;
         result = vkQueueSubmit(
             device_.queue,
             1,
@@ -1311,6 +1798,9 @@ public:
             return false;
         }
         frame.submissionPending = true;
+        if (frame.hardware && frame.importedFrame) {
+            frame.importedFrame->releaseToProducer();
+        }
         if (target.waitUntilCompleted
             && !waitForSubmission(frame, error)) {
             return false;
@@ -1328,6 +1818,7 @@ public:
                 destroyFrameResources(frame);
             }
             destroyPipeline();
+            destroyHardwarePipeline();
             for (auto& frame : frames_) {
                 if (frame.submitFence) {
                     vkDestroyFence(
@@ -1372,7 +1863,8 @@ public:
     std::mutex renderMutex_;
     BorrowedVulkanDevice device_;
     VulkanCurrentTargetCallback currentTarget_;
-    EventCallback eventCallback_;
+    std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop_;
+    std::shared_ptr<RendererEventState> eventState_;
     VideoRenderConfig config_;
     bool open_ = false;
 
@@ -1383,16 +1875,29 @@ public:
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkFormat pipelineFormat_ = VK_FORMAT_UNDEFINED;
     VkImageLayout pipelineFinalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkDescriptorSetLayout hardwareDescriptorSetLayout_ =
+        VK_NULL_HANDLE;
+    VkPipelineLayout hardwarePipelineLayout_ = VK_NULL_HANDLE;
+    VkRenderPass hardwareRenderPass_ = VK_NULL_HANDLE;
+    VkPipeline hardwarePipeline_ = VK_NULL_HANDLE;
+    VkFormat hardwarePipelineFormat_ = VK_FORMAT_UNDEFINED;
+    VkImageLayout hardwarePipelineFinalLayout_ =
+        VK_IMAGE_LAYOUT_UNDEFINED;
+    VkSampler hardwarePipelineSampler_ = VK_NULL_HANDLE;
+    std::shared_ptr<VulkanTextureFrame>
+        hardwarePipelineSamplerOwner_;
     std::array<FrameResources, FramesInFlight> frames_;
     std::size_t nextFrame_ = 0;
 };
 
 VulkanVideoRenderer::VulkanVideoRenderer(
     BorrowedVulkanDevice device,
-    VulkanCurrentTargetCallback currentTarget)
+    VulkanCurrentTargetCallback currentTarget,
+    std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop)
     : impl_(std::make_unique<Impl>(
           device,
-          std::move(currentTarget)))
+          std::move(currentTarget),
+          std::move(hardwareInterop)))
 {
 }
 
@@ -1421,6 +1926,16 @@ VideoRenderCapabilities VulkanVideoRenderer::capabilities() const
     };
     result.customViewport = true;
     result.rotation = true;
+    if (impl_) {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        if (impl_->hardwareInterop_
+            && sameDeviceContext(
+                impl_->hardwareInterop_->device(),
+                impl_->device_)) {
+            result.hardwareDevices =
+                impl_->hardwareInterop_->capabilities().sourceDevices;
+        }
+    }
     return result;
 }
 
@@ -1429,8 +1944,7 @@ void VulkanVideoRenderer::setEventCallback(EventCallback callback)
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
-    impl_->eventCallback_ = std::move(callback);
+    impl_->eventState_->set(std::move(callback));
 }
 
 bool VulkanVideoRenderer::open(const VideoRenderConfig& config)
@@ -1498,6 +2012,7 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
 
     VideoRenderConfig config;
     VulkanCurrentTargetCallback currentTarget;
+    std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop;
     {
         std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
         if (!impl_->open_) {
@@ -1505,6 +2020,7 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         } else {
             config = impl_->config_;
             currentTarget = impl_->currentTarget_;
+            hardwareInterop = impl_->hardwareInterop_;
         }
     }
     if (!config.surfaceSize.isValid()) {
@@ -1519,6 +2035,32 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         impl_->notify(VideoRenderEventType::Error, std::move(error));
         return false;
     }
+    if (frame.hasHardwareFrame()) {
+        if (!hardwareInterop
+            || !sameDeviceContext(
+                hardwareInterop->device(),
+                impl_->device_)
+            || !hardwareInterop->supports(frame.hardwareFrame())) {
+            impl_->notify(
+                VideoRenderEventType::Error,
+                "The Vulkan renderer has no compatible interop for this hardware frame");
+            return false;
+        }
+        const VulkanHardwareImportStatus status =
+            hardwareInterop->prepareFrame(frame, error);
+        if (status == VulkanHardwareImportStatus::Pending) {
+            return false;
+        }
+        if (status != VulkanHardwareImportStatus::Ready) {
+            impl_->notify(
+                VideoRenderEventType::Error,
+                error.empty()
+                    ? "The Vulkan hardware frame preparation failed"
+                    : std::move(error));
+            return false;
+        }
+    }
+
     const VulkanRenderTarget target =
         currentTarget ? currentTarget() : VulkanRenderTarget {};
     if (!target.isValid()) {
@@ -1536,25 +2078,72 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
             "The current Vulkan target extent does not match the configured surface");
         return false;
     }
+    bool prepared = false;
     if (frame.hasHardwareFrame()) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The Vulkan renderer has no interop for this hardware frame");
-        return false;
+        VulkanHardwareImportResult imported =
+            hardwareInterop->importFrame(frame);
+        if (!imported) {
+            impl_->notify(
+                VideoRenderEventType::Error,
+                imported.detail.empty()
+                    ? "The prepared Vulkan hardware frame import failed"
+                    : std::move(imported.detail));
+            return false;
+        }
+        std::shared_ptr<VulkanTextureFrame> importedFrame =
+            std::move(imported.texture);
+        if (importedFrame->width() != frame.width()
+            || importedFrame->height() != frame.height()) {
+            impl_->notify(
+                VideoRenderEventType::Error,
+                "The imported Vulkan image dimensions do not match the decoded frame");
+            return false;
+        }
+        ShaderParameters parameters =
+            shaderParameters(frame, config, target);
+        const VulkanNormalizedSourceRect sourceRect =
+            importedFrame->normalizedSourceRect();
+        if (!sourceRect.isValid()) {
+            impl_->notify(
+                VideoRenderEventType::Error,
+                "The imported Vulkan image has an invalid normalized source rectangle");
+            return false;
+        }
+        parameters.normalizedSourceRect = {
+            sourceRect.left,
+            sourceRect.top,
+            sourceRect.right,
+            sourceRect.bottom,
+        };
+        prepared =
+            impl_->createHardwarePipeline(
+                target.format,
+                target.finalLayout,
+                importedFrame,
+                error)
+            && impl_->prepareHardwareFrame(
+                parameters,
+                target,
+                frame,
+                std::move(importedFrame),
+                frameResources,
+                error);
+    } else {
+        PackedFrame packed;
+        prepared =
+            packFrame(frame, config, target, packed, error)
+            && impl_->createPipeline(
+                target.format,
+                target.finalLayout,
+                error)
+            && impl_->prepareFrame(
+                packed,
+                target,
+                frame,
+                frameResources,
+                error);
     }
-
-    PackedFrame packed;
-    if (!packFrame(frame, config, target, packed, error)
-        || !impl_->createPipeline(
-            target.format,
-            target.finalLayout,
-            error)
-        || !impl_->prepareFrame(
-            packed,
-            target,
-            frame,
-            frameResources,
-            error)
+    if (!prepared
         || !impl_->submit(target, frameResources, error)) {
         impl_->notify(VideoRenderEventType::Error, std::move(error));
         return false;
@@ -1584,6 +2173,73 @@ void VulkanVideoRenderer::setCurrentTargetCallback(
     }
     std::lock_guard<std::mutex> lock(impl_->stateMutex_);
     impl_->currentTarget_ = std::move(callback);
+}
+
+VulkanHardwareImportStatus
+VulkanVideoRenderer::prepareHardwareFrame(
+    const VideoFrame& frame,
+    std::string* detail)
+{
+    if (!impl_ || !frame || !frame.hasHardwareFrame()) {
+        if (detail) {
+            *detail =
+                "The frame is not a Vulkan-interoperable hardware frame";
+        }
+        return VulkanHardwareImportStatus::Unsupported;
+    }
+    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+    std::shared_ptr<VulkanHardwareFrameInterop> interop;
+    {
+        std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
+        interop = impl_->hardwareInterop_;
+    }
+    if (!interop
+        || !sameDeviceContext(
+            interop->device(),
+            impl_->device_)
+        || !interop->supports(frame.hardwareFrame())) {
+        if (detail) {
+            *detail =
+                "The Vulkan renderer has no compatible interop for this hardware frame";
+        }
+        return VulkanHardwareImportStatus::Unsupported;
+    }
+    std::string localDetail;
+    const VulkanHardwareImportStatus status =
+        interop->prepareFrame(frame, localDetail);
+    if (detail) {
+        *detail = std::move(localDetail);
+    }
+    return status;
+}
+
+void VulkanVideoRenderer::setHardwareFrameInterop(
+    std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+    std::shared_ptr<VulkanHardwareFrameInterop> previous;
+    {
+        std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
+        previous = std::move(impl_->hardwareInterop_);
+        impl_->hardwareInterop_ = std::move(hardwareInterop);
+    }
+    if (previous) {
+        previous->setFrameAvailableCallback({});
+    }
+    impl_->connectHardwareInterop();
+}
+
+std::shared_ptr<VulkanHardwareFrameInterop>
+VulkanVideoRenderer::hardwareFrameInterop() const noexcept
+{
+    if (!impl_) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    return impl_->hardwareInterop_;
 }
 
 } // namespace qtav

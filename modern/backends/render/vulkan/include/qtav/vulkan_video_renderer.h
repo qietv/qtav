@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 #include <qtav/video_render_api.h>
 #include <qtav/vulkan_export.h>
@@ -67,6 +68,88 @@ QTAV_RENDER_VULKAN_EXPORT VkSurfaceFormatKHR selectVulkanSurfaceFormat(
 
 using VulkanCurrentTargetCallback = std::function<VulkanRenderTarget()>;
 
+enum class VulkanHardwareImportStatus {
+    Ready,
+    Pending,
+    Unsupported,
+    Stale,
+    Error,
+};
+
+struct QTAV_RENDER_VULKAN_EXPORT VulkanNormalizedSourceRect {
+    float left = 0.0F;
+    float top = 0.0F;
+    float right = 1.0F;
+    float bottom = 1.0F;
+
+    bool isValid() const noexcept;
+};
+
+// A backend-specific, reference-counted view of a sampled image imported from
+// a hardware decoder. The image, view, sampler, and synchronization objects
+// remain valid while this object is alive. The renderer retains the object
+// until its submission fence completes.
+class QTAV_RENDER_VULKAN_EXPORT VulkanTextureFrame {
+public:
+    virtual ~VulkanTextureFrame();
+
+    virtual int width() const noexcept = 0;
+    virtual int height() const noexcept = 0;
+    virtual VkImage image() const noexcept = 0;
+    virtual VkImageView imageView() const noexcept = 0;
+    virtual VkSampler sampler() const noexcept = 0;
+    virtual VkSemaphore acquireSemaphore() const noexcept = 0;
+    virtual VkSemaphore releaseSemaphore() const noexcept = 0;
+    virtual VkImageLayout initialLayout() const noexcept;
+    virtual VkImageLayout sampledLayout() const noexcept;
+    virtual VkImageLayout releaseLayout() const noexcept;
+    virtual std::uint32_t sourceQueueFamilyIndex() const noexcept;
+    // The decoded image can occupy a cropped region of a larger native
+    // allocation. Coordinates are normalized against that allocation.
+    virtual VulkanNormalizedSourceRect normalizedSourceRect() const noexcept;
+
+    // Called immediately after a successful queue submission. Android
+    // implementations export the signalled release semaphore as a sync fd and
+    // return it through AImage_deleteAsync(). If export fails, the frame stays
+    // retained and is released synchronously after the Vulkan fence completes.
+    virtual void releaseToProducer() noexcept = 0;
+};
+
+struct QTAV_RENDER_VULKAN_EXPORT VulkanHardwareImportResult {
+    VulkanHardwareImportStatus status =
+        VulkanHardwareImportStatus::Unsupported;
+    std::shared_ptr<VulkanTextureFrame> texture;
+    std::string detail;
+
+    explicit operator bool() const noexcept
+    {
+        return status == VulkanHardwareImportStatus::Ready
+            && static_cast<bool>(texture);
+    }
+};
+
+// Implemented by an optional platform interop target. Import must not map,
+// transfer, stage, or re-upload decoded pixels through CPU memory.
+class QTAV_RENDER_VULKAN_EXPORT VulkanHardwareFrameInterop {
+public:
+    using FrameAvailableCallback = std::function<void()>;
+
+    virtual ~VulkanHardwareFrameInterop();
+
+    virtual BorrowedVulkanDevice device() const noexcept = 0;
+    virtual HardwareInteropCapabilities capabilities() const = 0;
+    virtual bool supports(const HardwareFrame& frame) const noexcept = 0;
+    // Starts producer release and reports whether the timestamp-correlated
+    // native image is ready. Ready does not consume/import the image.
+    virtual VulkanHardwareImportStatus prepareFrame(
+        const VideoFrame& frame,
+        std::string& detail) = 0;
+    virtual VulkanHardwareImportResult importFrame(
+        const VideoFrame& frame) = 0;
+    virtual void setFrameAvailableCallback(
+        FrameAvailableCallback callback) = 0;
+};
+
 class QTAV_RENDER_VULKAN_EXPORT VulkanVideoRenderer final
     : public VideoRenderAPI {
 public:
@@ -74,7 +157,8 @@ public:
 
     VulkanVideoRenderer(
         BorrowedVulkanDevice device,
-        VulkanCurrentTargetCallback currentTarget);
+        VulkanCurrentTargetCallback currentTarget,
+        std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop = {});
     ~VulkanVideoRenderer() override;
 
     VulkanVideoRenderer(VulkanVideoRenderer&&) noexcept;
@@ -91,6 +175,13 @@ public:
 
     BorrowedVulkanDevice device() const noexcept;
     void setCurrentTargetCallback(VulkanCurrentTargetCallback callback);
+    VulkanHardwareImportStatus prepareHardwareFrame(
+        const VideoFrame& frame,
+        std::string* detail = nullptr);
+    void setHardwareFrameInterop(
+        std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop);
+    std::shared_ptr<VulkanHardwareFrameInterop>
+    hardwareFrameInterop() const noexcept;
 
 private:
     class Impl;

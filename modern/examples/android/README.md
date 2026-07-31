@@ -6,7 +6,8 @@ and QtAVCore for `arm64-v8a`, packages a platform `NativeActivity`, and checks
 software MPEG-4 plus PCM decode, a bounded three-frame Vulkan submission ring,
 native HDR swapchain presentation, OpenGL ES 3.x/EGL native HDR, an explicit
 EGL SDR fallback, AAudio device output, MediaCodec H.264/HEVC direct-surface
-output, and background/foreground surface recreation on one connected device.
+output, MediaCodec H.264/HEVC private-AImageReader Vulkan texture import, and
+background/foreground surface recreation on one connected device.
 
 Requirements:
 
@@ -20,7 +21,9 @@ Requirements:
 - exactly one authorized, awake, unlocked arm64 Android device with OpenGL ES
   3.x, an exact RGB10_A2 BT.2020/PQ or BT.2020/HLG EGL surface, and a Vulkan
   HDR surface-format pair plus an AAudio output route and H.264/HEVC
-  MediaCodec decoders for deployment.
+  MediaCodec decoders, Android hardware-buffer external memory, external
+  semaphore fd, sampler YCbCr conversion, and foreign-queue support for
+  deployment.
 
 Build:
 
@@ -51,7 +54,9 @@ instead of repeatedly retrying window creation.
 
 The application creates its own Vulkan instance, logical device, and
 graphics/present queue, enables `VK_EXT_swapchain_colorspace`, and enables
-`VK_EXT_hdr_metadata` when the device exposes it.
+`VK_EXT_hdr_metadata` when the device exposes it. It also enables the Android
+hardware-buffer external-memory, external-semaphore-fd, foreign-queue, and
+sampler-YCbCr capabilities required by the strict MediaCodec/Vulkan phase.
 `QtAV::RenderMobile` remains attached to the player for the renderer session;
 its application factories prepare the current Android Vulkan or OpenGL ES
 adapter, and its bounded recovery policy recreates Vulkan after the
@@ -89,6 +94,17 @@ and resumes the activity with a new surface generation, rejects that new
 output against the stale token, and closes the activity cleanly. The generated
 six-second H.264 and HEVC MP4 inputs are packaged alongside the software A/V
 asset.
+After the direct-surface regression, the application creates an independent
+`QtAV::InteropMediaCodecVulkan` object for each codec. Its private
+GPU-sampled `AImageReader` surface receives MediaCodec output, correlates
+codec and `AImage` timestamps, imports retained external-format
+`AHardwareBuffer` images, and returns Vulkan release sync fds through
+asynchronous image deletion. The strict result requires at least 60 imports
+per codec, one returned release fence per import, no release-fence fallback,
+a pending-image high-water mark within five, valid native/Vulkan format
+diagnostics, and zero decoded-source CPU-map, software-transfer, staging-copy,
+and renderer-upload counters. Codec-aligned native buffers may be larger than
+the visible frame; the Vulkan shader applies the `AImage` crop rectangle.
 The same run creates an offscreen OpenGL ES 3 context and verifies actual
 uploads/readback for YUV420/422/444, NV12/NV21, little-endian P010,
 RGB/BGR/RGBA/BGRA/ARGB, and Gray8 together with viewport, rotation, and target
@@ -105,9 +121,10 @@ to the platform-neutral fatal/recovery/no-renderer tests.
 
 `install-consumer/` is a standalone Android CMake consumer for validating an
 installed package. It includes the mobile selector, Android EGL, AAudio, and
-MediaCodec headers and links `QtAV::RenderMobile`,
+MediaCodec/Vulkan interop headers and links `QtAV::RenderMobile`,
 `QtAV::RenderOpenGLAndroid`, `QtAV::AudioAAudio`, and
-`QtAV::HWMediaCodec`; this also proves that the exported targets bring in
-`QtAV::RenderOpenGL` plus logical Android
-`nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk` dependencies
-without embedding the producer machine's NDK sysroot path.
+`QtAV::HWMediaCodec` plus `QtAV::InteropMediaCodecVulkan`; this also proves
+that the exported targets bring in `QtAV::RenderOpenGL`,
+`QtAV::RenderVulkan`, and logical Android
+`nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk`/`vulkan`
+dependencies without embedding the producer machine's NDK sysroot path.

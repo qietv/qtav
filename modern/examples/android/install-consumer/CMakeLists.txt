@@ -14,4 +14,5 @@ target_link_libraries(
         QtAV::RenderOpenGLAndroid
         QtAV::AudioAAudio
         QtAV::HWMediaCodec
+        QtAV::InteropMediaCodecVulkan
 )

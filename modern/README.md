@@ -51,6 +51,9 @@ code is used.
   application-supplied, versioned `ANativeWindow`, with explicit present,
   monotonic-time present, drop, stale-generation rejection, and software
   fallback policy;
+- optional Android MediaCodec-to-Vulkan zero-CPU-copy texture interop through
+  a private GPU-sampled `AImageReader`, retained `AHardwareBuffer` external
+  memory, native YCbCr sampling, and acquire/release fence bridging;
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
   VideoToolbox-frame rendering through Metal;
 - optional platform-neutral Vulkan software-frame renderer using borrowed
@@ -72,7 +75,8 @@ code is used.
 - a reproducible macOS-to-Android arm64 build and connected-device
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
   decoding, Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback,
-  AAudio output, and MediaCodec H.264/HEVC direct-surface validation;
+  AAudio output, MediaCodec H.264/HEVC direct-surface validation, and
+  H.264/HEVC private-AImageReader Vulkan texture import;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -116,6 +120,12 @@ Current backend integration boundary:
   `QtAV::HWMediaCodec` explicitly selects FFmpeg's MediaCodec wrapper decoder,
   binds it to a versioned application `ANativeWindow`, and turns each decoded
   output into a single-decision direct-surface present/drop token;
+- `QtAV::InteropMediaCodecVulkan` owns a private GPU-sampled `AImageReader`,
+  supplies its surface to `QtAV::HWMediaCodec`, correlates codec and image
+  timestamps, imports retained `AHardwareBuffer` images and fences into the
+  application-owned Vulkan device, and returns a release sync fd after GPU
+  submission without a decoded-pixel map, software transfer, staging copy, or
+  renderer upload;
 - `QtAV::RenderCPU` converts and scales decoded software frames into packed
   RGB/BGR/RGBA/BGRA/ARGB or Gray8 buffers;
 - `QtAV::RenderD3D11` uploads software YUV420/422/444, NV12/NV21, P010,
@@ -168,8 +178,8 @@ Current backend integration boundary:
   supply Vulkan and OpenGL ES renderer factories for the current native-window
   generation; the selector keeps one stable `VideoRenderAPI` attached to
   `Player` across same-API recreation and one-way fallback;
-- no Linux native backend, Android GPU texture interop, or OHOS hardware
-  decoder has been implemented yet.
+- no Linux native backend, Android OpenGL ES hardware texture interop, or OHOS
+  hardware decoder has been implemented yet.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -185,11 +195,11 @@ decoded-frame callbacks remain usable. Decoder, direct-surface, interop, and
 renderer fallback policies remain independent. The accepted design is
 specified in [`MOBILE.md`](MOBILE.md).
 
-The same design plans separate zero-CPU-copy native-buffer interop for Vulkan
-and OpenGL ES after direct-surface hardware presentation is stable. On
-Android, Vulkan consumes a private GPU-sampled `AImageReader` image by
-importing its retained `AHardwareBuffer` and acquire/release fences; OpenGL ES
-primarily consumes MediaCodec `SurfaceTexture` output through
+The Android Vulkan zero-CPU-copy native-buffer path is now implemented
+separately from the remaining OpenGL ES work. It consumes private GPU-sampled
+`AImageReader` images by importing retained `AHardwareBuffer` allocations,
+native YCbCr/external formats, and acquire/release fences. OpenGL ES is still
+planned to consume MediaCodec `SurfaceTexture` output through
 `GL_TEXTURE_EXTERNAL_OES`, with `AHardwareBuffer`/`EGLImage` as a
 capability-gated alternative. On OHOS, the confirmed GLES path uses
 `OH_NativeImage` plus an external-OES texture. OHOS Vulkan additionally needs
@@ -228,8 +238,8 @@ clear error. Current switches are:
   `QTAV_AUDIO_FILE`;
 - hardware decode: `QTAV_HW_D3D11VA`, `QTAV_HW_VIDEOTOOLBOX`,
   `QTAV_HW_VAAPI`, and `QTAV_HW_MEDIACODEC`;
-- interop: `QTAV_INTEROP_D3D11`, `QTAV_INTEROP_CVMETAL`, and
-  `QTAV_INTEROP_VAAPI`.
+- interop: `QTAV_INTEROP_D3D11`, `QTAV_INTEROP_CVMETAL`,
+  `QTAV_INTEROP_MEDIACODEC_VULKAN`, and `QTAV_INTEROP_VAAPI`.
 - output: `QTAV_OUTPUT_D3D11`.
 
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
@@ -257,9 +267,12 @@ targets are available. `QTAV_AUDIO_AAUDIO=AUTO` builds the AAudio sink on
 Android API 26 or newer; the current Android harness targets API 28 and does
 not require OpenSL ES fallback. `QTAV_HW_MEDIACODEC=AUTO` builds the Android
 MediaCodec direct-surface backend when the NDK Media APIs and FFmpeg's
-MediaCodec hardware context are available. Backend implementations not
-otherwise described remain disabled under `AUTO`, and explicitly requesting
-one with `ON` is an error.
+MediaCodec hardware context are available.
+`QTAV_INTEROP_MEDIACODEC_VULKAN=AUTO` builds the private-AImageReader Vulkan
+interop on Android API 26 or newer when the MediaCodec and Vulkan targets are
+both available.
+Backend implementations not otherwise described remain disabled under
+`AUTO`, and explicitly requesting one with `ON` is an error.
 
 Run the headless example:
 
@@ -342,9 +355,14 @@ pause/resume transition. It then explicitly selects FFmpeg's H.264 and HEVC
 MediaCodec wrapper decoders, presents or drops their direct-surface outputs,
 seeks, replaces media, stops explicitly, rejects an output token against the
 old surface generation, and reopens against a replacement `ANativeWindow`
-without mapping decoded pixels. Texture-interoperable MediaCodec output
-remains deferred. The accepted shared Android/OHOS
-responsibility and lifecycle design is documented in [`MOBILE.md`](MOBILE.md).
+without mapping decoded pixels. A final texture-interoperable MediaCodec phase
+runs through the private `AImageReader` target for both H.264 and HEVC:
+the device imports external-format `AHardwareBuffer` images, samples them
+through Vulkan YCbCr conversion, returns release sync fds, and requires all
+decoded-source CPU-map, software-transfer, staging-copy, and renderer-upload
+counters to stay zero. OpenGL ES texture interop remains deferred. The
+accepted shared Android/OHOS responsibility and lifecycle design is documented
+in [`MOBILE.md`](MOBILE.md).
 
 ## API shape
 
@@ -532,6 +550,69 @@ window identity are copied into each output; `mediaCodecFrame()` rejects a
 stale or foreign token. The direct-surface path does not expose a
 shader-readable texture and does not imply Vulkan/OpenGL ES interop.
 
+### MediaCodec Vulkan zero-CPU-copy texture interop
+
+Link `QtAV::HWMediaCodec`, `QtAV::RenderVulkanAndroid`, and
+`QtAV::InteropMediaCodecVulkan`. Before creating the application-owned
+logical device, enable
+`VK_ANDROID_external_memory_android_hardware_buffer`,
+`VK_KHR_external_semaphore_fd`, `VK_EXT_queue_family_foreign`, and the
+sampler-YCbCr-conversion feature. Construct the interop for the decoded size,
+give its private surface to MediaCodec, and attach the same interop object to
+the Vulkan renderer:
+
+```cpp
+#include <qtav/android_vulkan_video_renderer.h>
+#include <qtav/mediacodec_vulkan_interop.h>
+
+qtav::MediaCodecVulkanInteropConfig interopConfig;
+interopConfig.width = videoWidth;
+interopConfig.height = videoHeight;
+interopConfig.maximumImages = 5;
+interopConfig.androidHardwareBufferExternalMemoryEnabled = true;
+interopConfig.externalSemaphoreFdEnabled = true;
+interopConfig.samplerYcbcrConversionEnabled = true;
+interopConfig.foreignQueueFamilyEnabled = true;
+
+auto interop = std::make_shared<qtav::MediaCodecVulkanInterop>(
+    borrowedVulkanDevice,
+    interopConfig);
+auto renderer = std::make_shared<qtav::AndroidVulkanVideoRenderer>(
+    borrowedAndroidVulkanContext,
+    qtav::VulkanOutputPreference::PreferHdr);
+renderer->setHardwareFrameInterop(interop);
+renderer->setWindow(nativeWindow);
+
+player
+    .setVideoRenderAPI(renderer)
+    .setHardwareDecodeConfig(
+        qtav::mediaCodecHardwareDecodeConfig(interop->surface()))
+    .setState(qtav::State::Playing);
+```
+
+The interop creates an `AIMAGE_FORMAT_PRIVATE` reader with
+`AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE`. Releasing a MediaCodec token to that
+surface produces an asynchronous `AImage`; codec and image timestamps are
+matched before its retained `AHardwareBuffer` is imported. Vulkan uses the
+driver-reported format or external format and suggested YCbCr conversion. The
+renderer also applies the `AImage` crop rectangle, so codec-aligned native
+allocations may be larger than the visible decoded frame.
+
+When an acquire sync fd is present it is imported into a temporary Vulkan
+semaphore. Submission waits on that semaphore and transfers ownership from
+the foreign queue family; completion signals an exportable semaphore whose
+sync fd is returned with `AImage_deleteAsync()`. The imported object retains
+the image, hardware buffer, Vulkan resources, and decoder output through the
+submission fence. Call `flush()` before seek, decoder/media replacement, or
+explicit stop to retire queued images and timestamp associations that have
+not entered a submission.
+
+`statistics()` exposes queue depth, import/fence counts, last native/Vulkan
+format, and decoded-source map/transfer/staging/upload counters. Unsupported
+or protected images fail explicitly. The implementation never calls
+`AHardwareBuffer_lock*()` and has no implicit software-frame fallback; decoder
+fallback and renderer/API fallback remain application policies.
+
 ### VideoToolbox hardware decode
 
 Link `QtAV::HWVideoToolbox` and select it before opening media:
@@ -680,6 +761,15 @@ BT.2020-linear output. PQ/HLG sources preserve BT.2020 and native HDR
 luminance on HDR targets; SDR targets retain the documented BT.709/sRGB tone
 mapping. Linear HDR targets use `1.0` as the renderer's 100-nit reference
 white and preserve brighter values above `1.0`.
+
+The renderer can also accept an optional `VulkanHardwareFrameInterop`.
+`prepareFrame()` starts or polls asynchronous producer release before a
+render target is acquired, while `importFrame()` returns a retained sampled
+image/view, immutable YCbCr sampler, acquire/release semaphores, native image
+layouts, foreign queue-family identity, and normalized source crop. The
+renderer retains that `VulkanTextureFrame` until its submission fence
+completes. Platform interop remains a separate target; `QtAV::RenderVulkan`
+does not depend on MediaCodec or Android.
 
 On Android, `QtAV::RenderVulkanAndroid` implements that target protocol and
 the `VideoRenderAPI` facade together. The application creates a Vulkan
@@ -1350,6 +1440,12 @@ The same connected harness verifies MediaCodec H.264/HEVC direct-surface
 outputs with explicit present/drop, seek/flush, media replacement, stop,
 surface-generation replacement, stale-token rejection, decoder/output
 lifetime, and NativeActivity shutdown.
+It then decodes H.264 and HEVC into separate private GPU-sampled
+`AImageReader` surfaces, imports external-format `AHardwareBuffer` images into
+Vulkan, samples aligned native allocations using their visible crop, and
+returns one release sync fd per import. The device result requires bounded
+pending images and zero decoded-source CPU map, software transfer, staging
+copy, and renderer upload counters.
 Windows D3D11 tests use the WARP device for deterministic offscreen rendering
 and cover RGB, YUV420P, NV12, and synthetic P010 PQ/HLG input; SDR tone
 mapping; FP16 scRGB and RGB10/PQ numeric output; viewport, aspect ratio,
@@ -1397,6 +1493,7 @@ Player facade
        ├─ AAudio device sink with callback-safe SPSC buffering
        ├─ D3D11VA decoder producing retained texture-array slices
        ├─ MediaCodec decoder producing direct-surface present/drop tokens
+       ├─ MediaCodec/AImageReader Vulkan hardware-buffer interop
        ├─ Metal software/hardware-frame renderer with borrowed native resources
        ├─ VideoToolbox decoder producing retained CVPixelBuffer frames
        ├─ CVMetalTextureCache zero-copy frame interop

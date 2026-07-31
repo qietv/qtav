@@ -73,6 +73,10 @@ already own a graphics context or require multiple/custom render targets:
 - optional Android H.264/HEVC MediaCodec hardware decode through
   `QtAV::HWMediaCodec`, using an application-supplied versioned
   `ANativeWindow` and move-only direct-surface present/drop tokens;
+- optional Android MediaCodec/Vulkan texture interop through
+  `QtAV::InteropMediaCodecVulkan`, using a private GPU-sampled `AImageReader`,
+  retained `AHardwareBuffer` external-format import, and acquire/release
+  synchronization without mapping or re-uploading decoded pixels;
 - optional `QtAV::InteropCVMetal` import of limited/full-range VideoToolbox
   NV12/P010 pixel-buffer planes into Metal textures without a CPU map or copy;
 - optional platform-neutral `QtAV::RenderVulkan` software-frame rendering and
@@ -100,7 +104,8 @@ already own a graphics context or require multiple/custom render targets:
 - a macOS-hosted Android arm64 cross-build and NativeActivity
   connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode,
   Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback, AAudio
-  output, and MediaCodec H.264/HEVC direct-surface decode without Qt.
+  output, MediaCodec H.264/HEVC direct-surface decode, and private-AImageReader
+  Vulkan texture import without Qt.
 
 The `VideoRenderAPI` and `AudioSink` contracts are connected to `Player`.
 The default decode path remains software-only. Applications can pass the
@@ -122,6 +127,16 @@ are rejected when the application validates the output against its current
 token. Retained MediaCodec frames keep their FFmpeg decoder context alive so
 queue invalidation, seek, stop, media replacement, and surface recreation
 cannot free the codec before its output buffers are released.
+Applications that link `QtAV::InteropMediaCodecVulkan` can instead construct
+a `MediaCodecVulkanInterop` against their Vulkan device, pass its private
+surface to `mediaCodecHardwareDecodeConfig()`, and bind the same interop to
+`AndroidVulkanVideoRenderer`. The interop correlates MediaCodec outputs with
+asynchronously acquired private `AImage` timestamps, imports retained
+`AHardwareBuffer` memory with driver-provided YCbCr/external-format sampling,
+and returns a Vulkan release sync fd through asynchronous image deletion.
+Visible crop coordinates are preserved when native codec allocations have
+padded dimensions. Pending images are bounded and the path has no implicit
+CPU mapping, software transfer, staging, or renderer-upload fallback.
 `HardwareDecodeConfig` can also carry a copied `HardwareDecodeDevice` token
 created by an in-tree backend. The token exposes only a generic device type
 and opaque native identity in the installed core API while privately retaining
@@ -268,8 +283,8 @@ or pace playback. Decoded planar audio therefore normally uses
 
 - remaining platform audio device implementations (ALSA/PulseAudio, OHAudio);
 - the OHOS EGL adapter and Vulkan OHOS/Linux validation;
-- remaining hardware decoders (VAAPI and OHCodec) plus Linux/Android GPU
-  zero-CPU-copy interop;
+- remaining hardware decoders (VAAPI and OHCodec) plus Linux, Android
+  OpenGL ES, and OHOS GPU zero-CPU-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;
@@ -290,18 +305,20 @@ independent.
 Android MediaCodec direct-surface H.264/HEVC output is now stable, including
 explicit present/drop, seek/flush, media replacement, stop, stale-surface
 rejection, background/foreground surface recreation, and shutdown on the
-recorded device. Separate Vulkan and OpenGL ES native-buffer adapters remain
-planned for both mobile platforms. Their
+recorded device. The separate Android Vulkan native-buffer adapter is now
+implemented and device-validated; Android OpenGL ES and both OHOS
+native-buffer adapters remain planned. Their
 zero-CPU-copy contract forbids decoded-pixel mapping, software transfer, CPU
 staging, and re-upload; it requires retained native-buffer lifetime, explicit
 producer/release synchronization, and capability-gated format support. A
 Vulkan-to-OpenGL ES switch attempts compatible GLES native import for
 subsequent frames, then follows the caller's explicit direct-surface,
 software-decode, or no-video policy instead of silently copying a hardware
-frame. Android's confirmed designs use private GPU-sampled
-`AImageReader`/`AHardwareBuffer` import for Vulkan and `SurfaceTexture` with
-`GL_TEXTURE_EXTERNAL_OES` for GLES. OHOS GLES uses `OH_NativeImage` with an
-external-OES texture. OHOS Vulkan remains conditional on adding a retained
+frame. Android Vulkan now uses private GPU-sampled
+`AImageReader`/`AHardwareBuffer` import; the remaining GLES design uses
+`SurfaceTexture` with `GL_TEXTURE_EXTERNAL_OES`. OHOS GLES uses
+`OH_NativeImage` with an external-OES texture. OHOS Vulkan remains conditional
+on adding a retained
 `OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer
 branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
 zero-CPU-copy source as-is.
@@ -327,9 +344,13 @@ publishes the playback-master clock and latency, and survives the harness
 pause/resume plus background/foreground lifecycle. MediaCodec direct-surface
 presentation now passes H.264 and HEVC connected-device coverage with explicit
 present/drop decisions, seek, media replacement, stop, surface-generation
-replacement, stale-token rejection, and clean shutdown. Vulkan/OpenGL ES
-texture interop and Vulkan validation on OHOS and Linux remain separate
-backend work under the responsibility and lifecycle boundaries in
+replacement, stale-token rejection, and clean shutdown. Android
+MediaCodec/Vulkan interop now passes H.264 and HEVC private-AImageReader
+import with native YCbCr/external-format sampling, one returned release fence
+per import, bounded pending images, and zero decoded-source
+map/transfer/staging/upload counters. Android OpenGL ES, OHOS, and Linux
+texture interop remain separate backend work under the responsibility and
+lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and

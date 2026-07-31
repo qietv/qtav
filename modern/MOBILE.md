@@ -275,17 +275,19 @@ both present and drop, seek/flush, media replacement, explicit stop,
 background/foreground surface loss and reopen, stale-generation rejection,
 and clean shutdown. No decoded pixel is mapped in this direct path. This
 completes the prerequisite for later `SurfaceTexture` and
-`AImageReader`/`AHardwareBuffer` work, but it does not claim a
-shader-readable or texture-interoperable frame. Decoder fallback and
-renderer/interop fallback remain independent.
+OpenGL ES work. The separate Vulkan interop checkpoint described below now
+provides shader-readable `AImageReader`/`AHardwareBuffer` frames; the
+direct-surface path itself still makes no texture-interoperability claim.
+Decoder fallback and renderer/interop fallback remain independent.
 
 ## Zero-CPU-copy texture interop
 
 Direct-surface presentation is the first hardware-output milestone because it
 can avoid CPU access without requiring a shader-readable decoder frame. It
 does not prove that a decoded image can participate in QtAVCore color,
-geometry, composition, or post-processing passes. Texture interop is a later,
-separate milestone for both Vulkan and OpenGL ES.
+geometry, composition, or post-processing passes. Texture interop is a
+separate milestone for each graphics API; the Vulkan milestone is implemented
+below, while OpenGL ES remains next.
 
 For this project, a mobile path is described as **zero-CPU-copy** only when no
 decoded pixel is mapped to CPU memory, transferred to a software
@@ -318,16 +320,32 @@ The shared interop contract requires:
   diagnostics, is disabled by default, emits an observable fallback event,
   and remains independent of hardware-decoder and graphics-API fallback.
 
-The confirmed Android Vulkan design uses an application-owned `AImageReader`
-created for private, GPU-sampled images. Its `ANativeWindow` is supplied to
-MediaCodec, and a decoded presentation token is released into that producer.
-The consumer acquires an `AImage` and acquire fence asynchronously, obtains
-the retained `AHardwareBuffer`, imports supported memory with
-`VK_ANDROID_external_memory_android_hardware_buffer`, and uses native
-YCbCr/external-format sampling where required. After the last GPU consumer,
-the release fence is returned through asynchronous image deletion. The
-adapter correlates the codec presentation timestamp with the acquired image
-timestamp and never calls `AHardwareBuffer_lock*()`.
+The Android Vulkan design is implemented by the independent
+`QtAV::InteropMediaCodecVulkan` target. Its application-owned interop object
+creates an `AImageReader` for private, GPU-sampled images and supplies the
+reader's versioned `ANativeWindow` to MediaCodec. A decoded presentation token
+is released into that producer; the consumer acquires an `AImage` and
+optional acquire fence asynchronously, obtains the retained `AHardwareBuffer`,
+and imports supported memory through
+`VK_ANDROID_external_memory_android_hardware_buffer`. Driver-reported native
+YCbCr/external-format conversion is attached to an immutable sampler, foreign
+queue-family ownership is transferred around sampling, and codec-aligned
+allocations use the `AImage` crop rectangle rather than assuming the buffer
+and visible dimensions are equal. After submission, an exportable semaphore
+provides the release sync fd returned through asynchronous image deletion.
+The adapter correlates codec and acquired-image timestamps, bounds outstanding
+images, and never calls `AHardwareBuffer_lock*()`.
+
+`QtAV::RenderVulkan` exposes the decoder-independent retained sampled-image
+contract used by this target; it keeps the imported image, hardware buffer,
+view, conversion sampler, and synchronization resources alive until the
+submission fence completes. `QtAV::RenderVulkanAndroid` polls image readiness
+before acquiring a swapchain image, so an asynchronous producer cannot strand
+the presentation ring. The Android 16/Adreno 830 checkpoint renders both
+H.264 and HEVC, returns one release fence for every imported image, keeps the
+pending-image high-water mark within the configured reader bound, and reports
+zero decoded-source map, software-transfer, staging-copy, and renderer-upload
+calls.
 
 The confirmed Android OpenGL ES design uses a MediaCodec `Surface` backed by
 `SurfaceTexture` as its primary path. `updateTexImage()` exposes the current
@@ -415,6 +433,10 @@ Shared generated media and lifecycle scenarios cover:
   seek/flush, media replacement, stop, background/foreground surface
   recreation, stale-generation rejection, bounded retained outputs, and clean
   shutdown;
+- MediaCodec H.264/HEVC private-AImageReader Vulkan import with timestamp
+  correlation, native/external-format validation, aligned-allocation crop,
+  bounded images, release-fence return, and zero decoded-source CPU
+  map/transfer/staging/upload counters;
 - capability-gated MediaCodec/OHCodec native-buffer import through Vulkan and
   OpenGL ES with zero CPU map/transfer calls, retained lifetime, fence
   ordering, format/color validation, and explicit unsupported-path results;

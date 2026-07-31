@@ -36,6 +36,12 @@ target_link_libraries(qtav_core
         FFmpeg::avutil
         Threads::Threads
 )
+if(ANDROID)
+    # A statically linked FFmpeg build may contain its MediaCodec/JNI wrapper
+    # objects. Shared QtAVCore must resolve those NDK references itself, and a
+    # static installed target must propagate the logical system libraries.
+    target_link_libraries(qtav_core PRIVATE android mediandk)
+endif()
 
 if(NOT BUILD_SHARED_LIBS)
     target_compile_definitions(qtav_core PUBLIC QTAV_CORE_STATIC)

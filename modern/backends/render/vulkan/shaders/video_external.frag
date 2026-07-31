@@ -2,91 +2,24 @@
 
 layout(location = 0) out vec4 outputColor;
 
-layout(std430, set = 0, binding = 0) readonly buffer FrameBytes {
-    uint words[];
-} frameBytes;
+layout(set = 0, binding = 0) uniform sampler2D sourceImage;
 
 layout(std140, set = 0, binding = 1) uniform Parameters {
-    // width, height, format, output color space
+    // width, height, unused, output color space
     uvec4 source;
-    // byte strides for planes 0..2
     uvec4 strides;
-    // byte offsets for planes 0..2
     uvec4 offsets;
     // surface width, height, transfer, primaries
     uvec4 surface;
     // x, y, width, height
     uvec4 viewport;
-    // rotation, aspect ratio, matrix, range
+    // rotation, aspect ratio, unused, unused
     uvec4 presentation;
     // reference white, maximum source luminance, unused, unused
     vec4 luminance;
     // normalized source crop: left, top, right, bottom
     vec4 normalizedSourceRect;
 } parameters;
-
-uint byteAt(uint index)
-{
-    const uint word = frameBytes.words[index >> 2U];
-    return (word >> ((index & 3U) * 8U)) & 255U;
-}
-
-float byteValue(uint offset, uint stride, uint x, uint y)
-{
-    return float(byteAt(offset + y * stride + x)) / 255.0;
-}
-
-float ushortValue(uint offset, uint stride, uint x, uint y)
-{
-    const uint index = offset + y * stride + x * 2U;
-    const uint value = byteAt(index) | (byteAt(index + 1U) << 8U);
-    return float(value) / 65535.0;
-}
-
-vec3 yuvToRgb(float y, float u, float v, uint matrix, uint range)
-{
-    if (range == 1U) {
-        u -= 0.5;
-        v -= 0.5;
-    } else {
-        y = (y - 16.0 / 255.0) * (255.0 / 219.0);
-        u = (u - 128.0 / 255.0) * (255.0 / 224.0);
-        v = (v - 128.0 / 255.0) * (255.0 / 224.0);
-    }
-
-    float kr = 0.2126;
-    float kb = 0.0722;
-    if (matrix == 1U) {
-        kr = 0.2990;
-        kb = 0.1140;
-    } else if (matrix == 2U) {
-        kr = 0.2627;
-        kb = 0.0593;
-    }
-    const float kg = 1.0 - kr - kb;
-    return vec3(
-        y + 2.0 * (1.0 - kr) * v,
-        y - 2.0 * kb * (1.0 - kb) / kg * u
-            - 2.0 * kr * (1.0 - kr) / kg * v,
-        y + 2.0 * (1.0 - kb) * u);
-}
-
-vec3 p010ToRgb(float y, float u, float v, uint matrix, uint range)
-{
-    const float normalizedCodeScale = 65535.0 / 65472.0;
-    y *= normalizedCodeScale;
-    u *= normalizedCodeScale;
-    v *= normalizedCodeScale;
-    if (range == 1U) {
-        u -= 512.0 / 1023.0;
-        v -= 512.0 / 1023.0;
-    } else {
-        y = (y - 64.0 / 1023.0) * (1023.0 / 876.0);
-        u = (u - 512.0 / 1023.0) * (1023.0 / 896.0);
-        v = (v - 512.0 / 1023.0) * (1023.0 / 896.0);
-    }
-    return yuvToRgb(y, u + 0.5, v + 0.5, matrix, 1U);
-}
 
 vec3 pqToNits(vec3 value)
 {
@@ -191,7 +124,7 @@ vec3 presentColor(vec3 rgb)
     const uint primaries = parameters.surface.w;
     const uint outputMode = parameters.source.w;
     vec3 linear;
-    float sourceWhite = parameters.luminance.x;
+    const float sourceWhite = parameters.luminance.x;
     if (transfer == 1U) {
         linear = pqToNits(max(rgb, vec3(0.0)));
     } else if (transfer == 2U) {
@@ -217,7 +150,6 @@ vec3 presentColor(vec3 rgb)
         return max(linear / sourceWhite, vec3(0.0));
     }
 
-    // SDR targets keep the deterministic HDR-to-SDR shoulder.
     const float maximum = max(parameters.luminance.y, sourceWhite);
     if (maximum > sourceWhite) {
         linear = linear / (vec3(1.0) + linear / maximum);
@@ -290,122 +222,10 @@ void main()
         outputColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
-
-    const uint x = min(
-        uint(coordinate.x * float(parameters.source.x)),
-        parameters.source.x - 1U);
-    const uint y = min(
-        uint(coordinate.y * float(parameters.source.y)),
-        parameters.source.y - 1U);
-
-    vec3 rgb;
-    const uint format = parameters.source.z;
-    if (format <= 5U) {
-        float luma;
-        float chromaU;
-        float chromaV;
-        if (format == 5U) {
-            luma = ushortValue(
-                parameters.offsets.x, parameters.strides.x, x, y);
-            const uint chromaX = x / 2U;
-            const uint chromaY = y / 2U;
-            chromaU = ushortValue(
-                parameters.offsets.y,
-                parameters.strides.y,
-                chromaX * 2U,
-                chromaY);
-            chromaV = ushortValue(
-                parameters.offsets.y,
-                parameters.strides.y,
-                chromaX * 2U + 1U,
-                chromaY);
-            rgb = p010ToRgb(
-                luma,
-                chromaU,
-                chromaV,
-                parameters.presentation.z,
-                parameters.presentation.w);
-        } else {
-            luma = byteValue(
-                parameters.offsets.x, parameters.strides.x, x, y);
-            uint chromaX = x;
-            uint chromaY = y;
-            if (format == 0U) {
-                chromaX /= 2U;
-                chromaY /= 2U;
-            } else if (format == 1U) {
-                chromaX /= 2U;
-            } else if (format == 3U || format == 4U) {
-                chromaX /= 2U;
-                chromaY /= 2U;
-            }
-
-            if (format <= 2U) {
-                chromaU = byteValue(
-                    parameters.offsets.y,
-                    parameters.strides.y,
-                    chromaX,
-                    chromaY);
-                chromaV = byteValue(
-                    parameters.offsets.z,
-                    parameters.strides.z,
-                    chromaX,
-                    chromaY);
-            } else {
-                const uint first = chromaX * 2U;
-                const float a = byteValue(
-                    parameters.offsets.y,
-                    parameters.strides.y,
-                    first,
-                    chromaY);
-                const float b = byteValue(
-                    parameters.offsets.y,
-                    parameters.strides.y,
-                    first + 1U,
-                    chromaY);
-                chromaU = format == 3U ? a : b;
-                chromaV = format == 3U ? b : a;
-            }
-            rgb = yuvToRgb(
-                luma,
-                chromaU,
-                chromaV,
-                parameters.presentation.z,
-                parameters.presentation.w);
-        }
-    } else {
-        const uint index =
-            parameters.offsets.x + y * parameters.strides.x;
-        if (format == 6U) {
-            rgb = vec3(
-                byteAt(index + x * 3U),
-                byteAt(index + x * 3U + 1U),
-                byteAt(index + x * 3U + 2U)) / 255.0;
-        } else if (format == 7U) {
-            rgb = vec3(
-                byteAt(index + x * 3U + 2U),
-                byteAt(index + x * 3U + 1U),
-                byteAt(index + x * 3U)) / 255.0;
-        } else if (format == 8U) {
-            rgb = vec3(
-                byteAt(index + x * 4U),
-                byteAt(index + x * 4U + 1U),
-                byteAt(index + x * 4U + 2U)) / 255.0;
-        } else if (format == 9U) {
-            rgb = vec3(
-                byteAt(index + x * 4U + 2U),
-                byteAt(index + x * 4U + 1U),
-                byteAt(index + x * 4U)) / 255.0;
-        } else if (format == 10U) {
-            rgb = vec3(
-                byteAt(index + x * 4U + 1U),
-                byteAt(index + x * 4U + 2U),
-                byteAt(index + x * 4U + 3U)) / 255.0;
-        } else {
-            const float gray =
-                float(byteAt(index + x)) / 255.0;
-            rgb = vec3(gray);
-        }
-    }
+    coordinate = mix(
+        parameters.normalizedSourceRect.xy,
+        parameters.normalizedSourceRect.zw,
+        coordinate);
+    const vec3 rgb = texture(sourceImage, coordinate).rgb;
     outputColor = vec4(presentColor(rgb), 1.0);
 }

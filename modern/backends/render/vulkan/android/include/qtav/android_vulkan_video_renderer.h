@@ -59,6 +59,10 @@ public:
     VkSurfaceFormatKHR surfaceFormat() const noexcept;
     bool hdrOutputActive() const noexcept;
     BorrowedAndroidVulkanContext context() const noexcept;
+    void setHardwareFrameInterop(
+        std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop);
+    std::shared_ptr<VulkanHardwareFrameInterop>
+    hardwareFrameInterop() const noexcept;
 
 private:
     class Impl;

@@ -273,10 +273,10 @@ fi
     -n "${package_name}/${activity_name}" \
     >/dev/null
 attempt=0
-while [ "${attempt}" -lt 45 ]; do
+while [ "${attempt}" -lt 75 ]; do
     "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
         > "${result_directory}/logcat.txt"
-    if rg -q "QTAV_ANDROID_TEST: PASS.*aaudio=pass.*gles_fallback=pass.*gles_offscreen=pass.*gles_hdr=pass.*native_hdr=pass.*hdr_source=pass.*mediacodec=h264,hevc.*mediacodec_surface_recreations=[1-9]" \
+    if rg -q "QTAV_ANDROID_TEST: PASS.*aaudio=pass.*gles_fallback=pass.*gles_offscreen=pass.*gles_hdr=pass.*native_hdr=pass.*hdr_source=pass.*mediacodec=h264,hevc.*mediacodec_surface_recreations=[1-9].*mediacodec_vulkan=h264,hevc.*ahardwarebuffer_imports=[1-9][0-9]*.*release_fences=[1-9][0-9]*.*cpu_map=0 transfer=0 staging=0 upload=0" \
         "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_SEEK codec=h264" \
            "${result_directory}/logcat.txt" \
@@ -289,6 +289,10 @@ while [ "${attempt}" -lt 45 ]; do
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_STOP codec=hevc" \
            "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_HEVC_PASS" \
+           "${result_directory}/logcat.txt" \
+       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_VULKAN_PASS codec=h264.*cpu_map=0 transfer=0 staging=0 upload=0" \
+           "${result_directory}/logcat.txt" \
+       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_VULKAN_PASS codec=hevc.*cpu_map=0 transfer=0 staging=0 upload=0" \
            "${result_directory}/logcat.txt"; then
         shutdown_attempt=0
         while [ "${shutdown_attempt}" -lt 10 ]; do

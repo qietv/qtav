@@ -712,6 +712,54 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
         if (!impl_->open_) {
             error = "The Android Vulkan renderer is not open";
+        } else if (frame.hasHardwareFrame()) {
+            const VulkanHardwareImportStatus status =
+                impl_->renderer_.prepareHardwareFrame(
+                    frame,
+                    &error);
+            if (status == VulkanHardwareImportStatus::Pending) {
+                error.clear();
+            } else if (status
+                       != VulkanHardwareImportStatus::Ready
+                       && error.empty()) {
+                error =
+                    "The Android Vulkan hardware-frame preparation failed";
+            }
+            if (status != VulkanHardwareImportStatus::Ready) {
+                rendered = false;
+            } else if (!impl_->acquire(error)) {
+                rendered = false;
+            } else {
+                impl_->applyHdrMetadata(frame);
+                if (!impl_->renderer_.render(frame)) {
+                    impl_->renderer_.close();
+                    impl_->engineOpen_ = false;
+                    vkDeviceWaitIdle(
+                        impl_->context_.device.device);
+                    impl_->destroySwapchain();
+                    impl_->destroySemaphores();
+                    std::string recoveryError;
+                    if (impl_->window_
+                        && impl_->createSwapchain(
+                            recoveryError)) {
+                        impl_->config_.surfaceSize = {
+                            static_cast<int>(
+                                impl_->extent_.width),
+                            static_cast<int>(
+                                impl_->extent_.height),
+                        };
+                        impl_->engineOpen_ =
+                            impl_->renderer_.open(
+                                impl_->config_);
+                    }
+                    impl_->acquired_ = false;
+                    impl_->activeTarget_ = {};
+                    error =
+                        "The Vulkan engine could not render the imported Android image";
+                } else {
+                    rendered = impl_->present(error);
+                }
+            }
         } else if (!impl_->acquire(error)) {
             rendered = false;
         } else {
@@ -851,6 +899,27 @@ AndroidVulkanVideoRenderer::context() const noexcept
 {
     return impl_ ? impl_->context_
                  : BorrowedAndroidVulkanContext {};
+}
+
+void AndroidVulkanVideoRenderer::setHardwareFrameInterop(
+    std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    impl_->renderer_.setHardwareFrameInterop(
+        std::move(hardwareInterop));
+}
+
+std::shared_ptr<VulkanHardwareFrameInterop>
+AndroidVulkanVideoRenderer::hardwareFrameInterop() const noexcept
+{
+    if (!impl_) {
+        return {};
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->renderer_.hardwareFrameInterop();
 }
 
 } // namespace qtav

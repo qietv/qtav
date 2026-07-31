@@ -4,6 +4,7 @@
 #include <qtav/android_opengl_video_renderer.h>
 #include <qtav/android_vulkan_video_renderer.h>
 #include <qtav/mediacodec_hardware_decoder.h>
+#include <qtav/mediacodec_vulkan_interop.h>
 #include <qtav/mobile_video_renderer.h>
 #include <qtav/player.h>
 #include <qtav/swresample_audio_converter.h>
@@ -23,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -30,6 +32,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <time.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -191,7 +194,7 @@ struct VulkanContext {
         application.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         application.pEngineName = "QtAVCore";
         application.engineVersion = VK_MAKE_VERSION(2, 0, 0);
-        application.apiVersion = VK_API_VERSION_1_0;
+        application.apiVersion = VK_API_VERSION_1_1;
         VkInstanceCreateInfo instanceInfo {
             VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         };
@@ -317,6 +320,42 @@ struct VulkanContext {
         std::vector<const char*> deviceExtensions {
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         };
+        constexpr std::array<const char*, 3>
+            RequiredInteropExtensions {
+                VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+                VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+                VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+            };
+        for (const char* extension : RequiredInteropExtensions) {
+            if (!hasExtension(
+                    availableDeviceExtensions,
+                    extension)) {
+                error =
+                    "The Android Vulkan device does not support required MediaCodec interop extension "
+                    + std::string(extension);
+                return false;
+            }
+            deviceExtensions.push_back(extension);
+        }
+        androidHardwareBufferExternalMemoryEnabled = true;
+        externalSemaphoreFdEnabled = true;
+        foreignQueueFamilyEnabled = true;
+        VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeatures {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+        };
+        VkPhysicalDeviceFeatures2 deviceFeatures {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        };
+        deviceFeatures.pNext = &ycbcrFeatures;
+        vkGetPhysicalDeviceFeatures2(
+            physicalDevice,
+            &deviceFeatures);
+        if (ycbcrFeatures.samplerYcbcrConversion != VK_TRUE) {
+            error =
+                "The Android Vulkan device does not support sampler YCbCr conversion";
+            return false;
+        }
+        samplerYcbcrConversionEnabled = true;
         if (hasExtension(
                 availableDeviceExtensions,
                 VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
@@ -331,6 +370,7 @@ struct VulkanContext {
         deviceInfo.enabledExtensionCount =
             static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+        deviceInfo.pNext = &ycbcrFeatures;
         result = vkCreateDevice(
             physicalDevice,
             &deviceInfo,
@@ -357,7 +397,11 @@ struct VulkanContext {
             + " swapchain_colorspace="
             + (swapchainColorSpaceEnabled ? "enabled" : "unavailable")
             + " hdr_metadata="
-            + (hdrMetadataEnabled ? "enabled" : "unavailable"));
+            + (hdrMetadataEnabled ? "enabled" : "unavailable")
+            + " ahardwarebuffer=enabled"
+            + " sync_fd=enabled"
+            + " ycbcr=enabled"
+            + " foreign_queue=enabled");
         return queue != VK_NULL_HANDLE;
     }
 
@@ -382,6 +426,10 @@ struct VulkanContext {
     std::uint32_t queueFamilyIndex = 0;
     bool swapchainColorSpaceEnabled = false;
     bool hdrMetadataEnabled = false;
+    bool androidHardwareBufferExternalMemoryEnabled = false;
+    bool externalSemaphoreFdEnabled = false;
+    bool samplerYcbcrConversionEnabled = false;
+    bool foreignQueueFamilyEnabled = false;
 };
 
 enum class TestPhase {
@@ -389,6 +437,9 @@ enum class TestPhase {
     WaitingForMediaCodecSurface,
     MediaCodecH264,
     MediaCodecHevc,
+    WaitingForMediaCodecVulkan,
+    MediaCodecVulkanH264,
+    MediaCodecVulkanHevc,
 };
 
 struct TestState {
@@ -399,9 +450,19 @@ struct TestState {
 
     ~TestState()
     {
+        finished = true;
+        if (mediaCodecVulkanTransition.joinable()) {
+            mediaCodecVulkanTransition.join();
+        }
         player.setState(qtav::State::Stopped);
         player.setHardwareDecodeConfig({});
         player.setVideoRenderAPI({});
+        if (mediaCodecVulkanRenderer) {
+            mediaCodecVulkanRenderer->close();
+        }
+        if (mediaCodecVulkanInterop) {
+            mediaCodecVulkanInterop->flush();
+        }
         if (rendererSelector) {
             rendererSelector->close();
         }
@@ -458,6 +519,24 @@ struct TestState {
             + " mediacodec_surface_recreations="
             + std::to_string(
                 mediaCodecSurfaceRecreations.load())
+            + " mediacodec_vulkan=h264,hevc"
+            + " mediacodec_vulkan_frames="
+            + std::to_string(
+                mediaCodecVulkanH264Frames.load()
+                + mediaCodecVulkanHevcFrames.load())
+            + " mediacodec_vulkan_rendered="
+            + std::to_string(
+                mediaCodecVulkanRendered.load())
+            + " ahardwarebuffer_imports="
+            + std::to_string(
+                mediaCodecVulkanImports.load())
+            + " acquire_fences="
+            + std::to_string(
+                mediaCodecVulkanAcquireFences.load())
+            + " release_fences="
+            + std::to_string(
+                mediaCodecVulkanReleaseFences.load())
+            + " cpu_map=0 transfer=0 staging=0 upload=0"
             + " hdr_metadata="
             + (vulkan && vulkan->hdrMetadataEnabled
                     ? "enabled"
@@ -585,6 +664,21 @@ struct TestState {
         if (currentPhase == TestPhase::MediaCodecHevc
             && !mediaCodecStopRequested.load()) {
             fail("MediaCodec HEVC reached end before explicit stop");
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecVulkanH264) {
+            if (!validateMediaCodecVulkanPhase("h264")) {
+                return;
+            }
+            startMediaCodecVulkanPhase(
+                TestPhase::MediaCodecVulkanHevc);
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecVulkanHevc) {
+            if (!validateMediaCodecVulkanPhase("hevc")) {
+                return;
+            }
+            pass();
         }
     }
 
@@ -629,7 +723,34 @@ struct TestState {
         }
 
         if (currentPhase != TestPhase::MediaCodecH264
-            && currentPhase != TestPhase::MediaCodecHevc) {
+            && currentPhase != TestPhase::MediaCodecHevc
+            && currentPhase != TestPhase::MediaCodecVulkanH264
+            && currentPhase != TestPhase::MediaCodecVulkanHevc) {
+            return;
+        }
+
+        if (currentPhase == TestPhase::MediaCodecVulkanH264
+            || currentPhase == TestPhase::MediaCodecVulkanHevc) {
+            std::atomic<int>& phaseFrames =
+                currentPhase
+                    == TestPhase::MediaCodecVulkanH264
+                ? mediaCodecVulkanH264Frames
+                : mediaCodecVulkanHevcFrames;
+            const int frameNumber =
+                phaseFrames.fetch_add(
+                    1,
+                    std::memory_order_acq_rel)
+                + 1;
+            if (frameNumber == 1) {
+                logInfo(
+                    std::string(
+                        "QTAV_ANDROID_TEST: "
+                        "MEDIACODEC_VULKAN_FIRST_OUTPUT codec=")
+                    + (currentPhase
+                               == TestPhase::MediaCodecVulkanH264
+                           ? "h264"
+                           : "hevc"));
+            }
             return;
         }
 
@@ -825,7 +946,251 @@ struct TestState {
             + std::to_string(mediaCodecPresented.load())
             + " dropped="
             + std::to_string(mediaCodecDropped.load()));
-        pass();
+        player.setHardwareDecodeConfig({});
+        {
+            std::lock_guard<std::mutex> lock(mediaCodecMutex);
+            mediaCodecSurface = {};
+            staleMediaCodecSurface = {};
+        }
+        phase = TestPhase::WaitingForMediaCodecVulkan;
+        mediaCodecVulkanTransition = std::thread([this] {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(500));
+            if (!finished.load()) {
+                startMediaCodecVulkanPhase(
+                    TestPhase::MediaCodecVulkanH264);
+            }
+        });
+    }
+
+    void startMediaCodecVulkanPhase(TestPhase targetPhase)
+    {
+        player
+            .setVideoRenderAPI({})
+            .setRenderCallback({})
+            .setHardwareDecodeConfig({});
+        if (mediaCodecVulkanRenderer) {
+            mediaCodecVulkanRenderer->close();
+            mediaCodecVulkanRenderer.reset();
+        }
+        if (mediaCodecVulkanInterop) {
+            mediaCodecVulkanInterop->flush();
+            mediaCodecVulkanInterop.reset();
+        }
+
+        if (!vulkan || !vulkan->device) {
+            fail(
+                "MediaCodec Vulkan interop has no Vulkan device");
+            return;
+        }
+        qtav::MediaCodecVulkanInteropConfig interopConfig;
+        interopConfig.width = 160;
+        interopConfig.height = 90;
+        interopConfig.maximumImages = 5;
+        interopConfig.androidHardwareBufferExternalMemoryEnabled =
+            vulkan->androidHardwareBufferExternalMemoryEnabled;
+        interopConfig.externalSemaphoreFdEnabled =
+            vulkan->externalSemaphoreFdEnabled;
+        interopConfig.samplerYcbcrConversionEnabled =
+            vulkan->samplerYcbcrConversionEnabled;
+        interopConfig.foreignQueueFamilyEnabled =
+            vulkan->foreignQueueFamilyEnabled;
+        mediaCodecVulkanInterop =
+            std::make_shared<qtav::MediaCodecVulkanInterop>(
+                vulkan->borrowed().device,
+                interopConfig);
+        if (!*mediaCodecVulkanInterop) {
+            fail(
+                "could not create MediaCodec Vulkan interop: "
+                + mediaCodecVulkanInterop->lastError());
+            return;
+        }
+
+        ANativeWindow* window = retainedActiveWindow();
+        if (!window) {
+            fail(
+                "MediaCodec Vulkan interop has no presentation window");
+            return;
+        }
+        mediaCodecVulkanRenderer =
+            std::make_shared<qtav::AndroidVulkanVideoRenderer>(
+                vulkan->borrowed(),
+                qtav::VulkanOutputPreference::SdrOnly);
+        std::string rendererError;
+        mediaCodecVulkanRenderer->setEventCallback(
+            [&rendererError](
+                const qtav::VideoRenderEvent& event) {
+                if (event.type
+                    != qtav::VideoRenderEventType::RedrawRequested) {
+                    rendererError = event.detail;
+                }
+            });
+        mediaCodecVulkanRenderer->setHardwareFrameInterop(
+            mediaCodecVulkanInterop);
+        const bool windowSet =
+            mediaCodecVulkanRenderer->setWindow(window);
+        ANativeWindow_release(window);
+        qtav::VideoRenderConfig renderConfig;
+        renderConfig.surfaceSize =
+            mediaCodecVulkanRenderer->surfaceSize();
+        renderConfig.aspectRatio =
+            qtav::VideoAspectRatioMode::Fit;
+        if (!windowSet
+            || !mediaCodecVulkanRenderer->open(renderConfig)) {
+            fail(
+                "could not open the MediaCodec Vulkan presentation renderer: "
+                + rendererError);
+            return;
+        }
+        mediaCodecVulkanRenderer->setEventCallback({});
+
+        qtav::MediaCodecHardwareDecodeOptions options;
+        options.allowSoftwareFallback = false;
+        options.extraHardwareFrames = 6;
+        const qtav::MediaCodecSurface surface =
+            mediaCodecVulkanInterop->surface();
+        const qtav::HardwareDecodeConfig decodeConfig =
+            qtav::mediaCodecHardwareDecodeConfig(
+                surface,
+                options);
+        if (!surface || !decodeConfig.device
+            || decodeConfig.surfaceGeneration
+                != surface.generation()) {
+            fail(
+                "could not bind MediaCodec to the private Vulkan AImageReader");
+            return;
+        }
+
+        phase = targetPhase;
+        const bool h264 =
+            targetPhase == TestPhase::MediaCodecVulkanH264;
+        const std::string& path =
+            h264 ? mediaCodecH264Path : mediaCodecHevcPath;
+        player
+            .setVideoRenderAPI(mediaCodecVulkanRenderer)
+            .setRenderCallback([this](void*) {
+                if (player.renderVideo() >= 0.0) {
+                    ++mediaCodecVulkanRendered;
+                }
+            });
+        player.setMedia(path);
+        player.setHardwareDecodeConfig(decodeConfig);
+        logInfo(
+            std::string(
+                "QTAV_ANDROID_TEST: "
+                "MEDIACODEC_VULKAN_PHASE_READY codec=")
+            + (h264 ? "h264" : "hevc")
+            + " generation="
+            + std::to_string(surface.generation())
+            + " max_images=5 zero_cpu_copy=required");
+        player.setState(qtav::State::Playing);
+    }
+
+    bool validateMediaCodecVulkanPhase(const char* codec)
+    {
+        player.setVideoRenderAPI({}).setRenderCallback({});
+        if (mediaCodecVulkanRenderer) {
+            mediaCodecVulkanRenderer->close();
+        }
+        if (!mediaCodecVulkanInterop) {
+            fail(
+                "MediaCodec Vulkan interop disappeared before validation");
+            return false;
+        }
+        const qtav::MediaCodecVulkanInteropStatistics statistics =
+            mediaCodecVulkanInterop->statistics();
+        const int decoded =
+            std::strcmp(codec, "h264") == 0
+            ? mediaCodecVulkanH264Frames.load()
+            : mediaCodecVulkanHevcFrames.load();
+        if (decoded < 60
+            || statistics.imagesImported < 60
+            || statistics.releaseFencesReturned
+                != statistics.imagesImported
+            || statistics.releaseFenceFallbacks != 0
+            || statistics.maximumPendingImages > 5
+            || statistics.cpuMapCalls != 0
+            || statistics.softwareTransferCalls != 0
+            || statistics.stagingCopies != 0
+            || statistics.rendererUploads != 0
+            || statistics.lastHardwareBufferFormat == 0
+            || (statistics.lastVulkanFormat
+                    == VK_FORMAT_UNDEFINED
+                && statistics.lastExternalFormat == 0)) {
+            fail(
+                std::string(
+                    "MediaCodec Vulkan zero-CPU-copy validation failed for ")
+                + codec
+                + " decoded=" + std::to_string(decoded)
+                + " rendered="
+                + std::to_string(
+                    mediaCodecVulkanRendered.load())
+                + " queued="
+                + std::to_string(
+                    statistics.codecOutputsQueued)
+                + " acquired="
+                + std::to_string(
+                    statistics.imagesAcquired)
+                + " imported="
+                + std::to_string(statistics.imagesImported)
+                + " release_fences="
+                + std::to_string(
+                    statistics.releaseFencesReturned)
+                + " release_fallbacks="
+                + std::to_string(
+                    statistics.releaseFenceFallbacks)
+                + " stale="
+                + std::to_string(
+                    statistics.staleImagesDropped)
+                + " max_pending="
+                + std::to_string(
+                    statistics.maximumPendingImages)
+                + " interop_error="
+                + mediaCodecVulkanInterop->lastError());
+            return false;
+        }
+        mediaCodecVulkanImports.fetch_add(
+            static_cast<int>(statistics.imagesImported));
+        mediaCodecVulkanAcquireFences.fetch_add(
+            static_cast<int>(
+                statistics.acquireFencesImported));
+        mediaCodecVulkanReleaseFences.fetch_add(
+            static_cast<int>(
+                statistics.releaseFencesReturned));
+        logInfo(
+            std::string(
+                "QTAV_ANDROID_TEST: "
+                "MEDIACODEC_VULKAN_PASS codec=")
+            + codec
+            + " decoded=" + std::to_string(decoded)
+            + " queued="
+            + std::to_string(
+                statistics.codecOutputsQueued)
+            + " acquired="
+            + std::to_string(statistics.imagesAcquired)
+            + " imported="
+            + std::to_string(statistics.imagesImported)
+            + " acquire_fences="
+            + std::to_string(
+                statistics.acquireFencesImported)
+            + " release_fences="
+            + std::to_string(
+                statistics.releaseFencesReturned)
+            + " ahb_format="
+            + std::to_string(
+                statistics.lastHardwareBufferFormat)
+            + " vk_format="
+            + std::to_string(
+                static_cast<int>(
+                    statistics.lastVulkanFormat))
+            + " external_format="
+            + std::to_string(
+                statistics.lastExternalFormat)
+            + " max_pending="
+            + std::to_string(
+                statistics.maximumPendingImages)
+            + " cpu_map=0 transfer=0 staging=0 upload=0");
+        return true;
     }
 
     void observeAAudio()
@@ -916,6 +1281,23 @@ struct TestState {
             if (currentPhase == TestPhase::MediaCodecH264
                 || currentPhase == TestPhase::MediaCodecHevc) {
                 recreateMediaCodecSurface(window);
+                return;
+            }
+            if (currentPhase
+                    == TestPhase::MediaCodecVulkanH264
+                || currentPhase
+                    == TestPhase::MediaCodecVulkanHevc) {
+                if (!mediaCodecVulkanRenderer
+                    || !mediaCodecVulkanRenderer->setWindow(
+                        window)) {
+                    fail(
+                        "could not recreate the MediaCodec Vulkan presentation surface");
+                    return;
+                }
+                player.setState(qtav::State::Playing);
+                logInfo(
+                    "QTAV_ANDROID_TEST: "
+                    "MEDIACODEC_VULKAN_SURFACE_RECREATED");
                 return;
             }
             if (!rendererSelector
@@ -1043,6 +1425,13 @@ struct TestState {
             if (rendererSelector) {
                 rendererSelector->suspendSurface();
             }
+        } else if (
+            currentPhase == TestPhase::MediaCodecVulkanH264
+            || currentPhase
+                == TestPhase::MediaCodecVulkanHevc) {
+            if (mediaCodecVulkanRenderer) {
+                mediaCodecVulkanRenderer->setWindow(nullptr);
+            }
         } else if (currentPhase
                    == TestPhase::WaitingForMediaCodecSurface) {
             if (openGlHdrSelector) {
@@ -1068,6 +1457,13 @@ struct TestState {
         }
         if (currentPhase == TestPhase::Software) {
             logInfo("QTAV_ANDROID_TEST: SURFACE_REMOVED");
+        } else if (
+            currentPhase == TestPhase::MediaCodecVulkanH264
+            || currentPhase
+                == TestPhase::MediaCodecVulkanHevc) {
+            logInfo(
+                "QTAV_ANDROID_TEST: "
+                "MEDIACODEC_VULKAN_SURFACE_REMOVED");
         } else if (currentPhase
                    == TestPhase::WaitingForMediaCodecSurface) {
             logInfo(
@@ -1386,6 +1782,17 @@ struct TestState {
     std::atomic<bool> mediaCodecSeekRequested { false };
     std::atomic<bool> mediaCodecStopRequested { false };
     std::atomic<bool> mediaCodecStaleSurfaceValidated { false };
+    std::shared_ptr<qtav::MediaCodecVulkanInterop>
+        mediaCodecVulkanInterop;
+    std::shared_ptr<qtav::AndroidVulkanVideoRenderer>
+        mediaCodecVulkanRenderer;
+    std::atomic<int> mediaCodecVulkanH264Frames { 0 };
+    std::atomic<int> mediaCodecVulkanHevcFrames { 0 };
+    std::atomic<int> mediaCodecVulkanRendered { 0 };
+    std::atomic<int> mediaCodecVulkanImports { 0 };
+    std::atomic<int> mediaCodecVulkanAcquireFences { 0 };
+    std::atomic<int> mediaCodecVulkanReleaseFences { 0 };
+    std::thread mediaCodecVulkanTransition;
     std::atomic<int> videoFrames { 0 };
     std::atomic<int> renderedFrames { 0 };
     std::atomic<int> audioFrames { 0 };
