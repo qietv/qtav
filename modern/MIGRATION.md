@@ -305,8 +305,8 @@ independent.
 Android MediaCodec direct-surface H.264/HEVC output is now stable, including
 explicit present/drop, seek/flush, media replacement, stop, stale-surface
 rejection, background/foreground surface recreation, and shutdown on the
-recorded device. The separate Android Vulkan native-buffer adapter is now
-implemented and device-validated; Android OpenGL ES and both OHOS
+recorded device. The separate Android Vulkan native-buffer and SurfaceTexture
+external-OES adapters are now implemented and device-validated; both OHOS
 native-buffer adapters remain planned. Their
 zero-CPU-copy contract forbids decoded-pixel mapping, software transfer, CPU
 staging, and re-upload; it requires retained native-buffer lifetime, explicit
@@ -315,8 +315,12 @@ Vulkan-to-OpenGL ES switch attempts compatible GLES native import for
 subsequent frames, then follows the caller's explicit direct-surface,
 software-decode, or no-video policy instead of silently copying a hardware
 frame. Android Vulkan now uses private GPU-sampled
-`AImageReader`/`AHardwareBuffer` import; the remaining GLES design uses
-`SurfaceTexture` with `GL_TEXTURE_EXTERNAL_OES`. OHOS GLES uses
+`AImageReader`/`AHardwareBuffer` import; Android GLES now uses a detached
+`SurfaceTexture` with timestamp/generation correlation and
+`GL_TEXTURE_EXTERNAL_OES`. Its SDR 8-bit path is enabled, while P010/HDR
+sampling remains capability-gated behind explicit application confirmation.
+The explicit Vulkan-to-GLES interop fallback policy is the next Android
+subtask. OHOS GLES uses
 `OH_NativeImage` with an external-OES texture. OHOS Vulkan remains conditional
 on adding a retained
 `OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer

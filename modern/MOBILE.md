@@ -274,9 +274,10 @@ The Android 16 device checkpoint passes H.264 and HEVC with bounded output,
 both present and drop, seek/flush, media replacement, explicit stop,
 background/foreground surface loss and reopen, stale-generation rejection,
 and clean shutdown. No decoded pixel is mapped in this direct path. This
-completes the prerequisite for later `SurfaceTexture` and
-OpenGL ES work. The separate Vulkan interop checkpoint described below now
-provides shader-readable `AImageReader`/`AHardwareBuffer` frames; the
+completes the prerequisite for the implemented `SurfaceTexture`/OpenGL ES and
+private-`AImageReader`/Vulkan paths described below. The separate Vulkan
+interop checkpoint provides shader-readable `AImageReader`/`AHardwareBuffer`
+frames; the
 direct-surface path itself still makes no texture-interoperability claim.
 Decoder fallback and renderer/interop fallback remain independent.
 
@@ -286,8 +287,8 @@ Direct-surface presentation is the first hardware-output milestone because it
 can avoid CPU access without requiring a shader-readable decoder frame. It
 does not prove that a decoded image can participate in QtAVCore color,
 geometry, composition, or post-processing passes. Texture interop is a
-separate milestone for each graphics API; the Vulkan milestone is implemented
-below, while OpenGL ES remains next.
+separate milestone for each graphics API; the Android Vulkan and OpenGL ES
+milestones are implemented below.
 
 For this project, a mobile path is described as **zero-CPU-copy** only when no
 decoded pixel is mapped to CPU memory, transferred to a software
@@ -347,12 +348,17 @@ pending-image high-water mark within the configured reader bound, and reports
 zero decoded-source map, software-transfer, staging-copy, and renderer-upload
 calls.
 
-The confirmed Android OpenGL ES design uses a MediaCodec `Surface` backed by
-`SurfaceTexture` as its primary path. `updateTexImage()` exposes the current
-decoded image through `GL_TEXTURE_EXTERNAL_OES`; timestamp/generation
-correlation and the single-current-image lifetime are explicit parts of the
-adapter. A private `AImageReader` plus `AHardwareBuffer`/`EGLImage` import is
-an optional alternative when all required EGL, GL, format, and fence
+The implemented Android OpenGL ES path uses a MediaCodec `Surface` backed by
+a detached `SurfaceTexture`. `updateTexImage()` exposes the current decoded
+image through `GL_TEXTURE_EXTERNAL_OES`; the adapter correlates timestamps and
+surface generations, retains the single current image until the renderer has
+submitted and flushed its draw, and releases each codec output exactly once.
+A native retry worker only schedules redraws and never touches GL.
+H.264/HEVC connected-device coverage includes bounded pending images,
+seek/flush, same-context EGL window suspension/recreation, clean texture
+attach/detach, and zero decoded-source CPU map, transfer, staging, or upload.
+A private `AImageReader` plus `AHardwareBuffer`/`EGLImage` import remains an
+optional future alternative when all required EGL, GL, format, and fence
 capabilities are present. Neither route reads decoded pixels through CPU
 memory. P010, HDR, and formats that cannot be sampled with the required color
 control remain capability-gated rather than silently converted on the CPU.

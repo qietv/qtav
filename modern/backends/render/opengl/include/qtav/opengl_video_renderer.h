@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 #include <qtav/opengl_export.h>
 #include <qtav/video_render_api.h>
@@ -53,11 +55,75 @@ QTAV_RENDER_OPENGL_EXPORT bool openGLColorSpaceIsHdr(
 using OpenGLCurrentTargetCallback =
     std::function<OpenGLRenderTarget()>;
 
+enum class OpenGLHardwareImportStatus {
+    Ready,
+    Pending,
+    Unsupported,
+    Stale,
+    Error,
+};
+
+// A current-context view of a native image sampled through
+// GL_TEXTURE_EXTERNAL_OES. The producer retains the single current image
+// until its next update; renderers must submit and flush the draw before
+// asking the interop to advance it.
+struct QTAV_RENDER_OPENGL_EXPORT OpenGLExternalTextureFrame {
+    std::uint32_t texture = 0;
+    std::array<float, 16> transform {
+        1.0F, 0.0F, 0.0F, 0.0F,
+        0.0F, 1.0F, 0.0F, 0.0F,
+        0.0F, 0.0F, 1.0F, 0.0F,
+        0.0F, 0.0F, 0.0F, 1.0F,
+    };
+    std::int64_t timestampNanoseconds = 0;
+    std::uint32_t generation = 0;
+
+    explicit operator bool() const noexcept
+    {
+        return texture != 0 && timestampNanoseconds > 0
+            && generation != 0;
+    }
+};
+
+struct QTAV_RENDER_OPENGL_EXPORT OpenGLHardwareImportResult {
+    OpenGLHardwareImportStatus status =
+        OpenGLHardwareImportStatus::Unsupported;
+    OpenGLExternalTextureFrame texture;
+    std::string detail;
+
+    explicit operator bool() const noexcept
+    {
+        return status == OpenGLHardwareImportStatus::Ready
+            && static_cast<bool>(texture);
+    }
+};
+
+// Implemented by an optional platform interop target. prepareFrame() and
+// releaseCurrentContextResources() run with the renderer's OpenGL ES context
+// current. Implementations must not map, transfer, stage, or re-upload
+// decoded pixels through CPU memory.
+class QTAV_RENDER_OPENGL_EXPORT OpenGLHardwareFrameInterop {
+public:
+    using FrameAvailableCallback = std::function<void()>;
+
+    virtual ~OpenGLHardwareFrameInterop();
+
+    virtual HardwareInteropCapabilities capabilities() const = 0;
+    virtual bool supports(const HardwareFrame& frame) const noexcept = 0;
+    virtual OpenGLHardwareImportResult prepareFrame(
+        const VideoFrame& frame) = 0;
+    virtual void releaseCurrentContextResources() noexcept = 0;
+    virtual void setFrameAvailableCallback(
+        FrameAvailableCallback callback) = 0;
+};
+
 class QTAV_RENDER_OPENGL_EXPORT OpenGLVideoRenderer final
     : public VideoRenderAPI {
 public:
     explicit OpenGLVideoRenderer(
-        OpenGLCurrentTargetCallback currentTarget);
+        OpenGLCurrentTargetCallback currentTarget,
+        std::shared_ptr<OpenGLHardwareFrameInterop>
+            hardwareInterop = {});
     ~OpenGLVideoRenderer() override;
 
     OpenGLVideoRenderer(OpenGLVideoRenderer&&) noexcept;
@@ -74,6 +140,13 @@ public:
 
     void setCurrentTargetCallback(
         OpenGLCurrentTargetCallback callback);
+    OpenGLHardwareImportStatus prepareHardwareFrame(
+        const VideoFrame& frame,
+        std::string* detail = nullptr);
+    void setHardwareFrameInterop(
+        std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop);
+    std::shared_ptr<OpenGLHardwareFrameInterop>
+    hardwareFrameInterop() const noexcept;
 
 private:
     class Impl;

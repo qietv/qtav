@@ -29,6 +29,7 @@ set(QTAV_HW_MEDIACODEC ON CACHE STRING "" FORCE)
 set(QTAV_INTEROP_D3D11 OFF CACHE STRING "" FORCE)
 set(QTAV_INTEROP_CVMETAL OFF CACHE STRING "" FORCE)
 set(QTAV_INTEROP_MEDIACODEC_VULKAN ON CACHE STRING "" FORCE)
+set(QTAV_INTEROP_MEDIACODEC_OPENGL ON CACHE STRING "" FORCE)
 set(QTAV_INTEROP_VAAPI OFF CACHE STRING "" FORCE)
 
 add_subdirectory(
@@ -71,6 +72,7 @@ target_link_libraries(qtav_android_test
         QtAV::AudioAAudio
         QtAV::AudioResample
         QtAV::HWMediaCodec
+        QtAV::InteropMediaCodecOpenGL
         QtAV::InteropMediaCodecVulkan
         QtAV::RenderMobile
         QtAV::RenderOpenGLAndroid

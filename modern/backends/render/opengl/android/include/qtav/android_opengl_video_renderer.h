@@ -48,6 +48,10 @@ public:
     OpenGLOutputColorSpace outputColorSpace() const noexcept;
     bool hdrOutputActive() const noexcept;
     int colorComponentBits() const noexcept;
+    void setHardwareFrameInterop(
+        std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop);
+    std::shared_ptr<OpenGLHardwareFrameInterop>
+    hardwareFrameInterop() const noexcept;
 
 private:
     class Impl;

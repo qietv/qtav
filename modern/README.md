@@ -54,6 +54,9 @@ code is used.
 - optional Android MediaCodec-to-Vulkan zero-CPU-copy texture interop through
   a private GPU-sampled `AImageReader`, retained `AHardwareBuffer` external
   memory, native YCbCr sampling, and acquire/release fence bridging;
+- optional Android MediaCodec-to-OpenGL ES zero-CPU-copy texture interop
+  through a detached `SurfaceTexture`, timestamp-correlated
+  `updateTexImage()`, and `GL_TEXTURE_EXTERNAL_OES` sampling;
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
   VideoToolbox-frame rendering through Metal;
 - optional platform-neutral Vulkan software-frame renderer using borrowed
@@ -76,7 +79,8 @@ code is used.
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
   decoding, Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback,
   AAudio output, MediaCodec H.264/HEVC direct-surface validation, and
-  H.264/HEVC private-AImageReader Vulkan texture import;
+  H.264/HEVC private-AImageReader Vulkan plus SurfaceTexture external-OES
+  texture paths;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -126,6 +130,11 @@ Current backend integration boundary:
   application-owned Vulkan device, and returns a release sync fd after GPU
   submission without a decoded-pixel map, software transfer, staging copy, or
   renderer upload;
+- `QtAV::InteropMediaCodecOpenGL` owns a detached Android `SurfaceTexture`,
+  supplies its producer window to `QtAV::HWMediaCodec`, releases each output
+  once, correlates the single current image by timestamp and surface
+  generation, and samples its transform through `GL_TEXTURE_EXTERNAL_OES`
+  without a decoded-pixel map, transfer, staging copy, or renderer upload;
 - `QtAV::RenderCPU` converts and scales decoded software frames into packed
   RGB/BGR/RGBA/BGRA/ARGB or Gray8 buffers;
 - `QtAV::RenderD3D11` uploads software YUV420/422/444, NV12/NV21, P010,
@@ -178,8 +187,9 @@ Current backend integration boundary:
   supply Vulkan and OpenGL ES renderer factories for the current native-window
   generation; the selector keeps one stable `VideoRenderAPI` attached to
   `Player` across same-API recreation and one-way fallback;
-- no Linux native backend, Android OpenGL ES hardware texture interop, or OHOS
-  hardware decoder has been implemented yet.
+- no Linux native backend or OHOS hardware decoder has been implemented yet;
+  the Android Vulkan-to-OpenGL ES hardware-interop fallback policy remains
+  application-controlled pending the next milestone subtask.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -195,13 +205,17 @@ decoded-frame callbacks remain usable. Decoder, direct-surface, interop, and
 renderer fallback policies remain independent. The accepted design is
 specified in [`MOBILE.md`](MOBILE.md).
 
-The Android Vulkan zero-CPU-copy native-buffer path is now implemented
-separately from the remaining OpenGL ES work. It consumes private GPU-sampled
+The Android Vulkan and OpenGL ES zero-CPU-copy paths are separate backends.
+Vulkan consumes private GPU-sampled
 `AImageReader` images by importing retained `AHardwareBuffer` allocations,
-native YCbCr/external formats, and acquire/release fences. OpenGL ES is still
-planned to consume MediaCodec `SurfaceTexture` output through
-`GL_TEXTURE_EXTERNAL_OES`, with `AHardwareBuffer`/`EGLImage` as a
-capability-gated alternative. On OHOS, the confirmed GLES path uses
+native YCbCr/external formats, and acquire/release fences. OpenGL ES consumes
+a detached MediaCodec `SurfaceTexture` through
+`GL_TEXTURE_EXTERNAL_OES`, with explicit timestamp/generation correlation,
+single-current-image lifetime, surface recreation, and seek/flush coverage.
+P010/HDR external-OES sampling remains disabled unless the application
+explicitly confirms device/codec/driver color control; private
+`AImageReader` plus `AHardwareBuffer`/`EGLImage` remains a future optional
+alternative. On OHOS, the confirmed GLES path uses
 `OH_NativeImage` plus an external-OES texture. OHOS Vulkan additionally needs
 a retained `OH_AVBuffer`/`OH_NativeBuffer` bridge because the current FFmpeg 8
 OHCodec buffer branch performs `OH_AVBuffer_GetAddr()` plus
@@ -271,6 +285,9 @@ MediaCodec hardware context are available.
 `QTAV_INTEROP_MEDIACODEC_VULKAN=AUTO` builds the private-AImageReader Vulkan
 interop on Android API 26 or newer when the MediaCodec and Vulkan targets are
 both available.
+`QTAV_INTEROP_MEDIACODEC_OPENGL=AUTO` builds the SurfaceTexture external-OES
+interop on Android API 28 or newer when the MediaCodec and OpenGL ES targets
+are both available.
 Backend implementations not otherwise described remain disabled under
 `AUTO`, and explicitly requesting one with `ON` is an error.
 
@@ -360,7 +377,11 @@ runs through the private `AImageReader` target for both H.264 and HEVC:
 the device imports external-format `AHardwareBuffer` images, samples them
 through Vulkan YCbCr conversion, returns release sync fds, and requires all
 decoded-source CPU-map, software-transfer, staging-copy, and renderer-upload
-counters to stay zero. OpenGL ES texture interop remains deferred. The
+counters to stay zero. Separate H.264 and HEVC phases then use detached
+`SurfaceTexture` producers, correlate MediaCodec output timestamps, sample
+the current images as `GL_TEXTURE_EXTERNAL_OES`, cover seek/flush plus EGL
+window suspension/recreation, and keep the same decoded-source counters at
+zero. The
 accepted shared Android/OHOS responsibility and lifecycle design is documented
 in [`MOBILE.md`](MOBILE.md).
 
@@ -612,6 +633,65 @@ format, and decoded-source map/transfer/staging/upload counters. Unsupported
 or protected images fail explicitly. The implementation never calls
 `AHardwareBuffer_lock*()` and has no implicit software-frame fallback; decoder
 fallback and renderer/API fallback remain application policies.
+
+### MediaCodec OpenGL ES zero-CPU-copy texture interop
+
+Link `QtAV::HWMediaCodec`, `QtAV::RenderOpenGLAndroid`, and
+`QtAV::InteropMediaCodecOpenGL`. Supply the NativeActivity's `JavaVM`, create
+the interop before opening the renderer, bind MediaCodec to the interop's
+private producer surface, and route renderer `RedrawRequested` events back to
+the application's normal `renderVideo()` scheduling:
+
+```cpp
+#include <qtav/android_opengl_video_renderer.h>
+#include <qtav/mediacodec_opengl_interop.h>
+
+qtav::MediaCodecOpenGLInteropConfig interopConfig;
+interopConfig.javaVM = nativeActivity->vm;
+interopConfig.width = videoWidth;
+interopConfig.height = videoHeight;
+
+auto interop = std::make_shared<qtav::MediaCodecOpenGLInterop>(
+    interopConfig);
+auto renderer = std::make_shared<qtav::AndroidOpenGLVideoRenderer>(
+    qtav::OpenGLOutputPreference::SdrOnly);
+renderer->setHardwareFrameInterop(interop);
+renderer->setWindow(nativeWindow);
+qtav::VideoRenderConfig renderConfig;
+renderConfig.surfaceSize = renderer->surfaceSize();
+renderer->open(renderConfig);
+
+player
+    .setVideoRenderAPI(renderer)
+    .setHardwareDecodeConfig(
+        qtav::mediaCodecHardwareDecodeConfig(interop->surface()))
+    .setState(qtav::State::Playing);
+```
+
+The interop constructs `android.graphics.SurfaceTexture` in detached mode and
+retains its producer `ANativeWindow`. On the renderer thread it attaches the
+consumer to the current OpenGL ES context, releases each MediaCodec output
+exactly once, calls `ASurfaceTexture_updateTexImage()`, and accepts only the
+timestamp-correlated surface generation. The renderer samples the returned
+external texture with its SurfaceTexture transform, submits the draw, and
+calls `glFlush()` before a later update advances the single current image.
+A short native retry worker only emits redraw requests; it never calls GL or
+SurfaceTexture APIs.
+
+Call `flush()` before seek, loop, decoder/media replacement, explicit stop, or
+an interop-policy switch. Close the renderer while its context can still be
+made current so the SurfaceTexture detaches cleanly. Same-context Android
+window loss/recreation does not replace the decoder surface or map the native
+frame.
+
+The default contract accepts SDR 8-bit external-OES sampling. P010 or HDR
+input is rejected unless
+`MediaCodecOpenGLInteropConfig::hdrExternalOesSamplingEnabled` is explicitly
+set after independent device/codec/driver color validation. There is no
+implicit hardware-frame mapping or software upload. `statistics()` reports
+codec decisions, latches, GL texture attach/detach/update counts, redraws,
+pending depth, timestamps, and the zero CPU-map/transfer/staging/upload
+counters.
 
 ### VideoToolbox hardware decode
 

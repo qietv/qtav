@@ -3,6 +3,7 @@
 #include <qtav/aaudio_audio_sink.h>
 #include <qtav/android_opengl_video_renderer.h>
 #include <qtav/mediacodec_hardware_decoder.h>
+#include <qtav/mediacodec_opengl_interop.h>
 #include <qtav/mediacodec_vulkan_interop.h>
 #include <qtav/mobile_video_renderer.h>
 
@@ -20,6 +21,7 @@ int qtav_android_opengl_install_consumer()
         qtav::mediaCodecHardwareDecodeConfig(
             emptyMediaCodecSurface);
     qtav::MediaCodecVulkanInteropConfig interopConfig;
+    qtav::MediaCodecOpenGLInteropConfig openGLInteropConfig;
     qtav::MobileRendererSelectorConfig selectorConfig;
     selectorConfig.openGLES = [] {
         return qtav::MobileRendererCandidate {
@@ -48,6 +50,7 @@ int qtav_android_opengl_install_consumer()
             && mediaCodecConfig.requireSuppliedDevice
             && !mediaCodecConfig.device
             && interopConfig.maximumImages == 5
+            && openGLInteropConfig.maximumPendingFrames == 4
         ? 0
         : 1;
 }

@@ -719,6 +719,8 @@ bool AndroidOpenGLVideoRenderer::render(
     }
     std::string error;
     bool rendered = false;
+    bool retryPending = false;
+    bool staleFrame = false;
     EGLint eglCode = EGL_SUCCESS;
     {
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
@@ -728,7 +730,29 @@ bool AndroidOpenGLVideoRenderer::render(
             eglCode = eglGetError();
         } else {
             impl_->lastEngineError_.clear();
-            if (!impl_->renderer_.render(frame)) {
+            OpenGLHardwareImportStatus hardwareStatus =
+                OpenGLHardwareImportStatus::Ready;
+            if (frame.hasHardwareFrame()) {
+                hardwareStatus =
+                    impl_->renderer_.prepareHardwareFrame(
+                        frame,
+                        &error);
+                retryPending =
+                    hardwareStatus
+                    == OpenGLHardwareImportStatus::Pending;
+                staleFrame =
+                    hardwareStatus
+                    == OpenGLHardwareImportStatus::Stale;
+            }
+            if (retryPending || staleFrame) {
+                error.clear();
+            } else if (hardwareStatus
+                           != OpenGLHardwareImportStatus::Ready) {
+                if (error.empty()) {
+                    error =
+                        "The Android OpenGL ES hardware-frame preparation failed";
+                }
+            } else if (!impl_->renderer_.render(frame)) {
                 error = impl_->lastEngineError_.empty()
                     ? "The OpenGL ES engine could not render the frame"
                     : impl_->lastEngineError_;
@@ -744,6 +768,9 @@ bool AndroidOpenGLVideoRenderer::render(
             }
         }
         impl_->doneCurrent();
+    }
+    if (retryPending || staleFrame) {
+        return false;
     }
     if (!rendered) {
         const VideoRenderEventType type =
@@ -852,6 +879,40 @@ int AndroidOpenGLVideoRenderer::colorComponentBits() const noexcept
     return impl_->surface_ != EGL_NO_SURFACE
         ? impl_->colorComponentBits_
         : 0;
+}
+
+void AndroidOpenGLVideoRenderer::setHardwareFrameInterop(
+    std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    std::string error;
+    const bool needsCurrent = impl_->engineOpen_;
+    if (needsCurrent && !impl_->makeCurrent(error)) {
+        impl_->notify(
+            VideoRenderEventType::Error,
+            error.empty()
+                ? "Could not make the Android OpenGL ES context current for interop replacement"
+                : std::move(error));
+        return;
+    }
+    impl_->renderer_.setHardwareFrameInterop(
+        std::move(hardwareInterop));
+    if (needsCurrent) {
+        impl_->doneCurrent();
+    }
+}
+
+std::shared_ptr<OpenGLHardwareFrameInterop>
+AndroidOpenGLVideoRenderer::hardwareFrameInterop() const noexcept
+{
+    if (!impl_) {
+        return {};
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->renderer_.hardwareFrameInterop();
 }
 
 } // namespace qtav

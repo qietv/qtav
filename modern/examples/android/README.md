@@ -105,6 +105,15 @@ a pending-image high-water mark within five, valid native/Vulkan format
 diagnostics, and zero decoded-source CPU-map, software-transfer, staging-copy,
 and renderer-upload counters. Codec-aligned native buffers may be larger than
 the visible frame; the Vulkan shader applies the `AImage` crop rectangle.
+The application then creates an independent
+`QtAV::InteropMediaCodecOpenGL` object for each codec. MediaCodec writes to
+its detached `SurfaceTexture`; the renderer latches timestamp-correlated
+images and samples them through `GL_TEXTURE_EXTERNAL_OES`. The deployment
+script backgrounds and restores the H.264 phase, then the harness flushes and
+seeks without replacing the decoder surface. The final device run latched 223
+H.264 and 179 HEVC images, kept the pending high-water mark at two, attached
+and detached one external texture per codec phase, and reported zero decoded
+source CPU-map, transfer, staging, and upload calls.
 The same run creates an offscreen OpenGL ES 3 context and verifies actual
 uploads/readback for YUV420/422/444, NV12/NV21, little-endian P010,
 RGB/BGR/RGBA/BGRA/ARGB, and Gray8 together with viewport, rotation, and target
@@ -121,9 +130,10 @@ to the platform-neutral fatal/recovery/no-renderer tests.
 
 `install-consumer/` is a standalone Android CMake consumer for validating an
 installed package. It includes the mobile selector, Android EGL, AAudio, and
-MediaCodec/Vulkan interop headers and links `QtAV::RenderMobile`,
+MediaCodec Vulkan/OpenGL ES interop headers and links `QtAV::RenderMobile`,
 `QtAV::RenderOpenGLAndroid`, `QtAV::AudioAAudio`, and
-`QtAV::HWMediaCodec` plus `QtAV::InteropMediaCodecVulkan`; this also proves
+`QtAV::HWMediaCodec` plus `QtAV::InteropMediaCodecVulkan` and
+`QtAV::InteropMediaCodecOpenGL`; this also proves
 that the exported targets bring in `QtAV::RenderOpenGL`,
 `QtAV::RenderVulkan`, and logical Android
 `nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk`/`vulkan`

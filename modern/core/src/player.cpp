@@ -110,6 +110,7 @@ AVHWDeviceType ffmpegHardwareDeviceType(HardwareDeviceType type) noexcept
     case HardwareDeviceType::Vulkan:
         return AV_HWDEVICE_TYPE_VULKAN;
     case HardwareDeviceType::Unknown:
+    case HardwareDeviceType::OpenGL:
     case HardwareDeviceType::Metal:
         return AV_HWDEVICE_TYPE_NONE;
     }

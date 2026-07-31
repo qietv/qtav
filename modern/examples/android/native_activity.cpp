@@ -4,6 +4,7 @@
 #include <qtav/android_opengl_video_renderer.h>
 #include <qtav/android_vulkan_video_renderer.h>
 #include <qtav/mediacodec_hardware_decoder.h>
+#include <qtav/mediacodec_opengl_interop.h>
 #include <qtav/mediacodec_vulkan_interop.h>
 #include <qtav/mobile_video_renderer.h>
 #include <qtav/player.h>
@@ -440,6 +441,8 @@ enum class TestPhase {
     WaitingForMediaCodecVulkan,
     MediaCodecVulkanH264,
     MediaCodecVulkanHevc,
+    MediaCodecOpenGLH264,
+    MediaCodecOpenGLHevc,
 };
 
 struct TestState {
@@ -462,6 +465,12 @@ struct TestState {
         }
         if (mediaCodecVulkanInterop) {
             mediaCodecVulkanInterop->flush();
+        }
+        if (mediaCodecOpenGLRenderer) {
+            mediaCodecOpenGLRenderer->close();
+        }
+        if (mediaCodecOpenGLInterop) {
+            mediaCodecOpenGLInterop->flush();
         }
         if (rendererSelector) {
             rendererSelector->close();
@@ -536,6 +545,23 @@ struct TestState {
             + " release_fences="
             + std::to_string(
                 mediaCodecVulkanReleaseFences.load())
+            + " mediacodec_opengl=h264,hevc"
+            + " mediacodec_opengl_frames="
+            + std::to_string(
+                mediaCodecOpenGLH264Frames.load()
+                + mediaCodecOpenGLHevcFrames.load())
+            + " mediacodec_opengl_rendered="
+            + std::to_string(
+                mediaCodecOpenGLRendered.load())
+            + " external_oes_images="
+            + std::to_string(
+                mediaCodecOpenGLImages.load())
+            + " external_oes_redraws="
+            + std::to_string(
+                mediaCodecOpenGLRedraws.load())
+            + " mediacodec_opengl_surface_recreations="
+            + std::to_string(
+                mediaCodecOpenGLSurfaceRecreations.load())
             + " cpu_map=0 transfer=0 staging=0 upload=0"
             + " hdr_metadata="
             + (vulkan && vulkan->hdrMetadataEnabled
@@ -678,6 +704,22 @@ struct TestState {
             if (!validateMediaCodecVulkanPhase("hevc")) {
                 return;
             }
+            startMediaCodecOpenGLPhase(
+                TestPhase::MediaCodecOpenGLH264);
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecOpenGLH264) {
+            if (!validateMediaCodecOpenGLPhase("h264")) {
+                return;
+            }
+            startMediaCodecOpenGLPhase(
+                TestPhase::MediaCodecOpenGLHevc);
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecOpenGLHevc) {
+            if (!validateMediaCodecOpenGLPhase("hevc")) {
+                return;
+            }
             pass();
         }
     }
@@ -725,7 +767,9 @@ struct TestState {
         if (currentPhase != TestPhase::MediaCodecH264
             && currentPhase != TestPhase::MediaCodecHevc
             && currentPhase != TestPhase::MediaCodecVulkanH264
-            && currentPhase != TestPhase::MediaCodecVulkanHevc) {
+            && currentPhase != TestPhase::MediaCodecVulkanHevc
+            && currentPhase != TestPhase::MediaCodecOpenGLH264
+            && currentPhase != TestPhase::MediaCodecOpenGLHevc) {
             return;
         }
 
@@ -750,6 +794,44 @@ struct TestState {
                                == TestPhase::MediaCodecVulkanH264
                            ? "h264"
                            : "hevc"));
+            }
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecOpenGLH264
+            || currentPhase == TestPhase::MediaCodecOpenGLHevc) {
+            std::atomic<int>& phaseFrames =
+                currentPhase
+                    == TestPhase::MediaCodecOpenGLH264
+                ? mediaCodecOpenGLH264Frames
+                : mediaCodecOpenGLHevcFrames;
+            const int frameNumber =
+                phaseFrames.fetch_add(
+                    1,
+                    std::memory_order_acq_rel)
+                + 1;
+            if (frameNumber == 1) {
+                logInfo(
+                    std::string(
+                        "QTAV_ANDROID_TEST: "
+                        "MEDIACODEC_OPENGL_FIRST_OUTPUT codec=")
+                    + (currentPhase
+                               == TestPhase::MediaCodecOpenGLH264
+                           ? "h264"
+                           : "hevc"));
+            }
+            if (currentPhase
+                    == TestPhase::MediaCodecOpenGLH264
+                && frameNumber >= 60
+                && !mediaCodecOpenGLSeekRequested.exchange(
+                    true)) {
+                if (mediaCodecOpenGLInterop) {
+                    mediaCodecOpenGLInterop->flush();
+                }
+                logInfo(
+                    "QTAV_ANDROID_TEST: "
+                    "MEDIACODEC_OPENGL_SEEK codec=h264 "
+                    "target_ms=2500");
+                player.seek(2'500);
             }
             return;
         }
@@ -1193,6 +1275,264 @@ struct TestState {
         return true;
     }
 
+    void startMediaCodecOpenGLPhase(TestPhase targetPhase)
+    {
+        player
+            .setVideoRenderAPI({})
+            .setRenderCallback({})
+            .setHardwareDecodeConfig({});
+        if (mediaCodecVulkanRenderer) {
+            mediaCodecVulkanRenderer->close();
+            mediaCodecVulkanRenderer.reset();
+        }
+        if (mediaCodecVulkanInterop) {
+            mediaCodecVulkanInterop->flush();
+            mediaCodecVulkanInterop.reset();
+        }
+        if (mediaCodecOpenGLRenderer) {
+            mediaCodecOpenGLRenderer->close();
+            mediaCodecOpenGLRenderer.reset();
+        }
+        if (mediaCodecOpenGLInterop) {
+            mediaCodecOpenGLInterop->flush();
+            mediaCodecOpenGLInterop.reset();
+        }
+
+        qtav::MediaCodecOpenGLInteropConfig interopConfig;
+        interopConfig.javaVM = activity->vm;
+        interopConfig.width = 160;
+        interopConfig.height = 90;
+        interopConfig.maximumPendingFrames = 4;
+        interopConfig.redrawRetryMilliseconds = 2;
+        mediaCodecOpenGLInterop =
+            std::make_shared<qtav::MediaCodecOpenGLInterop>(
+                interopConfig);
+        if (!*mediaCodecOpenGLInterop) {
+            fail(
+                "could not create MediaCodec OpenGL ES interop: "
+                + mediaCodecOpenGLInterop->lastError());
+            return;
+        }
+
+        ANativeWindow* window = retainedActiveWindow();
+        if (!window) {
+            fail(
+                "MediaCodec OpenGL ES interop has no presentation window");
+            return;
+        }
+        mediaCodecOpenGLRenderer =
+            std::make_shared<qtav::AndroidOpenGLVideoRenderer>(
+                qtav::OpenGLOutputPreference::SdrOnly);
+        mediaCodecOpenGLRenderer->setEventCallback(
+            [this](const qtav::VideoRenderEvent& event) {
+                if (event.type
+                    == qtav::VideoRenderEventType::RedrawRequested) {
+                    ++mediaCodecOpenGLRedraws;
+                    const TestPhase current = phase.load();
+                    if (!finished.load()
+                        && (current
+                                == TestPhase::MediaCodecOpenGLH264
+                            || current
+                                == TestPhase::MediaCodecOpenGLHevc)
+                        && player.renderVideo() >= 0.0) {
+                        ++mediaCodecOpenGLRendered;
+                    }
+                    return;
+                }
+                if (event.type
+                        == qtav::VideoRenderEventType::SurfaceLost
+                    && mediaCodecOpenGLSurfaceSuspended.load()) {
+                    return;
+                }
+                fail(
+                    "MediaCodec OpenGL ES renderer event: "
+                    + event.detail);
+            });
+        mediaCodecOpenGLRenderer->setHardwareFrameInterop(
+            mediaCodecOpenGLInterop);
+        const bool windowSet =
+            mediaCodecOpenGLRenderer->setWindow(window);
+        ANativeWindow_release(window);
+        qtav::VideoRenderConfig renderConfig;
+        renderConfig.surfaceSize =
+            mediaCodecOpenGLRenderer->surfaceSize();
+        renderConfig.aspectRatio =
+            qtav::VideoAspectRatioMode::Fit;
+        if (!windowSet
+            || !mediaCodecOpenGLRenderer->open(renderConfig)) {
+            fail(
+                "could not open the MediaCodec OpenGL ES presentation renderer");
+            return;
+        }
+        const qtav::VideoRenderCapabilities capabilities =
+            mediaCodecOpenGLRenderer->capabilities();
+        if (std::find(
+                capabilities.hardwareDevices.begin(),
+                capabilities.hardwareDevices.end(),
+                qtav::HardwareDeviceType::MediaCodec)
+            == capabilities.hardwareDevices.end()) {
+            fail(
+                "MediaCodec OpenGL ES renderer did not publish hardware-frame capability");
+            return;
+        }
+
+        qtav::MediaCodecHardwareDecodeOptions options;
+        options.allowSoftwareFallback = false;
+        options.extraHardwareFrames = 6;
+        const qtav::MediaCodecSurface surface =
+            mediaCodecOpenGLInterop->surface();
+        const qtav::HardwareDecodeConfig decodeConfig =
+            qtav::mediaCodecHardwareDecodeConfig(
+                surface,
+                options);
+        if (!surface || !decodeConfig.device
+            || decodeConfig.surfaceGeneration
+                != surface.generation()) {
+            fail(
+                "could not bind MediaCodec to the SurfaceTexture producer");
+            return;
+        }
+
+        phase = targetPhase;
+        const bool h264 =
+            targetPhase == TestPhase::MediaCodecOpenGLH264;
+        const std::string& path =
+            h264 ? mediaCodecH264Path : mediaCodecHevcPath;
+        player
+            .setVideoRenderAPI(mediaCodecOpenGLRenderer)
+            .setRenderCallback([this](void*) {
+                if (player.renderVideo() >= 0.0) {
+                    ++mediaCodecOpenGLRendered;
+                }
+            });
+        player.setMedia(path);
+        player.setHardwareDecodeConfig(decodeConfig);
+        logInfo(
+            std::string(
+                "QTAV_ANDROID_TEST: "
+                "MEDIACODEC_OPENGL_PHASE_READY codec=")
+            + (h264 ? "h264" : "hevc")
+            + " generation="
+            + std::to_string(surface.generation())
+            + " producer=surfacetexture"
+            + " texture=external_oes"
+            + " max_pending=4 zero_cpu_copy=required");
+        player.setState(qtav::State::Playing);
+    }
+
+    bool validateMediaCodecOpenGLPhase(const char* codec)
+    {
+        player.setVideoRenderAPI({}).setRenderCallback({});
+        if (mediaCodecOpenGLRenderer) {
+            mediaCodecOpenGLRenderer->close();
+        }
+        if (!mediaCodecOpenGLInterop) {
+            fail(
+                "MediaCodec OpenGL ES interop disappeared before validation");
+            return false;
+        }
+        const qtav::MediaCodecOpenGLInteropStatistics statistics =
+            mediaCodecOpenGLInterop->statistics();
+        const int decoded =
+            std::strcmp(codec, "h264") == 0
+            ? mediaCodecOpenGLH264Frames.load()
+            : mediaCodecOpenGLHevcFrames.load();
+        if (decoded < 60
+            || statistics.imagesLatched < 60
+            || statistics.textureAttachments != 1
+            || statistics.textureDetaches != 1
+            || statistics.textureUpdates
+                < statistics.imagesLatched
+            || statistics.redrawSignals == 0
+            || statistics.maximumPendingFrames > 4
+            || statistics.lastTimestampNanoseconds <= 0
+            || statistics.textureName != 0
+            || (std::strcmp(codec, "h264") == 0
+                && mediaCodecOpenGLSurfaceRecreations.load()
+                    == 0)
+            || (std::strcmp(codec, "h264") == 0
+                && !mediaCodecOpenGLSeekRequested.load())
+            || statistics.cpuMapCalls != 0
+            || statistics.softwareTransferCalls != 0
+            || statistics.stagingCopies != 0
+            || statistics.rendererUploads != 0) {
+            fail(
+                std::string(
+                    "MediaCodec OpenGL ES zero-CPU-copy validation failed for ")
+                + codec
+                + " decoded=" + std::to_string(decoded)
+                + " rendered="
+                + std::to_string(
+                    mediaCodecOpenGLRendered.load())
+                + " queued="
+                + std::to_string(
+                    statistics.codecOutputsQueued)
+                + " latched="
+                + std::to_string(statistics.imagesLatched)
+                + " attachments="
+                + std::to_string(
+                    statistics.textureAttachments)
+                + " detaches="
+                + std::to_string(
+                    statistics.textureDetaches)
+                + " updates="
+                + std::to_string(
+                    statistics.textureUpdates)
+                + " redraws="
+                + std::to_string(
+                    statistics.redrawSignals)
+                + " stale="
+                + std::to_string(
+                    statistics.staleFramesDropped)
+                + " max_pending="
+                + std::to_string(
+                    statistics.maximumPendingFrames)
+                + " timestamp_ns="
+                + std::to_string(
+                    statistics.lastTimestampNanoseconds)
+                + " interop_error="
+                + mediaCodecOpenGLInterop->lastError());
+            return false;
+        }
+        mediaCodecOpenGLImages.fetch_add(
+            static_cast<int>(statistics.imagesLatched));
+        logInfo(
+            std::string(
+                "QTAV_ANDROID_TEST: "
+                "MEDIACODEC_OPENGL_PASS codec=")
+            + codec
+            + " decoded=" + std::to_string(decoded)
+            + " queued="
+            + std::to_string(
+                statistics.codecOutputsQueued)
+            + " latched="
+            + std::to_string(statistics.imagesLatched)
+            + " attachments="
+            + std::to_string(
+                statistics.textureAttachments)
+            + " detaches="
+            + std::to_string(
+                statistics.textureDetaches)
+            + " updates="
+            + std::to_string(
+                statistics.textureUpdates)
+            + " redraws="
+            + std::to_string(
+                statistics.redrawSignals)
+            + " stale="
+            + std::to_string(
+                statistics.staleFramesDropped)
+            + " max_pending="
+            + std::to_string(
+                statistics.maximumPendingFrames)
+            + " timestamp_ns="
+            + std::to_string(
+                statistics.lastTimestampNanoseconds)
+            + " texture=external_oes"
+            + " cpu_map=0 transfer=0 staging=0 upload=0");
+        return true;
+    }
+
     void observeAAudio()
     {
         if (!aaudioSink) {
@@ -1298,6 +1638,25 @@ struct TestState {
                 logInfo(
                     "QTAV_ANDROID_TEST: "
                     "MEDIACODEC_VULKAN_SURFACE_RECREATED");
+                return;
+            }
+            if (currentPhase
+                    == TestPhase::MediaCodecOpenGLH264
+                || currentPhase
+                    == TestPhase::MediaCodecOpenGLHevc) {
+                if (!mediaCodecOpenGLRenderer
+                    || !mediaCodecOpenGLRenderer->setWindow(
+                        window)) {
+                    fail(
+                        "could not recreate the MediaCodec OpenGL ES presentation surface");
+                    return;
+                }
+                mediaCodecOpenGLSurfaceSuspended = false;
+                player.setState(qtav::State::Playing);
+                ++mediaCodecOpenGLSurfaceRecreations;
+                logInfo(
+                    "QTAV_ANDROID_TEST: "
+                    "MEDIACODEC_OPENGL_SURFACE_RECREATED");
                 return;
             }
             if (!rendererSelector
@@ -1432,6 +1791,14 @@ struct TestState {
             if (mediaCodecVulkanRenderer) {
                 mediaCodecVulkanRenderer->setWindow(nullptr);
             }
+        } else if (
+            currentPhase == TestPhase::MediaCodecOpenGLH264
+            || currentPhase
+                == TestPhase::MediaCodecOpenGLHevc) {
+            mediaCodecOpenGLSurfaceSuspended = true;
+            if (mediaCodecOpenGLRenderer) {
+                mediaCodecOpenGLRenderer->setWindow(nullptr);
+            }
         } else if (currentPhase
                    == TestPhase::WaitingForMediaCodecSurface) {
             if (openGlHdrSelector) {
@@ -1464,6 +1831,13 @@ struct TestState {
             logInfo(
                 "QTAV_ANDROID_TEST: "
                 "MEDIACODEC_VULKAN_SURFACE_REMOVED");
+        } else if (
+            currentPhase == TestPhase::MediaCodecOpenGLH264
+            || currentPhase
+                == TestPhase::MediaCodecOpenGLHevc) {
+            logInfo(
+                "QTAV_ANDROID_TEST: "
+                "MEDIACODEC_OPENGL_SURFACE_REMOVED");
         } else if (currentPhase
                    == TestPhase::WaitingForMediaCodecSurface) {
             logInfo(
@@ -1792,6 +2166,18 @@ struct TestState {
     std::atomic<int> mediaCodecVulkanImports { 0 };
     std::atomic<int> mediaCodecVulkanAcquireFences { 0 };
     std::atomic<int> mediaCodecVulkanReleaseFences { 0 };
+    std::shared_ptr<qtav::MediaCodecOpenGLInterop>
+        mediaCodecOpenGLInterop;
+    std::shared_ptr<qtav::AndroidOpenGLVideoRenderer>
+        mediaCodecOpenGLRenderer;
+    std::atomic<int> mediaCodecOpenGLH264Frames { 0 };
+    std::atomic<int> mediaCodecOpenGLHevcFrames { 0 };
+    std::atomic<int> mediaCodecOpenGLRendered { 0 };
+    std::atomic<int> mediaCodecOpenGLImages { 0 };
+    std::atomic<int> mediaCodecOpenGLRedraws { 0 };
+    std::atomic<bool> mediaCodecOpenGLSurfaceSuspended { false };
+    std::atomic<int> mediaCodecOpenGLSurfaceRecreations { 0 };
+    std::atomic<bool> mediaCodecOpenGLSeekRequested { false };
     std::thread mediaCodecVulkanTransition;
     std::atomic<int> videoFrames { 0 };
     std::atomic<int> renderedFrames { 0 };

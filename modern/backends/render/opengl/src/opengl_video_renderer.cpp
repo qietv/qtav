@@ -3,6 +3,7 @@
 #include <qtav/opengl_video_renderer.h>
 
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 
 #include <algorithm>
 #include <array>
@@ -35,10 +36,17 @@ void main()
 constexpr char FragmentShader[] = R"qtav(
 #version 300 es
 
+#if defined(QTAV_EXTERNAL_OES)
+#extension GL_OES_EGL_image_external_essl3 : require
+#endif
+
 precision highp float;
 precision highp int;
 precision highp sampler2D;
 precision highp usampler2D;
+#if defined(QTAV_EXTERNAL_OES)
+precision highp samplerExternalOES;
+#endif
 
 layout(location = 0) out vec4 outputColor;
 
@@ -47,6 +55,10 @@ uniform sampler2D plane1;
 uniform sampler2D plane2;
 uniform usampler2D p010Luma;
 uniform usampler2D p010Chroma;
+#if defined(QTAV_EXTERNAL_OES)
+uniform samplerExternalOES externalImage;
+uniform mat4 externalTransform;
+#endif
 
 // width, height, format, output color space
 uniform uvec4 source;
@@ -317,6 +329,13 @@ void main()
 
     vec3 rgb;
     uint format = source.z;
+#if defined(QTAV_EXTERNAL_OES)
+    if (format == 12U) {
+        vec4 transformed =
+            externalTransform * vec4(coordinate, 0.0, 1.0);
+        rgb = texture(externalImage, transformed.xy).rgb;
+    } else
+#endif
     if (format <= 5U) {
         float luma;
         float chromaU;
@@ -393,6 +412,7 @@ enum class ShaderPixelFormat : std::uint32_t {
     BGRA,
     ARGB,
     Gray8,
+    ExternalOES,
 };
 
 enum class ShaderColorMatrix : std::uint32_t {
@@ -730,15 +750,35 @@ GLuint compileShader(
     return shader;
 }
 
-GLuint createProgram(std::string& error)
+GLuint createProgram(bool externalOES, std::string& error)
 {
     const GLuint vertex =
         compileShader(GL_VERTEX_SHADER, VertexShader, error);
     if (!vertex) {
         return 0;
     }
+    std::string fragmentSource = FragmentShader;
+    if (externalOES) {
+        const std::size_t versionStart =
+            fragmentSource.find("#version 300 es");
+        const std::size_t versionEnd =
+            versionStart == std::string::npos
+            ? std::string::npos
+            : fragmentSource.find('\n', versionStart);
+        if (versionEnd == std::string::npos) {
+            error = "The OpenGL ES fragment shader has no version line";
+            glDeleteShader(vertex);
+            return 0;
+        }
+        fragmentSource.insert(
+            versionEnd + 1,
+            "#define QTAV_EXTERNAL_OES 1\n");
+    }
     const GLuint fragment =
-        compileShader(GL_FRAGMENT_SHADER, FragmentShader, error);
+        compileShader(
+            GL_FRAGMENT_SHADER,
+            fragmentSource.c_str(),
+            error);
     if (!fragment) {
         glDeleteShader(vertex);
         return 0;
@@ -796,6 +836,69 @@ bool checkError(const char* operation, std::string& error)
     return false;
 }
 
+struct ProgramResources {
+    GLuint program = 0;
+    GLint source = -1;
+    GLint surface = -1;
+    GLint viewport = -1;
+    GLint presentation = -1;
+    GLint luminance = -1;
+    GLint externalTransform = -1;
+};
+
+struct HardwareFrameKey {
+    std::uintptr_t buffer = 0;
+    std::uint32_t generation = 0;
+    std::int64_t timestampMilliseconds = 0;
+
+    bool operator==(const HardwareFrameKey& other) const noexcept
+    {
+        return buffer == other.buffer
+            && generation == other.generation
+            && timestampMilliseconds == other.timestampMilliseconds;
+    }
+};
+
+HardwareFrameKey hardwareFrameKey(
+    const VideoFrame& frame) noexcept
+{
+    HardwareFrameKey result;
+    if (!frame || !frame.hasHardwareFrame()) {
+        return result;
+    }
+    const NativeHandle output = frame.hardwareFrame().nativeHandle(
+        HardwareHandleType::Frame);
+    result.buffer = output.value;
+    result.generation = output.subresource;
+    result.timestampMilliseconds = frame.timestamp();
+    return result;
+}
+
+class RendererEventState final {
+public:
+    void set(VideoRenderAPI::EventCallback callback)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback_ = std::move(callback);
+    }
+
+    void notify(VideoRenderEventType type, std::string detail)
+    {
+        VideoRenderAPI::EventCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = callback_;
+        }
+        if (callback) {
+            callback({ type, std::move(detail) });
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    VideoRenderAPI::EventCallback callback_;
+};
+
 } // namespace
 
 bool OpenGLRenderTarget::isHdr() const noexcept
@@ -812,26 +915,128 @@ bool openGLColorSpaceIsHdr(
 
 class OpenGLVideoRenderer::Impl {
 public:
-    explicit Impl(OpenGLCurrentTargetCallback currentTarget)
+    Impl(
+        OpenGLCurrentTargetCallback currentTarget,
+        std::shared_ptr<OpenGLHardwareFrameInterop>
+            hardwareInterop)
         : currentTarget_(std::move(currentTarget))
+        , hardwareInterop_(std::move(hardwareInterop))
+        , eventState_(std::make_shared<RendererEventState>())
     {
+        connectHardwareInterop();
     }
 
     ~Impl()
     {
+        if (eventState_) {
+            eventState_->set({});
+        }
+        if (hardwareInterop_) {
+            hardwareInterop_->setFrameAvailableCallback({});
+        }
         close();
+    }
+
+    void connectHardwareInterop()
+    {
+        if (!hardwareInterop_ || !eventState_) {
+            return;
+        }
+        std::weak_ptr<RendererEventState> weak = eventState_;
+        hardwareInterop_->setFrameAvailableCallback([weak] {
+            if (const auto state = weak.lock()) {
+                state->notify(
+                    VideoRenderEventType::RedrawRequested,
+                    {});
+            }
+        });
     }
 
     void notify(VideoRenderEventType type, std::string detail)
     {
-        EventCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            callback = eventCallback_;
+        if (eventState_) {
+            eventState_->notify(type, std::move(detail));
         }
-        if (callback) {
-            callback({ type, std::move(detail) });
+    }
+
+    bool createProgramResources(
+        bool externalOES,
+        ProgramResources& result,
+        std::string& error)
+    {
+        result.program = createProgram(externalOES, error);
+        if (!result.program) {
+            return false;
         }
+        glUseProgram(result.program);
+        const std::array<const char*, 5> samplerNames {
+            "plane0", "plane1", "plane2", "p010Luma", "p010Chroma"
+        };
+        for (std::size_t index = 0;
+             index < samplerNames.size();
+             ++index) {
+            const GLint location =
+                glGetUniformLocation(result.program, samplerNames[index]);
+            if (location < 0) {
+                error = std::string("Missing OpenGL ES uniform ")
+                    + samplerNames[index];
+                return false;
+            }
+            glUniform1i(location, static_cast<GLint>(index));
+        }
+        if (externalOES) {
+            const GLint externalImage =
+                glGetUniformLocation(result.program, "externalImage");
+            result.externalTransform =
+                glGetUniformLocation(
+                    result.program,
+                    "externalTransform");
+            if (externalImage < 0
+                || result.externalTransform < 0) {
+                error =
+                    "The external-OES OpenGL ES shader parameters are unavailable";
+                return false;
+            }
+            glUniform1i(externalImage, 5);
+        }
+        result.source =
+            glGetUniformLocation(result.program, "source");
+        result.surface =
+            glGetUniformLocation(result.program, "surface");
+        result.viewport =
+            glGetUniformLocation(result.program, "viewport");
+        result.presentation =
+            glGetUniformLocation(result.program, "presentation");
+        result.luminance =
+            glGetUniformLocation(result.program, "luminance");
+        if (result.source < 0 || result.surface < 0
+            || result.viewport < 0 || result.presentation < 0
+            || result.luminance < 0) {
+            error =
+                "The OpenGL ES renderer could not resolve shader parameters";
+            return false;
+        }
+        return true;
+    }
+
+    bool ensureExternalProgram(std::string& error)
+    {
+        if (externalProgram_.program) {
+            return true;
+        }
+        if (!createProgramResources(
+                true,
+                externalProgram_,
+                error)) {
+            if (externalProgram_.program) {
+                glDeleteProgram(externalProgram_.program);
+            }
+            externalProgram_ = {};
+            return false;
+        }
+        return checkError(
+            "OpenGL ES external-OES resource creation",
+            error);
     }
 
     bool createResources(std::string& error)
@@ -849,8 +1054,10 @@ public:
                 "The OpenGL ES renderer requires OpenGL ES 3.x";
             return false;
         }
-        program_ = createProgram(error);
-        if (!program_) {
+        if (!createProgramResources(
+                false,
+                softwareProgram_,
+                error)) {
             return false;
         }
         glGenVertexArrays(1, &vertexArray_);
@@ -867,34 +1074,8 @@ public:
             return false;
         }
 
-        glUseProgram(program_);
-        const std::array<const char*, 5> samplerNames {
-            "plane0", "plane1", "plane2", "p010Luma", "p010Chroma"
-        };
-        for (std::size_t index = 0;
-             index < samplerNames.size();
-             ++index) {
-            const GLint location =
-                glGetUniformLocation(program_, samplerNames[index]);
-            if (location < 0) {
-                error = std::string("Missing OpenGL ES uniform ")
-                    + samplerNames[index];
-                return false;
-            }
-            glUniform1i(location, static_cast<GLint>(index));
-        }
-        sourceLocation_ = glGetUniformLocation(program_, "source");
-        surfaceLocation_ = glGetUniformLocation(program_, "surface");
-        viewportLocation_ = glGetUniformLocation(program_, "viewport");
-        presentationLocation_ =
-            glGetUniformLocation(program_, "presentation");
-        luminanceLocation_ =
-            glGetUniformLocation(program_, "luminance");
-        if (sourceLocation_ < 0 || surfaceLocation_ < 0
-            || viewportLocation_ < 0 || presentationLocation_ < 0
-            || luminanceLocation_ < 0) {
-            error =
-                "The OpenGL ES renderer could not resolve shader parameters";
+        if (hardwareInterop_
+            && !ensureExternalProgram(error)) {
             return false;
         }
 
@@ -915,6 +1096,65 @@ public:
             { 1, 1, 4, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT },
             integerZero);
         return checkError("OpenGL ES resource creation", error);
+    }
+
+    OpenGLHardwareImportStatus prepareHardwareFrame(
+        const VideoFrame& frame,
+        std::string& detail)
+    {
+        std::shared_ptr<OpenGLHardwareFrameInterop> interop;
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex_);
+            if (!open_) {
+                detail = "The OpenGL ES renderer is not open";
+                preparedHardware_ = {};
+                preparedKey_ = {};
+                return OpenGLHardwareImportStatus::Error;
+            }
+            interop = hardwareInterop_;
+        }
+        if (!frame || !frame.hasHardwareFrame()) {
+            detail =
+                "The frame is not an OpenGL ES-interoperable hardware frame";
+            preparedHardware_ = {};
+            preparedKey_ = {};
+            return OpenGLHardwareImportStatus::Unsupported;
+        }
+        if (!interop
+            || !interop->supports(frame.hardwareFrame())) {
+            detail =
+                "The OpenGL ES renderer has no compatible interop for this hardware frame";
+            preparedHardware_ = {};
+            preparedKey_ = {};
+            return OpenGLHardwareImportStatus::Unsupported;
+        }
+        if (!ensureExternalProgram(detail)) {
+            preparedHardware_ = {};
+            preparedKey_ = {};
+            return OpenGLHardwareImportStatus::Error;
+        }
+        OpenGLHardwareImportResult imported =
+            interop->prepareFrame(frame);
+        if (imported.status
+                == OpenGLHardwareImportStatus::Ready
+            && !imported) {
+            imported.status =
+                OpenGLHardwareImportStatus::Error;
+            if (imported.detail.empty()) {
+                imported.detail =
+                    "The OpenGL ES interop returned an invalid external texture";
+            }
+        }
+        detail = imported.detail;
+        if (imported.status
+            == OpenGLHardwareImportStatus::Ready) {
+            preparedKey_ = hardwareFrameKey(frame);
+            preparedHardware_ = std::move(imported.texture);
+        } else {
+            preparedKey_ = {};
+            preparedHardware_ = {};
+        }
+        return imported.status;
     }
 
     void uploadTexture(
@@ -946,6 +1186,11 @@ public:
 
     void destroyResources() noexcept
     {
+        if (hardwareInterop_) {
+            hardwareInterop_->releaseCurrentContextResources();
+        }
+        preparedHardware_ = {};
+        preparedKey_ = {};
         if (std::any_of(
                 textures_.begin(),
                 textures_.end(),
@@ -959,22 +1204,21 @@ public:
             glDeleteVertexArrays(1, &vertexArray_);
             vertexArray_ = 0;
         }
-        if (program_) {
-            glDeleteProgram(program_);
-            program_ = 0;
+        if (externalProgram_.program) {
+            glDeleteProgram(externalProgram_.program);
         }
-        sourceLocation_ = -1;
-        surfaceLocation_ = -1;
-        viewportLocation_ = -1;
-        presentationLocation_ = -1;
-        luminanceLocation_ = -1;
+        externalProgram_ = {};
+        if (softwareProgram_.program) {
+            glDeleteProgram(softwareProgram_.program);
+        }
+        softwareProgram_ = {};
     }
 
     void close() noexcept
     {
         std::lock_guard<std::mutex> renderLock(renderMutex_);
         std::lock_guard<std::mutex> stateLock(stateMutex_);
-        if (open_ || program_ || vertexArray_) {
+        if (open_ || softwareProgram_.program || vertexArray_) {
             destroyResources();
         }
         open_ = false;
@@ -984,22 +1228,26 @@ public:
     std::mutex stateMutex_;
     std::mutex renderMutex_;
     OpenGLCurrentTargetCallback currentTarget_;
-    EventCallback eventCallback_;
+    std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop_;
+    std::shared_ptr<RendererEventState> eventState_;
     VideoRenderConfig config_;
     bool open_ = false;
-    GLuint program_ = 0;
     GLuint vertexArray_ = 0;
     std::array<GLuint, 5> textures_ {};
-    GLint sourceLocation_ = -1;
-    GLint surfaceLocation_ = -1;
-    GLint viewportLocation_ = -1;
-    GLint presentationLocation_ = -1;
-    GLint luminanceLocation_ = -1;
+    ProgramResources softwareProgram_;
+    ProgramResources externalProgram_;
+    HardwareFrameKey preparedKey_;
+    OpenGLExternalTextureFrame preparedHardware_;
 };
 
+OpenGLHardwareFrameInterop::~OpenGLHardwareFrameInterop() = default;
+
 OpenGLVideoRenderer::OpenGLVideoRenderer(
-    OpenGLCurrentTargetCallback currentTarget)
-    : impl_(std::make_unique<Impl>(std::move(currentTarget)))
+    OpenGLCurrentTargetCallback currentTarget,
+    std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop)
+    : impl_(std::make_unique<Impl>(
+          std::move(currentTarget),
+          std::move(hardwareInterop)))
 {
 }
 
@@ -1028,6 +1276,15 @@ VideoRenderCapabilities OpenGLVideoRenderer::capabilities() const
     };
     result.customViewport = true;
     result.rotation = true;
+    if (impl_) {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        if (impl_->hardwareInterop_) {
+            result.hardwareDevices =
+                impl_->hardwareInterop_
+                    ->capabilities()
+                    .sourceDevices;
+        }
+    }
     return result;
 }
 
@@ -1036,8 +1293,7 @@ void OpenGLVideoRenderer::setEventCallback(EventCallback callback)
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
-    impl_->eventCallback_ = std::move(callback);
+    impl_->eventState_->set(std::move(callback));
 }
 
 bool OpenGLVideoRenderer::open(const VideoRenderConfig& config)
@@ -1136,18 +1392,43 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
             "The current OpenGL ES target size does not match the configured surface");
         return false;
     }
-    if (frame.hasHardwareFrame()) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The OpenGL ES renderer has no interop for this hardware frame");
-        return false;
-    }
-
     PackedFrame packed;
+    OpenGLExternalTextureFrame externalTexture;
+    ProgramResources* program = &impl_->softwareProgram_;
+    ShaderPixelFormat shaderFormat = ShaderPixelFormat::YUV420P;
     std::string error;
-    if (!packFrame(frame, packed, error)) {
-        impl_->notify(VideoRenderEventType::Error, std::move(error));
-        return false;
+    if (frame.hasHardwareFrame()) {
+        const HardwareFrameKey key = hardwareFrameKey(frame);
+        if (!(impl_->preparedKey_ == key)
+            || !impl_->preparedHardware_) {
+            const OpenGLHardwareImportStatus status =
+                impl_->prepareHardwareFrame(frame, error);
+            if (status == OpenGLHardwareImportStatus::Pending) {
+                return false;
+            }
+            if (status == OpenGLHardwareImportStatus::Stale) {
+                return false;
+            }
+            if (status != OpenGLHardwareImportStatus::Ready) {
+                impl_->notify(
+                    VideoRenderEventType::Error,
+                    error.empty()
+                        ? "The OpenGL ES hardware-frame preparation failed"
+                        : std::move(error));
+                return false;
+            }
+        }
+        externalTexture = impl_->preparedHardware_;
+        program = &impl_->externalProgram_;
+        shaderFormat = ShaderPixelFormat::ExternalOES;
+    } else {
+        if (!packFrame(frame, packed, error)) {
+            impl_->notify(
+                VideoRenderEventType::Error,
+                std::move(error));
+            return false;
+        }
+        shaderFormat = packed.format;
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
@@ -1160,7 +1441,12 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
         return false;
     }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    if (packed.format == ShaderPixelFormat::P010) {
+    if (externalTexture) {
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(
+            GL_TEXTURE_EXTERNAL_OES,
+            externalTexture.texture);
+    } else if (packed.format == ShaderPixelFormat::P010) {
         impl_->uploadTexture(
             3, packed.layouts[0], packed.bytes[0].data());
         impl_->uploadTexture(
@@ -1176,35 +1462,42 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
 
     const VideoColorSpace color = frame.colorSpaceInfo();
     const VideoViewport viewport = effectiveViewport(config);
-    glUseProgram(impl_->program_);
+    glUseProgram(program->program);
     glUniform4ui(
-        impl_->sourceLocation_,
+        program->source,
         static_cast<GLuint>(frame.width()),
         static_cast<GLuint>(frame.height()),
-        static_cast<GLuint>(packed.format),
+        static_cast<GLuint>(shaderFormat),
         shaderOutputColorSpace(target.colorSpace));
     glUniform4ui(
-        impl_->surfaceLocation_,
+        program->surface,
         static_cast<GLuint>(config.surfaceSize.width),
         static_cast<GLuint>(config.surfaceSize.height),
         static_cast<GLuint>(shaderColorTransfer(color.transfer)),
         static_cast<GLuint>(shaderColorPrimaries(color.primaries)));
     glUniform4i(
-        impl_->viewportLocation_,
+        program->viewport,
         viewport.x,
         viewport.y,
         viewport.width,
         viewport.height);
     glUniform4ui(
-        impl_->presentationLocation_,
+        program->presentation,
         static_cast<GLuint>(config.rotation),
         static_cast<GLuint>(config.aspectRatio),
         static_cast<GLuint>(shaderColorMatrix(color.matrix)),
         color.range == ColorRange::Full ? 1U : 0U);
     glUniform2f(
-        impl_->luminanceLocation_,
+        program->luminance,
         100.0F,
         maximumLuminance(frame));
+    if (externalTexture) {
+        glUniformMatrix4fv(
+            program->externalTransform,
+            1,
+            GL_FALSE,
+            externalTexture.transform.data());
+    }
     glViewport(
         0,
         0,
@@ -1218,6 +1511,10 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
     glBindVertexArray(impl_->vertexArray_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glFlush();
+    if (externalTexture) {
+        impl_->preparedHardware_ = {};
+        impl_->preparedKey_ = {};
+    }
     if (!checkError("OpenGL ES frame rendering", error)) {
         impl_->notify(VideoRenderEventType::Error, std::move(error));
         return false;
@@ -1240,6 +1537,63 @@ void OpenGLVideoRenderer::setCurrentTargetCallback(
     }
     std::lock_guard<std::mutex> lock(impl_->stateMutex_);
     impl_->currentTarget_ = std::move(callback);
+}
+
+OpenGLHardwareImportStatus
+OpenGLVideoRenderer::prepareHardwareFrame(
+    const VideoFrame& frame,
+    std::string* detail)
+{
+    if (!impl_) {
+        if (detail) {
+            *detail = "The OpenGL ES renderer object is empty";
+        }
+        return OpenGLHardwareImportStatus::Error;
+    }
+    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+    std::string localDetail;
+    const OpenGLHardwareImportStatus status =
+        impl_->prepareHardwareFrame(frame, localDetail);
+    if (detail) {
+        *detail = std::move(localDetail);
+    }
+    return status;
+}
+
+void OpenGLVideoRenderer::setHardwareFrameInterop(
+    std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+    std::shared_ptr<OpenGLHardwareFrameInterop> previous;
+    {
+        std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
+        previous = std::move(impl_->hardwareInterop_);
+        impl_->hardwareInterop_ = std::move(hardwareInterop);
+    }
+    if (previous) {
+        previous->setFrameAvailableCallback({});
+        previous->releaseCurrentContextResources();
+    }
+    if (impl_->externalProgram_.program) {
+        glDeleteProgram(impl_->externalProgram_.program);
+        impl_->externalProgram_ = {};
+    }
+    impl_->preparedHardware_ = {};
+    impl_->preparedKey_ = {};
+    impl_->connectHardwareInterop();
+}
+
+std::shared_ptr<OpenGLHardwareFrameInterop>
+OpenGLVideoRenderer::hardwareFrameInterop() const noexcept
+{
+    if (!impl_) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    return impl_->hardwareInterop_;
 }
 
 } // namespace qtav

@@ -17,6 +17,7 @@ enum class HardwareDeviceType {
     VideoToolbox,
     VAAPI,
     MediaCodec,
+    OpenGL,
     Vulkan,
     Metal,
 };

@@ -147,6 +147,7 @@ Current public entry points:
 - `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/hwaccel/mediacodec/include/qtav/mediacodec_hardware_decoder.h`
 - `modern/backends/interop/mediacodec_vulkan/include/qtav/mediacodec_vulkan_interop.h`
+- `modern/backends/interop/mediacodec_opengl/include/qtav/mediacodec_opengl_interop.h`
 - `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
 - `modern/backends/interop/d3d11/include/qtav/d3d11_frame_interop.h`
 - `modern/MOBILE.md`
@@ -177,6 +178,7 @@ Current implementation:
 - `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/hwaccel/mediacodec/src/mediacodec_hardware_decoder.cpp`
 - `modern/backends/interop/mediacodec_vulkan/src/mediacodec_vulkan_interop.cpp`
+- `modern/backends/interop/mediacodec_opengl/src/mediacodec_opengl_interop.cpp`
 - `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
 - `modern/backends/interop/d3d11/src/d3d11_frame_interop.cpp`
 - `modern/backends/output/d3d11/src/d3d11_video_output.cpp`
@@ -337,7 +339,8 @@ Current verification:
 - Android install plus external CMake consumption of
   `QtAV::RenderMobile`, `QtAV::RenderOpenGLAndroid`,
   `QtAV::RenderOpenGL`, `QtAV::AudioAAudio`, `QtAV::HWMediaCodec`, and
-  `QtAV::InteropMediaCodecVulkan` passes;
+  `QtAV::InteropMediaCodecVulkan` passes; the post-change install consumer
+  also links and consumes `QtAV::InteropMediaCodecOpenGL`;
   the exported static targets use logical
   `nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk`/`vulkan` link
   names and contain no producer NDK or host path;
@@ -351,6 +354,16 @@ Current verification:
   decoded-source CPU-map, software-transfer, staging-copy, and renderer-upload
   counters all remained zero; 160x90 decoded crops were sampled correctly
   from the device's aligned 160x96 native allocations.
+- the Android MediaCodec/OpenGL ES checkpoint cross-builds and exports
+  `QtAV::InteropMediaCodecOpenGL`. On the same Android 16/Adreno 830 device,
+  H.264 and HEVC decoded through independent detached `SurfaceTexture`
+  producers and rendered as `GL_TEXTURE_EXTERNAL_OES`; the final run latched
+  223 H.264 plus 179 HEVC images, kept the pending high-water mark at two,
+  attached/detached one external texture per codec phase, recreated the EGL
+  window surface during H.264, flushed and sought without replacing the
+  decoder surface, and completed clean shutdown with zero decoded-source
+  CPU-map, software-transfer, staging-copy, or renderer-upload calls. SDR
+  8-bit sampling is enabled; P010/HDR remains explicitly capability-gated.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -609,14 +622,17 @@ passed 34/34.
    replacement, surface recreation, stale-generation rejection, and shutdown.
 10. [x] Add the confirmed private, GPU-sampled
     `AImageReader`/`AHardwareBuffer` Vulkan zero-CPU-copy texture path.
-11. [ ] Add the confirmed `SurfaceTexture` external-OES OpenGL ES
-    zero-CPU-copy texture path, then connect explicit renderer-fallback policy.
+11. [x] Add the confirmed `SurfaceTexture` external-OES OpenGL ES
+    zero-CPU-copy texture path.
+12. [ ] Connect the explicit renderer-fallback policy: on a fatal Vulkan
+    transition, reconfigure subsequent MediaCodec output through compatible
+    GLES native interop or select the caller's direct-surface,
+    software-decode, or no-video policy without mapping a hardware frame.
 
 The first unchecked item, and therefore the next implementation task, is the
-Android `SurfaceTexture` external-OES OpenGL ES zero-CPU-copy texture path,
-followed by its explicit renderer-fallback policy. The completed Vulkan path
-remains a separate backend and does not authorize CPU mapping when Vulkan is
-unavailable.
+explicit MediaCodec renderer-fallback policy. The completed Vulkan and
+SurfaceTexture paths remain separate backends; a renderer switch does not
+authorize CPU mapping when native interop is unavailable.
 
 ### Shared Android/OHOS mobile design checkpoint
 
@@ -1390,7 +1406,7 @@ Status: complete; resume Milestone 6 from its first unchecked item.
   YCbCr/external-format capability checks, bridge acquire/release fences, and
   return the release fence through asynchronous `AImage` deletion without
   `AHardwareBuffer_lock*()` or a staging upload.
-- [ ] Android MediaCodec OpenGL ES interop using a `SurfaceTexture` producer
+- [x] Android MediaCodec OpenGL ES interop using a `SurfaceTexture` producer
   and `GL_TEXTURE_EXTERNAL_OES` as the primary path, with explicit
   timestamp/generation and current-image lifetime handling. Keep private
   `AImageReader` plus `AHardwareBuffer`/`EGLImage` import as a

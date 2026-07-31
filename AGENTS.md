@@ -84,7 +84,7 @@ modern/
 │   ├── render/{cpu,mobile,opengl,vulkan,d3d11,metal}/
 │   ├── audio/{resample,file,wasapi,coreaudio,alsa,pulseaudio,aaudio}/
 │   ├── hwaccel/{d3d11va,videotoolbox,vaapi,mediacodec}/
-│   └── interop/{d3d11,cvmetal,mediacodec_vulkan,vaapi}/
+│   └── interop/{d3d11,cvmetal,mediacodec_vulkan,mediacodec_opengl,vaapi}/
 ├── platform/{windows,apple,linux,android}/
 ├── examples/
 └── tests/
@@ -113,6 +113,7 @@ qtav_hw_mediacodec
 qtav_interop_d3d11
 qtav_interop_cvmetal
 qtav_interop_mediacodec_vulkan
+qtav_interop_mediacodec_opengl
 ```
 
 ## API conventions
@@ -178,6 +179,10 @@ Implemented under `modern/`:
   interop into Vulkan external-format YCbCr textures, with timestamp
   correlation, aligned-allocation cropping, foreign-queue ownership, release
   sync-fd return, and zero decoded-source CPU map/transfer/staging/upload;
+- Android MediaCodec `SurfaceTexture` interop into
+  `GL_TEXTURE_EXTERNAL_OES`, with timestamp/generation correlation,
+  single-current-image lifetime, seek/flush and EGL surface-recreation
+  coverage, and zero decoded-source CPU map/transfer/staging/upload;
 - zero-copy VideoToolbox/CVMetal plane import and Metal rendering;
 - platform-neutral Vulkan software-frame rendering with structured color and
   geometry shaders, explicit SDR/HDR10/extended-linear output color spaces,
@@ -202,8 +207,7 @@ Known intentional limitations:
 
 - no native audio-device sink outside macOS and Windows yet;
 - no OHOS or Linux platform adapters/device coverage yet;
-- no Linux hardware decoder, Android OpenGL ES GPU zero-copy interop, or OHOS
-  hardware decoder yet;
+- no Linux or OHOS hardware decoder yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
 - no compressed Dolby passthrough, Atmos object rendering, Dolby Vision, or
@@ -305,6 +309,13 @@ Last verified baseline:
   release-fence return: passed on the connected Adreno 830 device with 89
   imports and 89 release fences per codec, maximum pending depth one, and zero
   decoded-source CPU map/transfer/staging/upload.
+- Android MediaCodec H.264/HEVC `SurfaceTexture` OpenGL ES interop, package
+  export, static/shared cross-builds, external CMake consumption,
+  `GL_TEXTURE_EXTERNAL_OES` sampling, bounded timestamp correlation,
+  seek/flush, EGL window suspension/recreation, and clean shutdown: passed on
+  the connected Adreno 830 device with 223 H.264 and 179 HEVC images latched,
+  maximum pending depth two, and zero decoded-source CPU
+  map/transfer/staging/upload.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device
