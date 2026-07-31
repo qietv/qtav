@@ -30,6 +30,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -467,6 +468,18 @@ void testWarpContracts()
         != overlappingImport->texture());
     imported = std::move(retainedPooledImport);
     overlappingImport.reset();
+
+    std::vector<std::shared_ptr<qtav::D3D11TextureFrame>>
+        retainedImports;
+    for (int index = 0; index < 4; ++index) {
+        auto retained = interop.importFrame(frame);
+        assert(retained);
+        for (const auto& previous : retainedImports) {
+            assert(retained->texture() != previous->texture());
+        }
+        retainedImports.push_back(std::move(retained));
+    }
+    retainedImports.clear();
 
     frame = {};
     texture.Reset();
@@ -976,7 +989,17 @@ void testNativeZeroCopy(
             : DXGI_FORMAT_B8G8R8A8_UNORM);
     assert(target.texture && target.view);
     assert(renderer->configure(renderConfig));
-    assert(renderer->render(retainedFrame));
+    const auto renderDeadline =
+        std::chrono::steady_clock::now()
+        + std::chrono::seconds(2);
+    bool retainedFrameRendered = false;
+    while (!(retainedFrameRendered =
+                 renderer->render(retainedFrame))
+           && std::chrono::steady_clock::now()
+               < renderDeadline) {
+        std::this_thread::yield();
+    }
+    assert(retainedFrameRendered);
 
     auto guard = access->contextGuard();
     if (expectedFormat == qtav::PixelFormat::P010) {

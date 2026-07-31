@@ -30,8 +30,11 @@ attaches the player, and forwards panel size changes. UI state and log updates
 are marshalled through `DispatcherQueue`; device audio submission remains on
 the independent audio-output worker. While playback is active, the Debug
 window also reports five-second cadence snapshots for scheduled and rendered
-video rate, coalesced redraws, gaps over 80 ms, and maximum render/present
-time.
+video rate, coalesced redraws, compositor-busy presents, retryable skipped
+renders, gaps over 80 ms, maximum render/present time, and maximum
+color/interop/buffer-update/draw stage time. These counters make a slow
+decode/presentation cadence distinguishable from a blocking D3D11 driver
+stage.
 
 ## Requirements
 

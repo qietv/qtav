@@ -166,6 +166,11 @@ The lock is acquired for:
 - interop Video Processor input/output view creation and blits;
 - renderer immediate-context map, state, draw, copy, and flush operations.
 
+The renderer uses the non-blocking form of the shared guard and declines a
+retryable render attempt when another thread owns the context. Decode and
+interop retain the blocking guard because their submissions must complete as
+one serialized operation.
+
 Device resource-creation methods are free-threaded, but implementations may
 hold the guard across related creation and submission to keep failure and
 device-removal handling atomic. Backend event callbacks are invoked only after
@@ -199,6 +204,14 @@ hardware-frame support only while a compatible interop object is installed.
 6. return a retained texture frame which reports its DXGI format/color space
    and keeps the source frame and all imported resources alive through the
    renderer submission.
+
+The renderer releases that imported wrapper after the Video Processor and draw
+commands are submitted. All decode, interop, and render commands use the same
+serialized immediate context, so later decoder-surface reuse is ordered after
+the earlier GPU reads, and D3D11 retains COM resources referenced by queued
+commands. No per-frame event query or CPU wait is needed. Avoiding that extra
+completion fence prevents driver throttling and decoder-surface starvation
+after repeated seeks.
 
 SDR input uses a BGRA8 G22/P709 intermediate. PQ/BT.2020 input prefers an
 RGB10/PQ P2020 intermediate and falls back to FP16 linear scRGB when the driver

@@ -105,6 +105,7 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputEvent {
 };
 
 struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
+    // Counters and maxima accumulated since the previous takeStatistics().
     std::uint64_t renderRequests = 0;
     std::uint64_t coalescedRenderRequests = 0;
     std::uint64_t renderPasses = 0;
@@ -113,6 +114,12 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
     std::int64_t maximumRenderGapMicroseconds = 0;
     std::int64_t maximumRenderMicroseconds = 0;
     std::int64_t maximumPresentMicroseconds = 0;
+    std::uint64_t busyPresents = 0;
+    std::uint64_t skippedRenders = 0;
+    std::int64_t maximumColorSetupMicroseconds = 0;
+    std::int64_t maximumInteropMicroseconds = 0;
+    std::int64_t maximumBufferUpdateMicroseconds = 0;
+    std::int64_t maximumDrawMicroseconds = 0;
 };
 
 // High-level composition-surface output for ordinary Windows playback.
@@ -167,6 +174,7 @@ public:
     std::string deviceDescription() const;
     D3D11VideoOutputColorInfo colorInfo() const noexcept;
     std::shared_ptr<D3D11DeviceAccess> deviceAccess() const noexcept;
+    // Atomically returns and resets the accumulated render/present statistics.
     D3D11VideoOutputStatistics takeStatistics() noexcept;
 
 private:

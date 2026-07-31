@@ -125,7 +125,9 @@ int main(int argc, char** argv)
 
     const auto statistics = output.takeStatistics();
     assert(statistics.renderRequests >= statistics.presentedFrames);
-    assert(statistics.renderPasses >= statistics.presentedFrames);
+    assert(
+        statistics.renderPasses
+        >= statistics.presentedFrames + statistics.busyPresents);
     assert(statistics.presentedFrames >= 3);
     {
         std::lock_guard<std::mutex> lock(mutex);

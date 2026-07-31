@@ -163,9 +163,12 @@ render-target view and optional `IDXGISwapChain3` returned by an application
 callback, and holds the shared recursive context guard while rendering.
 Applications issuing concurrent calls on the same immediate context must
 acquire `D3D11DeviceAccess::contextGuard()` or provide equivalent external
-serialization. The renderer uploads software RGB, YUV, NV12/NV21, P010, and
-gray frames; handles range/matrix, PQ/HLG, primaries, and tone mapping in its
-pixel shader; and supports SDR 8-bit, FP16 scRGB, and RGB10/PQ targets.
+serialization. `tryContextGuard()` is the non-blocking alternative used by the
+real-time renderer; context or renderer contention declines that render
+attempt instead of waiting on the native/UI render thread. The renderer
+uploads software RGB, YUV, NV12/NV21, P010, and gray frames; handles
+range/matrix, PQ/HLG, primaries, and tone mapping in its pixel shader; and
+supports SDR 8-bit, FP16 scRGB, and RGB10/PQ targets.
 Supplying the swap chain enables per-frame `IDXGIOutput6` discovery,
 `SetColorSpace1()`, Windows SDR-white lookup, and automatic display/HDR-setting
 changes. Resize, custom viewports, aspect handling, right-angle rotation, and
@@ -216,6 +219,13 @@ source/import lifetime after player shutdown. The strict generated H.264/AAC
 console test passes with an active WASAPI render endpoint and audible output,
 while sessions without an endpoint report a CTest skip. The retained-resource
 contract remains documented in [D3D11VA.md](D3D11VA.md).
+
+Hardware imports are retained through Video Processor and draw submission,
+then released without a per-frame completion query. All decoder, interop, and
+renderer GPU submissions use the same serialized immediate context, so later
+decoder-surface reuse remains ordered after earlier reads while D3D11 retains
+resources referenced by queued commands. This avoids both decoder-surface
+starvation and query-induced driver stalls after repeated seeks.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -324,10 +334,14 @@ are separate backend/product work.
   reconnect attempts; `avformat.rw_timeout`, `avformat.reconnect`, and the
   other FFmpeg protocol properties can override those defaults;
 - `renderVideo()` runs synchronously on its caller and should be called from the
-  thread that owns the native graphics context;
+  thread that owns the native graphics context; it returns a negative value
+  when no frame is ready or a retryable player/backend lock is busy, so native
+  render loops should retry instead of blocking the UI/render thread;
 - D3D11 renderer, decoder, interop, and application calls sharing one
   immediate context must serialize through the same
-  `D3D11DeviceAccess::contextGuard()` or equivalent external locking;
+  `D3D11DeviceAccess::contextGuard()` or equivalent external locking; the
+  renderer uses non-blocking `tryContextGuard()` and declines a frame on
+  contention;
 - `VideoRenderAPI::render()` runs synchronously inside `renderVideo()` and
   backend event callbacks may request another player state;
 - audio-sink and video-render backend event callbacks run on the thread chosen

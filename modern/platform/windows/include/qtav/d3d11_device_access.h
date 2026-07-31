@@ -62,7 +62,8 @@ private:
 
     D3D11ContextGuard(
         std::shared_ptr<void> lifetime,
-        void* mutex);
+        void* mutex,
+        bool tryLock);
 
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -84,6 +85,9 @@ public:
     BorrowedD3D11Device device() const noexcept;
     BorrowedD3D11DeviceContext immediateContext() const noexcept;
     D3D11ContextGuard contextGuard() const;
+    // Non-blocking form for real-time render paths. The returned guard converts
+    // to false when another thread currently owns the immediate context.
+    D3D11ContextGuard tryContextGuard() const;
 
 private:
     friend class detail::D3D11DeviceAccessPrivate;

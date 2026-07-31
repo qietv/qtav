@@ -482,12 +482,17 @@ State/status callbacks are normally invoked from the playback worker. Decoded
 audio/video frame notifications and `setRenderCallback()` run on a separate
 presentation worker, so a slow application redraw path cannot stall demux,
 decode, or device audio submission. The video presentation queue is bounded;
-when the application falls behind, obsolete late frames are discarded instead
-of accumulating unbounded latency. `renderVideo()` runs on the caller's thread,
-so an OpenGL, Vulkan, Metal, or D3D integration can keep ownership of its native
-context and surface. A/V startup and playing seeks use a bounded video preroll
-before releasing device audio, avoiding an audio-first clock sprint while the
-first video frames are still being decoded.
+when the application falls behind, it preserves the imminent queued frame and
+discards an incoming farther-future frame instead of accumulating unbounded
+latency or repeatedly replacing the next presentable frame. `renderVideo()`
+runs on the caller's thread, so an OpenGL, Vulkan, Metal, or D3D integration
+can keep ownership of its native context and surface. It returns the rendered
+timestamp in seconds, or a negative value when no frame is ready or a
+real-time render attempt is temporarily declined; the render scheduler should
+retry on a later redraw rather than block its native/UI thread. A/V startup
+and playing seeks use a bounded video preroll before releasing device audio,
+avoiding an audio-first clock sprint while the first video frames are still
+being decoded.
 
 An accepted seek while playing changes the media status to `Buffering` and
 holds `position()` at the requested position until output really resumes. A
@@ -691,6 +696,14 @@ The current WinUI 3 example uses only its HWND, this surface binding, and
 `attach()`/`resize()`; it no longer implements a graphics device, swap chain,
 render thread, HDR policy, or presentation loop in application code.
 
+The composition output caps DXGI frame latency at one, uses non-blocking
+`Present()` and a bounded waitable-object wait on its private render thread,
+and retries when the compositor is busy. It never waits for presentation
+capacity on the UI thread. `takeStatistics()` returns and resets render
+requests/passes, presented frames, coalesced requests, busy presents, skipped
+renders, long gaps, render/present maxima, and the renderer's color, interop,
+buffer-update, and draw-stage maxima.
+
 ### D3D11 renderer (advanced external-context path)
 
 On Windows, link `QtAV::RenderD3D11`, include
@@ -720,9 +733,11 @@ player.setVideoRenderAPI(renderer);
 
 `D3D11DeviceAccess::create()` rejects null, foreign-device, and deferred
 contexts, retains the selected device and verified immediate context, and
-provides the recursive lock shared by the renderer and future D3D11VA/interop
-backends. The older renderer constructor taking the two borrowed wrappers
-remains a convenience path and creates the same retained access internally.
+provides the recursive lock shared by the renderer and D3D11VA/interop
+backends. `contextGuard()` waits for ownership; `tryContextGuard()` is its
+non-blocking real-time form and returns a false guard when the context is
+busy. The older renderer constructor taking the two borrowed wrappers remains
+a convenience path and creates the same retained access internally.
 The callback and returned `ID3D11RenderTargetView`/`IDXGISwapChain3` remain
 application-owned. The swap chain is optional for offscreen rendering, but it
 is required for native Advanced Color presentation. Composition swap chains
@@ -733,9 +748,12 @@ and is queried for every frame, so swap-chain resize, display moves, or other
 surface recreation can replace the current values before calling
 `configure()` with the new size.
 
-The renderer holds `D3D11DeviceAccess::contextGuard()` while issuing immediate
-context calls. Applications using that immediate context from another thread
-must acquire the same guard (or provide equivalent external serialization):
+The renderer uses `tryContextGuard()` and a non-blocking render lock while
+issuing immediate-context calls. If either is busy, `render()` returns false
+without emitting a backend error; `Player::renderVideo()` therefore returns a
+negative value and the scheduler retries. Applications using that immediate
+context from another thread must acquire `contextGuard()` (or provide
+equivalent external serialization):
 
 ```cpp
 {
@@ -790,6 +808,14 @@ support only when both objects use the same `D3D11DeviceAccess`. Imported
 textures report their DXGI format and color space so the final
 viewport/aspect/rotation/color pass can preserve or convert SDR, linear scRGB,
 and RGB10/PQ data correctly.
+
+The imported wrapper is retained only through submission of its Video
+Processor conversion and final draw. Decode, interop, and rendering use the
+same serialized immediate context, so a later decode submission that reuses a
+surface is ordered after the preceding GPU reads. D3D11 keeps resources
+referenced by queued commands alive; the renderer deliberately does not add a
+per-frame event query or CPU wait, which would retain decoder surfaces and
+introduce driver stalls after seek.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly

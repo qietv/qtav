@@ -79,10 +79,18 @@ public:
 
 class D3D11ContextGuard::Impl {
 public:
-    Impl(std::shared_ptr<void> lifetime, void* mutex)
+    Impl(std::shared_ptr<void> lifetime, void* mutex, bool tryLock)
         : lifetime_(std::move(lifetime))
-        , lock_(*static_cast<std::recursive_mutex*>(mutex))
+        , lock_(
+              *static_cast<std::recursive_mutex*>(mutex),
+              std::defer_lock)
     {
+        if (tryLock) {
+            const bool locked = lock_.try_lock();
+            (void)locked;
+        } else {
+            lock_.lock();
+        }
     }
 
     std::shared_ptr<void> lifetime_;
@@ -91,10 +99,12 @@ public:
 
 D3D11ContextGuard::D3D11ContextGuard(
     std::shared_ptr<void> lifetime,
-    void* mutex)
+    void* mutex,
+    bool tryLock)
     : impl_(std::make_unique<Impl>(
           std::move(lifetime),
-          mutex))
+          mutex,
+          tryLock))
 {
 }
 
@@ -106,7 +116,7 @@ D3D11ContextGuard& D3D11ContextGuard::operator=(
 
 D3D11ContextGuard::operator bool() const noexcept
 {
-    return impl_ != nullptr;
+    return impl_ && impl_->lock_.owns_lock();
 }
 
 std::shared_ptr<D3D11DeviceAccess> D3D11DeviceAccess::create(
@@ -167,7 +177,16 @@ D3D11ContextGuard D3D11DeviceAccess::contextGuard() const
 {
     return D3D11ContextGuard(
         impl_,
-        &impl_->contextMutex_);
+        &impl_->contextMutex_,
+        false);
+}
+
+D3D11ContextGuard D3D11DeviceAccess::tryContextGuard() const
+{
+    return D3D11ContextGuard(
+        impl_,
+        &impl_->contextMutex_,
+        true);
 }
 
 namespace detail {

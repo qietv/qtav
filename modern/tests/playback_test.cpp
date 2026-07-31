@@ -16,8 +16,11 @@ namespace {
 
 class CountingRenderer final : public qtav::VideoRenderAPI {
 public:
-    explicit CountingRenderer(std::atomic<int>& count)
+    explicit CountingRenderer(
+        std::atomic<int>& count,
+        bool renderResult = true)
         : count_(count)
+        , renderResult_(renderResult)
     {
     }
 
@@ -35,12 +38,13 @@ public:
     {
         assert(frame);
         ++count_;
-        return true;
+        return renderResult_;
     }
     void close() noexcept override {}
 
 private:
     std::atomic<int>& count_;
+    bool renderResult_ = true;
     EventCallback callback_;
 };
 
@@ -58,10 +62,15 @@ int main(int argc, char** argv)
     std::atomic<int> videoFrames { 0 };
     std::atomic<int> audioFrames { 0 };
     std::atomic<int> renderedFrames { 0 };
+    std::atomic<int> rejectedRenderAttempts { 0 };
     int firstRenderKey = 1;
     int secondRenderKey = 2;
+    int rejectingRenderKey = 3;
     auto firstRenderer = std::make_shared<CountingRenderer>(renderedFrames);
     auto secondRenderer = std::make_shared<CountingRenderer>(renderedFrames);
+    auto rejectingRenderer = std::make_shared<CountingRenderer>(
+        rejectedRenderAttempts,
+        false);
 
     player
         .onMediaStatus([&](qtav::MediaStatus, qtav::MediaStatus status) {
@@ -93,7 +102,14 @@ int main(int argc, char** argv)
         })
         .setVideoRenderAPI(firstRenderer, &firstRenderKey)
         .setVideoRenderAPI(secondRenderer, &secondRenderKey)
-        .setRenderCallback([&](void* opaque) { player.renderVideo(opaque); });
+        .setVideoRenderAPI(rejectingRenderer, &rejectingRenderKey)
+        .setRenderCallback([&](void* opaque) {
+            const auto timestamp = player.renderVideo(opaque);
+            assert(
+                opaque == &rejectingRenderKey
+                    ? timestamp < 0.0
+                    : timestamp >= 0.0);
+        });
 
     player.setPlaybackRate(4.0F);
     player.setMedia(argv[1]);
@@ -112,6 +128,7 @@ int main(int argc, char** argv)
     assert(videoFrames.load() >= 10);
     assert(audioFrames.load() > 0);
     assert(renderedFrames.load() == videoFrames.load() * 3);
+    assert(rejectedRenderAttempts.load() == videoFrames.load());
     assert(player.state() == qtav::State::Stopped);
     return 0;
 }

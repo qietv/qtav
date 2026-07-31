@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +34,27 @@ namespace qtav {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+std::int64_t steadyMicroseconds() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void updateMaximum(
+    std::atomic<std::int64_t>& destination,
+    std::int64_t value) noexcept
+{
+    auto current = destination.load(std::memory_order_relaxed);
+    while (current < value
+           && !destination.compare_exchange_weak(
+               current,
+               value,
+               std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+}
 
 constexpr const char* shaderSource = R"HLSL(
 struct VertexInput {
@@ -1677,6 +1700,10 @@ public:
     ComPtr<ID3D11Buffer> colorBuffer_;
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<ID3D11RasterizerState> rasterizer_;
+    std::atomic<std::int64_t> maximumColorSetupMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumInteropMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumBufferUpdateMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumDrawMicroseconds_ { 0 };
 };
 
 D3D11VideoRenderer::D3D11VideoRenderer(
@@ -1869,10 +1896,17 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     bool rendered = false;
     D3D11AdvancedColorInfo advancedColorInfo;
     bool advancedColorInfoResolved = false;
+    std::unique_lock<std::mutex> renderLock(
+        impl_->renderMutex_,
+        std::try_to_lock);
+    if (!renderLock.owns_lock()) {
+        return false;
+    }
+    auto contextGuard = impl_->deviceAccess_->tryContextGuard();
+    if (!contextGuard) {
+        return false;
+    }
     {
-        std::lock_guard<std::mutex> lock(impl_->renderMutex_);
-        auto contextGuard = impl_->deviceAccess_->contextGuard();
-        (void)contextGuard;
         const HRESULT removedReason =
             impl_->device_.get()->GetDeviceRemovedReason();
         if (detail::d3d11FailureEvent(removedReason)
@@ -1883,6 +1917,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 removedReason);
         }
 
+        const auto colorSetupStarted = steadyMicroseconds();
         D3D11_TEXTURE2D_DESC targetDescriptor {};
         DXGI_FORMAT targetFormat = DXGI_FORMAT_UNKNOWN;
         if (error.empty()
@@ -1911,6 +1946,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 advancedColorInfo,
                 error);
         }
+        updateMaximum(
+            impl_->maximumColorSetupMicroseconds_,
+            steadyMicroseconds() - colorSetupStarted);
 
         UploadedFrame uploaded;
         std::shared_ptr<D3D11TextureFrame> textureFrame;
@@ -1923,6 +1961,15 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                     == impl_->deviceAccess_
                 && hardwareInterop->supports(hardwareFrame);
             if (compatibleInterop) {
+                const auto interopStarted =
+                    steadyMicroseconds();
+                // Keep the imported object until the Video Processor and draw
+                // commands below are submitted. Decoder, interop, and renderer
+                // submissions share this serialized immediate context, so
+                // later decoder reuse is ordered after those GPU reads. D3D11
+                // retains resources referenced by queued commands; a per-frame
+                // completion query would only throttle submission and keep
+                // scarce decoder surfaces unavailable longer.
                 textureFrame = hardwareInterop->importFrame(
                     hardwareFrame,
                     frame.colorSpaceInfo());
@@ -1935,9 +1982,12 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                             error)) {
                         textureFrame.reset();
                     }
-                } else {
+                } else if (error.empty()) {
                     error = "D3D11 hardware-frame import failed";
                 }
+                updateMaximum(
+                    impl_->maximumInteropMicroseconds_,
+                    steadyMicroseconds() - interopStarted);
             } else {
                 error =
                     "The D3D11 renderer has no compatible interop for this hardware frame";
@@ -1987,6 +2037,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
         std::array<Vertex, 4> vertices;
         D3D11_VIEWPORT viewport {};
+        const auto bufferUpdateStarted = steadyMicroseconds();
         if (error.empty()) {
             makeGeometry(frame, config, vertices, viewport);
 
@@ -2035,8 +2086,14 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 errorType = detail::d3d11FailureEvent(result);
             }
         }
+        if (error.empty()) {
+            updateMaximum(
+                impl_->maximumBufferUpdateMicroseconds_,
+                steadyMicroseconds() - bufferUpdateStarted);
+        }
 
         if (error.empty()) {
+            const auto drawStarted = steadyMicroseconds();
             constexpr float clearColor[] { 0.0F, 0.0F, 0.0F, 1.0F };
             impl_->context_.get()->ClearRenderTargetView(
                 target.view,
@@ -2112,6 +2169,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 0,
                 nullptr,
                 nullptr);
+            updateMaximum(
+                impl_->maximumDrawMicroseconds_,
+                steadyMicroseconds() - drawStarted);
             rendered = true;
 
             const HRESULT drawReason =
@@ -2246,6 +2306,24 @@ D3D11VideoRenderer::advancedColorInfo() const noexcept
     }
     std::lock_guard<std::mutex> lock(impl_->stateMutex_);
     return impl_->advancedColorInfo_;
+}
+
+D3D11VideoRendererStatistics
+D3D11VideoRenderer::takeStatistics() noexcept
+{
+    if (!impl_) {
+        return {};
+    }
+    D3D11VideoRendererStatistics result;
+    result.maximumColorSetupMicroseconds =
+        impl_->maximumColorSetupMicroseconds_.exchange(0);
+    result.maximumInteropMicroseconds =
+        impl_->maximumInteropMicroseconds_.exchange(0);
+    result.maximumBufferUpdateMicroseconds =
+        impl_->maximumBufferUpdateMicroseconds_.exchange(0);
+    result.maximumDrawMicroseconds =
+        impl_->maximumDrawMicroseconds_.exchange(0);
+    return result;
 }
 
 } // namespace qtav

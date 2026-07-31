@@ -563,7 +563,16 @@ public:
         VideoRenderer renderer;
         std::shared_ptr<VideoRenderAPI> renderAPI;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            // Rendering is a real-time, retryable operation. A seek or output
+            // transition may briefly own the player state lock; waiting here
+            // would stall the native render thread (and any UI operation
+            // waiting for its surface lock) behind playback control work.
+            std::unique_lock<std::mutex> lock(
+                mutex_,
+                std::try_to_lock);
+            if (!lock.owns_lock()) {
+                return -1.0;
+            }
             frame = currentVideoFrame_;
             renderer = videoRenderer_;
             const auto found = videoRenderAPIs_.find(opaque);
@@ -575,7 +584,9 @@ public:
             return -1.0;
         }
         if (renderAPI) {
-            renderAPI->render(frame);
+            if (!renderAPI->render(frame)) {
+                return -1.0;
+            }
         } else if (renderer) {
             renderer(frame, opaque);
         }
@@ -1682,16 +1693,10 @@ private:
             : kMaximumQueuedSoftwareVideoFrames;
         if (item.type == PresentationItem::Type::Video
             && queuedVideoFrames_ >= maximumQueuedVideoFrames) {
-            const auto oldestVideo = std::find_if(
-                presentationQueue_.begin(),
-                presentationQueue_.end(),
-                [](const PresentationItem& candidate) {
-                    return candidate.type == PresentationItem::Type::Video;
-                });
-            if (oldestVideo != presentationQueue_.end()) {
-                presentationQueue_.erase(oldestVideo);
-                --queuedVideoFrames_;
-            }
+            // Keep the contiguous near-term presentation window. Evicting its
+            // oldest frame lets decode bursts, especially after seek, replace
+            // frames that are about to be shown with farther-future frames.
+            return;
         }
         const auto insertion = std::upper_bound(
             presentationQueue_.begin(),

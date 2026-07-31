@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -342,7 +343,7 @@ public:
         if (processor_.matches(frame)) {
             return true;
         }
-        outputPool_.clear();
+        retireOutputPool();
         processor_.reset();
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC content {};
@@ -491,18 +492,33 @@ public:
         return true;
     }
 
-    std::shared_ptr<OutputResource> acquireOutput(
+    void collectRetiredOutputs() noexcept
+    {
+        for (auto iterator = retiredOutputs_.begin();
+             iterator != retiredOutputs_.end();) {
+            if ((*iterator).use_count() == 1) {
+                iterator = retiredOutputs_.erase(iterator);
+            } else {
+                ++iterator;
+            }
+        }
+    }
+
+    void retireOutputPool()
+    {
+        retiredOutputs_.insert(
+            retiredOutputs_.end(),
+            std::make_move_iterator(outputPool_.begin()),
+            std::make_move_iterator(outputPool_.end()));
+        outputPool_.clear();
+        collectRetiredOutputs();
+    }
+
+    std::shared_ptr<OutputResource> createOutput(
         int width,
         int height,
         const OutputProfile& output)
     {
-        for (const auto& resource : outputPool_) {
-            if (resource.use_count() == 1
-                && resource->matches(width, height, output)) {
-                return resource;
-            }
-        }
-
         D3D11_TEXTURE2D_DESC description {};
         description.Width = static_cast<UINT>(width);
         description.Height = static_cast<UINT>(height);
@@ -549,20 +565,58 @@ public:
             return {};
         }
 
-        constexpr std::size_t maximumPooledOutputs = 3;
-        if (outputPool_.size() < maximumPooledOutputs) {
-            outputPool_.push_back(resource);
-        } else {
-            const auto reusable = std::find_if(
-                outputPool_.begin(),
-                outputPool_.end(),
-                [](const auto& candidate) {
-                    return candidate.use_count() == 1;
-                });
-            if (reusable != outputPool_.end()) {
-                *reusable = resource;
+        return resource;
+    }
+
+    std::shared_ptr<OutputResource> acquireOutput(
+        int width,
+        int height,
+        const OutputProfile& output)
+    {
+        collectRetiredOutputs();
+        for (const auto& resource : outputPool_) {
+            if (resource.use_count() == 1
+                && resource->matches(width, height, output)) {
+                return resource;
             }
         }
+
+        constexpr std::size_t maximumPooledOutputs = 3;
+        if (outputPool_.size() < maximumPooledOutputs) {
+            auto resource = createOutput(width, height, output);
+            if (!resource) {
+                return {};
+            }
+            outputPool_.push_back(resource);
+            return resource;
+        }
+
+        auto reusable = std::find_if(
+            outputPool_.begin(),
+            outputPool_.end(),
+            [](const auto& candidate) {
+                return candidate.use_count() == 1;
+            });
+
+        if (reusable != outputPool_.end()) {
+            if ((*reusable)->matches(width, height, output)) {
+                return *reusable;
+            }
+            auto resource = createOutput(width, height, output);
+            if (!resource) {
+                return {};
+            }
+            *reusable = resource;
+            return resource;
+        }
+
+        auto resource = createOutput(width, height, output);
+        if (!resource) {
+            return {};
+        }
+        // All pooled textures are still retained by callers. Keep this
+        // transient output until its caller releases it.
+        retiredOutputs_.push_back(resource);
         return resource;
     }
 
@@ -570,19 +624,22 @@ public:
     {
         if (!deviceAccess_) {
             outputPool_.clear();
+            retiredOutputs_.clear();
             processor_.reset();
             return;
         }
         try {
             auto contextGuard = deviceAccess_->contextGuard();
             (void)contextGuard;
-            outputPool_.clear();
-            processor_.reset();
             if (deviceAccess_->immediateContext()) {
                 deviceAccess_->immediateContext().get()->Flush();
             }
+            outputPool_.clear();
+            retiredOutputs_.clear();
+            processor_.reset();
         } catch (...) {
             outputPool_.clear();
+            retiredOutputs_.clear();
             processor_.reset();
         }
     }
@@ -593,6 +650,7 @@ public:
     ComPtr<ID3D11VideoContext1> videoContext1_;
     ProcessorState processor_;
     std::vector<std::shared_ptr<OutputResource>> outputPool_;
+    std::vector<std::shared_ptr<OutputResource>> retiredOutputs_;
 };
 
 D3D11FrameInterop::D3D11FrameInterop(
@@ -732,7 +790,6 @@ D3D11FrameInterop::importFrame(
             &stream))) {
         return {};
     }
-
     return std::make_shared<ImportedD3D11TextureFrame>(
         frame,
         std::move(inputView),

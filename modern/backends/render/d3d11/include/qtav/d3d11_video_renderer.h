@@ -7,6 +7,7 @@
 
 #include <dxgi1_4.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -45,6 +46,14 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11AdvancedColorInfo {
     bool sdrWhiteLevelFromSystem = false;
 
     bool isHdrOutput() const noexcept;
+};
+
+struct QTAV_RENDER_D3D11_EXPORT D3D11VideoRendererStatistics {
+    // Per-stage maxima accumulated since the previous takeStatistics() call.
+    std::int64_t maximumColorSetupMicroseconds = 0;
+    std::int64_t maximumInteropMicroseconds = 0;
+    std::int64_t maximumBufferUpdateMicroseconds = 0;
+    std::int64_t maximumDrawMicroseconds = 0;
 };
 
 // The view and optional swap chain remain application-owned and must stay
@@ -140,6 +149,8 @@ public:
     void setAllowSoftwareMappingFallback(bool allow) noexcept;
     bool allowSoftwareMappingFallback() const noexcept;
     D3D11AdvancedColorInfo advancedColorInfo() const noexcept;
+    // Atomically returns and resets the accumulated render-stage maxima.
+    D3D11VideoRendererStatistics takeStatistics() noexcept;
 
 private:
     class Impl;

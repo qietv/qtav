@@ -58,7 +58,13 @@ Continuation checkpoint:
   HTTP(S) inputs use bounded read-timeout/reconnect defaults instead of
   immediately converting a recoverable disconnect into `Invalid`;
   the D3D11 Video Processor interop now reuses a bounded three-output texture
-  pool instead of allocating a full-resolution output texture per frame;
+  pool instead of allocating a full-resolution output texture per frame and
+  retires replaced pools without invalidating externally retained imports;
+  D3D11 render attempts now use non-blocking player/render/context locks,
+  preserve the imminent queued presentation frame under pressure, and release
+  imported hardware frames immediately after ordered Video Processor/draw
+  submission instead of retaining decoder surfaces behind per-frame GPU event
+  queries;
   `QtAV::OutputD3D11` now owns the Windows device, composition swap chain,
   render target, display/HDR tracking, render scheduling thread,
   D3D11VA/interop wiring, `renderVideo()`, `Present()`, resize, and teardown;
@@ -67,7 +73,10 @@ Continuation checkpoint:
   tracks Windows HDR/SDR-white/luminance changes per frame, and exposes
   prefer-HDR, require-HDR, and SDR-only policies, while the WinUI 3 sample
   only supplies its HWND, binds its `SwapChainPanel`, attaches the player, and
-  forwards size changes;
+  forwards size changes; the output caps frame latency at one, uses
+  non-blocking `Present()` with bounded waitable-object backpressure on its
+  private render thread, and exposes render/present plus per-stage timing
+  statistics;
   its progress slider observes already-handled thumb pointer events and
   commits only one seek when a drag ends instead of issuing intermediate seeks;
   Milestone 5 is complete and the active next platform task is the Android
@@ -186,6 +195,14 @@ Current verification:
   P010/BT.2020/PQ -> FP16 scRGB -> an active Windows HDR layer, reporting
   system 240-nit SDR white and a 1405-nit display peak while sustaining
   25.0 fps;
+- after removing per-frame D3D11 completion queries, the same 3840x2160
+  Main10 HDR URL completed 12 alternating forward/backward seeks without
+  audio/video freeze; stable scheduled/rendered cadence remained 24-25 fps,
+  maximum draw time fell from the previously observed 155-194 ms to about
+  0.5 ms, and maximum total render time stayed about 3-5 ms. Process private
+  memory was 965.6 MiB before the seek run, 986.8 MiB after four seeks, and
+  984.8 MiB after eight more seeks, while working set returned from a
+  transient 886.4 MiB to 332.6 MiB, showing no per-seek linear growth;
 - static and shared macOS builds pass 27/27 CTest tests, including numeric
   FP16 HDR/BT.2020/headroom checks and real-screen EDR presentation on the
   active EDR-capable display; the scheduling-isolation audio tests wait for

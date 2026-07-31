@@ -73,6 +73,9 @@ public:
     Player& setVideoRenderAPI(
         std::shared_ptr<VideoRenderAPI> renderer,
         void* opaque = nullptr);
+    // Returns the rendered frame timestamp in seconds. A negative value means
+    // there is no current frame or this retryable render attempt was declined
+    // because player/backend state is temporarily busy.
     double renderVideo(void* opaque = nullptr);
 
     void setPlaybackRate(float value);

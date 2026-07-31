@@ -35,6 +35,8 @@ std::int64_t steadyMicroseconds() noexcept
         .count();
 }
 
+constexpr DWORD frameLatencyWaitMilliseconds = 20;
+
 void updateMaximum(
     std::atomic<std::int64_t>& destination,
     std::int64_t value) noexcept
@@ -139,11 +141,17 @@ public:
         std::atomic<std::uint64_t> coalescedRenderRequests { 0 };
         std::atomic<std::uint64_t> renderPasses { 0 };
         std::atomic<std::uint64_t> presentedFrames { 0 };
+        std::atomic<std::uint64_t> busyPresents { 0 };
+        std::atomic<std::uint64_t> skippedRenders { 0 };
         std::atomic<std::uint64_t> longRenderGaps { 0 };
         std::atomic<std::int64_t> previousRenderMicroseconds { 0 };
         std::atomic<std::int64_t> maximumRenderGapMicroseconds { 0 };
         std::atomic<std::int64_t> maximumRenderMicroseconds { 0 };
         std::atomic<std::int64_t> maximumPresentMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumColorSetupMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumInteropMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumBufferUpdateMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumDrawMicroseconds { 0 };
     };
 
     ~Impl()
@@ -430,7 +438,9 @@ public:
                     static_cast<UINT>(size.width),
                     static_cast<UINT>(size.height),
                     selectedFormat_,
-                    0);
+                    frameLatencyWaitableObject_
+                        ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                        : 0);
                 if (SUCCEEDED(status)) {
                     surface_.size = size;
                     surface_.compositionScaleX = compositionScaleX;
@@ -547,6 +557,9 @@ public:
             state->coalescedRenderRequests.exchange(0);
         result.renderPasses = state->renderPasses.exchange(0);
         result.presentedFrames = state->presentedFrames.exchange(0);
+        result.busyPresents = state->busyPresents.exchange(0);
+        result.skippedRenders =
+            state->skippedRenders.exchange(0);
         result.longRenderGaps = state->longRenderGaps.exchange(0);
         result.maximumRenderGapMicroseconds =
             state->maximumRenderGapMicroseconds.exchange(0);
@@ -554,6 +567,14 @@ public:
             state->maximumRenderMicroseconds.exchange(0);
         result.maximumPresentMicroseconds =
             state->maximumPresentMicroseconds.exchange(0);
+        result.maximumColorSetupMicroseconds =
+            state->maximumColorSetupMicroseconds.exchange(0);
+        result.maximumInteropMicroseconds =
+            state->maximumInteropMicroseconds.exchange(0);
+        result.maximumBufferUpdateMicroseconds =
+            state->maximumBufferUpdateMicroseconds.exchange(0);
+        result.maximumDrawMicroseconds =
+            state->maximumDrawMicroseconds.exchange(0);
         return result;
     }
 
@@ -639,9 +660,13 @@ private:
         if (FAILED(status)) {
             return status;
         }
-        status = dxgiDevice->SetMaximumFrameLatency(1);
-        if (FAILED(status)) {
-            return status;
+        const bool useFrameLatencyWaitableObject =
+            !options_.forceWarp;
+        if (!useFrameLatencyWaitableObject) {
+            status = dxgiDevice->SetMaximumFrameLatency(1);
+            if (FAILED(status)) {
+                return status;
+            }
         }
 
         ComPtr<IDXGIAdapter> adapter;
@@ -665,6 +690,9 @@ private:
         description.Scaling = DXGI_SCALING_STRETCH;
         description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         description.AlphaMode = options_.alphaMode;
+        description.Flags = useFrameLatencyWaitableObject
+            ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+            : 0;
 
         ComPtr<IDXGISwapChain1> swapChain;
         status = factory->CreateSwapChainForComposition(
@@ -675,7 +703,20 @@ private:
         if (FAILED(status)) {
             return status;
         }
-        return swapChain.As(&swapChain_);
+        status = swapChain.As(&swapChain_);
+        if (FAILED(status)) {
+            return status;
+        }
+        if (!useFrameLatencyWaitableObject) {
+            return S_OK;
+        }
+        status = swapChain_->SetMaximumFrameLatency(1);
+        if (FAILED(status)) {
+            return status;
+        }
+        frameLatencyWaitableObject_ =
+            swapChain_->GetFrameLatencyWaitableObject();
+        return frameLatencyWaitableObject_ ? S_OK : E_FAIL;
     }
 
     HRESULT createRenderTarget()
@@ -738,6 +779,7 @@ private:
 
     void runRenderThread(std::shared_ptr<RenderState> state)
     {
+        bool waitForPresentationCapacity = false;
         while (true) {
             Player* player = nullptr;
             std::uint64_t generation = 0;
@@ -753,12 +795,34 @@ private:
                 player = state->player;
                 generation = state->generation;
             }
-            state->renderPasses.fetch_add(
-                1,
-                std::memory_order_relaxed);
             if (!player) {
                 continue;
             }
+
+            if (frameLatencyWaitableObject_
+                && waitForPresentationCapacity) {
+                const DWORD waitStatus = WaitForSingleObjectEx(
+                    frameLatencyWaitableObject_,
+                    frameLatencyWaitMilliseconds,
+                    FALSE);
+                if (waitStatus == WAIT_TIMEOUT) {
+                    state->busyPresents.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    requestRender(state);
+                    continue;
+                }
+                if (waitStatus == WAIT_FAILED) {
+                    setError(
+                        "Waiting for D3D11 presentation capacity failed",
+                        HRESULT_FROM_WIN32(GetLastError()));
+                    continue;
+                }
+                waitForPresentationCapacity = false;
+            }
+            state->renderPasses.fetch_add(
+                1,
+                std::memory_order_relaxed);
 
             const auto renderStarted = steadyMicroseconds();
             double timestamp = -1.0;
@@ -780,20 +844,31 @@ private:
                     continue;
                 }
 
-                {
-                    auto guard = deviceAccess_->contextGuard();
-                    const float black[] {
-                        0.0F,
-                        0.0F,
-                        0.0F,
-                        1.0F,
-                    };
-                    context_->ClearRenderTargetView(
-                        renderTargetView_.Get(),
-                        black);
-                }
                 timestamp = player->renderVideo();
+                if (renderer_) {
+                    const auto rendererStatistics =
+                        renderer_->takeStatistics();
+                    updateMaximum(
+                        state->maximumColorSetupMicroseconds,
+                        rendererStatistics
+                            .maximumColorSetupMicroseconds);
+                    updateMaximum(
+                        state->maximumInteropMicroseconds,
+                        rendererStatistics
+                            .maximumInteropMicroseconds);
+                    updateMaximum(
+                        state->maximumBufferUpdateMicroseconds,
+                        rendererStatistics
+                            .maximumBufferUpdateMicroseconds);
+                    updateMaximum(
+                        state->maximumDrawMicroseconds,
+                        rendererStatistics
+                            .maximumDrawMicroseconds);
+                }
                 if (timestamp < 0.0) {
+                    state->skippedRenders.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
                     continue;
                 }
                 renderCompleted = steadyMicroseconds();
@@ -804,7 +879,9 @@ private:
                                 .isHdrOutput())) {
                     requiredHdrUnavailable = true;
                 } else {
-                    presentStatus = swapChain_->Present(1, 0);
+                    presentStatus = swapChain_->Present(
+                        1,
+                        DXGI_PRESENT_DO_NOT_WAIT);
                 }
             }
 
@@ -823,6 +900,21 @@ private:
             hdrRequirementFailed_.store(
                 false,
                 std::memory_order_relaxed);
+            if (presentStatus == DXGI_ERROR_WAS_STILL_DRAWING) {
+                waitForPresentationCapacity =
+                    frameLatencyWaitableObject_ != nullptr;
+                state->busyPresents.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                updateMaximum(
+                    state->maximumRenderMicroseconds,
+                    renderCompleted - renderStarted);
+                updateMaximum(
+                    state->maximumPresentMicroseconds,
+                    presentCompleted - renderCompleted);
+                requestRender(state);
+                continue;
+            }
             if (FAILED(presentStatus)) {
                 const auto type =
                     presentStatus == DXGI_ERROR_DEVICE_REMOVED
@@ -832,6 +924,8 @@ private:
                 setError("D3D11 Present failed", presentStatus, type);
                 continue;
             }
+            waitForPresentationCapacity =
+                frameLatencyWaitableObject_ != nullptr;
 
             const auto previous =
                 state->previousRenderMicroseconds.exchange(
@@ -910,6 +1004,10 @@ private:
         interop_.reset();
         renderer_.reset();
         renderTargetView_.Reset();
+        if (frameLatencyWaitableObject_) {
+            CloseHandle(frameLatencyWaitableObject_);
+            frameLatencyWaitableObject_ = nullptr;
+        }
         swapChain_.Reset();
         deviceAccess_.reset();
         context_.Reset();
@@ -984,6 +1082,7 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGISwapChain3> swapChain_;
+    HANDLE frameLatencyWaitableObject_ = nullptr;
     ComPtr<ID3D11RenderTargetView> renderTargetView_;
     std::shared_ptr<D3D11DeviceAccess> deviceAccess_;
     std::shared_ptr<D3D11VideoRenderer> renderer_;

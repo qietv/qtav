@@ -888,18 +888,17 @@ int main(int argc, char** argv)
 
     const qtav::VideoFrame rgb =
         renderFile(argv[1], qtav::PixelFormat::RGB24, renderer);
-    std::future<bool> blockedRender;
+    std::future<bool> contendedRender;
     {
         auto contextGuard = deviceAccess->contextGuard();
-        blockedRender = std::async(
+        contendedRender = std::async(
             std::launch::async,
             [&] { return renderer->render(rgb); });
-        assert(blockedRender.wait_for(std::chrono::milliseconds(50))
-            == std::future_status::timeout);
+        assert(contendedRender.wait_for(std::chrono::seconds(2))
+            == std::future_status::ready);
+        assert(!contendedRender.get());
     }
-    assert(blockedRender.wait_for(std::chrono::seconds(2))
-        == std::future_status::ready);
-    assert(blockedRender.get());
+    assert(renderer->render(rgb));
 
     pixels =
         readTarget(d3d.device.Get(), d3d.context.Get(), target.texture.Get());

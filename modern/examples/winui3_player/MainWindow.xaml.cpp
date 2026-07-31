@@ -827,6 +827,8 @@ struct MainWindowPrivate final {
             outputStatistics.coalescedRenderRequests;
         const auto passes = outputStatistics.renderPasses;
         const auto rendered = outputStatistics.presentedFrames;
+        const auto busyPresents = outputStatistics.busyPresents;
+        const auto skippedRenders = outputStatistics.skippedRenders;
         const auto videoLongGaps =
             callbackState_->longVideoGaps.exchange(0);
         const auto renderLongGaps = outputStatistics.longRenderGaps;
@@ -838,6 +840,14 @@ struct MainWindowPrivate final {
             outputStatistics.maximumRenderMicroseconds;
         const auto maximumPresent =
             outputStatistics.maximumPresentMicroseconds;
+        const auto maximumColorSetup =
+            outputStatistics.maximumColorSetupMicroseconds;
+        const auto maximumInterop =
+            outputStatistics.maximumInteropMicroseconds;
+        const auto maximumBufferUpdate =
+            outputStatistics.maximumBufferUpdateMicroseconds;
+        const auto maximumDraw =
+            outputStatistics.maximumDrawMicroseconds;
         if (video == 0 && audio == 0 && requests == 0
             && passes == 0 && rendered == 0) {
             return;
@@ -853,6 +863,8 @@ struct MainWindowPrivate final {
             << L", passes=" << passes
             << L", rendered=" << static_cast<double>(rendered) / elapsed
             << L" fps, coalesced=" << coalesced
+            << L", present-busy=" << busyPresents
+            << L", render-skipped=" << skippedRenders
             << L", >80ms gaps(video/render)="
             << videoLongGaps << L'/' << renderLongGaps
             << L", max-gap-ms="
@@ -862,7 +874,15 @@ struct MainWindowPrivate final {
             << L", max-render/present-ms="
             << static_cast<double>(maximumRender) / 1'000.0
             << L'/'
-            << static_cast<double>(maximumPresent) / 1'000.0;
+            << static_cast<double>(maximumPresent) / 1'000.0
+            << L", max-stage-ms(color/interop/buffer/draw)="
+            << static_cast<double>(maximumColorSetup) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumInterop) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumBufferUpdate) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumDraw) / 1'000.0;
         AppendLog(message.str());
     }
 

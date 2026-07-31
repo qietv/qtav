@@ -108,8 +108,28 @@ int main()
     {
         auto outerGuard = access->contextGuard();
         auto recursiveGuard = access->contextGuard();
+        auto recursiveTryGuard = access->tryContextGuard();
         assert(outerGuard);
         assert(recursiveGuard);
+        assert(recursiveTryGuard);
+    }
+
+    std::promise<void> tryWorkerStarted;
+    auto tryWorkerStartedFuture = tryWorkerStarted.get_future();
+    std::future<bool> tryWorker;
+    {
+        auto mainGuard = access->contextGuard();
+        tryWorker = std::async(
+            std::launch::async,
+            [&access, &tryWorkerStarted] {
+                tryWorkerStarted.set_value();
+                auto workerGuard = access->tryContextGuard();
+                return static_cast<bool>(workerGuard);
+            });
+        tryWorkerStartedFuture.wait();
+        assert(tryWorker.wait_for(std::chrono::seconds(2))
+            == std::future_status::ready);
+        assert(!tryWorker.get());
     }
 
     std::promise<void> workerStarted;
