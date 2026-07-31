@@ -4,8 +4,9 @@ This harness proves the first Android production-path slice without Qt or a
 Gradle dependency. It cross-builds a pinned minimal FFmpeg 8.1.2 configuration
 and QtAVCore for `arm64-v8a`, packages a platform `NativeActivity`, and checks
 software MPEG-4 plus PCM decode, a bounded three-frame Vulkan submission ring,
-native HDR swapchain presentation, an OpenGL ES 3.x/EGL SDR fallback, and
-background/foreground surface recreation on one connected device.
+native HDR swapchain presentation, OpenGL ES 3.x/EGL native HDR, an explicit
+EGL SDR fallback, AAudio device output, MediaCodec H.264/HEVC direct-surface
+output, and background/foreground surface recreation on one connected device.
 
 Requirements:
 
@@ -17,7 +18,9 @@ Requirements:
 - CMake, Ninja, curl, and host FFmpeg;
 - the NDK `glslc` shader compiler and an Android Vulkan device;
 - exactly one authorized, awake, unlocked arm64 Android device with OpenGL ES
-  3.x and a Vulkan HDR surface-format pair for deployment.
+  3.x, an exact RGB10_A2 BT.2020/PQ or BT.2020/HLG EGL surface, and a Vulkan
+  HDR surface-format pair plus an AAudio output route and H.264/HEVC
+  MediaCodec decoders for deployment.
 
 Build:
 
@@ -49,6 +52,10 @@ instead of repeatedly retrying window creation.
 The application creates its own Vulkan instance, logical device, and
 graphics/present queue, enables `VK_EXT_swapchain_colorspace`, and enables
 `VK_EXT_hdr_metadata` when the device exposes it.
+`QtAV::RenderMobile` remains attached to the player for the renderer session;
+its application factories prepare the current Android Vulkan or OpenGL ES
+adapter, and its bounded recovery policy recreates Vulkan after the
+background/foreground window replacement without reopening media.
 `QtAV::RenderVulkanAndroid` retains the current `ANativeWindow`, requires a
 native HDR target in this harness, and owns only its surface/swapchain
 generation. A successful result reports decoded video frames,
@@ -66,16 +73,41 @@ HDR10/HLG encoding, HLG-to-PQ conversion, FP16 extended-linear-sRGB and
 BT.2020-linear output above reference white,
 mastering-display/MaxCLL/default-luminance selection, viewport, rotation, and
 target recreation.
+Decoded PCM is converted through `QtAV::AudioResample` into the Float32
+mono/stereo format negotiated by `QtAV::AudioAAudio`. The connected run
+requires a valid monotonic AAudio presentation clock, non-negative combined
+backend/device latency, positive device/buffer/burst diagnostics, native
+device output, and continued playback after the same pause plus
+background/foreground transition. The current minimum API 28 result needs no
+OpenSL ES fallback.
+The final hardware-decode phase binds a versioned application
+`ANativeWindow` through `QtAV::HWMediaCodec`, explicitly selects FFmpeg's
+H.264 and HEVC MediaCodec wrappers, and validates immediate/monotonic
+presentation plus drop decisions without accessing decoded pixels. It seeks
+the H.264 stream, replaces it with HEVC, stops HEVC explicitly, backgrounds
+and resumes the activity with a new surface generation, rejects that new
+output against the stale token, and closes the activity cleanly. The generated
+six-second H.264 and HEVC MP4 inputs are packaged alongside the software A/V
+asset.
 The same run creates an offscreen OpenGL ES 3 context and verifies actual
 uploads/readback for YUV420/422/444, NV12/NV21, little-endian P010,
 RGB/BGR/RGBA/BGRA/ARGB, and Gray8 together with viewport, rotation, and target
-generation. After the Vulkan HDR playback/lifecycle checks finish, the Android
-EGL adapter owns a real window surface and presents a synthetic
-P010/BT.2020/PQ frame through the documented SDR tone-mapping fallback. The
-automatic Vulkan-to-OpenGL ES selector is intentionally a separate next step.
+generation. It numerically checks the explicit SDR tone-mapped, BT.2020/PQ,
+and BT.2020/HLG target encodings. After the Vulkan HDR playback/lifecycle
+checks finish, the Android EGL adapter first forces RGBA8/sRGB and presents a
+synthetic P010/BT.2020/PQ frame through the documented SDR tone-mapping
+fallback. It then requires exact RGB10_A2 with BT.2020/PQ or BT.2020/HLG,
+presents the HDR frame without SDR tone mapping, and leaves the surface active
+while the deployment script independently checks Android compositor
+HDR-layer recognition. Both cases force Vulkan-unavailable startup through
+`MobileVideoRendererSelector`, proving the real-adapter policies in addition
+to the platform-neutral fatal/recovery/no-renderer tests.
 
 `install-consumer/` is a standalone Android CMake consumer for validating an
-installed package. It includes the installed Android EGL header and links only
-`QtAV::RenderOpenGLAndroid`, which also proves that the exported target brings
-in `QtAV::RenderOpenGL` and logical Android `EGL`/`GLESv3` dependencies without
-embedding the producer machine's NDK sysroot path.
+installed package. It includes the mobile selector, Android EGL, AAudio, and
+MediaCodec headers and links `QtAV::RenderMobile`,
+`QtAV::RenderOpenGLAndroid`, `QtAV::AudioAAudio`, and
+`QtAV::HWMediaCodec`; this also proves that the exported targets bring in
+`QtAV::RenderOpenGL` plus logical Android
+`nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk` dependencies
+without embedding the producer machine's NDK sysroot path.

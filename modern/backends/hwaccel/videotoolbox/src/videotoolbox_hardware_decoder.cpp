@@ -7,10 +7,10 @@ namespace qtav {
 HardwareDecodeConfig videoToolboxHardwareDecodeConfig(
     VideoToolboxHardwareDecodeConfig config) noexcept
 {
-    return {
-        HardwareDeviceType::VideoToolbox,
-        config.allowSoftwareFallback,
-    };
+    HardwareDecodeConfig result;
+    result.deviceType = HardwareDeviceType::VideoToolbox;
+    result.allowSoftwareFallback = config.allowSoftwareFallback;
+    return result;
 }
 
 CVPixelBufferRef videoToolboxPixelBuffer(

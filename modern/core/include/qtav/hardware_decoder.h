@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include <qtav/export.h>
 #include <qtav/hardware_frame.h>
@@ -56,6 +57,13 @@ struct QTAV_CORE_EXPORT HardwareDecodeConfig {
     // Backend helpers which promise an application-selected device set this
     // so a failed token creation cannot silently select another native device.
     bool requireSuppliedDevice = false;
+    // Optional FFmpeg decoder wrapper name selected by a backend helper.
+    // This keeps wrapper-specific decoder lookup explicit without exposing
+    // FFmpeg codec declarations through the public API.
+    std::string decoderWrapper;
+    // Version of an application-supplied direct-output surface. Zero means
+    // that the hardware path does not use a versioned surface token.
+    std::uint32_t surfaceGeneration = 0;
 
     bool isValid() const noexcept
     {

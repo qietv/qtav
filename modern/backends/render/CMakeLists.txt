@@ -1,4 +1,5 @@
 qtav_add_optional_backend(QTAV_RENDER_CPU qtav_render_cpu cpu)
+qtav_add_optional_backend(QTAV_RENDER_MOBILE qtav_render_mobile mobile)
 qtav_add_optional_backend(QTAV_RENDER_OPENGL qtav_render_opengl opengl)
 qtav_add_optional_backend(QTAV_RENDER_VULKAN qtav_render_vulkan vulkan)
 qtav_add_optional_backend(QTAV_RENDER_D3D11 qtav_render_d3d11 d3d11)

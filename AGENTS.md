@@ -81,7 +81,7 @@ modern/
 │   ├── include/qtav/
 │   └── src/
 ├── backends/
-│   ├── render/{cpu,opengl,vulkan,d3d11,metal}/
+│   ├── render/{cpu,mobile,opengl,vulkan,d3d11,metal}/
 │   ├── audio/{resample,file,wasapi,coreaudio,alsa,pulseaudio,aaudio}/
 │   ├── hwaccel/{d3d11va,videotoolbox,vaapi,mediacodec}/
 │   └── interop/{d3d11,cvmetal,vaapi}/
@@ -98,6 +98,7 @@ Expected target names:
 ```text
 qtav_core
 qtav_render_cpu
+qtav_render_mobile
 qtav_render_opengl
 qtav_render_vulkan
 qtav_render_d3d11
@@ -108,6 +109,7 @@ qtav_audio_wasapi
 qtav_audio_coreaudio
 qtav_hw_d3d11va
 qtav_hw_videotoolbox
+qtav_hw_mediacodec
 qtav_interop_d3d11
 qtav_interop_cvmetal
 ```
@@ -169,14 +171,20 @@ Implemented under `modern/`:
 - Metal software-frame rendering into borrowed textures or drawables;
 - CoreAudio device output with playback clock and latency reporting;
 - VideoToolbox hardware decoding into retained `CVPixelBuffer` frames;
+- MediaCodec H.264/HEVC hardware decoding into an application-supplied,
+  versioned Android surface, with explicit present/drop output tokens;
 - zero-copy VideoToolbox/CVMetal plane import and Metal rendering;
 - platform-neutral Vulkan software-frame rendering with structured color and
   geometry shaders, explicit SDR/HDR10/extended-linear output color spaces,
   plus an Android `ANativeWindow` adapter with native HDR swapchain selection
   and optional `VK_EXT_hdr_metadata` submission;
 - platform-neutral OpenGL ES 3.x software-frame rendering for
-  YUV/NV12/P010/RGB families with structured SDR color and geometry handling,
-  plus an Android EGL/`ANativeWindow` adapter for the required SDR fallback;
+  YUV/NV12/P010/RGB families with structured color and geometry handling,
+  explicit SDR/PQ/HLG output encoding, plus an Android EGL/`ANativeWindow`
+  adapter with exact RGB10_A2 native HDR and explicit RGBA8/sRGB fallback;
+- a platform-neutral mobile renderer selector with Vulkan-preferred startup,
+  bounded same-API surface recovery, fatal one-way OpenGL ES fallback, native
+  window suspension/recreation, and explicit no-renderer behavior;
 - structured video color-space/HDR10 metadata and Metal
   SDR/extended-linear output;
 - libswresample conversion to negotiated interleaved PCM;
@@ -188,10 +196,9 @@ Implemented under `modern/`:
 Known intentional limitations:
 
 - no native audio-device sink outside macOS and Windows yet;
-- no automatic Vulkan-to-OpenGL ES selector yet; both software engines and
-  their Android adapters are validated, while OHOS and Linux adapters/device
-  coverage remain;
-- no Linux or Android hardware decoder or GPU zero-copy interop yet;
+- no OHOS or Linux platform adapters/device coverage yet;
+- no Linux hardware decoder, Android GPU zero-copy interop, or OHOS hardware
+  decoder yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
 - no compressed Dolby passthrough, Atmos object rendering, Dolby Vision, or
@@ -244,13 +251,14 @@ development host; explicit leak detection aborts as unsupported.
 
 Last verified baseline:
 
-- current macOS recheck builds successfully and passes 27/27 CTest after the
+- current macOS recheck builds successfully and passes 29/29 CTest after the
   scheduling-isolation audio tests were updated to wait explicitly for frame
-  callbacks and to expect one sink drain per completed loop segment;
+  callbacks and to expect one sink drain per completed loop segment, including
+  the mobile renderer selector state-machine coverage;
 - static build: passed;
 - shared build: passed;
-- CTest: 27/27 passed;
-- ASan/UBSan: 27/27 passed;
+- CTest: 29/29 passed;
+- ASan/UBSan: 29/29 passed;
 - all-backends-disabled macOS CTest: 10/10 passed;
 - install plus external `find_package(QtAVCore)` consumption of
   `QtAV::Core`, `QtAV::RenderCPU`, `QtAV::RenderMetal`,
@@ -275,7 +283,17 @@ Last verified baseline:
   consumption, offscreen readback, and connected Adreno 830 device
   presentation: passed for YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, Gray8, viewport, rotation, target-generation
-  replacement, and real-window P010/PQ-to-SDR presentation.
+  replacement, P010/PQ-to-SDR, native BT.2020/PQ and BT.2020/HLG encoding,
+  real-window exact RGB10_A2 BT.2020/PQ presentation, and Android compositor
+  HDR-layer recognition.
+- Android mobile selector NDK build, package export, deterministic startup,
+  recovery, fatal-fallback, one-way, and no-renderer tests, plus connected
+  Adreno 830 Vulkan HDR surface recreation and forced initial EGL fallback:
+  passed.
+- Android MediaCodec H.264/HEVC NDK build, package export, direct-surface
+  present/drop, seek/flush, media replacement, explicit stop, surface
+  recreation, stale-generation rejection, and clean shutdown on the connected
+  Adreno 830 device: passed.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus
   HEVC Main10/P010 zero-CPU-map Video Processor rendering, WASAPI device

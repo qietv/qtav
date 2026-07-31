@@ -20,7 +20,9 @@ namespace qtav {
 class QTAV_RENDER_OPENGL_ANDROID_EXPORT
 AndroidOpenGLVideoRenderer final : public VideoRenderAPI {
 public:
-    AndroidOpenGLVideoRenderer();
+    explicit AndroidOpenGLVideoRenderer(
+        OpenGLOutputPreference outputPreference =
+            OpenGLOutputPreference::PreferHdr);
     ~AndroidOpenGLVideoRenderer() override;
 
     AndroidOpenGLVideoRenderer(AndroidOpenGLVideoRenderer&&) noexcept;
@@ -43,6 +45,9 @@ public:
     bool setWindow(ANativeWindow* window);
     VideoSize surfaceSize() const noexcept;
     std::uint64_t surfaceGeneration() const noexcept;
+    OpenGLOutputColorSpace outputColorSpace() const noexcept;
+    bool hdrOutputActive() const noexcept;
+    int colorComponentBits() const noexcept;
 
 private:
     class Impl;

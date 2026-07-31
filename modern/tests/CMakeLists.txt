@@ -32,6 +32,40 @@ target_link_libraries(qtav_core_backend_api_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_backend_api_test PRIVATE cxx_std_17)
 add_test(NAME qtav_core_backend_api COMMAND qtav_core_backend_api_test)
 
+if(NOT QTAV_AUDIO_AAUDIO STREQUAL "OFF")
+    add_executable(
+        qtav_audio_aaudio_pcm_queue_test
+        aaudio_pcm_queue_test.cpp
+    )
+    target_compile_features(
+        qtav_audio_aaudio_pcm_queue_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_audio_aaudio_pcm_queue
+        COMMAND qtav_audio_aaudio_pcm_queue_test
+    )
+endif()
+
+if(TARGET qtav_render_mobile)
+    add_executable(
+        qtav_render_mobile_test
+        mobile_video_renderer_test.cpp
+    )
+    target_link_libraries(
+        qtav_render_mobile_test
+        PRIVATE QtAV::RenderMobile
+    )
+    target_compile_features(
+        qtav_render_mobile_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_render_mobile_selector
+        COMMAND qtav_render_mobile_test
+    )
+endif()
+
 add_executable(
     qtav_core_frame_color_metadata_test
     frame_color_metadata_test.cpp

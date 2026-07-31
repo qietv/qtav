@@ -10,6 +10,25 @@
 
 namespace qtav {
 
+// PreferHdr selects native HDR when the platform adapter exposes it and falls
+// back to SDR. RequireHdr rejects an SDR-only surface. SdrOnly always requests
+// the deterministic HDR-to-SDR rendering path.
+enum class OpenGLOutputPreference {
+    PreferHdr,
+    RequireHdr,
+    SdrOnly,
+};
+
+// Defines the encoding written by OpenGLVideoRenderer. Platform adapters must
+// ensure that the framebuffer and presentation surface use the same color
+// space. HDR10PQ and HDR10HLG contain BT.2020 primaries with the named
+// transfer function; SdrSrgb contains BT.709/sRGB output.
+enum class OpenGLOutputColorSpace {
+    SdrSrgb,
+    HDR10PQ,
+    HDR10HLG,
+};
+
 // OpenGLVideoRenderer renders into the application-provided framebuffer of
 // the OpenGL ES 3.x context that is current on the calling thread. Framebuffer
 // zero is valid and represents the current default framebuffer.
@@ -17,12 +36,19 @@ struct QTAV_RENDER_OPENGL_EXPORT OpenGLRenderTarget {
     std::uint32_t framebuffer = 0;
     VideoSize size;
     std::uint64_t generation = 0;
+    OpenGLOutputColorSpace colorSpace =
+        OpenGLOutputColorSpace::SdrSrgb;
 
     bool isValid() const noexcept
     {
         return size.isValid();
     }
+
+    bool isHdr() const noexcept;
 };
+
+QTAV_RENDER_OPENGL_EXPORT bool openGLColorSpaceIsHdr(
+    OpenGLOutputColorSpace colorSpace) noexcept;
 
 using OpenGLCurrentTargetCallback =
     std::function<OpenGLRenderTarget()>;

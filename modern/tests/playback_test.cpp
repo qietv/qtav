@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <mutex>
 #include <memory>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -104,11 +105,26 @@ int main(int argc, char** argv)
         .setVideoRenderAPI(secondRenderer, &secondRenderKey)
         .setVideoRenderAPI(rejectingRenderer, &rejectingRenderKey)
         .setRenderCallback([&](void* opaque) {
-            const auto timestamp = player.renderVideo(opaque);
+            const auto rejectedBefore = rejectedRenderAttempts.load();
+            auto timestamp = player.renderVideo(opaque);
+            for (int attempt = 0;
+                 (opaque == &rejectingRenderKey
+                      ? rejectedRenderAttempts.load() == rejectedBefore
+                      : timestamp < 0.0)
+                     && attempt < 1'000;
+                 ++attempt) {
+                std::this_thread::yield();
+                timestamp = player.renderVideo(opaque);
+            }
             assert(
                 opaque == &rejectingRenderKey
                     ? timestamp < 0.0
                     : timestamp >= 0.0);
+            if (opaque == &rejectingRenderKey) {
+                assert(
+                    rejectedRenderAttempts.load()
+                    == rejectedBefore + 1);
+            }
         });
 
     player.setPlaybackRate(4.0F);

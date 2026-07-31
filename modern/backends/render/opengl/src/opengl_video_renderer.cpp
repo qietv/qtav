@@ -48,7 +48,7 @@ uniform sampler2D plane2;
 uniform usampler2D p010Luma;
 uniform usampler2D p010Chroma;
 
-// width, height, format, unused
+// width, height, format, output color space
 uniform uvec4 source;
 // surface width, height, transfer, primaries
 uniform uvec4 surface;
@@ -159,10 +159,54 @@ vec3 sourceToBt709(vec3 value, uint primaries)
     return value;
 }
 
+vec3 sourceToBt2020(vec3 value, uint primaries)
+{
+    if (primaries == 0U) {
+        return mat3(
+            0.6274, 0.0691, 0.0164,
+            0.3293, 0.9195, 0.0880,
+            0.0433, 0.0114, 0.8956) * value;
+    }
+    if (primaries == 2U) {
+        return mat3(
+             0.7538, 0.0457, -0.0012,
+             0.1986, 0.9418,  0.0176,
+             0.0475, 0.0125,  0.9836) * value;
+    }
+    return value;
+}
+
+vec3 nitsToPq(vec3 value)
+{
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    vec3 power =
+        pow(clamp(value / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow(
+        (c1 + c2 * power) / (1.0 + c3 * power),
+        vec3(m2));
+}
+
+vec3 nitsToHlg(vec3 value)
+{
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    vec3 linear = max(value, vec3(0.0)) / 1000.0;
+    vec3 low = sqrt(3.0 * linear);
+    vec3 high =
+        a * log(max(12.0 * linear - b, vec3(0.000001))) + c;
+    return mix(low, high, greaterThan(linear, vec3(1.0 / 12.0)));
+}
+
 vec3 presentColor(vec3 rgb)
 {
     uint transfer = surface.z;
     uint primaries = surface.w;
+    uint outputMode = source.w;
     vec3 linear;
     float sourceWhite = luminance.x;
     if (transfer == 1U) {
@@ -174,10 +218,19 @@ vec3 presentColor(vec3 rgb)
     } else {
         linear = sdrToLinear(clamp(rgb, 0.0, 1.0)) * sourceWhite;
     }
-    linear = sourceToBt709(linear, primaries);
+    if (outputMode == 1U || outputMode == 2U) {
+        linear = sourceToBt2020(linear, primaries);
+    } else {
+        linear = sourceToBt709(linear, primaries);
+    }
+    if (outputMode == 1U) {
+        return nitsToPq(linear);
+    }
+    if (outputMode == 2U) {
+        return nitsToHlg(linear);
+    }
 
-    // The baseline EGL adapter exposes an SDR surface. Keep the same
-    // deterministic HDR-to-SDR shoulder as the Vulkan SDR path.
+    // SDR targets keep the deterministic HDR-to-SDR shoulder.
     float maximum = max(luminance.y, sourceWhite);
     if (maximum > sourceWhite) {
         linear = linear / (vec3(1.0) + linear / maximum);
@@ -360,6 +413,19 @@ enum class ShaderColorPrimaries : std::uint32_t {
     BT2020,
     DisplayP3,
 };
+
+std::uint32_t shaderOutputColorSpace(
+    OpenGLOutputColorSpace colorSpace) noexcept
+{
+    switch (colorSpace) {
+    case OpenGLOutputColorSpace::HDR10PQ:
+        return 1;
+    case OpenGLOutputColorSpace::HDR10HLG:
+        return 2;
+    default:
+        return 0;
+    }
+}
 
 struct PlaneLayout {
     int width = 0;
@@ -731,6 +797,18 @@ bool checkError(const char* operation, std::string& error)
 }
 
 } // namespace
+
+bool OpenGLRenderTarget::isHdr() const noexcept
+{
+    return isValid() && openGLColorSpaceIsHdr(colorSpace);
+}
+
+bool openGLColorSpaceIsHdr(
+    OpenGLOutputColorSpace colorSpace) noexcept
+{
+    return colorSpace == OpenGLOutputColorSpace::HDR10PQ
+        || colorSpace == OpenGLOutputColorSpace::HDR10HLG;
+}
 
 class OpenGLVideoRenderer::Impl {
 public:
@@ -1104,7 +1182,7 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
         static_cast<GLuint>(frame.width()),
         static_cast<GLuint>(frame.height()),
         static_cast<GLuint>(packed.format),
-        0);
+        shaderOutputColorSpace(target.colorSpace));
     glUniform4ui(
         impl_->surfaceLocation_,
         static_cast<GLuint>(config.surfaceSize.width),

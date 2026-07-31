@@ -29,6 +29,7 @@ target_link_libraries(qtav_render_opengl_android
     PUBLIC QtAV::RenderOpenGL
     PRIVATE
         android
+        nativewindow
         "${QTAV_EGL_LIBRARY}"
         "${QTAV_GLES3_LIBRARY}"
 )

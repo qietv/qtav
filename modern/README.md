@@ -40,11 +40,17 @@ code is used.
 - optional RIFF/WAVE PCM diagnostic file sink;
 - optional macOS CoreAudio device sink with native playback timing;
 - optional Windows WASAPI shared-mode device sink with native playback timing;
+- optional Android AAudio device sink with callback-safe bounded buffering,
+  device timing, latency reporting, and disconnect recovery;
 - optional D3D11VA hardware decoding on an application-selected retained
   D3D11 device, with reference-counted decoder texture-array slices and
   explicit software fallback;
 - optional VideoToolbox hardware decoding with reference-counted
   `CVPixelBuffer` frames and explicit software fallback;
+- optional Android MediaCodec H.264/HEVC hardware decoding into an
+  application-supplied, versioned `ANativeWindow`, with explicit present,
+  monotonic-time present, drop, stale-generation rejection, and software
+  fallback policy;
 - optional CVMetalTextureCache interop for zero-copy limited/full-range
   VideoToolbox-frame rendering through Metal;
 - optional platform-neutral Vulkan software-frame renderer using borrowed
@@ -55,19 +61,25 @@ code is used.
   publishes its output color space, and owns surface/swapchain synchronization;
 - optional platform-neutral OpenGL ES 3.x software-frame renderer plus an
   Android EGL adapter that owns its display, context, window surface, and
-  surface generation as the mobile SDR fallback;
+  surface generation, selects native 10-bit BT.2020/PQ or BT.2020/HLG when
+  available, and preserves an explicit RGBA8/sRGB SDR fallback;
+- optional platform-neutral mobile renderer selector that performs
+  Vulkan-preferred startup, bounded same-API recovery, fatal one-way fallback
+  to OpenGL ES, and an explicit no-renderer state;
 - an accepted Android/OHOS mobile rendering policy that prefers Vulkan and
   uses a separate OpenGL ES/EGL backend after Vulkan is unavailable or fails
   fatally, while keeping recoverable surface recreation within the active API;
 - a reproducible macOS-to-Android arm64 build and connected-device
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
-  decoding, Vulkan presentation, and OpenGL ES/EGL SDR fallback validation;
+  decoding, Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback,
+  AAudio output, and MediaCodec H.264/HEVC direct-surface validation;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
 keep consuming decoded frames through `onAudioFrame()` and can optionally bind
-an `AudioSink`; the macOS CoreAudio and Windows WASAPI implementations remain
-separate backend targets so the core acquires no Qt or platform dependency.
+an `AudioSink`; the macOS CoreAudio, Windows WASAPI, and Android AAudio
+implementations remain separate backend targets so the core acquires no Qt or
+platform dependency.
 
 Current backend integration boundary:
 
@@ -91,12 +103,19 @@ Current backend integration boundary:
 - `QtAV::AudioWASAPI` negotiates shared-mode Float32 mono/stereo PCM against a
   Windows render endpoint, owns an event-driven queue on a dedicated COM
   thread, and supplies an `IAudioClock`-backed playback clock and latency;
+- `QtAV::AudioAAudio` negotiates Float32 mono/stereo PCM against the current
+  Android output route, feeds AAudio's real-time callback from a bounded
+  lock-free queue, maps AAudio presentation timestamps to the media timeline,
+  and rebuilds a disconnected default-route stream on a non-callback thread;
 - `HardwareDecodeConfig` selects an optional hardware device for video decode;
   its optional reference-counted `HardwareDecodeDevice` lets an in-tree
   backend supply a pre-created native device without exposing FFmpeg or
   platform SDK types;
   `QtAV::HWVideoToolbox` supplies the Apple configuration helper and produces
   `HardwareFrame` values backed by retained `CVPixelBuffer` storage;
+  `QtAV::HWMediaCodec` explicitly selects FFmpeg's MediaCodec wrapper decoder,
+  binds it to a versioned application `ANativeWindow`, and turns each decoded
+  output into a single-decision direct-surface present/drop token;
 - `QtAV::RenderCPU` converts and scales decoded software frames into packed
   RGB/BGR/RGBA/BGRA/ARGB or Gray8 buffers;
 - `QtAV::RenderD3D11` uploads software YUV420/422/444, NV12/NV21, P010,
@@ -137,28 +156,34 @@ Current backend integration boundary:
   owns the Vulkan instance, device, queue, and NativeActivity;
 - `QtAV::RenderOpenGL` uploads the same software YUV420/422/444, NV12/NV21,
   P010, RGB/BGR/RGBA/BGRA/ARGB, and Gray8 families into OpenGL ES textures,
-  applies the structured SDR/HDR-to-SDR color path plus the common
-  viewport/aspect/rotation contract, and draws into a caller-supplied current
-  framebuffer;
+  applies the structured color path plus the common viewport/aspect/rotation
+  contract, and writes explicit SDR sRGB, HDR10/PQ, or HDR10/HLG encoding into
+  a caller-supplied current framebuffer;
 - `QtAV::RenderOpenGLAndroid` retains the current `ANativeWindow` generation
   and owns its EGL display, OpenGL ES 3.x context, window surface, and swap,
-  while keeping Android and EGL types outside core public headers;
-- no Linux native backend, Android audio sink, or Android hardware decoder has
-  been implemented yet.
+  prefers an exact RGB10_A2 BT.2020/PQ surface, considers BT.2020/HLG, and
+  falls back explicitly to RGBA8/sRGB while keeping Android and EGL types
+  outside core public headers;
+- `QtAV::RenderMobile` owns no graphics or platform resources. Applications
+  supply Vulkan and OpenGL ES renderer factories for the current native-window
+  generation; the selector keeps one stable `VideoRenderAPI` attached to
+  `Player` across same-API recreation and one-way fallback;
+- no Linux native backend, Android GPU texture interop, or OHOS hardware
+  decoder has been implemented yet.
 
-Mobile renderer selection remains in the application or thin platform layer
-that owns the native window and graphics devices. A new renderer session
-prefers Vulkan and selects the OpenGL ES 3.x/EGL backend when Vulkan
-is unavailable, lacks required capabilities, or cannot create its initial
-surface generation. Recoverable Vulkan surface/swapchain events recreate
-Vulkan in place; device loss, unrecoverable submission/presentation failure,
-or repeated recreation failure causes a one-way switch to OpenGL ES without
-reopening the media. If both APIs fail, video presentation reports an error
-while playback, audio, and decoded-frame callbacks remain available. Decoder,
-direct-surface, interop, and renderer fallback policies remain independent.
-The accepted design is specified in [`MOBILE.md`](MOBILE.md). The OpenGL ES
-engine and Android EGL adapter are implemented without SDL3; the automatic
-startup/recovery/fatal-error selector is the next Android rendering task.
+Mobile renderer creation remains in the application or thin platform layer
+that owns the native window and graphics devices, while
+`MobileVideoRendererSelector` implements the accepted shared selection policy.
+A new session probes Vulkan first and selects OpenGL ES when Vulkan is
+unavailable or cannot open its initial surface. `SurfaceLost` causes bounded
+same-API recreation; a fatal error or exhausted Vulkan recovery retires Vulkan
+for that session and retries the retained frame through OpenGL ES without
+reopening media. `suspendSurface()` and `recreateSurface()` preserve the
+selected API across an application-led native-window replacement. If both
+APIs fail, video presentation reports unavailable while playback, audio, and
+decoded-frame callbacks remain usable. Decoder, direct-surface, interop, and
+renderer fallback policies remain independent. The accepted design is
+specified in [`MOBILE.md`](MOBILE.md).
 
 The same design plans separate zero-CPU-copy native-buffer interop for Vulkan
 and OpenGL ES after direct-surface hardware presentation is stable. On
@@ -196,8 +221,8 @@ enables a backend when its implementation and host requirements are available,
 `OFF` always disables it, and `ON` requires it or stops configuration with a
 clear error. Current switches are:
 
-- render: `QTAV_RENDER_CPU`, `QTAV_RENDER_OPENGL`, `QTAV_RENDER_VULKAN`,
-  `QTAV_RENDER_D3D11`, and `QTAV_RENDER_METAL`;
+- render: `QTAV_RENDER_CPU`, `QTAV_RENDER_MOBILE`, `QTAV_RENDER_OPENGL`,
+  `QTAV_RENDER_VULKAN`, `QTAV_RENDER_D3D11`, and `QTAV_RENDER_METAL`;
 - audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_COREAUDIO`, `QTAV_AUDIO_ALSA`,
   `QTAV_AUDIO_PULSEAUDIO`, `QTAV_AUDIO_AAUDIO`, `QTAV_AUDIO_RESAMPLE`, and
   `QTAV_AUDIO_FILE`;
@@ -208,6 +233,7 @@ clear error. Current switches are:
 - output: `QTAV_OUTPUT_D3D11`.
 
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
+`QTAV_RENDER_MOBILE=AUTO` builds the dependency-free mobile renderer selector,
 `QTAV_RENDER_OPENGL=AUTO` builds the OpenGL ES renderer when GLES 3 headers
 and libraries are available and adds the Android EGL adapter on Android,
 `QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader and
@@ -227,9 +253,13 @@ selection and native-frame access target. `QTAV_INTEROP_D3D11=AUTO` builds the
 Windows Video Processor adapter when the D3D11 renderer and D3D11VA decoder
 targets are available. `QTAV_OUTPUT_D3D11=AUTO` builds the high-level Windows
 composition output when the D3D11 renderer, D3D11VA decoder, and interop
-targets are available. Backend implementations not otherwise described
-remain disabled under `AUTO`, and explicitly requesting one with `ON` is an
-error.
+targets are available. `QTAV_AUDIO_AAUDIO=AUTO` builds the AAudio sink on
+Android API 26 or newer; the current Android harness targets API 28 and does
+not require OpenSL ES fallback. `QTAV_HW_MEDIACODEC=AUTO` builds the Android
+MediaCodec direct-surface backend when the NDK Media APIs and FFmpeg's
+MediaCodec hardware context are available. Backend implementations not
+otherwise described remain disabled under `AUTO`, and explicitly requesting
+one with `ON` is an error.
 
 Run the headless example:
 
@@ -281,8 +311,8 @@ decodes and presents 180 MPEG-4 video frames through an Adreno 830 Vulkan
 background/foreground transition.
 
 This is a toolchain, packaging, software-decode, Vulkan-rendering, and
-OpenGL ES fallback checkpoint. The Vulkan renderer uses a bounded three-frame
-resource ring and retains
+OpenGL ES presentation checkpoint. The Vulkan renderer uses a bounded
+three-frame resource ring and retains
 each source frame until its fence completes. Platform-neutral offscreen
 readback goldens run in the Android harness and cover YUV color conversion,
 limited/full range, BT.601/BT.709 matrices, viewport, rotation, target
@@ -298,9 +328,22 @@ recreation. The same device run now compiles the OpenGL ES 3 shaders, validates
 offscreen uploads for YUV420/422/444, NV12/NV21, P010, RGB/BGR,
 RGBA/BGRA/ARGB, and Gray8, checks viewport, rotation, and target-generation
 replacement, and presents a P010/PQ-to-SDR frame through the real Android EGL
-window adapter after the Vulkan lifecycle completes. It does not yet provide
-the automatic renderer selector, an AAudio sink, or a MediaCodec backend.
-Their accepted shared Android/OHOS
+window adapter after the Vulkan lifecycle completes. It then requires an
+RGB10_A2 BT.2020/PQ-or-HLG EGL surface, renders the same P010/PQ source without
+SDR tone mapping, and independently verifies that Android reports the EGL
+surface as an active HDR layer. The harness keeps one
+`MobileVideoRendererSelector` attached to the player, recreates Vulkan across
+the activity background/foreground window replacement, and separately proves
+forced Vulkan-unavailable startup through both the explicit SDR and required
+HDR OpenGL ES policies. The same run converts decoded PCM through
+`QtAV::AudioResample`, presents it through `QtAV::AudioAAudio`, and validates
+a monotonic device clock plus non-negative queued/device latency across the
+pause/resume transition. It then explicitly selects FFmpeg's H.264 and HEVC
+MediaCodec wrapper decoders, presents or drops their direct-surface outputs,
+seeks, replaces media, stops explicitly, rejects an output token against the
+old surface generation, and reopens against a replacement `ANativeWindow`
+without mapping decoded pixels. Texture-interoperable MediaCodec output
+remains deferred. The accepted shared Android/OHOS
 responsibility and lifecycle design is documented in [`MOBILE.md`](MOBILE.md).
 
 ## API shape
@@ -402,6 +445,92 @@ event-driven `IAudioClient`, copied PCM queue, pause/flush/drain lifecycle, and
 the `IAudioClock` media-timeline anchor. A device-clock underrun temporarily
 returns an invalid clock so `Player` can use its monotonic fallback until the
 next buffer establishes a new anchor.
+
+### AAudio device sink
+
+Link `QtAV::AudioAAudio` and `QtAV::AudioResample` in an Android application
+whose minimum API is 26 or newer:
+
+```cpp
+#include <qtav/aaudio_audio_sink.h>
+#include <qtav/swresample_audio_converter.h>
+
+player
+    .setAudioFrameConverter(
+        std::make_shared<qtav::SwresampleAudioConverter>())
+    .setAudioSink(
+        std::make_shared<qtav::AAudioAudioSink>());
+```
+
+The default configuration follows the current Android output route, requests
+low-latency shared mode, and negotiates mono/stereo interleaved Float32 PCM.
+Decoded PCM is copied on the audio-output worker into a fixed-capacity
+single-producer/single-consumer queue; AAudio's real-time data callback only
+performs lock-free queue reads, bounded memory copies, silence fill, and atomic
+state updates. It never allocates, locks, sleeps, or opens/closes a stream.
+
+`clock()` maps `AAudioStream_getTimestamp(CLOCK_MONOTONIC)` frame positions to
+the media timestamp of the corresponding queued frame. Reported latency
+combines callback/device pipeline frames with backend-queued PCM. Pause,
+flush, drain, underrun re-anchoring, and stream teardown follow the generic
+`AudioSink` lifecycle. If Android disconnects the stream during a default
+route change, a separate backend worker closes and reopens it with the same
+negotiated PCM format; successful recovery emits an underrun event so
+`Player` buffers until a new device-clock anchor is available. A failed
+restart emits `DeviceLost`.
+
+`AAudioStreamInfo` exposes the current device identifier, burst/capacity,
+xrun count, transparent route-change count, and disconnect-restart count for
+diagnostics. The backend requires no OpenSL ES fallback at the current API 28
+baseline.
+
+### MediaCodec direct-surface hardware decode
+
+Link `QtAV::HWMediaCodec` in an Android application. Create a new
+`MediaCodecSurface` token for every application-published `ANativeWindow`
+generation, then select the explicit FFmpeg wrapper decoder before playing:
+
+```cpp
+#include <qtav/mediacodec_hardware_decoder.h>
+
+qtav::MediaCodecSurface surface(nativeWindow);
+qtav::MediaCodecHardwareDecodeOptions options;
+options.allowSoftwareFallback = false;
+
+player.setMedia(path);
+player.setHardwareDecodeConfig(
+    qtav::mediaCodecHardwareDecodeConfig(surface, options));
+player.onVideoFrame(
+    [&surface](const qtav::VideoFrame& frame, int) {
+        auto output = qtav::mediaCodecFrame(frame, surface);
+        if (!output) {
+            return;
+        }
+        if (isLate(frame.timestamp())) {
+            output.drop();
+        } else {
+            output.presentAt(applicationMonotonicNowNanoseconds());
+        }
+    });
+player.setState(qtav::State::Playing);
+```
+
+The helper selects FFmpeg's `*_mediacodec` wrapper by wrapper identity instead
+of relying on the default software decoder lookup. `MediaCodecFrame` is a
+move-only, single-decision token. `present()` releases immediately to the
+configured surface, `presentAt()` uses a `CLOCK_MONOTONIC` nanosecond
+timestamp, and `drop()` releases without display. Destroying an undecided last
+frame copy lets FFmpeg drop it. Hardware-frame storage retains the decoder
+context until all copied outputs are released, including across seek, stop,
+media replacement, and asynchronous decoder reopen.
+
+On surface loss, pause playback, publish an empty hardware-decode
+configuration, and release the old token only after application-held frame
+copies are no longer being used. Create a new `MediaCodecSurface` for the new
+window, publish its configuration, and resume. The generation and native
+window identity are copied into each output; `mediaCodecFrame()` rejects a
+stale or foreign token. The direct-surface path does not expose a
+shader-readable texture and does not imply Vulkan/OpenGL ES interop.
 
 ### VideoToolbox hardware decode
 
@@ -593,15 +722,16 @@ contract for diagnostics and tests.
 
 ### OpenGL ES renderer and Android EGL adapter
 
-Link `QtAV::RenderOpenGLAndroid` for the Android SDR fallback. The adapter
-owns its EGL display, OpenGL ES 3.x context, window surface, and swap
+Link `QtAV::RenderOpenGLAndroid` for the Android OpenGL ES fallback. The
+adapter owns its EGL display, OpenGL ES 3.x context, window surface, and swap
 operations while retaining only the active `ANativeWindow` generation:
 
 ```cpp
 #include <qtav/android_opengl_video_renderer.h>
 
 auto renderer =
-    std::make_shared<qtav::AndroidOpenGLVideoRenderer>();
+    std::make_shared<qtav::AndroidOpenGLVideoRenderer>(
+        qtav::OpenGLOutputPreference::PreferHdr);
 renderer->setWindow(nativeWindow);
 
 qtav::VideoRenderConfig config;
@@ -609,7 +739,21 @@ config.surfaceSize = renderer->surfaceSize();
 config.aspectRatio = qtav::VideoAspectRatioMode::Fit;
 renderer->open(config);
 player.setVideoRenderAPI(renderer);
+
+if (renderer->hdrOutputActive()) {
+    recordHdrSurface(
+        renderer->outputColorSpace(),
+        renderer->colorComponentBits());
+}
 ```
+
+`PreferHdr` tries an exact RGB10_A2 BT.2020/PQ EGLConfig and colorspace first,
+then BT.2020/HLG when the display exposes it, and finally RGBA8/sRGB.
+`RequireHdr` rejects an SDR-only display, while `SdrOnly` always selects the
+RGBA8 path and preserves deterministic HDR-to-SDR tone mapping.
+`outputColorSpace()`, `hdrOutputActive()`, and `colorComponentBits()` expose
+the selected contract. The adapter verifies the EGL surface color space and
+the `ANativeWindow` dataspace used by Android composition.
 
 Passing `nullptr` to `setWindow()` invalidates the active EGL surface; a later
 window recreates it and reconfigures the still-open renderer generation.
@@ -621,14 +765,62 @@ policy layer.
 `QtAV::RenderOpenGL` is the reusable engine for applications or future
 platform adapters that already own an OpenGL ES 3.x context. Its
 `OpenGLCurrentTargetCallback` returns the current framebuffer number, size,
-and generation; framebuffer zero is the default framebuffer. The context must
-be current for `open()`, `render()`, and `close()`. The engine accepts
+generation, and `OpenGLOutputColorSpace`; framebuffer zero is the default
+framebuffer. The context must be current for `open()`, `render()`, and
+`close()`. The engine accepts
 YUV420/422/444, NV12/NV21, little-endian P010, RGB/BGR,
 RGBA/BGRA/ARGB, and Gray8 software frames. It applies structured
 range/matrix/transfer/primaries metadata, Fit/Fill/Stretch, custom viewports,
 and all right-angle rotations. The current baseline writes SDR sRGB-coded
-output and tone-maps PQ/HLG input; it does not claim native HDR EGL output or
-hardware-frame interop.
+output with PQ/HLG tone mapping for `SdrSrgb`, or preserves HDR luminance and
+converts primaries/transfer explicitly for BT.2020 `HDR10PQ` and `HDR10HLG`
+targets. Hardware-frame interop remains separate work.
+
+### Mobile renderer selector
+
+Link `QtAV::RenderMobile` and provide factories that create a fully prepared
+platform adapter for the current native-window generation. The Android
+application continues to own its activity, window reference, and borrowed
+Vulkan device:
+
+```cpp
+#include <qtav/mobile_video_renderer.h>
+
+qtav::MobileRendererSelectorConfig selectorConfig;
+selectorConfig.vulkan = [&] {
+    return createPreparedAndroidVulkanRenderer(currentWindow);
+};
+selectorConfig.openGLES = [&] {
+    return createPreparedAndroidOpenGLRenderer(currentWindow);
+};
+
+auto selector =
+    std::make_shared<qtav::MobileVideoRendererSelector>(
+        std::move(selectorConfig));
+selector->setSelectionCallback([](const auto& event) {
+    recordRendererSelection(
+        qtav::mobileRenderAPIName(event.selectedAPI),
+        event.detail);
+});
+
+selector->open(config);
+player.setVideoRenderAPI(selector);
+```
+
+Each successful factory result contains an already window-bound
+`VideoRenderAPI`; an unavailable result carries its diagnostic reason. The
+selector prefers Vulkan on every new `open()` session. A candidate
+`SurfaceLost` event triggers at most `maximumRecoveryAttempts` complete
+same-API recreations. A candidate `Error` is fatal: Vulkan switches one-way to
+OpenGL ES, while fatal OpenGL ES failure reports video unavailable. The
+current frame is retained and retried after successful recovery or fallback,
+and the selector object remains attached to `Player`, so media is not reopened.
+
+Call `suspendSurface()` before releasing a platform window, publish the new
+window to the factory's application state, and call `recreateSurface()`.
+Selection notifications distinguish initial selection, recovery, fallback,
+and no-renderer results. `selectedAPI()`, `usingFallback()`,
+`presentationAvailable()`, and `lastError()` provide synchronous diagnostics.
 
 ### D3D11 composition output
 
@@ -1054,6 +1246,17 @@ pause/flush/drain. COM and native WASAPI interfaces stay on a dedicated
 multimedia-class thread; callers can query a cached media-timeline
 `IAudioClock` position and combined engine/stream latency from any thread.
 
+`QtAV::AudioAAudio` implements `AAudioAudioSink` on Android API 26 or newer.
+Its backend-specific header represents an optional device selection as an
+owning integer `AAudioDeviceId`, so no AAudio declaration enters the generic
+contract or core headers. It negotiates interleaved Float32 mono/stereo PCM,
+copies accepted buffers into a preallocated SPSC ring, and feeds the native
+data callback without allocation or locks. AAudio presentation timestamps
+supply the media-timeline clock; latency includes queued PCM and frames already
+submitted to the native stream. Pause, flush, drain, xrun detection, transparent
+route observation, and disconnect-triggered stream reconstruction remain
+inside the Android target.
+
 `QtAV::PlatformWindows` owns the Windows-only `D3D11DeviceAccess` helper and
 strong non-owning wrappers for `ID3D11Device` and `ID3D11DeviceContext`; no
 Windows SDK type reaches the core headers. `QtAV::RenderD3D11` retains that
@@ -1094,7 +1297,10 @@ video decoder opens. Changing it while media is loaded interrupts the current
 open/read operation and asynchronously reopens the media. The generic core
 maps `HardwareDeviceType` to FFmpeg's internal hardware-device selection,
 checks the codec's advertised hardware pixel format, and keeps the platform
-types private. An unknown device type selects the ordinary software path.
+types private. A backend can additionally request a registered FFmpeg decoder
+by wrapper identity and attach an application surface generation; both values
+participate in asynchronous configuration replacement. An unknown device type
+selects the ordinary software path.
 
 An in-tree hardware backend may attach a `HardwareDecodeDevice` to the config.
 The public token reports only its generic device type and opaque native
@@ -1134,6 +1340,16 @@ and verify channel data, drain timing, sample counts, and seek reset behavior.
 Audio-file tests verify RIFF/WAVE headers and little-endian samples, then run
 the player and converter to produce an exact 64,000-byte 16 kHz stereo S16
 payload from deterministic 8 kHz mono input.
+AAudio's portable SPSC queue test covers capacity, wraparound, timestamp
+continuity, rejection, and reset without an Android device. The connected
+Android harness additionally verifies Float32 negotiation, real-time
+presentation, monotonic device-clock samples, non-negative combined latency,
+pause/resume, background/foreground recovery, drain, and clean close on an
+AAudio-capable device.
+The same connected harness verifies MediaCodec H.264/HEVC direct-surface
+outputs with explicit present/drop, seek/flush, media replacement, stop,
+surface-generation replacement, stale-token rejection, decoder/output
+lifetime, and NativeActivity shutdown.
 Windows D3D11 tests use the WARP device for deterministic offscreen rendering
 and cover RGB, YUV420P, NV12, and synthetic P010 PQ/HLG input; SDR tone
 mapping; FP16 scRGB and RGB10/PQ numeric output; viewport, aspect ratio,
@@ -1173,11 +1389,14 @@ Player facade
   └─ optional backend contracts
        ├─ libswscale CPU image-buffer renderer
        ├─ D3D11 software-frame renderer with borrowed Windows resources
+       ├─ mobile Vulkan/OpenGL ES selection and bounded recovery policy
        ├─ libswresample interleaved PCM converter
        ├─ RIFF/WAVE diagnostic PCM file sink
        ├─ CoreAudio device sink with AudioQueue clocking
        ├─ WASAPI shared-mode device sink with IAudioClock clocking
+       ├─ AAudio device sink with callback-safe SPSC buffering
        ├─ D3D11VA decoder producing retained texture-array slices
+       ├─ MediaCodec decoder producing direct-surface present/drop tokens
        ├─ Metal software/hardware-frame renderer with borrowed native resources
        ├─ VideoToolbox decoder producing retained CVPixelBuffer frames
        ├─ CVMetalTextureCache zero-copy frame interop

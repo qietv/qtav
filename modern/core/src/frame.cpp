@@ -309,9 +309,15 @@ class FFmpegHardwareFrameData final : public HardwareFrameData {
 public:
     FFmpegHardwareFrameData(
         const AVFrame* source,
-        HardwareDeviceType deviceType)
+        HardwareDeviceType deviceType,
+        std::uintptr_t nativeIdentity,
+        std::uint32_t surfaceGeneration,
+        std::shared_ptr<void> decoderLifetime)
         : frame_(av_frame_clone(source))
         , deviceType_(deviceType)
+        , nativeIdentity_(nativeIdentity)
+        , surfaceGeneration_(surfaceGeneration)
+        , decoderLifetime_(std::move(decoderLifetime))
     {
     }
 
@@ -337,6 +343,9 @@ public:
 
     PixelFormat softwareFormat() const noexcept override
     {
+        if (frame_ && deviceType_ == HardwareDeviceType::MediaCodec) {
+            return PixelFormat::Native;
+        }
         if (!frame_ || !frame_->hw_frames_ctx) {
             return PixelFormat::Unknown;
         }
@@ -371,6 +380,22 @@ public:
                     reinterpret_cast<std::uintptr_t>(frame_->data[1])),
             };
         }
+        if (deviceType_ == HardwareDeviceType::MediaCodec) {
+            if (type == HardwareHandleType::Frame) {
+                return {
+                    type,
+                    reinterpret_cast<std::uintptr_t>(frame_->data[3]),
+                    surfaceGeneration_,
+                };
+            }
+            if (type == HardwareHandleType::Surface) {
+                return {
+                    type,
+                    nativeIdentity_,
+                    surfaceGeneration_,
+                };
+            }
+        }
         return { type, 0, 0 };
     }
 
@@ -401,6 +426,9 @@ public:
 private:
     AVFrame* frame_ = nullptr;
     HardwareDeviceType deviceType_ = HardwareDeviceType::Unknown;
+    std::uintptr_t nativeIdentity_ = 0;
+    std::uint32_t surfaceGeneration_ = 0;
+    std::shared_ptr<void> decoderLifetime_;
 };
 
 } // namespace
@@ -410,7 +438,10 @@ struct VideoFrame::Storage {
         const AVFrame* source,
         std::int64_t timestamp,
         std::int64_t duration,
-        HardwareDeviceType hardwareDeviceType)
+        HardwareDeviceType hardwareDeviceType,
+        std::uintptr_t hardwareNativeIdentity,
+        std::uint32_t hardwareSurfaceGeneration,
+        std::shared_ptr<void> decoderLifetime)
         : frame(av_frame_clone(source))
         , timestampMs(timestamp)
         , durationMs(duration)
@@ -419,7 +450,10 @@ struct VideoFrame::Storage {
             hardwareFrame = HardwareFrame(
                 std::make_shared<FFmpegHardwareFrameData>(
                     frame,
-                    hardwareDeviceType));
+                    hardwareDeviceType,
+                    hardwareNativeIdentity,
+                    hardwareSurfaceGeneration,
+                    std::move(decoderLifetime)));
         }
     }
 
@@ -773,7 +807,10 @@ VideoFrame detail::FrameFactory::video(
     const AVFrame* frame,
     std::int64_t timestampMs,
     std::int64_t durationMs,
-    HardwareDeviceType hardwareDeviceType)
+    HardwareDeviceType hardwareDeviceType,
+    std::uintptr_t hardwareNativeIdentity,
+    std::uint32_t hardwareSurfaceGeneration,
+    std::shared_ptr<void> decoderLifetime)
 {
     if (!frame) {
         return {};
@@ -783,7 +820,10 @@ VideoFrame detail::FrameFactory::video(
             frame,
             timestampMs,
             durationMs,
-            hardwareDeviceType);
+            hardwareDeviceType,
+            hardwareNativeIdentity,
+            hardwareSurfaceGeneration,
+            std::move(decoderLifetime));
     return storage->frame ? VideoFrame(std::move(storage)) : VideoFrame {};
 }
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -173,6 +174,43 @@ bool containsVisiblePixel(const std::vector<Pixel>& pixels) noexcept
         > 16;
 }
 
+double pqSignalForNits(double nits) noexcept
+{
+    constexpr double M1 = 2610.0 / 16384.0;
+    constexpr double M2 = 2523.0 / 32.0;
+    constexpr double C1 = 3424.0 / 4096.0;
+    constexpr double C2 = 2413.0 / 128.0;
+    constexpr double C3 = 2392.0 / 128.0;
+    const double luminance =
+        std::clamp(nits / 10000.0, 0.0, 1.0);
+    const double power = std::pow(luminance, M1);
+    return std::pow(
+        (C1 + C2 * power) / (1.0 + C3 * power),
+        M2);
+}
+
+double hlgSignalForNits(double nits) noexcept
+{
+    constexpr double A = 0.17883277;
+    constexpr double B = 0.28466892;
+    constexpr double C = 0.55991073;
+    const double luminance =
+        std::clamp(nits / 1000.0, 0.0, 1.0);
+    if (luminance <= 1.0 / 12.0) {
+        return std::sqrt(3.0 * luminance);
+    }
+    return A * std::log(12.0 * luminance - B) + C;
+}
+
+bool closeToByte(
+    std::uint8_t actual,
+    double expectedSignal) noexcept
+{
+    const int expected = static_cast<int>(
+        std::lround(std::clamp(expectedSignal, 0.0, 1.0) * 255.0));
+    return std::abs(static_cast<int>(actual) - expected) <= 8;
+}
+
 VideoFrame makeUploadFrame(AVPixelFormat format)
 {
     AVFrame* native = av_frame_alloc();
@@ -300,11 +338,14 @@ bool runOpenGLOffscreenRendererChecks(
     }
 
     std::uint64_t generation = 1;
+    OpenGLOutputColorSpace outputColorSpace =
+        OpenGLOutputColorSpace::SdrSrgb;
     OpenGLVideoRenderer renderer([&] {
         return OpenGLRenderTarget {
             0,
             context.size(),
             generation,
+            outputColorSpace,
         };
     });
     std::string rendererError;
@@ -435,6 +476,75 @@ bool runOpenGLOffscreenRendererChecks(
             error =
                 "The OpenGL ES P010/PQ-to-SDR readback check failed";
         }
+        renderer.close();
+        return false;
+    }
+
+    const auto validateHdrOutput =
+        [&](OpenGLOutputColorSpace colorSpace, const char* name) {
+            outputColorSpace = colorSpace;
+            ++generation;
+            const OpenGLRenderTarget target {
+                0,
+                context.size(),
+                generation,
+                outputColorSpace,
+            };
+            if (!target.isValid() || !target.isHdr()
+                || !renderer.render(hdrFrame)
+                || !readPixels(context.size(), pixels, error)) {
+                if (error.empty()) {
+                    error = std::string(
+                        "The OpenGL ES native HDR target failed for ")
+                        + name;
+                }
+                return false;
+            }
+            constexpr std::array<double, 4> SampleNits {
+                0.0,
+                10.0,
+                100.0,
+                400.0,
+            };
+            constexpr std::array<int, 4> SampleX {
+                Width / 8,
+                Width * 3 / 8,
+                Width * 5 / 8,
+                Width * 7 / 8,
+            };
+            for (std::size_t index = 0;
+                 index < SampleNits.size();
+                 ++index) {
+                const Pixel& actual =
+                    pixels[static_cast<std::size_t>(Height / 2) * Width
+                        + static_cast<std::size_t>(SampleX[index])];
+                const double expected =
+                    colorSpace == OpenGLOutputColorSpace::HDR10PQ
+                    ? pqSignalForNits(SampleNits[index])
+                    : hlgSignalForNits(SampleNits[index]);
+                if (!closeToByte(actual.red, expected)
+                    || !closeToByte(actual.green, expected)
+                    || !closeToByte(actual.blue, expected)
+                    || actual.alpha < 239) {
+                    error =
+                        std::string(
+                            "The OpenGL ES HDR numeric golden failed for ")
+                        + name + " sample " + std::to_string(index)
+                        + ": got RGB("
+                        + std::to_string(actual.red) + ','
+                        + std::to_string(actual.green) + ','
+                        + std::to_string(actual.blue) + ')';
+                    return false;
+                }
+            }
+            return true;
+        };
+    if (!validateHdrOutput(
+            OpenGLOutputColorSpace::HDR10PQ,
+            "BT.2020/PQ")
+        || !validateHdrOutput(
+            OpenGLOutputColorSpace::HDR10HLG,
+            "BT.2020/HLG")) {
         renderer.close();
         return false;
     }

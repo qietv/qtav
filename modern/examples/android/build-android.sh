@@ -21,7 +21,7 @@ build_tools_version=${QTAV_ANDROID_BUILD_TOOLS:-37.0.0}
 cmake_version=${QTAV_ANDROID_CMAKE_VERSION:-4.1.2}
 ffmpeg_version=8.1.2
 ffmpeg_sha256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
-ffmpeg_configuration=qtav-minimal-v1
+ffmpeg_configuration=qtav-minimal-v2
 
 ndk_directory="${android_sdk}/ndk/${ndk_version}"
 toolchain_directory="${ndk_directory}/toolchains/llvm/prebuilt/darwin-x86_64"
@@ -98,6 +98,7 @@ if [ ! -f "${ffmpeg_prefix}/lib/libavcodec.a" ]; then
             --arch=aarch64 \
             --cpu=armv8-a \
             --enable-cross-compile \
+            --enable-jni \
             --sysroot="${toolchain_directory}/sysroot" \
             --cc="${toolchain_directory}/bin/aarch64-linux-android${android_api}-clang" \
             --cxx="${toolchain_directory}/bin/aarch64-linux-android${android_api}-clang++" \
@@ -114,6 +115,7 @@ if [ ! -f "${ffmpeg_prefix}/lib/libavcodec.a" ]; then
             --disable-programs \
             --disable-network \
             --disable-shared \
+            --enable-mediacodec \
             --enable-static \
             --enable-pic \
             --disable-everything \
@@ -122,9 +124,18 @@ if [ ! -f "${ffmpeg_prefix}/lib/libavcodec.a" ]; then
             --enable-avutil \
             --enable-swresample \
             --enable-swscale \
+            --enable-bsf=h264_mp4toannexb \
+            --enable-bsf=hevc_mp4toannexb \
+            --enable-decoder=h264 \
+            --enable-decoder=h264_mediacodec \
+            --enable-decoder=hevc \
+            --enable-decoder=hevc_mediacodec \
             --enable-decoder=mpeg4 \
             --enable-decoder=pcm_s16le \
             --enable-demuxer=avi \
+            --enable-demuxer=mov \
+            --enable-parser=h264 \
+            --enable-parser=hevc \
             --enable-parser=mpeg4video \
             --enable-protocol=file
         make -j"${QTAV_BUILD_JOBS:-$(sysctl -n hw.ncpu)}"
@@ -147,7 +158,9 @@ fi
     -DFFmpeg_avcodec_INCLUDE_DIR="${ffmpeg_prefix}/include" \
     -DFFmpeg_avcodec_LIBRARY="${ffmpeg_prefix}/lib/libavcodec.a" \
     -DFFmpeg_avutil_INCLUDE_DIR="${ffmpeg_prefix}/include" \
-    -DFFmpeg_avutil_LIBRARY="${ffmpeg_prefix}/lib/libavutil.a"
+    -DFFmpeg_avutil_LIBRARY="${ffmpeg_prefix}/lib/libavutil.a" \
+    -DFFmpeg_swresample_INCLUDE_DIR="${ffmpeg_prefix}/include" \
+    -DFFmpeg_swresample_LIBRARY="${ffmpeg_prefix}/lib/libswresample.a"
 "${cmake_executable}" --build "${native_build_directory}" --parallel
 
 host_ffmpeg=${QTAV_HOST_FFMPEG:-}
@@ -176,6 +189,31 @@ fi
     -shortest \
     -y \
     "${asset_directory}/qtav-test.avi"
+"${host_ffmpeg}" \
+    -hide_banner \
+    -loglevel error \
+    -f lavfi \
+    -i "testsrc2=size=160x90:rate=30:duration=6" \
+    -c:v libx264 \
+    -preset ultrafast \
+    -pix_fmt yuv420p \
+    -movflags +faststart \
+    -an \
+    -y \
+    "${asset_directory}/qtav-mediacodec-h264.mp4"
+"${host_ffmpeg}" \
+    -hide_banner \
+    -loglevel error \
+    -f lavfi \
+    -i "testsrc2=size=160x90:rate=30:duration=6" \
+    -c:v libx265 \
+    -preset ultrafast \
+    -pix_fmt yuv420p \
+    -tag:v hvc1 \
+    -movflags +faststart \
+    -an \
+    -y \
+    "${asset_directory}/qtav-mediacodec-hevc.mp4"
 
 cp \
     "${native_build_directory}/libqtav_android_test.so" \

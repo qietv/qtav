@@ -107,14 +107,21 @@ The implemented baseline lives under `backends/render/opengl/`.
 `QtAV::RenderOpenGL` uploads YUV420/422/444, NV12/NV21, little-endian P010,
 RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames, applies the same structured
 range, matrix, transfer, primaries, viewport, aspect, and rotation semantics as
-the Vulkan SDR path, and renders to a caller-supplied current framebuffer.
-P010/PQ/HLG input is deterministically tone-mapped to SDR; native HDR EGL
-output is not claimed. `QtAV::RenderOpenGLAndroid` separately owns its EGL
+the Vulkan path, and renders to a caller-supplied current framebuffer whose
+target contract explicitly selects SDR sRGB, BT.2020/PQ, or BT.2020/HLG.
+P010/PQ/HLG input is deterministically tone-mapped only for the SDR target;
+native HDR targets preserve luminance, convert primaries to BT.2020, and encode
+PQ or HLG as selected. `QtAV::RenderOpenGLAndroid` separately owns its EGL
 display, OpenGL ES 3.x context, window surface, and generation while retaining
-the active `ANativeWindow`. Android device checks cover all advertised upload
-families, viewport, rotation, target-generation replacement, P010/PQ-to-SDR
-readback, and a real window-surface presentation. The application/platform
-selector and one-way Vulkan-to-OpenGL ES transition remain separate work.
+the active `ANativeWindow`. It tries exact RGB10_A2 with
+`EGL_EXT_gl_colorspace_bt2020_pq`, then the HLG extension, and finally explicit
+RGBA8/sRGB according to the caller's prefer/require/SDR-only policy. It also
+sets and verifies the corresponding Android buffer dataspace. Android device
+checks cover all advertised upload families, viewport, rotation,
+target-generation replacement, P010/PQ-to-SDR readback, PQ/HLG output numeric
+encoding, real RGB10_A2/PQ presentation, and compositor HDR-layer recognition.
+The application/platform selector is implemented separately as
+`QtAV::RenderMobile`.
 
 ## Renderer selection and fallback
 
@@ -149,6 +156,32 @@ for Android and OHOS is:
    report video presentation as unavailable; playback, audio output, and
    decoded-frame callbacks remain usable.
 
+The implemented platform-neutral policy lives in
+`backends/render/mobile/`. `MobileVideoRendererSelector` owns neither graphics
+API nor a native window; application/platform factories return a prepared
+`VideoRenderAPI` for the current window generation or an explicit unavailable
+reason. `open()` starts a new session and probes Vulkan first. `SurfaceLost`
+performs the configured bounded number of complete same-API recreations,
+whereas `Error` is fatal. Fatal or repeatedly unrecoverable Vulkan is retired
+for the session before OpenGL ES is created and the retained frame is retried.
+OpenGL ES context/display/surface loss is classified as recoverable by the
+Android adapter and uses the same bounded recreation path; fatal OpenGL ES or
+failed recovery enters the explicit no-renderer state. Selection notifications
+record selected, recovered, fallback, and unavailable transitions with their
+reasons.
+
+The platform calls `suspendSurface()` before releasing a native-window
+generation, updates the application state captured by the factories, and calls
+`recreateSurface()` after publishing the replacement. The selector object
+remains attached to `Player`, so same-API recreation and Vulkan-to-OpenGL ES
+fallback do not reopen media. Deterministic mock-adapter tests cover
+Vulkan-unavailable startup, initial Vulkan open failure, recoverable Vulkan and
+OpenGL ES recreation, fatal Vulkan fallback, bounded-recovery exhaustion,
+window replacement, one-way behavior, and both-backends-unavailable. The
+Android NativeActivity harness uses the same selector for real Vulkan HDR
+playback/surface recreation and a forced-startup fallback check through the
+real EGL adapter.
+
 Fallback transfers no live Vulkan or EGL resource between APIs. Copied
 `VideoFrame` values retain software-frame data across the transition, while
 old renderer generations reject late redraw or completion work. Renderer
@@ -182,6 +215,14 @@ the HDR surface/swapchain after a background/foreground window replacement
 without reopening the media. Production callers can instead prefer HDR with
 SDR fallback or require SDR explicitly; selected format/color space and
 HDR-active state remain observable.
+
+`QtAV::RenderOpenGLAndroid` follows the same output-policy meanings without
+sharing Vulkan objects or lifecycle code. The recorded Android 16/Adreno 830
+device exposes an exact RGB10_A2 BT.2020/PQ EGL surface; the adapter presents a
+synthetic P010/BT.2020/PQ frame through it, and Android reports the layer as
+HDR. The same run first forces `SdrOnly` to prove the RGBA8/sRGB tone-mapping
+fallback remains explicit. HLG is selected only when the EGL display exposes
+its colorspace extension and PQ cannot be established.
 
 The OHOS application owns ArkUI/XComponent state and the current
 `OHNativeWindow`. Its adapter follows the same renderer-target protocol but
@@ -219,10 +260,24 @@ backends:
    retained is represented as a presentation token, not a fake texture
    handle.
 
-Direct-surface H.264 and HEVC presentation must be implemented and validated
-before `SurfaceTexture`, `AHardwareBuffer`, `OH_NativeBuffer`, or graphics
-texture import is claimed. Decoder fallback and renderer/interop fallback
-remain independent.
+The Android direct-surface checkpoint is implemented in
+`QtAV::HWMediaCodec`. `MediaCodecSurface` retains and versions the
+application-supplied `ANativeWindow`; the backend creates FFmpeg's MediaCodec
+hardware device for that surface and explicitly selects the
+`*_mediacodec` wrapper decoder. Each hardware `VideoFrame` produces a
+move-only `MediaCodecFrame` with immediate present, monotonic-time present,
+and drop decisions. The core keeps the decoder context alive until every
+copied output is released, so invalidating playback queues cannot leave an
+FFmpeg output buffer referring to a destroyed codec.
+
+The Android 16 device checkpoint passes H.264 and HEVC with bounded output,
+both present and drop, seek/flush, media replacement, explicit stop,
+background/foreground surface loss and reopen, stale-generation rejection,
+and clean shutdown. No decoded pixel is mapped in this direct path. This
+completes the prerequisite for later `SurfaceTexture` and
+`AImageReader`/`AHardwareBuffer` work, but it does not claim a
+shader-readable or texture-interoperable frame. Decoder fallback and
+renderer/interop fallback remain independent.
 
 ## Zero-CPU-copy texture interop
 
@@ -334,6 +389,18 @@ disconnects, latency queries, and restart behavior remain in separate
 targets. No OpenSL ES fallback is added unless the selected Android minimum
 API or device results demonstrate that it is required.
 
+The Android implementation now lives in `QtAV::AudioAAudio`. It negotiates
+mono/stereo Float32 PCM and copies accepted buffers into a fixed-capacity SPSC
+ring on the player's audio-output worker. The AAudio data callback performs no
+allocation, lock, sleep, stream lifecycle operation, or application callback;
+it only consumes that ring, fills bounded silence, and publishes atomic timing
+state. `AAudioStream_getTimestamp(CLOCK_MONOTONIC)` supplies the media-timeline
+device clock, while latency includes native pipeline frames and queued PCM.
+A separate management worker observes transparent route-ID changes and handles
+AAudio disconnect callbacks by closing and rebuilding the default-route stream
+with the same negotiated format. The API 28 device baseline passes without an
+OpenSL ES fallback.
+
 ## Connected-device validation
 
 Shared generated media and lifecycle scenarios cover:
@@ -344,6 +411,10 @@ Shared generated media and lifecycle scenarios cover:
 - recoverable Vulkan surface/swapchain recreation without an API switch;
 - fatal Vulkan failure followed by one-way OpenGL ES fallback without media
   reopen, plus explicit failure when neither renderer is usable;
+- MediaCodec H.264/HEVC direct-surface output with explicit present/drop,
+  seek/flush, media replacement, stop, background/foreground surface
+  recreation, stale-generation rejection, bounded retained outputs, and clean
+  shutdown;
 - capability-gated MediaCodec/OHCodec native-buffer import through Vulkan and
   OpenGL ES with zero CPU map/transfer calls, retained lifetime, fence
   ordering, format/color validation, and explicit unsupported-path results;

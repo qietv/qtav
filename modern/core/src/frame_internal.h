@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 #include <qtav/frame.h>
 
@@ -15,7 +16,10 @@ struct QTAV_CORE_EXPORT FrameFactory {
         std::int64_t timestampMs,
         std::int64_t durationMs,
         HardwareDeviceType hardwareDeviceType =
-            HardwareDeviceType::Unknown);
+            HardwareDeviceType::Unknown,
+        std::uintptr_t hardwareNativeIdentity = 0,
+        std::uint32_t hardwareSurfaceGeneration = 0,
+        std::shared_ptr<void> decoderLifetime = {});
     static AudioFrame audio(
         const AVFrame* frame,
         std::int64_t timestampMs,

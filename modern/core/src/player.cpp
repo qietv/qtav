@@ -116,6 +116,28 @@ AVHWDeviceType ffmpegHardwareDeviceType(HardwareDeviceType type) noexcept
     return AV_HWDEVICE_TYPE_NONE;
 }
 
+const AVCodec* decoderForWrapper(
+    AVCodecID codecId,
+    AVMediaType mediaType,
+    const std::string& wrapper) noexcept
+{
+    if (wrapper.empty()) {
+        return nullptr;
+    }
+    void* opaque = nullptr;
+    while (const AVCodec* codec = av_codec_iterate(&opaque)) {
+        if (!av_codec_is_decoder(codec)
+            || codec->id != codecId
+            || codec->type != mediaType
+            || !codec->wrapper_name
+            || wrapper != codec->wrapper_name) {
+            continue;
+        }
+        return codec;
+    }
+    return nullptr;
+}
+
 bool isSoftwarePixelFormat(AVPixelFormat format) noexcept
 {
     const auto* descriptor = av_pix_fmt_desc_get(format);
@@ -202,11 +224,14 @@ public:
 
     struct Decoder {
         AVCodecContext* context = nullptr;
+        std::shared_ptr<AVCodecContext> contextLifetime;
         AVStream* stream = nullptr;
         int streamIndex = -1;
         MediaType type = MediaType::Unknown;
         HardwareDeviceType hardwareDeviceType = HardwareDeviceType::Unknown;
         AVPixelFormat hardwarePixelFormat = AV_PIX_FMT_NONE;
+        std::uintptr_t hardwareNativeIdentity = 0;
+        std::uint32_t hardwareSurfaceGeneration = 0;
         bool allowSoftwareFallback = false;
         bool hardwareFallbackUsed = false;
         bool hardwareFallbackReported = false;
@@ -222,12 +247,15 @@ public:
 
         void reset()
         {
-            avcodec_free_context(&context);
+            context = nullptr;
+            contextLifetime.reset();
             stream = nullptr;
             streamIndex = -1;
             type = MediaType::Unknown;
             hardwareDeviceType = HardwareDeviceType::Unknown;
             hardwarePixelFormat = AV_PIX_FMT_NONE;
+            hardwareNativeIdentity = 0;
+            hardwareSurfaceGeneration = 0;
             allowSoftwareFallback = false;
             hardwareFallbackUsed = false;
             hardwareFallbackReported = false;
@@ -515,7 +543,11 @@ public:
                 && hardwareDecodeConfig_.extraHardwareFrames
                     == config.extraHardwareFrames
                 && hardwareDecodeConfig_.requireSuppliedDevice
-                    == config.requireSuppliedDevice) {
+                    == config.requireSuppliedDevice
+                && hardwareDecodeConfig_.decoderWrapper
+                    == config.decoderWrapper
+                && hardwareDecodeConfig_.surfaceGeneration
+                    == config.surfaceGeneration) {
                 return;
             }
             hardwareDecodeConfig_ = config;
@@ -1004,10 +1036,16 @@ private:
         HardwareDecodeConfig hardwareDecodeConfig = {})
     {
         result.reset();
-        const AVCodec* decoder = nullptr;
+        const AVCodec* softwareDecoder = nullptr;
         const int streamIndex =
-            av_find_best_stream(media_.format, type, -1, -1, &decoder, 0);
-        if (streamIndex < 0 || !decoder) {
+            av_find_best_stream(
+                media_.format,
+                type,
+                -1,
+                -1,
+                &softwareDecoder,
+                0);
+        if (streamIndex < 0 || !softwareDecoder) {
             return false;
         }
 
@@ -1023,11 +1061,19 @@ private:
         const bool requiredDeviceMissing =
             hardwareDecodeConfig.requireSuppliedDevice
             && !hardwareDecodeConfig.device;
+        const AVCodec* hardwareDecoder = softwareDecoder;
+        if (requestedDevice != HardwareDeviceType::Unknown
+            && !hardwareDecodeConfig.decoderWrapper.empty()) {
+            hardwareDecoder = decoderForWrapper(
+                stream->codecpar->codec_id,
+                type,
+                hardwareDecodeConfig.decoderWrapper);
+        }
         const AVCodecHWConfig* selectedHardwareConfig = nullptr;
-        if (ffmpegDevice != AV_HWDEVICE_TYPE_NONE) {
+        if (ffmpegDevice != AV_HWDEVICE_TYPE_NONE && hardwareDecoder) {
             for (int index = 0;; ++index) {
                 const auto* candidate =
-                    avcodec_get_hw_config(decoder, index);
+                    avcodec_get_hw_config(hardwareDecoder, index);
                 if (!candidate) {
                     break;
                 }
@@ -1041,7 +1087,12 @@ private:
             }
         }
 
-        auto openContext = [&](bool hardware, int& error) {
+        auto openContext =
+            [&](const AVCodec* decoder, bool hardware, int& error) {
+            if (!decoder) {
+                error = AVERROR_DECODER_NOT_FOUND;
+                return static_cast<AVCodecContext*>(nullptr);
+            }
             auto* context = avcodec_alloc_context3(decoder);
             if (!context) {
                 error = AVERROR(ENOMEM);
@@ -1056,6 +1107,10 @@ private:
                 result.hardwareDeviceType = requestedDevice;
                 result.hardwarePixelFormat =
                     selectedHardwareConfig->pix_fmt;
+                result.hardwareNativeIdentity =
+                    hardwareDecodeConfig.device.nativeIdentity();
+                result.hardwareSurfaceGeneration =
+                    hardwareDecodeConfig.surfaceGeneration;
                 result.allowSoftwareFallback =
                     hardwareDecodeConfig.allowSoftwareFallback;
                 context->opaque = &result;
@@ -1094,29 +1149,42 @@ private:
         if (requestedDevice != HardwareDeviceType::Unknown) {
             if (suppliedDeviceMismatch || requiredDeviceMissing) {
                 error = AVERROR(EINVAL);
-            } else if (ffmpegDevice == AV_HWDEVICE_TYPE_NONE
+            } else if (!hardwareDecoder
+                || ffmpegDevice == AV_HWDEVICE_TYPE_NONE
                 || !selectedHardwareConfig) {
                 error = AVERROR(ENOSYS);
             } else {
-                context = openContext(true, error);
+                context = openContext(hardwareDecoder, true, error);
             }
             if (!context && hardwareDecodeConfig.allowSoftwareFallback) {
+                const std::string requestedDecoder =
+                    hardwareDecoder && hardwareDecoder->name
+                    ? hardwareDecoder->name
+                    : hardwareDecodeConfig.decoderWrapper.empty()
+                        ? softwareDecoder->name
+                        : hardwareDecodeConfig.decoderWrapper;
                 publishEvent({
                     "decoder.hardware.fallback",
                     "Hardware decode is unavailable for decoder '"
-                        + std::string(decoder->name)
+                        + requestedDecoder
                         + "'; using software decode: "
                         + ffmpegError(error),
                     error,
                 });
                 result.reset();
-                context = openContext(false, error);
+                context = openContext(softwareDecoder, false, error);
             }
         } else {
-            context = openContext(false, error);
+            context = openContext(softwareDecoder, false, error);
         }
 
         if (!context) {
+            const std::string requestedDecoder =
+                hardwareDecoder && hardwareDecoder->name
+                ? hardwareDecoder->name
+                : hardwareDecodeConfig.decoderWrapper.empty()
+                    ? softwareDecoder->name
+                    : hardwareDecodeConfig.decoderWrapper;
             publishEvent({
                 requestedDevice == HardwareDeviceType::Unknown
                     ? "decoder.error"
@@ -1126,14 +1194,19 @@ private:
                         requestedDevice == HardwareDeviceType::Unknown
                             ? ""
                             : "the requested hardware path for ")
-                    + "decoder '" + decoder->name + "': "
+                    + "decoder '" + requestedDecoder + "': "
                     + ffmpegError(error),
                 error,
             });
             return false;
         }
 
-        result.context = context;
+        result.contextLifetime = std::shared_ptr<AVCodecContext>(
+            context,
+            [](AVCodecContext* ownedContext) {
+                avcodec_free_context(&ownedContext);
+            });
+        result.context = result.contextLifetime.get();
         result.stream = stream;
         result.streamIndex = streamIndex;
         result.type = mediaTypeFromFFmpeg(type);
@@ -1477,7 +1550,19 @@ private:
                 frame,
                 timestampMs,
                 durationMs,
-                hardwareDeviceType);
+                hardwareDeviceType,
+                hardwareDeviceType
+                        != HardwareDeviceType::Unknown
+                    ? decoder.hardwareNativeIdentity
+                    : 0,
+                hardwareDeviceType
+                        != HardwareDeviceType::Unknown
+                    ? decoder.hardwareSurfaceGeneration
+                    : 0,
+                hardwareDeviceType
+                        != HardwareDeviceType::Unknown
+                    ? decoder.contextLifetime
+                    : std::shared_ptr<void> {});
             enqueuePresentation(PresentationItem {
                 PresentationItem::Type::Video,
                 {},

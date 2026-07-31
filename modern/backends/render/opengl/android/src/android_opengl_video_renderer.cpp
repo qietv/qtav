@@ -3,11 +3,17 @@
 #include <qtav/android_opengl_video_renderer.h>
 
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <android/data_space.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace qtav {
 namespace {
@@ -73,16 +79,133 @@ bool validConfig(const VideoRenderConfig& config) noexcept
                 <= config.surfaceSize.height - viewport.y);
 }
 
+bool eglLifecycleLoss(EGLint code) noexcept
+{
+    return code == EGL_BAD_SURFACE
+        || code == EGL_BAD_NATIVE_WINDOW
+        || code == EGL_BAD_CONTEXT
+        || code == EGL_BAD_DISPLAY
+        || code == EGL_CONTEXT_LOST;
+}
+
+bool hasExtension(
+    const char* extensions,
+    const char* requested) noexcept
+{
+    if (!extensions || !requested || !*requested
+        || std::strchr(requested, ' ')) {
+        return false;
+    }
+    const std::size_t length = std::strlen(requested);
+    const char* current = extensions;
+    while ((current = std::strstr(current, requested))) {
+        const bool startsToken =
+            current == extensions || current[-1] == ' ';
+        const bool endsToken =
+            current[length] == '\0' || current[length] == ' ';
+        if (startsToken && endsToken) {
+            return true;
+        }
+        current += length;
+    }
+    return false;
+}
+
+struct EGLSurfaceCandidate {
+    OpenGLOutputColorSpace colorSpace =
+        OpenGLOutputColorSpace::SdrSrgb;
+    EGLint eglColorSpace = EGL_GL_COLORSPACE_SRGB_KHR;
+    ADataSpace dataSpace = ADATASPACE_SRGB;
+    int componentBits = 8;
+    const char* name = "SDR sRGB";
+};
+
+bool chooseConfig(
+    EGLDisplay display,
+    int componentBits,
+    EGLConfig& result,
+    EGLint& nativeVisual,
+    std::string& error)
+{
+    const EGLint alphaBits = componentBits == 10 ? 2 : 8;
+    const EGLint attributes[] {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_RED_SIZE, componentBits,
+        EGL_GREEN_SIZE, componentBits,
+        EGL_BLUE_SIZE, componentBits,
+        EGL_ALPHA_SIZE, alphaBits,
+        EGL_DEPTH_SIZE, 0,
+        EGL_STENCIL_SIZE, 0,
+        EGL_NONE,
+    };
+    EGLint count = 0;
+    if (eglChooseConfig(
+            display, attributes, nullptr, 0, &count) != EGL_TRUE
+        || count <= 0) {
+        error = componentBits == 10
+            ? "No exact RGB10_A2 OpenGL ES 3 window EGLConfig is available"
+            : "No exact RGBA8 OpenGL ES 3 window EGLConfig is available";
+        return false;
+    }
+    std::vector<EGLConfig> configs(static_cast<std::size_t>(count));
+    if (eglChooseConfig(
+            display,
+            attributes,
+            configs.data(),
+            count,
+            &count) != EGL_TRUE) {
+        error = eglError("eglChooseConfig");
+        return false;
+    }
+    configs.resize(static_cast<std::size_t>(std::max(count, 0)));
+    for (EGLConfig config : configs) {
+        EGLint red = 0;
+        EGLint green = 0;
+        EGLint blue = 0;
+        EGLint alpha = 0;
+        EGLint visual = 0;
+        if (eglGetConfigAttrib(
+                display, config, EGL_RED_SIZE, &red) != EGL_TRUE
+            || eglGetConfigAttrib(
+                   display, config, EGL_GREEN_SIZE, &green) != EGL_TRUE
+            || eglGetConfigAttrib(
+                   display, config, EGL_BLUE_SIZE, &blue) != EGL_TRUE
+            || eglGetConfigAttrib(
+                   display, config, EGL_ALPHA_SIZE, &alpha) != EGL_TRUE
+            || eglGetConfigAttrib(
+                   display,
+                   config,
+                   EGL_NATIVE_VISUAL_ID,
+                   &visual) != EGL_TRUE) {
+            continue;
+        }
+        if (red == componentBits && green == componentBits
+            && blue == componentBits && alpha == alphaBits
+            && visual != 0) {
+            result = config;
+            nativeVisual = visual;
+            return true;
+        }
+    }
+    error = componentBits == 10
+        ? "The EGL display exposes no exact RGB10_A2 native window config"
+        : "The EGL display exposes no exact RGBA8 native window config";
+    return false;
+}
+
 } // namespace
 
 class AndroidOpenGLVideoRenderer::Impl {
 public:
-    Impl()
-        : renderer_([this] {
+    explicit Impl(OpenGLOutputPreference outputPreference)
+        : outputPreference_(outputPreference)
+        , renderer_([this] {
               return OpenGLRenderTarget {
                   0,
                   surfaceSize_,
                   generation_,
+                  outputColorSpace_,
               };
           })
     {
@@ -113,10 +236,9 @@ public:
         }
     }
 
-    bool createContext(std::string& error)
+    bool initializeDisplay(std::string& error)
     {
-        if (display_ != EGL_NO_DISPLAY
-            && context_ != EGL_NO_CONTEXT) {
+        if (display_ != EGL_NO_DISPLAY) {
             return true;
         }
         display_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -128,39 +250,169 @@ public:
         EGLint minor = 0;
         if (eglInitialize(display_, &major, &minor) != EGL_TRUE) {
             error = eglError("eglInitialize");
+            display_ = EGL_NO_DISPLAY;
             return false;
         }
         if (eglBindAPI(EGL_OPENGL_ES_API) != EGL_TRUE) {
             error = eglError("eglBindAPI");
+            eglTerminate(display_);
+            display_ = EGL_NO_DISPLAY;
             return false;
         }
-        const EGLint attributes[] {
-            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-            EGL_RED_SIZE, 8,
-            EGL_GREEN_SIZE, 8,
-            EGL_BLUE_SIZE, 8,
-            EGL_ALPHA_SIZE, 8,
-            EGL_DEPTH_SIZE, 0,
-            EGL_STENCIL_SIZE, 0,
+        const char* extensions =
+            eglQueryString(display_, EGL_EXTENSIONS);
+        extensions_ = extensions ? extensions : "";
+        return true;
+    }
+
+    std::vector<EGLSurfaceCandidate> surfaceCandidates() const
+    {
+        std::vector<EGLSurfaceCandidate> result;
+        const bool colorspace =
+            hasExtension(
+                extensions_.c_str(), "EGL_KHR_gl_colorspace");
+        if (outputPreference_ != OpenGLOutputPreference::SdrOnly
+            && colorspace) {
+            if (hasExtension(
+                    extensions_.c_str(),
+                    "EGL_EXT_gl_colorspace_bt2020_pq")) {
+                result.push_back({
+                    OpenGLOutputColorSpace::HDR10PQ,
+                    EGL_GL_COLORSPACE_BT2020_PQ_EXT,
+                    ADATASPACE_BT2020_PQ,
+                    10,
+                    "BT.2020/PQ",
+                });
+            }
+            if (hasExtension(
+                    extensions_.c_str(),
+                    "EGL_EXT_gl_colorspace_bt2020_hlg")) {
+                result.push_back({
+                    OpenGLOutputColorSpace::HDR10HLG,
+                    EGL_GL_COLORSPACE_BT2020_HLG_EXT,
+                    ADATASPACE_BT2020_HLG,
+                    10,
+                    "BT.2020/HLG",
+                });
+            }
+        }
+        if (outputPreference_
+            != OpenGLOutputPreference::RequireHdr) {
+            result.push_back({
+                OpenGLOutputColorSpace::SdrSrgb,
+                EGL_GL_COLORSPACE_SRGB_KHR,
+                ADATASPACE_SRGB,
+                8,
+                "SDR sRGB",
+            });
+        }
+        return result;
+    }
+
+    bool createWindowSurface(
+        const EGLSurfaceCandidate& candidate,
+        EGLint nativeVisual,
+        std::string& error)
+    {
+        if (ANativeWindow_setBuffersGeometry(
+                window_, 0, 0, nativeVisual) != 0) {
+            error =
+                "ANativeWindow_setBuffersGeometry rejected the selected "
+                + std::string(candidate.name) + " EGL native visual";
+            return false;
+        }
+        const bool explicitColorSpace =
+            hasExtension(
+                extensions_.c_str(), "EGL_KHR_gl_colorspace");
+        const EGLint surfaceAttributes[] {
+            EGL_GL_COLORSPACE_KHR,
+            candidate.eglColorSpace,
             EGL_NONE,
         };
-        EGLint count = 0;
-        if (eglChooseConfig(
-                display_,
-                attributes,
-                &eglConfig_,
-                1,
-                &count) != EGL_TRUE
-            || count != 1) {
+        surface_ = eglCreateWindowSurface(
+            display_,
+            eglConfig_,
+            window_,
+            explicitColorSpace ? surfaceAttributes : nullptr);
+        if (surface_ == EGL_NO_SURFACE) {
+            error = eglError("eglCreateWindowSurface");
+            return false;
+        }
+
+        const int32_t dataSpaceResult =
+            ANativeWindow_setBuffersDataSpace(
+                window_, candidate.dataSpace);
+        const int32_t actualDataSpace =
+            ANativeWindow_getBuffersDataSpace(window_);
+        if (dataSpaceResult != 0
+            || actualDataSpace != candidate.dataSpace) {
             error =
-                "No Android EGLConfig supports an RGBA8 OpenGL ES 3 window";
+                "The Android native window rejected the selected "
+                + std::string(candidate.name) + " dataspace";
+            eglDestroySurface(display_, surface_);
+            surface_ = EGL_NO_SURFACE;
+            return false;
+        }
+        if (explicitColorSpace) {
+            EGLint actualColorSpace = EGL_GL_COLORSPACE_DEFAULT_EXT;
+            if (eglQuerySurface(
+                    display_,
+                    surface_,
+                    EGL_GL_COLORSPACE_KHR,
+                    &actualColorSpace) != EGL_TRUE
+                || actualColorSpace != candidate.eglColorSpace) {
+                error =
+                    "The EGL window surface did not retain the requested "
+                    + std::string(candidate.name) + " color space";
+                eglDestroySurface(display_, surface_);
+                surface_ = EGL_NO_SURFACE;
+                return false;
+            }
+        }
+
+        EGLint width = 0;
+        EGLint height = 0;
+        if (eglQuerySurface(
+                display_, surface_, EGL_WIDTH, &width) != EGL_TRUE
+            || eglQuerySurface(
+                   display_,
+                   surface_,
+                   EGL_HEIGHT,
+                   &height) != EGL_TRUE
+            || width <= 0 || height <= 0) {
+            error = eglError("eglQuerySurface");
+            eglDestroySurface(display_, surface_);
+            surface_ = EGL_NO_SURFACE;
+            return false;
+        }
+        surfaceSize_ = { width, height };
+        outputColorSpace_ = candidate.colorSpace;
+        colorComponentBits_ = candidate.componentBits;
+        activeCandidate_ = candidate;
+        nativeVisual_ = nativeVisual;
+        ++generation_;
+        return true;
+    }
+
+    bool createCandidate(
+        const EGLSurfaceCandidate& candidate,
+        std::string& error)
+    {
+        EGLConfig config = nullptr;
+        EGLint nativeVisual = 0;
+        if (!chooseConfig(
+                display_,
+                candidate.componentBits,
+                config,
+                nativeVisual,
+                error)) {
             return false;
         }
         const EGLint contextAttributes[] {
             EGL_CONTEXT_CLIENT_VERSION, 3,
             EGL_NONE,
         };
+        eglConfig_ = config;
         context_ = eglCreateContext(
             display_,
             eglConfig_,
@@ -168,9 +420,16 @@ public:
             contextAttributes);
         if (context_ == EGL_NO_CONTEXT) {
             error = eglError("eglCreateContext");
+            eglConfig_ = nullptr;
             return false;
         }
-        return true;
+        if (createWindowSurface(candidate, nativeVisual, error)) {
+            return true;
+        }
+        eglDestroyContext(display_, context_);
+        context_ = EGL_NO_CONTEXT;
+        eglConfig_ = nullptr;
+        return false;
     }
 
     bool createSurface(std::string& error)
@@ -182,32 +441,43 @@ public:
             error = "The Android native window is unavailable";
             return false;
         }
-        if (!createContext(error)) {
+        if (!initializeDisplay(error)) {
             return false;
         }
-        surface_ = eglCreateWindowSurface(
-            display_,
-            eglConfig_,
-            window_,
-            nullptr);
-        if (surface_ == EGL_NO_SURFACE) {
-            error = eglError("eglCreateWindowSurface");
+        if (context_ != EGL_NO_CONTEXT && eglConfig_) {
+            return createWindowSurface(
+                activeCandidate_, nativeVisual_, error);
+        }
+
+        const std::vector<EGLSurfaceCandidate> candidates =
+            surfaceCandidates();
+        if (candidates.empty()) {
+            error =
+                "The Android EGL display exposes no implemented native HDR "
+                "color-space extension";
             return false;
         }
-        EGLint width = 0;
-        EGLint height = 0;
-        if (eglQuerySurface(
-                display_, surface_, EGL_WIDTH, &width) != EGL_TRUE
-            || eglQuerySurface(
-                display_, surface_, EGL_HEIGHT, &height) != EGL_TRUE
-            || width <= 0 || height <= 0) {
-            error = eglError("eglQuerySurface");
-            destroySurface();
-            return false;
+        std::string failures;
+        for (const EGLSurfaceCandidate& candidate : candidates) {
+            std::string candidateError;
+            if (createCandidate(candidate, candidateError)) {
+                return true;
+            }
+            if (!failures.empty()) {
+                failures += "; ";
+            }
+            failures += std::string(candidate.name) + ": "
+                + (candidateError.empty()
+                        ? "surface creation failed"
+                        : candidateError);
         }
-        surfaceSize_ = { width, height };
-        ++generation_;
-        return true;
+        error = outputPreference_
+                == OpenGLOutputPreference::RequireHdr
+            ? "The Android EGL display could not create a required native "
+                "HDR surface: " + failures
+            : "The Android EGL display could not create an HDR or SDR "
+                "surface: " + failures;
+        return false;
     }
 
     void destroySurface() noexcept
@@ -307,6 +577,11 @@ public:
         }
         display_ = EGL_NO_DISPLAY;
         eglConfig_ = nullptr;
+        extensions_.clear();
+        activeCandidate_ = {};
+        nativeVisual_ = 0;
+        outputColorSpace_ = OpenGLOutputColorSpace::SdrSrgb;
+        colorComponentBits_ = 0;
     }
 
     void close() noexcept
@@ -329,6 +604,8 @@ public:
 
     mutable std::recursive_mutex mutex_;
     EventCallback eventCallback_;
+    OpenGLOutputPreference outputPreference_ =
+        OpenGLOutputPreference::PreferHdr;
     EGLDisplay display_ = EGL_NO_DISPLAY;
     EGLConfig eglConfig_ = nullptr;
     EGLContext context_ = EGL_NO_CONTEXT;
@@ -336,6 +613,12 @@ public:
     ANativeWindow* window_ = nullptr;
     VideoSize surfaceSize_;
     std::uint64_t generation_ = 0;
+    std::string extensions_;
+    EGLSurfaceCandidate activeCandidate_;
+    EGLint nativeVisual_ = 0;
+    OpenGLOutputColorSpace outputColorSpace_ =
+        OpenGLOutputColorSpace::SdrSrgb;
+    int colorComponentBits_ = 0;
     VideoRenderConfig renderConfig_;
     bool open_ = false;
     bool engineOpen_ = false;
@@ -343,8 +626,9 @@ public:
     OpenGLVideoRenderer renderer_;
 };
 
-AndroidOpenGLVideoRenderer::AndroidOpenGLVideoRenderer()
-    : impl_(std::make_unique<Impl>())
+AndroidOpenGLVideoRenderer::AndroidOpenGLVideoRenderer(
+    OpenGLOutputPreference outputPreference)
+    : impl_(std::make_unique<Impl>(outputPreference))
 {
 }
 
@@ -463,8 +747,7 @@ bool AndroidOpenGLVideoRenderer::render(
     }
     if (!rendered) {
         const VideoRenderEventType type =
-            eglCode == EGL_BAD_SURFACE
-                || eglCode == EGL_BAD_NATIVE_WINDOW
+            eglLifecycleLoss(eglCode)
                 || error.find("surface") != std::string::npos
             ? VideoRenderEventType::SurfaceLost
             : VideoRenderEventType::Error;
@@ -537,6 +820,38 @@ AndroidOpenGLVideoRenderer::surfaceGeneration() const noexcept
     }
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     return impl_->generation_;
+}
+
+OpenGLOutputColorSpace
+AndroidOpenGLVideoRenderer::outputColorSpace() const noexcept
+{
+    if (!impl_) {
+        return OpenGLOutputColorSpace::SdrSrgb;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->outputColorSpace_;
+}
+
+bool AndroidOpenGLVideoRenderer::hdrOutputActive() const noexcept
+{
+    if (!impl_) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->surface_ != EGL_NO_SURFACE
+        && impl_->colorComponentBits_ >= 10
+        && openGLColorSpaceIsHdr(impl_->outputColorSpace_);
+}
+
+int AndroidOpenGLVideoRenderer::colorComponentBits() const noexcept
+{
+    if (!impl_) {
+        return 0;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->surface_ != EGL_NO_SURFACE
+        ? impl_->colorComponentBits_
+        : 0;
 }
 
 } // namespace qtav

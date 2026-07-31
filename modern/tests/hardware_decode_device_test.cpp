@@ -117,6 +117,8 @@ void testTokenLifetimeAndIdentity()
         7,
         true,
     };
+    config.decoderWrapper = "test-wrapper";
+    config.surfaceGeneration = 42;
     assert(config.isValid());
     assert(config.device == device);
 
@@ -128,6 +130,8 @@ void testTokenLifetimeAndIdentity()
     assert(copiedConfig.device == device);
     assert(copiedConfig.extraHardwareFrames == 7);
     assert(copiedConfig.requireSuppliedDevice);
+    assert(copiedConfig.decoderWrapper == "test-wrapper");
+    assert(copiedConfig.surfaceGeneration == 42);
 }
 
 void testMismatchedSuppliedDeviceFallsBack(const char* media)
