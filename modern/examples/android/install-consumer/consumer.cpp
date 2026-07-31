@@ -8,6 +8,7 @@
 #include <qtav/mobile_video_renderer.h>
 
 #include <memory>
+#include <string>
 #include <utility>
 
 extern "C" __attribute__((visibility("default")))
@@ -31,6 +32,13 @@ int qtav_android_opengl_install_consumer()
     };
     qtav::MobileVideoRendererSelector selector(
         std::move(selectorConfig));
+    selector.setHardwareFrameFallbackCallback(
+        [](const qtav::MobileHardwareFrameFallbackEvent&) {
+            return qtav::MobileHardwareFrameFallbackDecision {
+                qtav::MobileHardwareFrameFallbackRoute::NoVideo,
+                {},
+            };
+        });
     const qtav::VideoRenderCapabilities capabilities =
         renderer.capabilities();
     const qtav::AudioSinkCapabilities audioCapabilities =
@@ -44,6 +52,13 @@ int qtav_android_opengl_install_consumer()
             && !renderer.hdrOutputActive()
             && renderer.colorComponentBits() == 0
             && selector.selectedAPI() == qtav::MobileRenderAPI::None
+            && selector.hardwareFrameFallbackRoute()
+                == qtav::MobileHardwareFrameFallbackRoute::None
+            && std::string(
+                   qtav::mobileHardwareFrameFallbackRouteName(
+                       qtav::MobileHardwareFrameFallbackRoute::
+                           OpenGLESInterop))
+                == "opengl-es-interop"
             && mediaCodecConfig.deviceType
                 == qtav::HardwareDeviceType::MediaCodec
             && mediaCodecConfig.decoderWrapper == "mediacodec"

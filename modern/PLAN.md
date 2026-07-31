@@ -79,8 +79,8 @@ Continuation checkpoint:
   statistics;
   its progress slider observes already-handled thumb pointer events and
   commits only one seek when a drag ends instead of issuing intermediate seeks;
-  Milestone 5 is complete and the active next platform task is the Android
-  production path, followed by OHOS and then Linux; the shared Android/OHOS
+  Milestones 5 and 6 are complete and the active next platform task is the
+  OHOS production path, followed by Linux; the shared Android/OHOS
   responsibility and lifecycle design is now recorded in `MOBILE.md`, and the
   Android arm64 Vulkan checkpoint cross-builds FFmpeg 8.1.2 plus QtAVCore,
   packages a minimal NativeActivity APK, verifies generated software A/V
@@ -113,6 +113,12 @@ Continuation checkpoint:
   `AHardwareBuffer`/external-format import, Vulkan YCbCr sampling, explicit
   foreign-queue and sync-fd release fencing, and aligned-allocation cropping
   without decoded-pixel mapping, staging, transfer, or re-upload;
+  `QtAV::InteropMediaCodecOpenGL` now supplies the detached
+  `SurfaceTexture`/external-OES path, and `QtAV::RenderMobile` connects fatal
+  Vulkan hardware-frame fallback to an explicit synchronous application
+  decision that rebinds subsequent output to compatible OpenGL ES interop or
+  selects direct surface, software decode, or no video without retrying or
+  mapping the retired frame;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
@@ -364,6 +370,17 @@ Current verification:
   decoder surface, and completed clean shutdown with zero decoded-source
   CPU-map, software-transfer, staging-copy, or renderer-upload calls. SDR
   8-bit sampling is enabled; P010/HDR remains explicitly capability-gated.
+- the explicit MediaCodec renderer-fallback checkpoint adds
+  `MobileHardwareFrameFallbackRoute` and a synchronous selector callback.
+  Deterministic tests cover compatible OpenGL ES interop, direct-surface,
+  software-decode, no-video, missing-policy, retired-surface rejection, and
+  retryable asynchronous interop without a CPU map. The connected Android
+  run injected a fatal Vulkan error after 30 successful AImageReader imports,
+  rebound the same H.264 media session from generation 5 to a generation 6
+  SurfaceTexture, and continued with 32 Vulkan-generation plus 180 OpenGL
+  ES-generation decoded frames, 30 matching Vulkan release fences, 179
+  external-OES images, and zero decoded-source map, transfer, staging, or
+  upload calls.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -585,7 +602,7 @@ Completed file-output checkpoint:
 
 ## Next task
 
-Begin the Android production path:
+Begin the OHOS production path after the completed Android reference:
 
 Windows Advanced Color validation is complete: on a PHL 27B1U7903,
 `qtav_render_d3d11_advanced_color_test` passed with
@@ -624,15 +641,17 @@ passed 34/34.
     `AImageReader`/`AHardwareBuffer` Vulkan zero-CPU-copy texture path.
 11. [x] Add the confirmed `SurfaceTexture` external-OES OpenGL ES
     zero-CPU-copy texture path.
-12. [ ] Connect the explicit renderer-fallback policy: on a fatal Vulkan
+12. [x] Connect the explicit renderer-fallback policy: on a fatal Vulkan
     transition, reconfigure subsequent MediaCodec output through compatible
     GLES native interop or select the caller's direct-surface,
     software-decode, or no-video policy without mapping a hardware frame.
 
 The first unchecked item, and therefore the next implementation task, is the
-explicit MediaCodec renderer-fallback policy. The completed Vulkan and
-SurfaceTexture paths remain separate backends; a renderer switch does not
-authorize CPU mapping when native interop is unavailable.
+Milestone 7 target clarification gate: record whether the initial target is a
+HarmonyOS NEXT commercial device application, a specific OpenHarmony
+distribution/device, or both, together with its SDK/API, signing, system
+capabilities, and connected-device workflow before fixing OHOS backend
+availability rules.
 
 ### Shared Android/OHOS mobile design checkpoint
 
@@ -1353,7 +1372,8 @@ Acceptance:
   swap-chain/display-switch tests.
 - [x] No Windows type leaks into core public headers.
 
-Status: complete; resume Milestone 6 from its first unchecked item.
+Status: complete; Milestone 6 is also complete, so resume Milestone 7 from its
+target clarification gate.
 
 ## Milestone 6 — Android production path
 
@@ -1412,7 +1432,7 @@ Status: complete; resume Milestone 6 from its first unchecked item.
   `AImageReader` plus `AHardwareBuffer`/`EGLImage` import as a
   capability-gated alternative; neither path may map or re-upload decoded
   pixels.
-- [ ] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
+- [x] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
   interop for subsequent frames; otherwise follow an explicit direct-surface,
   software-decode, or no-video policy without implicit hardware-frame mapping.
 - [x] Software fallback independent of renderer mapping/interop fallback.
@@ -1438,6 +1458,9 @@ Acceptance:
 - an unsupported Vulkan or OpenGL ES import capability is reported explicitly
   as unavailable or skipped, not counted as zero-CPU-copy success;
 - Android SDK types remain outside core public headers.
+
+Status: complete; proceed to Milestone 7 only after its target clarification
+gate is recorded.
 
 ## Milestone 7 — OHOS production path
 

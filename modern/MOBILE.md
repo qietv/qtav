@@ -190,6 +190,22 @@ hardware-frame interop are independent policies: a Vulkan failure does not by
 itself reopen the decoder, and an interop failure must not be disguised as a
 graphics-API fallback.
 
+Hardware frames are the deliberate exception to retained-frame retry. A frame
+decoded for the retired Vulkan producer surface is never submitted to the new
+OpenGL ES renderer. `MobileVideoRendererSelector` invokes its synchronous
+hardware-frame fallback callback after preparing the OpenGL ES candidate. The
+application rebinds subsequent decoder output and returns one explicit route:
+compatible OpenGL ES native interop, direct-surface presentation, software
+decode, or no video. Late frames from the retired native surface are discarded
+without mapping. OpenGL ES interop requires the prepared candidate to
+advertise the source hardware device; no callback or a `None` decision makes
+presentation explicitly unavailable.
+
+An asynchronous interop attempt may return `false` before its producer image
+is ready without emitting `SurfaceLost` or `Error`. The selector treats this
+as retryable and preserves the active API. Only an emitted lifecycle or fatal
+event starts recovery or fallback.
+
 ## Platform surface adapters
 
 Android and OHOS use separate adapters because their window ownership and
@@ -384,13 +400,15 @@ but it does not expose a Vulkan-importable native buffer. The exact bridge,
 format, protected-content, lifetime, and fence APIs remain target-SDK/device
 gates.
 
-When the active renderer changes from Vulkan to OpenGL ES, the platform layer
-first attempts the OpenGL ES interop path for newly decoded native buffers. If
-that path is unavailable, it follows the caller's explicit policy: reconfigure
-for direct-surface presentation, reopen video in software, or report video
-presentation unavailable. It never maps and uploads a hardware frame merely
-because the graphics API changed. The reverse transition is not attempted
-during the same renderer session.
+When the active renderer changes from Vulkan to OpenGL ES, the implemented
+selector callback first permits the platform layer to reconfigure newly
+decoded native buffers for the prepared OpenGL ES interop path. If that path
+is unavailable, the callback selects direct-surface presentation, software
+decode, or no video. Direct-surface and no-video routes retire the renderer;
+software decode keeps OpenGL ES active for the later software frames. The
+current Vulkan hardware frame is dropped, not retried, and none of these
+routes maps or uploads it. The reverse transition is not attempted during the
+same renderer session.
 
 Seek, loop, stop, media replacement, decoder flush, surface replacement, and
 renderer fallback advance a generation and reject late native buffers. Device
@@ -435,6 +453,10 @@ Shared generated media and lifecycle scenarios cover:
 - recoverable Vulkan surface/swapchain recreation without an API switch;
 - fatal Vulkan failure followed by one-way OpenGL ES fallback without media
   reopen, plus explicit failure when neither renderer is usable;
+- fatal Vulkan failure while MediaCodec is producing for a private
+  AImageReader, followed by synchronous decoder rebind to the prepared
+  SurfaceTexture producer and continued external-OES rendering without a
+  media replacement or decoded-source CPU access;
 - MediaCodec H.264/HEVC direct-surface output with explicit present/drop,
   seek/flush, media replacement, stop, background/foreground surface
   recreation, stale-generation rejection, bounded retained outputs, and clean

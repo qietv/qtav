@@ -433,6 +433,90 @@ struct VulkanContext {
     bool foreignQueueFamilyEnabled = false;
 };
 
+class FatalAfterVideoRenderer final : public qtav::VideoRenderAPI {
+public:
+    FatalAfterVideoRenderer(
+        std::shared_ptr<qtav::VideoRenderAPI> renderer,
+        int successfulRendersBeforeFailure)
+        : renderer_(std::move(renderer))
+        , successfulRendersBeforeFailure_(
+              std::max(1, successfulRendersBeforeFailure))
+    {
+    }
+
+    qtav::VideoRenderCapabilities capabilities() const override
+    {
+        return renderer_
+            ? renderer_->capabilities()
+            : qtav::VideoRenderCapabilities {};
+    }
+
+    void setEventCallback(EventCallback callback) override
+    {
+        callback_ = std::move(callback);
+        if (renderer_) {
+            renderer_->setEventCallback(
+                [this](const qtav::VideoRenderEvent& event) {
+                    if (callback_) {
+                        callback_(event);
+                    }
+                });
+        }
+    }
+
+    bool open(const qtav::VideoRenderConfig& config) override
+    {
+        return renderer_ && renderer_->open(config);
+    }
+
+    bool configure(
+        const qtav::VideoRenderConfig& config) override
+    {
+        return renderer_ && renderer_->configure(config);
+    }
+
+    bool render(const qtav::VideoFrame& frame) override
+    {
+        if (!renderer_) {
+            return false;
+        }
+        if (successfulRenders_.load(std::memory_order_acquire)
+            >= successfulRendersBeforeFailure_) {
+            if (!failureReported_.exchange(true)
+                && callback_) {
+                callback_({
+                    qtav::VideoRenderEventType::Error,
+                    "injected fatal Vulkan failure for MediaCodec "
+                    "fallback validation",
+                });
+            }
+            return false;
+        }
+        const bool succeeded = renderer_->render(frame);
+        if (succeeded) {
+            successfulRenders_.fetch_add(
+                1,
+                std::memory_order_acq_rel);
+        }
+        return succeeded;
+    }
+
+    void close() noexcept override
+    {
+        if (renderer_) {
+            renderer_->setEventCallback({});
+            renderer_->close();
+        }
+    }
+
+private:
+    std::shared_ptr<qtav::VideoRenderAPI> renderer_;
+    EventCallback callback_;
+    int successfulRendersBeforeFailure_ = 1;
+    std::atomic<int> successfulRenders_ { 0 };
+    std::atomic<bool> failureReported_ { false };
+};
+
 enum class TestPhase {
     Software,
     WaitingForMediaCodecSurface,
@@ -441,6 +525,7 @@ enum class TestPhase {
     WaitingForMediaCodecVulkan,
     MediaCodecVulkanH264,
     MediaCodecVulkanHevc,
+    MediaCodecFallbackH264,
     MediaCodecOpenGLH264,
     MediaCodecOpenGLHevc,
 };
@@ -465,6 +550,15 @@ struct TestState {
         }
         if (mediaCodecVulkanInterop) {
             mediaCodecVulkanInterop->flush();
+        }
+        if (mediaCodecFallbackSelector) {
+            mediaCodecFallbackSelector->close();
+        }
+        if (mediaCodecFallbackVulkanInterop) {
+            mediaCodecFallbackVulkanInterop->flush();
+        }
+        if (mediaCodecFallbackOpenGLInterop) {
+            mediaCodecFallbackOpenGLInterop->flush();
         }
         if (mediaCodecOpenGLRenderer) {
             mediaCodecOpenGLRenderer->close();
@@ -545,6 +639,14 @@ struct TestState {
             + " release_fences="
             + std::to_string(
                 mediaCodecVulkanReleaseFences.load())
+            + " mediacodec_renderer_fallback="
+            + (mediaCodecFallbackPassed.load() ? "pass" : "fail")
+            + " fallback_vulkan_frames="
+            + std::to_string(
+                mediaCodecFallbackVulkanFrames.load())
+            + " fallback_gles_frames="
+            + std::to_string(
+                mediaCodecFallbackOpenGLFrames.load())
             + " mediacodec_opengl=h264,hevc"
             + " mediacodec_opengl_frames="
             + std::to_string(
@@ -704,6 +806,13 @@ struct TestState {
             if (!validateMediaCodecVulkanPhase("hevc")) {
                 return;
             }
+            startMediaCodecFallbackPhase();
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecFallbackH264) {
+            if (!validateMediaCodecFallbackPhase()) {
+                return;
+            }
             startMediaCodecOpenGLPhase(
                 TestPhase::MediaCodecOpenGLH264);
             return;
@@ -768,6 +877,7 @@ struct TestState {
             && currentPhase != TestPhase::MediaCodecHevc
             && currentPhase != TestPhase::MediaCodecVulkanH264
             && currentPhase != TestPhase::MediaCodecVulkanHevc
+            && currentPhase != TestPhase::MediaCodecFallbackH264
             && currentPhase != TestPhase::MediaCodecOpenGLH264
             && currentPhase != TestPhase::MediaCodecOpenGLHevc) {
             return;
@@ -794,6 +904,43 @@ struct TestState {
                                == TestPhase::MediaCodecVulkanH264
                            ? "h264"
                            : "hevc"));
+            }
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecFallbackH264) {
+            const qtav::HardwareFrame hardware =
+                frame.hardwareFrame();
+            if (!hardware
+                || hardware.deviceType()
+                    != qtav::HardwareDeviceType::MediaCodec) {
+                fail(
+                    "MediaCodec renderer fallback received a non-native frame");
+                return;
+            }
+            const std::uint32_t generation =
+                hardware
+                    .nativeHandle(
+                        qtav::HardwareHandleType::Surface)
+                    .subresource;
+            const std::uint32_t openGLGeneration =
+                mediaCodecFallbackOpenGLInterop
+                ? mediaCodecFallbackOpenGLInterop
+                      ->surface()
+                      .generation()
+                : 0;
+            if (openGLGeneration != 0
+                && generation == openGLGeneration) {
+                ++mediaCodecFallbackOpenGLFrames;
+            } else {
+                ++mediaCodecFallbackVulkanFrames;
+            }
+            if (mediaCodecFallbackVulkanFrames.load()
+                    + mediaCodecFallbackOpenGLFrames.load()
+                == 1) {
+                logInfo(
+                    "QTAV_ANDROID_TEST: "
+                    "MEDIACODEC_RENDERER_FALLBACK_FIRST_OUTPUT "
+                    "route=vulkan");
             }
             return;
         }
@@ -1275,6 +1422,408 @@ struct TestState {
         return true;
     }
 
+    qtav::MobileRendererCandidate
+    createMediaCodecFallbackVulkanCandidate()
+    {
+        if (!vulkan || !vulkan->borrowed().isValid()
+            || !mediaCodecFallbackVulkanInterop) {
+            return {
+                {},
+                "MediaCodec fallback has no Vulkan device or interop",
+            };
+        }
+        ANativeWindow* window = retainedActiveWindow();
+        if (!window) {
+            return { {}, "No active Android native window" };
+        }
+        auto renderer =
+            std::make_shared<qtav::AndroidVulkanVideoRenderer>(
+                vulkan->borrowed(),
+                qtav::VulkanOutputPreference::SdrOnly);
+        renderer->setHardwareFrameInterop(
+            mediaCodecFallbackVulkanInterop);
+        const bool windowSet = renderer->setWindow(window);
+        ANativeWindow_release(window);
+        if (!windowSet) {
+            return {
+                {},
+                "Could not create the MediaCodec fallback Vulkan surface",
+            };
+        }
+        mediaCodecFallbackVulkanRenderer = renderer;
+        return {
+            std::make_shared<FatalAfterVideoRenderer>(
+                std::move(renderer),
+                30),
+            {},
+        };
+    }
+
+    qtav::MobileRendererCandidate
+    createMediaCodecFallbackOpenGLCandidate()
+    {
+        if (!mediaCodecFallbackOpenGLInterop) {
+            qtav::MediaCodecOpenGLInteropConfig interopConfig;
+            interopConfig.javaVM = activity->vm;
+            interopConfig.width = 160;
+            interopConfig.height = 90;
+            interopConfig.maximumPendingFrames = 4;
+            interopConfig.redrawRetryMilliseconds = 2;
+            mediaCodecFallbackOpenGLInterop =
+                std::make_shared<qtav::MediaCodecOpenGLInterop>(
+                    interopConfig);
+        }
+        if (!mediaCodecFallbackOpenGLInterop
+            || !*mediaCodecFallbackOpenGLInterop) {
+            return {
+                {},
+                mediaCodecFallbackOpenGLInterop
+                    ? mediaCodecFallbackOpenGLInterop->lastError()
+                    : "Could not create MediaCodec OpenGL ES interop",
+            };
+        }
+
+        ANativeWindow* window = retainedActiveWindow();
+        if (!window) {
+            return { {}, "No active Android native window" };
+        }
+        auto renderer =
+            std::make_shared<qtav::AndroidOpenGLVideoRenderer>(
+                qtav::OpenGLOutputPreference::SdrOnly);
+        renderer->setHardwareFrameInterop(
+            mediaCodecFallbackOpenGLInterop);
+        const bool windowSet = renderer->setWindow(window);
+        ANativeWindow_release(window);
+        if (!windowSet) {
+            return {
+                {},
+                "Could not create the MediaCodec fallback OpenGL ES surface",
+            };
+        }
+        mediaCodecFallbackOpenGLRenderer = renderer;
+        return { std::move(renderer), {} };
+    }
+
+    void startMediaCodecFallbackPhase()
+    {
+        player
+            .setVideoRenderAPI({})
+            .setRenderCallback({})
+            .setHardwareDecodeConfig({});
+        if (mediaCodecVulkanRenderer) {
+            mediaCodecVulkanRenderer->close();
+            mediaCodecVulkanRenderer.reset();
+        }
+        if (mediaCodecVulkanInterop) {
+            mediaCodecVulkanInterop->flush();
+            mediaCodecVulkanInterop.reset();
+        }
+        if (mediaCodecFallbackSelector) {
+            mediaCodecFallbackSelector->close();
+            mediaCodecFallbackSelector.reset();
+        }
+        mediaCodecFallbackVulkanRenderer.reset();
+        mediaCodecFallbackOpenGLRenderer.reset();
+        if (mediaCodecFallbackVulkanInterop) {
+            mediaCodecFallbackVulkanInterop->flush();
+            mediaCodecFallbackVulkanInterop.reset();
+        }
+        if (mediaCodecFallbackOpenGLInterop) {
+            mediaCodecFallbackOpenGLInterop->flush();
+            mediaCodecFallbackOpenGLInterop.reset();
+        }
+
+        if (!vulkan || !vulkan->device) {
+            fail(
+                "MediaCodec renderer fallback has no Vulkan device");
+            return;
+        }
+        qtav::MediaCodecVulkanInteropConfig interopConfig;
+        interopConfig.width = 160;
+        interopConfig.height = 90;
+        interopConfig.maximumImages = 5;
+        interopConfig.androidHardwareBufferExternalMemoryEnabled =
+            vulkan->androidHardwareBufferExternalMemoryEnabled;
+        interopConfig.externalSemaphoreFdEnabled =
+            vulkan->externalSemaphoreFdEnabled;
+        interopConfig.samplerYcbcrConversionEnabled =
+            vulkan->samplerYcbcrConversionEnabled;
+        interopConfig.foreignQueueFamilyEnabled =
+            vulkan->foreignQueueFamilyEnabled;
+        mediaCodecFallbackVulkanInterop =
+            std::make_shared<qtav::MediaCodecVulkanInterop>(
+                vulkan->borrowed().device,
+                interopConfig);
+        if (!*mediaCodecFallbackVulkanInterop) {
+            fail(
+                "could not create fallback MediaCodec Vulkan interop: "
+                + mediaCodecFallbackVulkanInterop->lastError());
+            return;
+        }
+
+        qtav::MobileRendererSelectorConfig selectorConfig;
+        selectorConfig.maximumRecoveryAttempts = 2;
+        selectorConfig.vulkan = [this] {
+            return createMediaCodecFallbackVulkanCandidate();
+        };
+        selectorConfig.openGLES = [this] {
+            return createMediaCodecFallbackOpenGLCandidate();
+        };
+        mediaCodecFallbackSelector =
+            std::make_shared<qtav::MobileVideoRendererSelector>(
+                std::move(selectorConfig));
+        mediaCodecFallbackSelector->setSelectionCallback(
+            [](const qtav::MobileRendererSelectionEvent& event) {
+                logInfo(
+                    "QTAV_ANDROID_TEST: "
+                    "MEDIACODEC_RENDERER_SELECTION previous="
+                    + std::string(
+                        qtav::mobileRenderAPIName(event.previousAPI))
+                    + " selected="
+                    + qtav::mobileRenderAPIName(event.selectedAPI)
+                    + " generation="
+                    + std::to_string(event.sessionGeneration)
+                    + " detail=" + event.detail);
+            });
+        mediaCodecFallbackSelector
+            ->setHardwareFrameFallbackCallback(
+                [this](
+                    const qtav::MobileHardwareFrameFallbackEvent&
+                        event) {
+                    if (event.previousAPI
+                            != qtav::MobileRenderAPI::Vulkan
+                        || event.selectedAPI
+                            != qtav::MobileRenderAPI::OpenGLES
+                        || event.sourceDevice
+                            != qtav::HardwareDeviceType::MediaCodec
+                        || !mediaCodecFallbackOpenGLInterop
+                        || !*mediaCodecFallbackOpenGLInterop) {
+                        return qtav::
+                            MobileHardwareFrameFallbackDecision {
+                                qtav::
+                                    MobileHardwareFrameFallbackRoute::
+                                        NoVideo,
+                                "compatible SurfaceTexture interop "
+                                "was unavailable",
+                            };
+                    }
+
+                    if (mediaCodecFallbackVulkanInterop) {
+                        mediaCodecFallbackVulkanInterop->flush();
+                    }
+                    qtav::MediaCodecHardwareDecodeOptions options;
+                    options.allowSoftwareFallback = false;
+                    options.extraHardwareFrames = 6;
+                    const qtav::MediaCodecSurface surface =
+                        mediaCodecFallbackOpenGLInterop->surface();
+                    const qtav::HardwareDecodeConfig config =
+                        qtav::mediaCodecHardwareDecodeConfig(
+                            surface,
+                            options);
+                    if (!surface || !config.device
+                        || config.surfaceGeneration
+                            != surface.generation()) {
+                        return qtav::
+                            MobileHardwareFrameFallbackDecision {
+                                qtav::
+                                    MobileHardwareFrameFallbackRoute::
+                                        NoVideo,
+                                "could not bind MediaCodec to the "
+                                "replacement SurfaceTexture",
+                            };
+                    }
+                    player.setHardwareDecodeConfig(config);
+                    mediaCodecFallbackTransitioned = true;
+                    logInfo(
+                        "QTAV_ANDROID_TEST: "
+                        "MEDIACODEC_RENDERER_FALLBACK_POLICY "
+                        "route=opengl-es-interop old_generation="
+                        + std::to_string(
+                            event.sourceSurfaceGeneration)
+                        + " new_generation="
+                        + std::to_string(surface.generation())
+                        + " cpu_map=0 transfer=0 staging=0 upload=0");
+                    return qtav::
+                        MobileHardwareFrameFallbackDecision {
+                            qtav::
+                                MobileHardwareFrameFallbackRoute::
+                                    OpenGLESInterop,
+                            "MediaCodec rebound to the detached "
+                            "SurfaceTexture producer",
+                        };
+                });
+        mediaCodecFallbackSelector->setEventCallback(
+            [this](const qtav::VideoRenderEvent& event) {
+                if (event.type
+                    == qtav::VideoRenderEventType::RedrawRequested) {
+                    if (!finished.load()
+                        && phase.load()
+                            == TestPhase::MediaCodecFallbackH264
+                        && player.renderVideo() >= 0.0) {
+                        ++mediaCodecFallbackRendered;
+                    }
+                    return;
+                }
+                if (event.type == qtav::VideoRenderEventType::Error) {
+                    fail(
+                        "MediaCodec renderer fallback: "
+                        + event.detail);
+                }
+            });
+
+        ANativeWindow* window = retainedActiveWindow();
+        if (!window) {
+            fail(
+                "MediaCodec renderer fallback has no presentation window");
+            return;
+        }
+        qtav::VideoRenderConfig renderConfig;
+        renderConfig.surfaceSize = {
+            ANativeWindow_getWidth(window),
+            ANativeWindow_getHeight(window),
+        };
+        renderConfig.aspectRatio =
+            qtav::VideoAspectRatioMode::Fit;
+        ANativeWindow_release(window);
+        if (!mediaCodecFallbackSelector->open(renderConfig)
+            || mediaCodecFallbackSelector->selectedAPI()
+                != qtav::MobileRenderAPI::Vulkan) {
+            fail(
+                "could not open the MediaCodec Vulkan fallback selector: "
+                + mediaCodecFallbackSelector->lastError());
+            return;
+        }
+
+        qtav::MediaCodecHardwareDecodeOptions options;
+        options.allowSoftwareFallback = false;
+        options.extraHardwareFrames = 6;
+        const qtav::MediaCodecSurface surface =
+            mediaCodecFallbackVulkanInterop->surface();
+        const qtav::HardwareDecodeConfig decodeConfig =
+            qtav::mediaCodecHardwareDecodeConfig(
+                surface,
+                options);
+        if (!surface || !decodeConfig.device
+            || decodeConfig.surfaceGeneration
+                != surface.generation()) {
+            fail(
+                "could not bind MediaCodec to the fallback Vulkan AImageReader");
+            return;
+        }
+
+        phase = TestPhase::MediaCodecFallbackH264;
+        player
+            .setVideoRenderAPI(mediaCodecFallbackSelector)
+            .setRenderCallback([this](void*) {
+                if (player.renderVideo() >= 0.0) {
+                    ++mediaCodecFallbackRendered;
+                }
+            });
+        player.setMedia(mediaCodecH264Path);
+        player.setHardwareDecodeConfig(decodeConfig);
+        logInfo(
+            "QTAV_ANDROID_TEST: "
+            "MEDIACODEC_RENDERER_FALLBACK_PHASE_READY codec=h264 "
+            "initial=vulkan fallback=opengl-es-interop "
+            "fatal_after=30 zero_cpu_copy=required");
+        player.setState(qtav::State::Playing);
+    }
+
+    bool validateMediaCodecFallbackPhase()
+    {
+        player.setVideoRenderAPI({}).setRenderCallback({});
+        const qtav::MobileHardwareFrameFallbackRoute route =
+            mediaCodecFallbackSelector
+            ? mediaCodecFallbackSelector
+                  ->hardwareFrameFallbackRoute()
+            : qtav::MobileHardwareFrameFallbackRoute::None;
+        const qtav::MobileRenderAPI selected =
+            mediaCodecFallbackSelector
+            ? mediaCodecFallbackSelector->selectedAPI()
+            : qtav::MobileRenderAPI::None;
+        if (mediaCodecFallbackSelector) {
+            mediaCodecFallbackSelector->close();
+        }
+        if (!mediaCodecFallbackVulkanInterop
+            || !mediaCodecFallbackOpenGLInterop) {
+            fail(
+                "MediaCodec renderer fallback interop disappeared before validation");
+            return false;
+        }
+        const qtav::MediaCodecVulkanInteropStatistics vulkanStatistics =
+            mediaCodecFallbackVulkanInterop->statistics();
+        const qtav::MediaCodecOpenGLInteropStatistics openGLStatistics =
+            mediaCodecFallbackOpenGLInterop->statistics();
+        if (!mediaCodecFallbackTransitioned.load()
+            || route
+                != qtav::MobileHardwareFrameFallbackRoute::
+                    OpenGLESInterop
+            || selected != qtav::MobileRenderAPI::OpenGLES
+            || mediaCodecFallbackVulkanFrames.load() < 20
+            || mediaCodecFallbackOpenGLFrames.load() < 60
+            || mediaCodecFallbackRendered.load() < 80
+            || vulkanStatistics.imagesImported < 20
+            || vulkanStatistics.releaseFencesReturned
+                != vulkanStatistics.imagesImported
+            || vulkanStatistics.releaseFenceFallbacks != 0
+            || openGLStatistics.imagesLatched < 60
+            || openGLStatistics.maximumPendingFrames > 4
+            || vulkanStatistics.cpuMapCalls != 0
+            || vulkanStatistics.softwareTransferCalls != 0
+            || vulkanStatistics.stagingCopies != 0
+            || vulkanStatistics.rendererUploads != 0
+            || openGLStatistics.cpuMapCalls != 0
+            || openGLStatistics.softwareTransferCalls != 0
+            || openGLStatistics.stagingCopies != 0
+            || openGLStatistics.rendererUploads != 0) {
+            fail(
+                "MediaCodec renderer fallback validation failed"
+                " vulkan_frames="
+                + std::to_string(
+                    mediaCodecFallbackVulkanFrames.load())
+                + " gles_frames="
+                + std::to_string(
+                    mediaCodecFallbackOpenGLFrames.load())
+                + " rendered="
+                + std::to_string(
+                    mediaCodecFallbackRendered.load())
+                + " vulkan_imports="
+                + std::to_string(
+                    vulkanStatistics.imagesImported)
+                + " release_fences="
+                + std::to_string(
+                    vulkanStatistics.releaseFencesReturned)
+                + " gles_images="
+                + std::to_string(
+                    openGLStatistics.imagesLatched)
+                + " route="
+                + qtav::mobileHardwareFrameFallbackRouteName(route));
+            return false;
+        }
+
+        mediaCodecFallbackPassed = true;
+        logInfo(
+            "QTAV_ANDROID_TEST: "
+            "MEDIACODEC_RENDERER_FALLBACK_PASS "
+            "initial=vulkan selected=opengl-es "
+            "route=opengl-es-interop vulkan_frames="
+            + std::to_string(
+                mediaCodecFallbackVulkanFrames.load())
+            + " gles_frames="
+            + std::to_string(
+                mediaCodecFallbackOpenGLFrames.load())
+            + " vulkan_imports="
+            + std::to_string(
+                vulkanStatistics.imagesImported)
+            + " release_fences="
+            + std::to_string(
+                vulkanStatistics.releaseFencesReturned)
+            + " external_oes_images="
+            + std::to_string(openGLStatistics.imagesLatched)
+            + " cpu_map=0 transfer=0 staging=0 upload=0");
+        return true;
+    }
+
     void startMediaCodecOpenGLPhase(TestPhase targetPhase)
     {
         player
@@ -1641,6 +2190,21 @@ struct TestState {
                 return;
             }
             if (currentPhase
+                == TestPhase::MediaCodecFallbackH264) {
+                if (!mediaCodecFallbackSelector
+                    || !mediaCodecFallbackSelector
+                            ->recreateSurface()) {
+                    fail(
+                        "could not recreate the MediaCodec fallback renderer");
+                    return;
+                }
+                player.setState(qtav::State::Playing);
+                logInfo(
+                    "QTAV_ANDROID_TEST: "
+                    "MEDIACODEC_RENDERER_FALLBACK_SURFACE_RECREATED");
+                return;
+            }
+            if (currentPhase
                     == TestPhase::MediaCodecOpenGLH264
                 || currentPhase
                     == TestPhase::MediaCodecOpenGLHevc) {
@@ -1792,6 +2356,12 @@ struct TestState {
                 mediaCodecVulkanRenderer->setWindow(nullptr);
             }
         } else if (
+            currentPhase
+            == TestPhase::MediaCodecFallbackH264) {
+            if (mediaCodecFallbackSelector) {
+                mediaCodecFallbackSelector->suspendSurface();
+            }
+        } else if (
             currentPhase == TestPhase::MediaCodecOpenGLH264
             || currentPhase
                 == TestPhase::MediaCodecOpenGLHevc) {
@@ -1831,6 +2401,12 @@ struct TestState {
             logInfo(
                 "QTAV_ANDROID_TEST: "
                 "MEDIACODEC_VULKAN_SURFACE_REMOVED");
+        } else if (
+            currentPhase
+            == TestPhase::MediaCodecFallbackH264) {
+            logInfo(
+                "QTAV_ANDROID_TEST: "
+                "MEDIACODEC_RENDERER_FALLBACK_SURFACE_REMOVED");
         } else if (
             currentPhase == TestPhase::MediaCodecOpenGLH264
             || currentPhase
@@ -2166,6 +2742,21 @@ struct TestState {
     std::atomic<int> mediaCodecVulkanImports { 0 };
     std::atomic<int> mediaCodecVulkanAcquireFences { 0 };
     std::atomic<int> mediaCodecVulkanReleaseFences { 0 };
+    std::shared_ptr<qtav::MobileVideoRendererSelector>
+        mediaCodecFallbackSelector;
+    std::shared_ptr<qtav::MediaCodecVulkanInterop>
+        mediaCodecFallbackVulkanInterop;
+    std::shared_ptr<qtav::AndroidVulkanVideoRenderer>
+        mediaCodecFallbackVulkanRenderer;
+    std::shared_ptr<qtav::MediaCodecOpenGLInterop>
+        mediaCodecFallbackOpenGLInterop;
+    std::shared_ptr<qtav::AndroidOpenGLVideoRenderer>
+        mediaCodecFallbackOpenGLRenderer;
+    std::atomic<int> mediaCodecFallbackVulkanFrames { 0 };
+    std::atomic<int> mediaCodecFallbackOpenGLFrames { 0 };
+    std::atomic<int> mediaCodecFallbackRendered { 0 };
+    std::atomic<bool> mediaCodecFallbackTransitioned { false };
+    std::atomic<bool> mediaCodecFallbackPassed { false };
     std::shared_ptr<qtav::MediaCodecOpenGLInterop>
         mediaCodecOpenGLInterop;
     std::shared_ptr<qtav::AndroidOpenGLVideoRenderer>

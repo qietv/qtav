@@ -56,6 +56,10 @@ if(TARGET qtav_render_mobile)
         qtav_render_mobile_test
         PRIVATE QtAV::RenderMobile
     )
+    target_include_directories(
+        qtav_render_mobile_test
+        PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
+    )
     target_compile_features(
         qtav_render_mobile_test
         PRIVATE cxx_std_17

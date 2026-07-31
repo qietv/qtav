@@ -2,6 +2,7 @@
 
 #include <qtav/mobile_video_renderer.h>
 
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -38,6 +39,24 @@ const char* mobileRenderAPIName(MobileRenderAPI api) noexcept
         return "vulkan";
     case MobileRenderAPI::OpenGLES:
         return "opengl-es";
+    }
+    return "unknown";
+}
+
+const char* mobileHardwareFrameFallbackRouteName(
+    MobileHardwareFrameFallbackRoute route) noexcept
+{
+    switch (route) {
+    case MobileHardwareFrameFallbackRoute::None:
+        return "none";
+    case MobileHardwareFrameFallbackRoute::OpenGLESInterop:
+        return "opengl-es-interop";
+    case MobileHardwareFrameFallbackRoute::DirectSurface:
+        return "direct-surface";
+    case MobileHardwareFrameFallbackRoute::SoftwareDecode:
+        return "software-decode";
+    case MobileHardwareFrameFallbackRoute::NoVideo:
+        return "no-video";
     }
     return "unknown";
 }
@@ -85,6 +104,55 @@ public:
                 std::move(detail),
             });
         }
+    }
+
+    bool candidateSupports(
+        HardwareDeviceType device) const
+    {
+        if (!renderer_ || device == HardwareDeviceType::Unknown) {
+            return false;
+        }
+        const auto devices = renderer_->capabilities().hardwareDevices;
+        return std::find(devices.begin(), devices.end(), device)
+            != devices.end();
+    }
+
+    static NativeHandle hardwareSurface(
+        const VideoFrame& frame) noexcept
+    {
+        if (!frame.hasHardwareFrame()) {
+            return {};
+        }
+        return frame.hardwareFrame().nativeHandle(
+            HardwareHandleType::Surface);
+    }
+
+    bool isRetiredHardwareFrame(
+        const VideoFrame& frame) const noexcept
+    {
+        if (!frame.hasHardwareFrame()) {
+            return false;
+        }
+        if (hardwareFallbackRoute_
+            == MobileHardwareFrameFallbackRoute::SoftwareDecode) {
+            return true;
+        }
+        if (hardwareFallbackRoute_
+                != MobileHardwareFrameFallbackRoute::OpenGLESInterop
+            || retiredHardwareDevice_
+                == HardwareDeviceType::Unknown) {
+            return false;
+        }
+        const HardwareFrame hardware = frame.hardwareFrame();
+        if (hardware.deviceType() != retiredHardwareDevice_) {
+            return false;
+        }
+        const NativeHandle surface =
+            hardware.nativeHandle(HardwareHandleType::Surface);
+        return retiredHardwareSurface_
+            && surface.value == retiredHardwareSurface_.value
+            && surface.subresource
+                == retiredHardwareSurface_.subresource;
     }
 
     void onCandidateEvent(
@@ -196,6 +264,14 @@ public:
             clearPendingEvent();
             return true;
         }
+        if (!hasPendingEvent_) {
+            failure = {
+                VideoRenderEventType::RedrawRequested,
+                apiLabel(selectedAPI_)
+                    + " renderer deferred this retryable render attempt",
+            };
+            return false;
+        }
         failure = takeFailureEvent(
             apiLabel(selectedAPI_) + " renderer failed to render");
         return false;
@@ -206,12 +282,32 @@ public:
         std::string reason,
         const VideoFrame* retryFrame)
     {
+        const bool hardwareFallback =
+            retryFrame && retryFrame->hasHardwareFrame();
+        HardwareDeviceType sourceDevice =
+            HardwareDeviceType::Unknown;
+        NativeHandle sourceSurface;
+        if (hardwareFallback) {
+            const HardwareFrame hardware =
+                retryFrame->hardwareFrame();
+            sourceDevice = hardware.deviceType();
+            sourceSurface = hardwareSurface(*retryFrame);
+        }
+
         closeRenderer();
         selectedAPI_ = MobileRenderAPI::None;
         vulkanRetired_ = true;
 
         std::string openGLError;
         if (!activate(MobileRenderAPI::OpenGLES, openGLError)) {
+            if (hardwareFallback) {
+                return applyHardwareFrameFallback(
+                    previous,
+                    std::move(reason),
+                    sourceDevice,
+                    sourceSurface,
+                    std::move(openGLError));
+            }
             const std::string detail =
                 joinDetail(
                     joinDetail(
@@ -221,6 +317,15 @@ public:
                         "OpenGL ES is unavailable",
                         openGLError));
             return becomeUnavailable(previous, detail);
+        }
+
+        if (hardwareFallback) {
+            return applyHardwareFrameFallback(
+                previous,
+                std::move(reason),
+                sourceDevice,
+                sourceSurface,
+                {});
         }
 
         notifySelection(
@@ -242,6 +347,136 @@ public:
             MobileRenderAPI::OpenGLES,
             std::move(failure),
             retryFrame);
+    }
+
+    bool applyHardwareFrameFallback(
+        MobileRenderAPI previous,
+        std::string reason,
+        HardwareDeviceType sourceDevice,
+        NativeHandle sourceSurface,
+        std::string openGLError)
+    {
+        if (!hardwareFallbackCallback_) {
+            return becomeUnavailable(
+                previous,
+                joinDetail(
+                    joinDetail(
+                        "A Vulkan hardware frame requires an explicit "
+                        "cross-API fallback policy",
+                        reason),
+                    openGLError));
+        }
+
+        MobileHardwareFrameFallbackEvent event;
+        event.previousAPI = previous;
+        event.selectedAPI = selectedAPI_;
+        event.sourceDevice = sourceDevice;
+        event.sourceSurfaceGeneration = sourceSurface.subresource;
+        event.sessionGeneration = sessionGeneration_;
+        event.detail = joinDetail(reason, openGLError);
+        const MobileHardwareFrameFallbackDecision decision =
+            hardwareFallbackCallback_(event);
+        const std::string routeDetail = joinDetail(
+            std::string("Selected hardware-frame route ")
+                + mobileHardwareFrameFallbackRouteName(decision.route),
+            decision.detail);
+
+        if (decision.route
+            == MobileHardwareFrameFallbackRoute::OpenGLESInterop) {
+            if (selectedAPI_ != MobileRenderAPI::OpenGLES
+                || !candidateSupports(sourceDevice)) {
+                return becomeUnavailable(
+                    previous,
+                    joinDetail(
+                        "The selected OpenGL ES candidate does not "
+                        "advertise compatible native hardware interop",
+                        routeDetail));
+            }
+            hardwareFallbackRoute_ = decision.route;
+            retiredHardwareDevice_ = sourceDevice;
+            retiredHardwareSurface_ = sourceSurface;
+            notifySelection(
+                MobileRendererSelectionEventType::FellBack,
+                previous,
+                MobileRenderAPI::OpenGLES,
+                joinDetail(
+                    "Selected OpenGL ES after Vulkan hardware-frame "
+                    "failure; subsequent decoder output must use the "
+                    "new native interop surface",
+                    routeDetail));
+            return true;
+        }
+
+        if (decision.route
+            == MobileHardwareFrameFallbackRoute::SoftwareDecode) {
+            if (selectedAPI_ != MobileRenderAPI::OpenGLES
+                || !renderer_) {
+                return becomeUnavailable(
+                    previous,
+                    joinDetail(
+                        "Software decode fallback has no OpenGL ES "
+                        "renderer",
+                        routeDetail));
+            }
+            hardwareFallbackRoute_ = decision.route;
+            retiredHardwareDevice_ = sourceDevice;
+            retiredHardwareSurface_ = sourceSurface;
+            notifySelection(
+                MobileRendererSelectionEventType::FellBack,
+                previous,
+                MobileRenderAPI::OpenGLES,
+                joinDetail(
+                    "Selected OpenGL ES after Vulkan hardware-frame "
+                    "failure; subsequent decoder output must be "
+                    "software frames",
+                    routeDetail));
+            return true;
+        }
+
+        if (decision.route
+            == MobileHardwareFrameFallbackRoute::DirectSurface) {
+            closeRenderer();
+            selectedAPI_ = MobileRenderAPI::None;
+            hardwareFallbackRoute_ = decision.route;
+            retiredHardwareDevice_ = sourceDevice;
+            retiredHardwareSurface_ = sourceSurface;
+            lastError_.clear();
+            notifySelection(
+                MobileRendererSelectionEventType::FellBack,
+                previous,
+                MobileRenderAPI::None,
+                joinDetail(
+                    "Handed hardware video presentation to the "
+                    "application's direct surface",
+                    routeDetail));
+            return true;
+        }
+
+        if (decision.route
+            == MobileHardwareFrameFallbackRoute::NoVideo) {
+            closeRenderer();
+            selectedAPI_ = MobileRenderAPI::None;
+            hardwareFallbackRoute_ = decision.route;
+            retiredHardwareDevice_ = sourceDevice;
+            retiredHardwareSurface_ = sourceSurface;
+            lastError_ = joinDetail(
+                "Video presentation was disabled by the explicit "
+                "hardware-frame fallback policy",
+                routeDetail);
+            notifySelection(
+                MobileRendererSelectionEventType::Unavailable,
+                previous,
+                MobileRenderAPI::None,
+                lastError_);
+            return true;
+        }
+
+        return becomeUnavailable(
+            previous,
+            joinDetail(
+                "The hardware-frame fallback callback returned no "
+                "explicit route",
+                routeDetail));
     }
 
     bool becomeUnavailable(
@@ -284,6 +519,19 @@ public:
             if (retryFrame) {
                 VideoRenderEvent retryFailure;
                 if (!renderOnce(*retryFrame, retryFailure)) {
+                    if (retryFailure.type
+                        == VideoRenderEventType::RedrawRequested) {
+                        notifySelection(
+                            MobileRendererSelectionEventType::Recovered,
+                            api,
+                            api,
+                            joinDetail(
+                                "Recreated " + apiLabel(api)
+                                    + " renderer on attempt "
+                                    + std::to_string(attempt + 1),
+                                reason));
+                        return false;
+                    }
                     lastRecoveryError = retryFailure.detail;
                     if (retryFailure.type
                         != VideoRenderEventType::SurfaceLost) {
@@ -328,6 +576,9 @@ public:
         VideoRenderEvent failure,
         const VideoFrame* retryFrame)
     {
+        if (failure.type == VideoRenderEventType::RedrawRequested) {
+            return false;
+        }
         if (failure.type == VideoRenderEventType::SurfaceLost) {
             return recover(api, std::move(failure.detail), retryFrame);
         }
@@ -349,6 +600,10 @@ public:
         sessionConfigured_ = true;
         suspended_ = false;
         vulkanRetired_ = false;
+        hardwareFallbackRoute_ =
+            MobileHardwareFrameFallbackRoute::None;
+        retiredHardwareDevice_ = HardwareDeviceType::Unknown;
+        retiredHardwareSurface_ = {};
         lastError_.clear();
         ++sessionGeneration_;
 
@@ -417,6 +672,13 @@ public:
         if (!sessionConfigured_ || suspended_) {
             return false;
         }
+        if (hardwareFallbackRoute_
+                == MobileHardwareFrameFallbackRoute::DirectSurface
+            || hardwareFallbackRoute_
+                == MobileHardwareFrameFallbackRoute::NoVideo
+            || isRetiredHardwareFrame(frame)) {
+            return true;
+        }
         const MobileRenderAPI api = selectedAPI_;
         VideoRenderEvent failure;
         if (renderOnce(frame, failure)) {
@@ -437,6 +699,10 @@ public:
         sessionConfigured_ = false;
         suspended_ = false;
         vulkanRetired_ = false;
+        hardwareFallbackRoute_ =
+            MobileHardwareFrameFallbackRoute::None;
+        retiredHardwareDevice_ = HardwareDeviceType::Unknown;
+        retiredHardwareSurface_ = {};
         lastError_.clear();
     }
 
@@ -477,6 +743,7 @@ public:
     MobileRendererSelectorConfig selectorConfig_;
     EventCallback eventCallback_;
     SelectionCallback selectionCallback_;
+    HardwareFrameFallbackCallback hardwareFallbackCallback_;
     std::shared_ptr<VideoRenderAPI> renderer_;
     VideoRenderConfig renderConfig_;
     VideoRenderEvent pendingEvent_;
@@ -487,6 +754,11 @@ public:
     bool suspended_ = false;
     bool vulkanRetired_ = false;
     bool hasPendingEvent_ = false;
+    MobileHardwareFrameFallbackRoute hardwareFallbackRoute_ =
+        MobileHardwareFrameFallbackRoute::None;
+    HardwareDeviceType retiredHardwareDevice_ =
+        HardwareDeviceType::Unknown;
+    NativeHandle retiredHardwareSurface_;
     std::string lastError_;
 };
 
@@ -560,6 +832,16 @@ void MobileVideoRendererSelector::setSelectionCallback(
     impl_->selectionCallback_ = std::move(callback);
 }
 
+void MobileVideoRendererSelector::setHardwareFrameFallbackCallback(
+    HardwareFrameFallbackCallback callback)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    impl_->hardwareFallbackCallback_ = std::move(callback);
+}
+
 void MobileVideoRendererSelector::suspendSurface() noexcept
 {
     if (impl_) {
@@ -599,6 +881,16 @@ bool MobileVideoRendererSelector::usingFallback() const noexcept
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
     return impl_->selectedAPI_ == MobileRenderAPI::OpenGLES
         && impl_->vulkanRetired_;
+}
+
+MobileHardwareFrameFallbackRoute
+MobileVideoRendererSelector::hardwareFrameFallbackRoute() const noexcept
+{
+    if (!impl_) {
+        return MobileHardwareFrameFallbackRoute::None;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->hardwareFallbackRoute_;
 }
 
 std::uint64_t

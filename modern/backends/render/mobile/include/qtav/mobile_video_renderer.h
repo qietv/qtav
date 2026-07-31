@@ -60,6 +60,38 @@ struct QTAV_RENDER_MOBILE_EXPORT MobileRendererSelectionEvent {
     std::string detail;
 };
 
+// A hardware frame produced for one graphics API's native interop surface
+// cannot be retried through another API. When Vulkan is retired while such a
+// frame is current, the application selects one explicit route for subsequent
+// decoder output. The current frame and any late frames from its retired
+// surface are discarded without CPU mapping.
+enum class MobileHardwareFrameFallbackRoute {
+    None,
+    OpenGLESInterop,
+    DirectSurface,
+    SoftwareDecode,
+    NoVideo,
+};
+
+QTAV_RENDER_MOBILE_EXPORT const char*
+mobileHardwareFrameFallbackRouteName(
+    MobileHardwareFrameFallbackRoute route) noexcept;
+
+struct QTAV_RENDER_MOBILE_EXPORT MobileHardwareFrameFallbackEvent {
+    MobileRenderAPI previousAPI = MobileRenderAPI::None;
+    MobileRenderAPI selectedAPI = MobileRenderAPI::None;
+    HardwareDeviceType sourceDevice = HardwareDeviceType::Unknown;
+    std::uint32_t sourceSurfaceGeneration = 0;
+    std::uint64_t sessionGeneration = 0;
+    std::string detail;
+};
+
+struct QTAV_RENDER_MOBILE_EXPORT MobileHardwareFrameFallbackDecision {
+    MobileHardwareFrameFallbackRoute route =
+        MobileHardwareFrameFallbackRoute::None;
+    std::string detail;
+};
+
 // Platform-neutral mobile renderer policy. Platform factories create fully
 // prepared Vulkan or OpenGL ES VideoRenderAPI adapters for the current native
 // window generation. The selector prefers Vulkan for each new open session,
@@ -71,6 +103,9 @@ MobileVideoRendererSelector final : public VideoRenderAPI {
 public:
     using SelectionCallback =
         std::function<void(const MobileRendererSelectionEvent&)>;
+    using HardwareFrameFallbackCallback =
+        std::function<MobileHardwareFrameFallbackDecision(
+            const MobileHardwareFrameFallbackEvent&)>;
 
     explicit MobileVideoRendererSelector(
         MobileRendererSelectorConfig config);
@@ -93,6 +128,17 @@ public:
     void close() noexcept override;
 
     void setSelectionCallback(SelectionCallback callback);
+    // Invoked synchronously after Vulkan is retired for a current hardware
+    // frame. OpenGLESInterop requires the prepared OpenGL ES candidate to
+    // advertise the source device and asks the callback to reconfigure future
+    // decoder output for that interop surface. SoftwareDecode keeps OpenGL ES
+    // active for future software frames. DirectSurface hands presentation back
+    // to the application, while NoVideo deliberately discards future video.
+    // Returning None, or omitting this callback, reports presentation
+    // unavailable. The callback may request thread-safe Player control changes
+    // but must not destroy this selector.
+    void setHardwareFrameFallbackCallback(
+        HardwareFrameFallbackCallback callback);
 
     // Called after the platform invalidates the active native-window
     // generation. This closes native graphics resources while preserving the
@@ -107,6 +153,8 @@ public:
     MobileRenderAPI selectedAPI() const noexcept;
     bool presentationAvailable() const noexcept;
     bool usingFallback() const noexcept;
+    MobileHardwareFrameFallbackRoute
+    hardwareFrameFallbackRoute() const noexcept;
     std::uint64_t sessionGeneration() const noexcept;
     std::string lastError() const;
 

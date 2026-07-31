@@ -6,7 +6,8 @@ and QtAVCore for `arm64-v8a`, packages a platform `NativeActivity`, and checks
 software MPEG-4 plus PCM decode, a bounded three-frame Vulkan submission ring,
 native HDR swapchain presentation, OpenGL ES 3.x/EGL native HDR, an explicit
 EGL SDR fallback, AAudio device output, MediaCodec H.264/HEVC direct-surface
-output, MediaCodec H.264/HEVC private-AImageReader Vulkan texture import, and
+output, MediaCodec H.264/HEVC private-AImageReader Vulkan texture import, an
+explicit fatal Vulkan-to-SurfaceTexture MediaCodec fallback, and
 background/foreground surface recreation on one connected device.
 
 Requirements:
@@ -114,6 +115,16 @@ seeks without replacing the decoder surface. The final device run latched 223
 H.264 and 179 HEVC images, kept the pending high-water mark at two, attached
 and detached one external texture per codec phase, and reported zero decoded
 source CPU-map, transfer, staging, and upload calls.
+Between the independent Vulkan and OpenGL ES codec regressions, the harness
+keeps one H.264 media session attached to `MobileVideoRendererSelector`.
+After 30 successful Vulkan presentations it injects a fatal renderer error,
+prepares an OpenGL ES renderer with compatible SurfaceTexture interop, and
+uses `setHardwareFrameFallbackCallback()` to publish the new MediaCodec
+surface. The retired Vulkan frame is discarded rather than retried through
+GLES. The recorded run continued with 32 Vulkan-generation and 180
+SurfaceTexture-generation decoded frames, 30 AHardwareBuffer imports and
+release fences, 179 external-OES images, and zero decoded-source
+map/transfer/staging/upload calls.
 The same run creates an offscreen OpenGL ES 3 context and verifies actual
 uploads/readback for YUV420/422/444, NV12/NV21, little-endian P010,
 RGB/BGR/RGBA/BGRA/ARGB, and Gray8 together with viewport, rotation, and target
@@ -137,4 +148,6 @@ MediaCodec Vulkan/OpenGL ES interop headers and links `QtAV::RenderMobile`,
 that the exported targets bring in `QtAV::RenderOpenGL`,
 `QtAV::RenderVulkan`, and logical Android
 `nativewindow`/`EGL`/`GLESv3`/`aaudio`/`android`/`mediandk`/`vulkan`
-dependencies without embedding the producer machine's NDK sysroot path.
+dependencies without embedding the producer machine's NDK sysroot path. It
+also compiles the explicit hardware-frame fallback callback, route enum, and
+diagnostic query.

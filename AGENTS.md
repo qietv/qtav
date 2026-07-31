@@ -195,6 +195,10 @@ Implemented under `modern/`:
 - a platform-neutral mobile renderer selector with Vulkan-preferred startup,
   bounded same-API surface recovery, fatal one-way OpenGL ES fallback, native
   window suspension/recreation, and explicit no-renderer behavior;
+- explicit mobile hardware-frame fallback routes that reconfigure subsequent
+  decoder output for compatible OpenGL ES interop, direct-surface
+  presentation, software decode, or no video without retrying or mapping a
+  frame from the retired Vulkan surface;
 - structured video color-space/HDR10 metadata and Metal
   SDR/extended-linear output;
 - libswresample conversion to negotiated interleaved PCM;
@@ -315,6 +319,11 @@ Last verified baseline:
   seek/flush, EGL window suspension/recreation, and clean shutdown: passed on
   the connected Adreno 830 device with 223 H.264 and 179 HEVC images latched,
   maximum pending depth two, and zero decoded-source CPU
+  map/transfer/staging/upload.
+- Android fatal Vulkan-to-OpenGL ES MediaCodec fallback on the same H.264
+  media session: passed with 32 Vulkan-generation frames, 180
+  SurfaceTexture-generation frames, 30 AHardwareBuffer imports and matching
+  release fences, 179 external-OES images, and zero decoded-source
   map/transfer/staging/upload.
 - Windows Visual Studio 2026 static/shared Release CTest: 32/32 passed,
   including WARP D3D11 contracts, D3D11VA lifecycle, native H.264/NV12 plus

@@ -2,6 +2,8 @@
 
 #include <qtav/mobile_video_renderer.h>
 
+#include "frame_internal.h"
+
 #include <cstdlib>
 #include <deque>
 #include <iostream>
@@ -25,11 +27,13 @@ struct RenderResult {
     qtav::VideoRenderEventType eventType =
         qtav::VideoRenderEventType::RedrawRequested;
     std::string detail;
+    bool emitEvent = true;
 };
 
 struct RendererBehavior {
     bool openSucceeded = true;
     bool configureSucceeded = true;
+    std::vector<qtav::HardwareDeviceType> hardwareDevices;
     std::deque<RenderResult> renderResults;
     int openCount = 0;
     int configureCount = 0;
@@ -49,6 +53,7 @@ public:
     {
         qtav::VideoRenderCapabilities result;
         result.softwareFormats = { qtav::PixelFormat::YUV420P };
+        result.hardwareDevices = behavior_->hardwareDevices;
         return result;
     }
 
@@ -89,7 +94,7 @@ public:
             result = std::move(behavior_->renderResults.front());
             behavior_->renderResults.pop_front();
         }
-        if (!result.succeeded && callback_) {
+        if (!result.succeeded && result.emitEvent && callback_) {
             callback_({ result.eventType, std::move(result.detail) });
         }
         return result.succeeded;
@@ -131,6 +136,71 @@ std::shared_ptr<RendererBehavior> behavior(
     auto result = std::make_shared<RendererBehavior>();
     result->renderResults.assign(results.begin(), results.end());
     return result;
+}
+
+class MockHardwareFrameData final : public qtav::HardwareFrameData {
+public:
+    MockHardwareFrameData(
+        std::uintptr_t surface,
+        std::uint32_t generation,
+        int* mapCalls)
+        : surface_(surface)
+        , generation_(generation)
+        , mapCalls_(mapCalls)
+    {
+    }
+
+    qtav::HardwareDeviceType deviceType() const noexcept override
+    {
+        return qtav::HardwareDeviceType::MediaCodec;
+    }
+    int width() const noexcept override { return 160; }
+    int height() const noexcept override { return 90; }
+    qtav::PixelFormat softwareFormat() const noexcept override
+    {
+        return qtav::PixelFormat::Native;
+    }
+    qtav::NativeHandle nativeHandle(
+        qtav::HardwareHandleType type) const noexcept override
+    {
+        if (type == qtav::HardwareHandleType::Surface) {
+            return { type, surface_, generation_ };
+        }
+        if (type == qtav::HardwareHandleType::Frame) {
+            return { type, surface_ + 1, generation_ };
+        }
+        return { type, 0, 0 };
+    }
+    bool isMappable(qtav::HardwareMapMode) const noexcept override
+    {
+        return true;
+    }
+    std::shared_ptr<qtav::HardwareFrameMapping> map(
+        qtav::HardwareMapMode) const override
+    {
+        if (mapCalls_) {
+            ++*mapCalls_;
+        }
+        return {};
+    }
+
+private:
+    std::uintptr_t surface_ = 0;
+    std::uint32_t generation_ = 0;
+    int* mapCalls_ = nullptr;
+};
+
+qtav::VideoFrame hardwareFrame(
+    std::uintptr_t surface,
+    std::uint32_t generation,
+    int& mapCalls)
+{
+    return qtav::detail::FrameFactory::hardware(
+        qtav::HardwareFrame(
+            std::make_shared<MockHardwareFrameData>(
+                surface,
+                generation,
+                &mapCalls)));
 }
 
 qtav::MobileRendererSelectorConfig selectorConfig(
@@ -295,6 +365,234 @@ void testFatalOneWayFallback()
     expect(vulkan->calls == 2, "New session did not recreate Vulkan");
 }
 
+void testRetryableRenderDoesNotChangeAPI()
+{
+    auto vulkan = std::make_shared<FactoryScript>();
+    auto openGLES = std::make_shared<FactoryScript>();
+    auto retryable = behavior({
+        {
+            false,
+            qtav::VideoRenderEventType::RedrawRequested,
+            {},
+            false,
+        },
+    });
+    vulkan->behaviors.push_back(retryable);
+
+    qtav::MobileVideoRendererSelector selector(
+        selectorConfig(vulkan, openGLES));
+    expect(selector.open(renderConfig()), "Vulkan startup failed");
+    expect(
+        !selector.render(qtav::VideoFrame {}),
+        "A retryable render attempt unexpectedly succeeded");
+    expect(
+        selector.selectedAPI() == qtav::MobileRenderAPI::Vulkan,
+        "A retryable render attempt changed graphics APIs");
+    expect(
+        selector.presentationAvailable(),
+        "A retryable render attempt retired the renderer");
+    expect(openGLES->calls == 0, "Retryable render probed OpenGL ES");
+}
+
+void testHardwareFrameFallbackRoutes()
+{
+    {
+        auto vulkan = std::make_shared<FactoryScript>();
+        auto openGLES = std::make_shared<FactoryScript>();
+        vulkan->behaviors.push_back(
+            behavior({
+                {
+                    false,
+                    qtav::VideoRenderEventType::Error,
+                    "VK_ERROR_DEVICE_LOST",
+                },
+            }));
+        auto openGLBehavior = behavior();
+        openGLBehavior->hardwareDevices = {
+            qtav::HardwareDeviceType::MediaCodec,
+        };
+        openGLES->behaviors.push_back(openGLBehavior);
+
+        int mapCalls = 0;
+        const qtav::VideoFrame oldFrame =
+            hardwareFrame(0x1000U, 7, mapCalls);
+        const qtav::VideoFrame newFrame =
+            hardwareFrame(0x2000U, 8, mapCalls);
+        qtav::MobileHardwareFrameFallbackEvent fallbackEvent;
+        qtav::MobileVideoRendererSelector selector(
+            selectorConfig(vulkan, openGLES));
+        selector.setHardwareFrameFallbackCallback(
+            [&fallbackEvent](
+                const qtav::MobileHardwareFrameFallbackEvent& event) {
+                fallbackEvent = event;
+                return qtav::MobileHardwareFrameFallbackDecision {
+                    qtav::MobileHardwareFrameFallbackRoute::
+                        OpenGLESInterop,
+                    "bound MediaCodec to the replacement native surface",
+                };
+            });
+        expect(selector.open(renderConfig()), "Vulkan startup failed");
+        expect(
+            selector.render(oldFrame),
+            "Hardware-frame fallback did not consume the retired frame");
+        expect(
+            selector.selectedAPI() == qtav::MobileRenderAPI::OpenGLES,
+            "Hardware-frame fallback did not keep OpenGL ES active");
+        expect(
+            selector.hardwareFrameFallbackRoute()
+                == qtav::MobileHardwareFrameFallbackRoute::
+                    OpenGLESInterop,
+            "OpenGL ES interop route was not recorded");
+        expect(
+            fallbackEvent.sourceDevice
+                    == qtav::HardwareDeviceType::MediaCodec
+                && fallbackEvent.sourceSurfaceGeneration == 7,
+            "Hardware fallback omitted the retired source identity");
+        expect(
+            openGLBehavior->renderCount == 0,
+            "The retired Vulkan hardware frame was retried through OpenGL ES");
+        expect(
+            selector.render(oldFrame)
+                && openGLBehavior->renderCount == 0,
+            "A late retired-surface frame reached OpenGL ES");
+        expect(
+            selector.render(newFrame)
+                && openGLBehavior->renderCount == 1,
+            "A replacement-surface hardware frame did not reach OpenGL ES");
+        expect(mapCalls == 0, "Hardware fallback mapped a native frame");
+    }
+
+    {
+        auto vulkan = std::make_shared<FactoryScript>();
+        auto openGLES = std::make_shared<FactoryScript>();
+        vulkan->behaviors.push_back(
+            behavior({
+                {
+                    false,
+                    qtav::VideoRenderEventType::Error,
+                    "VK_ERROR_DEVICE_LOST",
+                },
+            }));
+        auto openGLBehavior = behavior();
+        openGLES->behaviors.push_back(openGLBehavior);
+        int mapCalls = 0;
+        const qtav::VideoFrame native =
+            hardwareFrame(0x3000U, 9, mapCalls);
+
+        qtav::MobileVideoRendererSelector selector(
+            selectorConfig(vulkan, openGLES));
+        selector.setHardwareFrameFallbackCallback(
+            [](const qtav::MobileHardwareFrameFallbackEvent&) {
+                return qtav::MobileHardwareFrameFallbackDecision {
+                    qtav::MobileHardwareFrameFallbackRoute::
+                        SoftwareDecode,
+                    "reopened the video stream in software",
+                };
+            });
+        expect(selector.open(renderConfig()), "Vulkan startup failed");
+        expect(
+            selector.render(native),
+            "Software fallback did not consume the retired frame");
+        expect(
+            selector.render(native)
+                && openGLBehavior->renderCount == 0,
+            "Software fallback forwarded a late hardware frame");
+        expect(
+            selector.render(qtav::VideoFrame {})
+                && openGLBehavior->renderCount == 1,
+            "Software fallback did not render a later software frame");
+        expect(mapCalls == 0, "Software-decode route mapped a native frame");
+    }
+
+    for (const auto route : {
+             qtav::MobileHardwareFrameFallbackRoute::DirectSurface,
+             qtav::MobileHardwareFrameFallbackRoute::NoVideo,
+         }) {
+        auto vulkan = std::make_shared<FactoryScript>();
+        auto openGLES = std::make_shared<FactoryScript>();
+        vulkan->behaviors.push_back(
+            behavior({
+                {
+                    false,
+                    qtav::VideoRenderEventType::Error,
+                    "VK_ERROR_DEVICE_LOST",
+                },
+            }));
+        auto openGLBehavior = behavior();
+        if (route
+            == qtav::MobileHardwareFrameFallbackRoute::DirectSurface) {
+            openGLES->unavailableDetail =
+                "No compatible OpenGL ES native interop";
+        } else {
+            openGLES->behaviors.push_back(openGLBehavior);
+        }
+        int mapCalls = 0;
+        const qtav::VideoFrame native =
+            hardwareFrame(0x4000U, 10, mapCalls);
+
+        qtav::MobileVideoRendererSelector selector(
+            selectorConfig(vulkan, openGLES));
+        selector.setHardwareFrameFallbackCallback(
+            [route](const qtav::MobileHardwareFrameFallbackEvent&) {
+                return qtav::MobileHardwareFrameFallbackDecision {
+                    route,
+                    "caller-selected terminal renderer route",
+                };
+            });
+        expect(selector.open(renderConfig()), "Vulkan startup failed");
+        expect(
+            selector.render(native),
+            "Explicit terminal hardware route failed");
+        expect(
+            selector.selectedAPI() == qtav::MobileRenderAPI::None
+                && !selector.presentationAvailable(),
+            "Terminal hardware route left a renderer active");
+        expect(
+            selector.hardwareFrameFallbackRoute() == route,
+            "Terminal hardware route was not recorded");
+        expect(
+            selector.render(native),
+            "Terminal hardware route did not safely consume later frames");
+        expect(
+            openGLBehavior->renderCount == 0 && mapCalls == 0,
+            "Terminal hardware route rendered or mapped a native frame");
+    }
+}
+
+void testHardwareFrameFallbackRequiresExplicitPolicy()
+{
+    auto vulkan = std::make_shared<FactoryScript>();
+    auto openGLES = std::make_shared<FactoryScript>();
+    vulkan->behaviors.push_back(
+        behavior({
+            {
+                false,
+                qtav::VideoRenderEventType::Error,
+                "VK_ERROR_DEVICE_LOST",
+            },
+        }));
+    auto openGLBehavior = behavior();
+    openGLBehavior->hardwareDevices = {
+        qtav::HardwareDeviceType::MediaCodec,
+    };
+    openGLES->behaviors.push_back(openGLBehavior);
+    int mapCalls = 0;
+
+    qtav::MobileVideoRendererSelector selector(
+        selectorConfig(vulkan, openGLES));
+    expect(selector.open(renderConfig()), "Vulkan startup failed");
+    expect(
+        !selector.render(hardwareFrame(0x5000U, 11, mapCalls)),
+        "A hardware fallback without an explicit policy succeeded");
+    expect(
+        selector.selectedAPI() == qtav::MobileRenderAPI::None,
+        "Missing hardware policy left OpenGL ES active");
+    expect(
+        selector.lastError().find("explicit") != std::string::npos,
+        "Missing hardware policy did not report its requirement");
+    expect(mapCalls == 0, "Missing hardware policy mapped a native frame");
+}
+
 void testRepeatedRecoveryFailureFallsBack()
 {
     auto vulkan = std::make_shared<FactoryScript>();
@@ -421,6 +719,9 @@ int main()
     testVulkanUnavailableAndInitialFailure();
     testRecoverableVulkanRecreation();
     testFatalOneWayFallback();
+    testRetryableRenderDoesNotChangeAPI();
+    testHardwareFrameFallbackRoutes();
+    testHardwareFrameFallbackRequiresExplicitPolicy();
     testRepeatedRecoveryFailureFallsBack();
     testSurfaceSuspendAndSameAPIResume();
     testRecoverableOpenGLESRecreation();

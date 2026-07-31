@@ -77,6 +77,10 @@ already own a graphics context or require multiple/custom render targets:
   `QtAV::InteropMediaCodecVulkan`, using a private GPU-sampled `AImageReader`,
   retained `AHardwareBuffer` external-format import, and acquire/release
   synchronization without mapping or re-uploading decoded pixels;
+- optional Android MediaCodec/OpenGL ES texture interop through
+  `QtAV::InteropMediaCodecOpenGL`, using a detached `SurfaceTexture`,
+  timestamp-correlated `GL_TEXTURE_EXTERNAL_OES` sampling, and no decoded
+  source mapping or upload;
 - optional `QtAV::InteropCVMetal` import of limited/full-range VideoToolbox
   NV12/P010 pixel-buffer planes into Metal textures without a CPU map or copy;
 - optional platform-neutral `QtAV::RenderVulkan` software-frame rendering and
@@ -88,7 +92,9 @@ already own a graphics context or require multiple/custom render targets:
   explicit RGBA8/sRGB fallback;
 - optional platform-neutral `QtAV::RenderMobile` policy that keeps one
   `VideoRenderAPI` attached across Vulkan-preferred startup, bounded same-API
-  recovery, one-way OpenGL ES fallback, and the no-renderer state;
+  recovery, one-way OpenGL ES fallback, and the no-renderer state, with an
+  explicit synchronous route for hardware frames that reconfigures subsequent
+  decoder output instead of retrying a retired Vulkan-surface frame;
 - multiple video renderer instances keyed by an application opaque pointer;
 - libswscale CPU rendering into application-owned packed image buffers;
 - D3D11 rendering of decoded software frames into an application-provided
@@ -283,8 +289,8 @@ or pace playback. Decoded planar audio therefore normally uses
 
 - remaining platform audio device implementations (ALSA/PulseAudio, OHAudio);
 - the OHOS EGL adapter and Vulkan OHOS/Linux validation;
-- remaining hardware decoders (VAAPI and OHCodec) plus Linux, Android
-  OpenGL ES, and OHOS GPU zero-CPU-copy interop;
+- remaining hardware decoders (VAAPI and OHCodec) plus Linux and OHOS GPU
+  zero-CPU-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;
@@ -319,8 +325,15 @@ frame. Android Vulkan now uses private GPU-sampled
 `SurfaceTexture` with timestamp/generation correlation and
 `GL_TEXTURE_EXTERNAL_OES`. Its SDR 8-bit path is enabled, while P010/HDR
 sampling remains capability-gated behind explicit application confirmation.
-The explicit Vulkan-to-GLES interop fallback policy is the next Android
-subtask. OHOS GLES uses
+The Vulkan-to-GLES policy is now connected: after the selector prepares the
+OpenGL ES candidate, its synchronous hardware-frame callback rebinds
+subsequent MediaCodec output to the SurfaceTexture producer or selects the
+caller's direct-surface, software-decode, or no-video route. The current and
+late frames from the retired Vulkan surface are discarded without mapping.
+The connected Adreno 830 run injected fatal Vulkan failure after 30 successful
+imports and continued the same H.264 media session with 179 external-OES
+images; both interop paths reported zero decoded-source
+map/transfer/staging/upload calls. OHOS GLES uses
 `OH_NativeImage` with an external-OES texture. OHOS Vulkan remains conditional
 on adding a retained
 `OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer
@@ -352,9 +365,8 @@ replacement, stale-token rejection, and clean shutdown. Android
 MediaCodec/Vulkan interop now passes H.264 and HEVC private-AImageReader
 import with native YCbCr/external-format sampling, one returned release fence
 per import, bounded pending images, and zero decoded-source
-map/transfer/staging/upload counters. Android OpenGL ES, OHOS, and Linux
-texture interop remain separate backend work under the responsibility and
-lifecycle boundaries in
+map/transfer/staging/upload counters. OHOS and Linux texture interop remain
+separate backend work under the responsibility and lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and

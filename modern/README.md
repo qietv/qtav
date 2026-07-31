@@ -72,6 +72,10 @@ code is used.
 - optional platform-neutral mobile renderer selector that performs
   Vulkan-preferred startup, bounded same-API recovery, fatal one-way fallback
   to OpenGL ES, and an explicit no-renderer state;
+- explicit cross-API hardware-frame fallback decisions that rebind subsequent
+  decoder output to compatible OpenGL ES native interop or select direct
+  surface, software decode, or no video without retrying or mapping a frame
+  produced for the retired Vulkan surface;
 - an accepted Android/OHOS mobile rendering policy that prefers Vulkan and
   uses a separate OpenGL ES/EGL backend after Vulkan is unavailable or fails
   fatally, while keeping recoverable surface recreation within the active API;
@@ -186,10 +190,13 @@ Current backend integration boundary:
 - `QtAV::RenderMobile` owns no graphics or platform resources. Applications
   supply Vulkan and OpenGL ES renderer factories for the current native-window
   generation; the selector keeps one stable `VideoRenderAPI` attached to
-  `Player` across same-API recreation and one-way fallback;
+  `Player` across same-API recreation and one-way fallback. A synchronous
+  hardware-frame fallback callback selects OpenGL ES native interop,
+  direct-surface presentation, software decode, or no video for subsequent
+  output; cross-API fallback never retries or maps the retired native frame;
 - no Linux native backend or OHOS hardware decoder has been implemented yet;
-  the Android Vulkan-to-OpenGL ES hardware-interop fallback policy remains
-  application-controlled pending the next milestone subtask.
+  Android is the completed reference for the mobile renderer/hardware-interop
+  fallback policy.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -202,7 +209,13 @@ reopening media. `suspendSurface()` and `recreateSurface()` preserve the
 selected API across an application-led native-window replacement. If both
 APIs fail, video presentation reports unavailable while playback, audio, and
 decoded-frame callbacks remain usable. Decoder, direct-surface, interop, and
-renderer fallback policies remain independent. The accepted design is
+renderer fallback policies remain independent. When the current frame is
+hardware-backed, `setHardwareFrameFallbackCallback()` runs synchronously
+after the OpenGL ES candidate is prepared and before any cross-API retry. The
+application reconfigures subsequent decoder output and returns the chosen
+route. Late frames from the retired native surface are discarded without
+mapping; no callback or a `None` decision reports presentation unavailable.
+The accepted design is
 specified in [`MOBILE.md`](MOBILE.md).
 
 The Android Vulkan and OpenGL ES zero-CPU-copy paths are separate backends.
@@ -381,7 +394,14 @@ counters to stay zero. Separate H.264 and HEVC phases then use detached
 `SurfaceTexture` producers, correlate MediaCodec output timestamps, sample
 the current images as `GL_TEXTURE_EXTERNAL_OES`, cover seek/flush plus EGL
 window suspension/recreation, and keep the same decoded-source counters at
-zero. The
+zero. A connected fallback phase keeps the same H.264 media session, injects
+a fatal Vulkan renderer error after 30 successful native-buffer
+presentations, creates the compatible SurfaceTexture/OpenGL ES candidate, and
+rebinds MediaCodec from AImageReader generation 5 to SurfaceTexture generation
+6 through the explicit policy callback. The recorded run continued with 32
+Vulkan-generation and 180 OpenGL ES-generation decoded frames, 30 Vulkan
+imports/release fences, 179 external-OES images, and zero decoded-source
+map/transfer/staging/upload calls. The
 accepted shared Android/OHOS responsibility and lifecycle design is documented
 in [`MOBILE.md`](MOBILE.md).
 
@@ -972,6 +992,25 @@ selector->setSelectionCallback([](const auto& event) {
         qtav::mobileRenderAPIName(event.selectedAPI),
         event.detail);
 });
+selector->setHardwareFrameFallbackCallback(
+    [&](const qtav::MobileHardwareFrameFallbackEvent& event) {
+        if (event.sourceDevice
+                == qtav::HardwareDeviceType::MediaCodec
+            && preparedOpenGLInterop) {
+            player.setHardwareDecodeConfig(
+                qtav::mediaCodecHardwareDecodeConfig(
+                    preparedOpenGLInterop->surface()));
+            return qtav::MobileHardwareFrameFallbackDecision {
+                qtav::MobileHardwareFrameFallbackRoute::
+                    OpenGLESInterop,
+                "MediaCodec rebound to the SurfaceTexture producer",
+            };
+        }
+        return qtav::MobileHardwareFrameFallbackDecision {
+            qtav::MobileHardwareFrameFallbackRoute::NoVideo,
+            "No compatible native interop was available",
+        };
+    });
 
 selector->open(config);
 player.setVideoRenderAPI(selector);
@@ -985,12 +1024,28 @@ same-API recreations. A candidate `Error` is fatal: Vulkan switches one-way to
 OpenGL ES, while fatal OpenGL ES failure reports video unavailable. The
 current frame is retained and retried after successful recovery or fallback,
 and the selector object remains attached to `Player`, so media is not reopened.
+The exception is a cross-API hardware frame: it belongs to the retired native
+surface and is discarded rather than retried. The hardware fallback callback
+runs synchronously inside `renderVideo()` and must choose
+`OpenGLESInterop`, `DirectSurface`, `SoftwareDecode`, or `NoVideo`; returning
+`None` or omitting the callback is an explicit unavailable result. It may
+publish a new `HardwareDecodeConfig`, but must not destroy the selector.
+OpenGL ES interop also requires the prepared candidate to advertise the
+source hardware device. Software decode keeps the OpenGL ES renderer for later
+software frames, while direct-surface and no-video routes retire it.
+
+A renderer may return `false` without emitting `SurfaceLost` or `Error` while
+asynchronous native interop is pending. The selector treats that as retryable
+and does not change graphics APIs. Late frames from the retired native surface
+and hardware frames arriving while a software-decode transition completes are
+discarded without calling `HardwareFrame::map()`.
 
 Call `suspendSurface()` before releasing a platform window, publish the new
 window to the factory's application state, and call `recreateSurface()`.
 Selection notifications distinguish initial selection, recovery, fallback,
 and no-renderer results. `selectedAPI()`, `usingFallback()`,
-`presentationAvailable()`, and `lastError()` provide synchronous diagnostics.
+`presentationAvailable()`, `hardwareFrameFallbackRoute()`, and `lastError()`
+provide synchronous diagnostics.
 
 ### D3D11 composition output
 
