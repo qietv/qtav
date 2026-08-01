@@ -164,6 +164,8 @@ public:
             config_.redrawRetryMilliseconds,
             1,
             16);
+        config_.width = std::max(1, config_.width);
+        config_.height = std::max(1, config_.height);
         initialize();
     }
 
@@ -208,12 +210,6 @@ public:
                 "MediaCodec OpenGL ES interop requires the application's JavaVM";
             return;
         }
-        if (config_.width <= 0 || config_.height <= 0) {
-            error_ =
-                "MediaCodec OpenGL ES interop requires positive image dimensions";
-            return;
-        }
-
         ScopedJNIEnv scoped(config_.javaVM);
         JNIEnv* env = scoped.get();
         if (!env) {

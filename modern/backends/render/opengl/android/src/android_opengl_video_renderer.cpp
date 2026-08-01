@@ -800,17 +800,22 @@ bool AndroidOpenGLVideoRenderer::setWindow(
     bool succeeded = false;
     {
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
-        if (window == impl_->window_
-            && impl_->surface_ != EGL_NO_SURFACE) {
-            return window != nullptr;
-        }
+        const bool sameWindow = window == impl_->window_;
+        // SurfaceView can publish a same-identity Surface whose new base
+        // geometry is not yet reflected by ANativeWindow_getWidth/Height.
+        // Recreate the EGL surface so setBuffersGeometry(0, 0, visual) adopts
+        // the latest Java-side base size.
         impl_->destroySurface();
-        if (impl_->window_) {
+        if (!sameWindow && impl_->window_) {
             ANativeWindow_release(impl_->window_);
         }
-        impl_->window_ = window;
+        if (!sameWindow) {
+            impl_->window_ = window;
+            if (impl_->window_) {
+                ANativeWindow_acquire(impl_->window_);
+            }
+        }
         if (impl_->window_) {
-            ANativeWindow_acquire(impl_->window_);
             succeeded = impl_->createSurface(error);
             if (succeeded && impl_->open_) {
                 VideoRenderConfig replacement = impl_->renderConfig_;

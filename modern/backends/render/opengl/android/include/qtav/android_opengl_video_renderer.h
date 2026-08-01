@@ -41,7 +41,8 @@ public:
     void close() noexcept override;
 
     // The adapter acquires its own window reference. Replacing or removing the
-    // window invalidates the old EGL surface generation.
+    // window invalidates the old EGL surface generation. Republishing the same
+    // window after its buffer geometry changes refreshes that generation.
     bool setWindow(ANativeWindow* window);
     VideoSize surfaceSize() const noexcept;
     std::uint64_t surfaceGeneration() const noexcept;

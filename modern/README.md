@@ -659,17 +659,15 @@ Link `QtAV::HWMediaCodec`, `QtAV::RenderVulkanAndroid`, and
 logical device, enable
 `VK_ANDROID_external_memory_android_hardware_buffer`,
 `VK_KHR_external_semaphore_fd`, `VK_EXT_queue_family_foreign`, and the
-sampler-YCbCr-conversion feature. Construct the interop for the decoded size,
-give its private surface to MediaCodec, and attach the same interop object to
-the Vulkan renderer:
+sampler-YCbCr-conversion feature. Construct the interop, give its private
+surface to MediaCodec, and attach the same interop object to the Vulkan
+renderer:
 
 ```cpp
 #include <qtav/android_vulkan_video_renderer.h>
 #include <qtav/mediacodec_vulkan_interop.h>
 
 qtav::MediaCodecVulkanInteropConfig interopConfig;
-interopConfig.width = videoWidth;
-interopConfig.height = videoHeight;
 interopConfig.maximumImages = 5;
 interopConfig.androidHardwareBufferExternalMemoryEnabled = true;
 interopConfig.externalSemaphoreFdEnabled = true;
@@ -711,6 +709,11 @@ The interop creates an `AIMAGE_FORMAT_PRIVATE` reader with
 surface produces an asynchronous `AImage`; codec and image timestamps are
 matched before its retained `AHardwareBuffer` is imported. Timestamp zero is
 valid and is correlated normally; only negative image timestamps are rejected.
+The config's optional `width` and `height` are only the reader's default
+dimensions; when omitted, the interop uses `1x1`. MediaCodec overrides that
+default with its decoded output size, and every import uses the actual
+`AImage` dimensions and crop, so applications do not need a separate media
+probe before creating the zero-copy path.
 `queueFrame()` performs a bounded wait for the matching asynchronous image to
 be acquired, serializing producer ownership transfer without waiting for the
 playback deadline or Vulkan submission. Applications should reserve their own
@@ -754,8 +757,6 @@ the application's normal `renderVideo()` scheduling:
 
 qtav::MediaCodecOpenGLInteropConfig interopConfig;
 interopConfig.javaVM = nativeActivity->vm;
-interopConfig.width = videoWidth;
-interopConfig.height = videoHeight;
 
 auto interop = std::make_shared<qtav::MediaCodecOpenGLInterop>(
     interopConfig);
@@ -781,6 +782,9 @@ exactly once, calls `ASurfaceTexture_updateTexImage()`, and accepts only the
 timestamp-correlated surface generation. The renderer samples the returned
 external texture with its SurfaceTexture transform, submits the draw, and
 calls `glFlush()` before a later update advances the single current image.
+A configured `width` and `height` only set the SurfaceTexture's default buffer
+size; omitted values use `1x1`, and MediaCodec video output overrides that
+default with the decoded size.
 A short native retry worker only emits redraw requests; it never calls GL or
 SurfaceTexture APIs.
 
@@ -995,7 +999,9 @@ The adapter acquires its own window reference and owns the associated
 `VkSurfaceKHR`, swapchain, image views, and per-frame acquire/present
 semaphores. Passing `nullptr` to `setWindow()` invalidates that generation.
 Publishing a new window while the renderer remains open rebuilds the
-surface/swapchain and resumes presentation without reopening media. The Vulkan
+surface/swapchain and resumes presentation without reopening media. Publishing
+the same window again after its buffer geometry changes refreshes the
+swapchain extent and Fit/Fill viewport in place. The Vulkan
 instance, device, and queue remain application-owned and must outlive the
 renderer. `PreferHdr` chooses HDR10/PQ first, then native HLG or
 extended-linear output, and falls back to SDR; `RequireHdr` fails explicitly
@@ -1045,6 +1051,8 @@ the `ANativeWindow` dataspace used by Android composition.
 
 Passing `nullptr` to `setWindow()` invalidates the active EGL surface; a later
 window recreates it and reconfigures the still-open renderer generation.
+Publishing the same window after an in-place buffer-geometry change recreates
+the EGL surface and refreshes the renderer target size.
 `render()` makes the owned context current for the call, presents with
 `eglSwapBuffers()`, and then releases it from the calling thread. The adapter
 does not create or select Vulkan and is not itself the Vulkan-to-OpenGL ES

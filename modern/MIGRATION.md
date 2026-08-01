@@ -145,6 +145,10 @@ surface to `mediaCodecHardwareDecodeConfig()`, and bind the same interop to
 asynchronously acquired private `AImage` timestamps, imports retained
 `AHardwareBuffer` memory with driver-provided YCbCr/external-format sampling,
 and returns a Vulkan release sync fd through asynchronous image deletion.
+Its configured width and height are optional default reader dimensions;
+MediaCodec supplies the actual decoded buffer size, so applications do not
+need to pre-probe media dimensions before creating the interop. The OpenGL ES
+SurfaceTexture interop follows the same default-size behavior.
 `MediaCodecVulkanInterop::queueFrame()` releases an output and performs a
 bounded wait for its matching AImage ownership transfer, allowing applications
 to reserve a render slot and schedule Vulkan presentation independently.
@@ -337,6 +341,9 @@ frame. Android Vulkan now uses private GPU-sampled
 `SurfaceTexture` with timestamp/generation correlation and
 `GL_TEXTURE_EXTERNAL_OES`. Its SDR 8-bit path is enabled, while P010/HDR
 sampling remains capability-gated behind explicit application confirmation.
+Both Android presentation adapters also treat a republished identical
+`ANativeWindow` with changed buffer geometry as a resize and refresh their
+swapchain/EGL target without reopening the decoder.
 The Vulkan-to-GLES policy is now connected: after the selector prepares the
 OpenGL ES candidate, its synchronous hardware-frame callback rebinds
 subsequent MediaCodec output to the SurfaceTexture producer or selects the

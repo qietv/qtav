@@ -140,9 +140,10 @@ off to continue. It is inactive on the OpenGL ES path.
 The OpenGL ES MediaCodec ZeroCopy path keeps HDR external-OES source sampling
 disabled because that capability requires separate device/codec/driver color
 validation. HDR output selection still applies to supported sources and the
-software path. A P010/HDR source therefore reports this path as unavailable
-instead of continuing with a black surface; use Vulkan ZeroCopy or turn
-ZeroCopy off for MediaCodec direct-Surface presentation.
+software path. If a P010/HDR source reaches this guarded path, the demo stops
+retrying the rejected frame, switches ZeroCopy off, and resumes at the same
+position through MediaCodec direct-Surface presentation instead of leaving a
+black surface.
 
 SurfaceTexture cannot distinguish a legitimate zero presentation timestamp
 from its initial no-image timestamp. That path therefore drops only a
@@ -174,12 +175,24 @@ adaptive-streaming example. The demo manifest explicitly allows cleartext
 HTTP for manual test servers; production applications should remove that
 allowance unless their own network-security policy requires it.
 
-Hardware ZeroCopy needs the coded video dimensions before its private
-MediaCodec target is created. Local document dimensions come from
-`MediaMetadataRetriever`; remote dimensions are probed asynchronously with
-`libavformat`, using the same FFmpeg/OpenSSL libraries and verified CA bundle
-as playback. If the container cannot report dimensions, the status line asks
-the user to disable ZeroCopy or hardware decode for that file.
+Hardware ZeroCopy does not pre-probe the coded video dimensions. The private
+`AImageReader` or `SurfaceTexture` starts with a minimal default buffer size;
+MediaCodec overrides that default with its decoded output size, and the
+interop reads each produced image's actual dimensions and crop. Opening a
+remote URL therefore performs one FFmpeg open for playback instead of a
+separate metadata request followed by playback.
+
+The decoded image size is independent of the presentation Surface size.
+Resizing the video area or changing orientation rebuilds or reconfigures the
+Vulkan/EGL presentation target without using the window size as a decoder
+buffer size. Republishing the same Android Surface after `surfaceChanged()` is
+enough to refresh an in-place Vulkan swapchain or EGL-surface size change. In
+the Java `SurfaceView` shell, the settled Android display rotation is also
+forwarded to the Vulkan render configuration so View-system buffer transforms
+do not change the picture aspect after an orientation change. In
+direct-Surface mode the demo fits and centers the `SurfaceView` from the
+already-open track or decoded-frame dimensions so MediaCodec does not stretch
+the picture to the control area's aspect ratio.
 
 The long-form 4K performance samples used for connected-device checks are
 `Download/legend.mkv` and `Download/suzume.mkv`. The matching direct-streaming

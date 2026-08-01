@@ -20,6 +20,8 @@ namespace qtav {
 struct QTAV_INTEROP_MEDIACODEC_OPENGL_EXPORT
 MediaCodecOpenGLInteropConfig {
     JavaVM* javaVM = nullptr;
+    // Optional default SurfaceTexture buffer dimensions. MediaCodec video
+    // output overrides them; non-positive values use a 1x1 default.
     int width = 0;
     int height = 0;
     // Bounds MediaCodec outputs released but not yet matched to the

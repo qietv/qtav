@@ -15,11 +15,6 @@
 #include <qtav/player.h>
 #include <qtav/swresample_audio_converter.h>
 
-extern "C" {
-#include <libavformat/avformat.h>
-#include <libavutil/error.h>
-}
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -158,108 +153,6 @@ void applyRemoteTlsOptions(qtav::Player& player)
         "QtAVCore-Android-Player/1.0");
 }
 
-std::string ffmpegErrorString(int error)
-{
-    std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer {};
-    if (av_strerror(error, buffer.data(), buffer.size()) < 0) {
-        return "FFmpeg error " + std::to_string(error);
-    }
-    return buffer.data();
-}
-
-struct ProbeInterruptState {
-    std::chrono::steady_clock::time_point deadline;
-};
-
-int interruptExpired(void* opaque) noexcept
-{
-    const auto* state = static_cast<const ProbeInterruptState*>(opaque);
-    return state && std::chrono::steady_clock::now() >= state->deadline;
-}
-
-jlong probeVideoSize(const std::string& url)
-{
-    // Keep QtAVCore's FFmpeg network runtime active while this example makes
-    // a metadata-only libavformat probe. Playback itself is opened separately
-    // by qtav::Player, using the same FFmpeg/OpenSSL build.
-    qtav::Player networkRuntime;
-    AVFormatContext* input = avformat_alloc_context();
-    if (!input) {
-        logMessage(ANDROID_LOG_ERROR, "FFmpeg probe allocation failed");
-        return 0;
-    }
-    ProbeInterruptState interrupt {
-        std::chrono::steady_clock::now() + std::chrono::seconds(30),
-    };
-    input->interrupt_callback = { &interruptExpired, &interrupt };
-
-    AVDictionary* options = nullptr;
-    av_dict_set(&options, "tls_verify", "1", 0);
-    if (!GlobalCaBundlePath.empty()) {
-        av_dict_set(
-            &options,
-            "ca_file",
-            GlobalCaBundlePath.c_str(),
-            0);
-    }
-    av_dict_set(
-        &options,
-        "user_agent",
-        "QtAVCore-Android-Player/1.0",
-        0);
-    av_dict_set(&options, "rw_timeout", "15000000", 0);
-    int result = avformat_open_input(
-        &input,
-        url.c_str(),
-        nullptr,
-        &options);
-    av_dict_free(&options);
-    if (result >= 0) {
-        result = avformat_find_stream_info(input, nullptr);
-    }
-
-    int width = 0;
-    int height = 0;
-    if (result >= 0) {
-        const int stream = av_find_best_stream(
-            input,
-            AVMEDIA_TYPE_VIDEO,
-            -1,
-            -1,
-            nullptr,
-            0);
-        if (stream >= 0 && input->streams[stream]
-            && input->streams[stream]->codecpar) {
-            width = std::max(0, input->streams[stream]->codecpar->width);
-            height = std::max(0, input->streams[stream]->codecpar->height);
-        } else {
-            result = stream;
-        }
-    }
-
-    if (result < 0) {
-        logMessage(
-            ANDROID_LOG_ERROR,
-            "FFmpeg remote probe failed: " + ffmpegErrorString(result));
-    } else if (width <= 0 || height <= 0) {
-        logMessage(
-            ANDROID_LOG_ERROR,
-            "FFmpeg remote probe found no usable video dimensions");
-    } else {
-        logMessage(
-            ANDROID_LOG_INFO,
-            "FFmpeg/OpenSSL remote probe: " + std::to_string(width)
-                + "x" + std::to_string(height));
-    }
-    avformat_close_input(&input);
-    const std::uint64_t packed =
-        (static_cast<std::uint64_t>(
-             static_cast<std::uint32_t>(width))
-         << 32U)
-        | static_cast<std::uint32_t>(height);
-    return static_cast<jlong>(packed);
-}
-
 struct PlayerOptions {
     bool vulkan = true;
     bool hdr = true;
@@ -307,20 +200,43 @@ public:
         stopRenderThread();
     }
 
-    void setSurface(ANativeWindow* window)
+    void setSurface(ANativeWindow* window, int displayRotation)
     {
         std::lock_guard<std::mutex> lock(commandMutex_);
+        if (window) {
+            displayRotation_ = std::clamp(displayRotation, 0, 3);
+        }
         if (window == window_) {
             // surfaceCreated() and the initial surfaceChanged() normally
             // deliver the same ANativeWindow. The JNI call acquired another
-            // reference, but the active pipeline must not be interrupted and
-            // rebuilt merely because its size callback followed creation.
+            // reference. A later surfaceChanged() can still mean that the
+            // buffer geometry changed in place, so refresh only the active
+            // presentation target without rebuilding the decoder.
             if (window) {
                 ANativeWindow_release(window);
             }
+            if (vulkanRenderer_) {
+                const bool refreshed =
+                    vulkanRenderer_->setWindow(window_);
+                qtav::VideoRenderConfig config;
+                config.surfaceSize = vulkanRenderer_->surfaceSize();
+                config.aspectRatio = qtav::VideoAspectRatioMode::Fit;
+                config.rotation = static_cast<qtav::VideoRotation>(
+                    displayRotation_);
+                if (refreshed
+                    && !vulkanRenderer_->configure(config)) {
+                    const std::string message =
+                        "Vulkan renderer could not apply the rotated Surface size";
+                    if (setPipelineErrorOnce(message)) {
+                        logMessage(ANDROID_LOG_ERROR, message);
+                    }
+                }
+            } else if (openGLRenderer_) {
+                openGLRenderer_->setWindow(window_);
+            }
             return;
         }
-        const std::int64_t resumePosition = currentPositionLocked();
+        const std::int64_t resumePosition = resumePositionLocked();
         releasePlayerAndPipeline();
         if (window_) {
             ANativeWindow_release(window_);
@@ -346,9 +262,7 @@ public:
     void openMedia(
         std::string label,
         std::string path,
-        int descriptor,
-        int videoWidth,
-        int videoHeight)
+        int descriptor)
     {
         std::lock_guard<std::mutex> lock(commandMutex_);
         releasePlayerAndPipeline();
@@ -359,10 +273,11 @@ public:
         mediaPath_ = descriptor >= 0
             ? "fd:"
             : std::move(path);
-        videoWidth_ = std::max(0, videoWidth);
-        videoHeight_ = std::max(0, videoHeight);
         savedPosition_ = 0;
         userWantsPlaying_.store(true);
+        videoSizePacked_.store(0);
+        openGLDirectFallbackPending_.store(false);
+        openGLDirectFallbackActive_ = false;
 
         if (mediaPath_.empty()) {
             setStatus("The selected media has no readable path or descriptor");
@@ -382,7 +297,9 @@ public:
         if (options == options_) {
             return;
         }
-        const std::int64_t resumePosition = currentPositionLocked();
+        openGLDirectFallbackPending_.store(false);
+        openGLDirectFallbackActive_ = false;
+        const std::int64_t resumePosition = resumePositionLocked();
         options_ = options;
         savedPosition_ = resumePosition;
         if (!mediaPath_.empty() && window_) {
@@ -485,6 +402,32 @@ public:
     {
         std::lock_guard<std::mutex> lock(commandMutex_);
         return player_ && player_->state() == qtav::State::Playing;
+    }
+
+    std::uint64_t videoSizePacked() const noexcept
+    {
+        return videoSizePacked_.load();
+    }
+
+    bool applyPendingVideoFallback()
+    {
+        if (!openGLDirectFallbackPending_.exchange(false)) {
+            return false;
+        }
+        const std::uint64_t requestedGeneration =
+            openGLDirectFallbackGeneration_.load();
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (playerGeneration_.load() != requestedGeneration
+            || options_.vulkan || !options_.zeroCopy
+            || !options_.hardwareDecode) {
+            return false;
+        }
+        const std::int64_t resumePosition = resumePositionLocked();
+        options_.zeroCopy = false;
+        openGLDirectFallbackActive_ = true;
+        savedPosition_ = resumePosition;
+        rebuildPlayer(savedPosition_, userWantsPlaying_.load());
+        return true;
     }
 
     int requestedFrameRateMilliHertz() const noexcept
@@ -618,6 +561,39 @@ public:
 private:
     static constexpr std::int64_t InvalidTimestamp =
         std::numeric_limits<std::int64_t>::min();
+
+    void observeVideoSize(int width, int height) noexcept
+    {
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+        videoSizePacked_.store(
+            (static_cast<std::uint64_t>(
+                 static_cast<std::uint32_t>(width))
+             << 32U)
+            | static_cast<std::uint32_t>(height));
+    }
+
+    void requestOpenGLDirectFallback(
+        std::uint64_t generation,
+        const std::string& message)
+    {
+        if (playerGeneration_.load() != generation) {
+            return;
+        }
+        openGLDirectFallbackGeneration_.store(generation);
+        if (openGLDirectFallbackPending_.exchange(true)) {
+            return;
+        }
+        renderEnabled_.store(false);
+        setStatus(
+            message
+            + "; switching to the MediaCodec direct Surface path");
+        logMessage(
+            ANDROID_LOG_WARN,
+            message
+                + "; switching to the MediaCodec direct Surface path");
+    }
 
     void setFrameRateWindow(ANativeWindow* window)
     {
@@ -826,10 +802,24 @@ private:
                         return false;
                     }
                     if (auto current = weakPlayer.lock()) {
+                        const qtav::MediaInfo mediaInfo =
+                            current->mediaInfo();
                         const std::int64_t mediaDuration =
-                            current->mediaInfo().duration;
+                            mediaInfo.duration;
                         if (mediaDuration > 0) {
                             duration_.store(mediaDuration);
+                        }
+                        const auto activeTrack = std::find_if(
+                            mediaInfo.tracks.begin(),
+                            mediaInfo.tracks.end(),
+                            [&mediaInfo](const qtav::TrackInfo& track) {
+                                return track.index
+                                    == mediaInfo.activeVideoTrack;
+                            });
+                        if (activeTrack != mediaInfo.tracks.end()) {
+                            observeVideoSize(
+                                activeTrack->width,
+                                activeTrack->height);
                         }
                     }
                     if (status == qtav::MediaStatus::EndOfMedia) {
@@ -860,6 +850,7 @@ private:
                         return;
                     }
                     decodedVideoFrames_.fetch_add(1);
+                    observeVideoSize(frame.width(), frame.height());
                     latestVideoTimestamp_.store(frame.timestamp());
                     observeVideoCallback(frame.timestamp(), generation);
                     if (!frame.hasHardwareFrame()
@@ -932,15 +923,7 @@ private:
             });
 
         if (useHardwareZeroCopy) {
-            if (videoWidth_ <= 0 || videoHeight_ <= 0) {
-                error =
-                    "MediaCodec ZeroCopy needs video dimensions. "
-                    "The Android metadata probe did not report them";
-                return false;
-            }
             qtav::MediaCodecVulkanInteropConfig interopConfig;
-            interopConfig.width = videoWidth_;
-            interopConfig.height = videoHeight_;
             interopConfig.maximumImages = 8;
             interopConfig.androidHardwareBufferExternalMemoryEnabled = true;
             interopConfig.externalSemaphoreFdEnabled = true;
@@ -971,6 +954,8 @@ private:
         qtav::VideoRenderConfig renderConfig;
         renderConfig.surfaceSize = vulkanRenderer_->surfaceSize();
         renderConfig.aspectRatio = qtav::VideoAspectRatioMode::Fit;
+        renderConfig.rotation = static_cast<qtav::VideoRotation>(
+            displayRotation_);
         if (renderConfig.surfaceSize.width <= 0
             || renderConfig.surfaceSize.height <= 0
             || !vulkanRenderer_->open(renderConfig)) {
@@ -1016,22 +1001,20 @@ private:
                 }
                 const std::string message =
                     "OpenGL ES renderer: " + event.detail;
+                if (event.detail.find(
+                        "P010/HDR SurfaceTexture sampling is capability-gated")
+                    != std::string::npos) {
+                    requestOpenGLDirectFallback(generation, message);
+                    return;
+                }
                 if (setPipelineErrorOnce(message)) {
                     logMessage(ANDROID_LOG_ERROR, message);
                 }
             });
 
         if (useHardwareZeroCopy) {
-            if (videoWidth_ <= 0 || videoHeight_ <= 0) {
-                error =
-                    "MediaCodec ZeroCopy needs video dimensions. "
-                    "The Android metadata probe did not report them";
-                return false;
-            }
             qtav::MediaCodecOpenGLInteropConfig interopConfig;
             interopConfig.javaVM = javaVM_;
-            interopConfig.width = videoWidth_;
-            interopConfig.height = videoHeight_;
             interopConfig.maximumPendingFrames = 4;
             // HDR external-OES input sampling remains deliberately disabled:
             // output HDR selection is independent and the source path must be
@@ -1107,7 +1090,10 @@ private:
                 decodeOptions);
             directEnabled_.store(true);
             setActiveMode(
-                "MediaCodec direct Surface · Android controls color/HDR");
+                openGLDirectFallbackActive_
+                    ? "MediaCodec direct Surface · OpenGL ES HDR ZeroCopy "
+                      "unavailable; Android controls color/HDR"
+                    : "MediaCodec direct Surface · Android controls color/HDR");
         } else {
             const bool hardwareZeroCopy =
                 options_.hardwareDecode && options_.zeroCopy;
@@ -1145,6 +1131,7 @@ private:
                             return false;
                         }
                         decodedVideoFrames_.fetch_add(1);
+                        observeVideoSize(frame.width(), frame.height());
                         latestVideoTimestamp_.store(frame.timestamp());
                         observeVideoCallback(
                             frame.timestamp(),
@@ -1609,7 +1596,9 @@ private:
                 }
 
                 if (!rendered) {
-                    return AttemptResult::Pending;
+                    return renderEnabled_.load()
+                        ? AttemptResult::Pending
+                        : AttemptResult::Discarded;
                 }
                 const auto renderMicroseconds =
                     static_cast<std::uint64_t>(
@@ -1820,6 +1809,21 @@ private:
             : savedPosition_;
     }
 
+    std::int64_t resumePositionLocked() const
+    {
+        const std::int64_t observedVideoTimestamp =
+            latestVideoTimestamp_.load();
+        const std::int64_t latestVideoPosition =
+            observedVideoTimestamp == InvalidTimestamp
+            ? 0
+            : observedVideoTimestamp;
+        return std::max({
+            currentPositionLocked(),
+            savedPosition_,
+            latestVideoPosition,
+        });
+    }
+
     void closeMediaDescriptor() noexcept
     {
         if (mediaDescriptor_ >= 0) {
@@ -1900,7 +1904,10 @@ private:
     std::atomic<bool> renderEnabled_ { false };
     std::atomic<bool> directEnabled_ { false };
     std::atomic<std::int64_t> duration_ { 0 };
+    std::atomic<std::uint64_t> videoSizePacked_ { 0 };
     std::atomic<std::uint64_t> playerGeneration_ { 0 };
+    std::atomic<bool> openGLDirectFallbackPending_ { false };
+    std::atomic<std::uint64_t> openGLDirectFallbackGeneration_ { 0 };
     std::atomic<std::uint64_t> decodedVideoFrames_ { 0 };
     std::atomic<std::int64_t> latestVideoTimestamp_ {
         InvalidTimestamp
@@ -1938,14 +1945,14 @@ private:
     std::int64_t lastPresentedTimestamp_ = InvalidTimestamp;
     std::chrono::steady_clock::time_point lastPresentationTime_;
     std::int64_t savedPosition_ = 0;
+    int displayRotation_ = 0;
     int mediaDescriptor_ = -1;
-    int videoWidth_ = 0;
-    int videoHeight_ = 0;
     std::string mediaLabel_;
     std::string mediaPath_;
     std::string activeMode_;
     std::string status_;
     std::string pipelineError_;
+    bool openGLDirectFallbackActive_ = false;
 
     std::shared_ptr<qtav::VideoRenderAPI> renderer_;
     std::shared_ptr<qtav::AndroidVulkanVideoRenderer> vulkanRenderer_;
@@ -2010,7 +2017,8 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeSetSurface(
     JNIEnv* environment,
     jobject,
     jlong handle,
-    jobject surface)
+    jobject surface,
+    jint displayRotation)
 {
     AndroidPlayerController* controller = controllerFromHandle(handle);
     if (!controller) {
@@ -2021,7 +2029,7 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeSetSurface(
         : nullptr;
     // ANativeWindow_fromSurface returns an acquired reference. The
     // controller takes ownership and releases it on replacement/destruction.
-    controller->setSurface(window);
+    controller->setSurface(window, displayRotation);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2031,30 +2039,17 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeOpenMedia(
     jlong handle,
     jstring label,
     jstring path,
-    jint descriptor,
-    jint videoWidth,
-    jint videoHeight)
+    jint descriptor)
 {
     if (AndroidPlayerController* controller =
             controllerFromHandle(handle)) {
         controller->openMedia(
             fromJavaString(environment, label),
             fromJavaString(environment, path),
-            descriptor,
-            videoWidth,
-            videoHeight);
+            descriptor);
     } else if (descriptor >= 0) {
         close(descriptor);
     }
-}
-
-extern "C" JNIEXPORT jlong JNICALL
-Java_org_qtav_core_player_QtAVPlayerActivity_nativeProbeVideoSize(
-    JNIEnv* environment,
-    jobject,
-    jstring address)
-{
-    return probeVideoSize(fromJavaString(environment, address));
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2141,6 +2136,34 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetDuration(
         return controller->duration();
     }
     return 0;
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetVideoSize(
+    JNIEnv*,
+    jobject,
+    jlong handle)
+{
+    if (AndroidPlayerController* controller =
+            controllerFromHandle(handle)) {
+        return static_cast<jlong>(controller->videoSizePacked());
+    }
+    return 0;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_qtav_core_player_QtAVPlayerActivity_nativeApplyPendingVideoFallback(
+    JNIEnv*,
+    jobject,
+    jlong handle)
+{
+    if (AndroidPlayerController* controller =
+            controllerFromHandle(handle)) {
+        return controller->applyPendingVideoFallback()
+            ? JNI_TRUE
+            : JNI_FALSE;
+    }
+    return JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

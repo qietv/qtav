@@ -7,7 +7,6 @@ import android.content.ContentResolver;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Color;
-import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -37,8 +36,6 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Locale;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 @SuppressWarnings("deprecation")
 public final class QtAVPlayerActivity extends Activity
@@ -51,10 +48,9 @@ public final class QtAVPlayerActivity extends Activity
     }
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService mediaProbeExecutor =
-            Executors.newSingleThreadExecutor();
 
     private long nativeHandle;
+    private FrameLayout playerArea;
     private SurfaceView surfaceView;
     private SeekBar seekBar;
     private TextView currentTimeView;
@@ -68,18 +64,41 @@ public final class QtAVPlayerActivity extends Activity
     private Switch debugSwitch;
     private boolean userSeeking;
     private long knownDuration;
-    private volatile String temporaryStatus;
-    private volatile boolean destroyed;
-    private int openGeneration;
     private int lastRequestedFrameRateMilliHertz = -1;
     private int preferredDisplayModeId;
     private float preferredDisplayRefreshRate;
+    private int videoWidth;
+    private int videoHeight;
+    private int publishedDisplayRotation = -1;
 
     private final Runnable pollPlayback = new Runnable() {
         @Override
         public void run() {
             if (nativeHandle == 0) {
                 return;
+            }
+            int currentRotation = currentDisplayRotation();
+            if (currentRotation != publishedDisplayRotation
+                    && surfaceView != null) {
+                Surface currentSurface =
+                        surfaceView.getHolder().getSurface();
+                if (currentSurface != null && currentSurface.isValid()) {
+                    publishSurface(currentSurface);
+                }
+            }
+            if (nativeApplyPendingVideoFallback(nativeHandle)) {
+                zeroCopySwitch.setChecked(false);
+                updateOptionAvailability();
+                applyVideoSurfaceLayout();
+            }
+            long packedVideoSize = nativeGetVideoSize(nativeHandle);
+            int nextVideoWidth = (int) (packedVideoSize >>> 32);
+            int nextVideoHeight = (int) packedVideoSize;
+            if (videoWidth != nextVideoWidth
+                    || videoHeight != nextVideoHeight) {
+                videoWidth = nextVideoWidth;
+                videoHeight = nextVideoHeight;
+                applyVideoSurfaceLayout();
             }
             long duration = Math.max(0, nativeGetDuration(nativeHandle));
             long position = Math.max(0, nativeGetPosition(nativeHandle));
@@ -105,10 +124,7 @@ public final class QtAVPlayerActivity extends Activity
                     != lastRequestedFrameRateMilliHertz) {
                 updatePreferredDisplayMode(requestedFrameRate);
             }
-            String override = temporaryStatus;
-            String nextStatus = override != null
-                    ? override
-                    : nativeGetStatus(nativeHandle);
+            String nextStatus = nativeGetStatus(nativeHandle);
             if (preferredDisplayRefreshRate > 0.0f) {
                 nextStatus += String.format(
                         Locale.US,
@@ -183,7 +199,7 @@ public final class QtAVPlayerActivity extends Activity
         if (nativeHandle != 0 && surfaceView != null) {
             Surface surface = surfaceView.getHolder().getSurface();
             if (surface != null && surface.isValid()) {
-                nativeSetSurface(nativeHandle, surface);
+                publishSurface(surface);
             }
         }
     }
@@ -191,16 +207,15 @@ public final class QtAVPlayerActivity extends Activity
     @Override
     protected void onPause() {
         if (nativeHandle != 0) {
-            nativeSetSurface(nativeHandle, null);
+            nativeSetSurface(nativeHandle, null, currentDisplayRotation());
+            publishedDisplayRotation = -1;
         }
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
-        destroyed = true;
         mainHandler.removeCallbacksAndMessages(null);
-        mediaProbeExecutor.shutdownNow();
         if (nativeHandle != 0) {
             nativeDestroy(nativeHandle);
             nativeHandle = 0;
@@ -211,7 +226,7 @@ public final class QtAVPlayerActivity extends Activity
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         if (nativeHandle != 0) {
-            nativeSetSurface(nativeHandle, holder.getSurface());
+            publishSurface(holder.getSurface());
         }
     }
 
@@ -222,14 +237,15 @@ public final class QtAVPlayerActivity extends Activity
             int width,
             int height) {
         if (nativeHandle != 0) {
-            nativeSetSurface(nativeHandle, holder.getSurface());
+            publishSurface(holder.getSurface());
         }
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         if (nativeHandle != 0) {
-            nativeSetSurface(nativeHandle, null);
+            nativeSetSurface(nativeHandle, null, currentDisplayRotation());
+            publishedDisplayRotation = -1;
         }
     }
 
@@ -247,7 +263,7 @@ public final class QtAVPlayerActivity extends Activity
             return insets;
         });
 
-        FrameLayout playerArea = new FrameLayout(this);
+        playerArea = new FrameLayout(this);
         playerArea.setBackgroundColor(Color.BLACK);
         root.addView(
                 playerArea,
@@ -264,7 +280,12 @@ public final class QtAVPlayerActivity extends Activity
                 surfaceView,
                 new FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
-                        FrameLayout.LayoutParams.MATCH_PARENT));
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        Gravity.CENTER));
+        playerArea.addOnLayoutChangeListener(
+                (view, left, top, right, bottom,
+                        oldLeft, oldTop, oldRight, oldBottom) ->
+                        applyVideoSurfaceLayout());
 
         statusView = new TextView(this);
         statusView.setTextColor(Color.WHITE);
@@ -387,6 +408,7 @@ public final class QtAVPlayerActivity extends Activity
 
         View.OnClickListener optionListener = view -> {
             updateOptionAvailability();
+            applyVideoSurfaceLayout();
             mainHandler.removeCallbacks(applyOptions);
             mainHandler.postDelayed(applyOptions, 250);
         };
@@ -407,6 +429,39 @@ public final class QtAVPlayerActivity extends Activity
         hdrSwitch.setEnabled(appRendererActive);
         debugSwitch.setEnabled(
                 appRendererActive && vulkanSwitch.isChecked());
+    }
+
+    private void applyVideoSurfaceLayout() {
+        if (playerArea == null || surfaceView == null) {
+            return;
+        }
+        int targetWidth = FrameLayout.LayoutParams.MATCH_PARENT;
+        int targetHeight = FrameLayout.LayoutParams.MATCH_PARENT;
+        boolean directSurface = hardwareSwitch != null
+                && hardwareSwitch.isChecked()
+                && zeroCopySwitch != null
+                && !zeroCopySwitch.isChecked();
+        int availableWidth = playerArea.getWidth();
+        int availableHeight = playerArea.getHeight();
+        if (directSurface && videoWidth > 0 && videoHeight > 0
+                && availableWidth > 0 && availableHeight > 0) {
+            double scale = Math.min(
+                    (double) availableWidth / videoWidth,
+                    (double) availableHeight / videoHeight);
+            targetWidth = Math.max(1, (int) Math.round(videoWidth * scale));
+            targetHeight = Math.max(1, (int) Math.round(videoHeight * scale));
+        }
+        FrameLayout.LayoutParams layout =
+                (FrameLayout.LayoutParams) surfaceView.getLayoutParams();
+        if (layout.width == targetWidth
+                && layout.height == targetHeight
+                && layout.gravity == Gravity.CENTER) {
+            return;
+        }
+        layout.width = targetWidth;
+        layout.height = targetHeight;
+        layout.gravity = Gravity.CENTER;
+        surfaceView.setLayoutParams(layout);
     }
 
     private void openLocalMedia() {
@@ -446,7 +501,6 @@ public final class QtAVPlayerActivity extends Activity
     }
 
     private void openDocumentUri(Uri uri) {
-        ++openGeneration;
         ParcelFileDescriptor descriptor = null;
         try {
             ContentResolver resolver = getContentResolver();
@@ -455,19 +509,17 @@ public final class QtAVPlayerActivity extends Activity
                 throw new IllegalStateException(
                         "The document provider returned no descriptor");
             }
-            MediaSize size = probeMedia(descriptor);
             String label = displayName(uri);
             int detachedDescriptor = descriptor.detachFd();
             descriptor.close();
             descriptor = null;
             knownDuration = 0;
+            resetVideoSurfaceLayout();
             nativeOpenMedia(
                     nativeHandle,
                     label,
                     "",
-                    detachedDescriptor,
-                    size.width,
-                    size.height);
+                    detachedDescriptor);
         } catch (Exception exception) {
             showError("Could not open the local file", exception);
         } finally {
@@ -517,73 +569,13 @@ public final class QtAVPlayerActivity extends Activity
                     Toast.LENGTH_LONG).show();
             return;
         }
-        final int generation = ++openGeneration;
-        temporaryStatus =
-                "Probing remote media through FFmpeg/OpenSSL…";
-        mediaProbeExecutor.execute(() -> {
-            try {
-                long packedSize = nativeProbeVideoSize(address);
-                int width = (int) (packedSize >>> 32);
-                int height = (int) packedSize;
-                mainHandler.post(() -> {
-                    if (destroyed
-                            || nativeHandle == 0
-                            || generation != openGeneration) {
-                        return;
-                    }
-                    temporaryStatus = null;
-                    knownDuration = 0;
-                    nativeOpenMedia(
-                            nativeHandle,
-                            address,
-                            address,
-                            -1,
-                            width,
-                            height);
-                    if (width <= 0 || height <= 0) {
-                        Toast.makeText(
-                                this,
-                                "FFmpeg could not report video dimensions; "
-                                + "hardware ZeroCopy may need to be disabled",
-                                Toast.LENGTH_LONG).show();
-                    }
-                });
-            } catch (Exception exception) {
-                Exception reported = exception;
-                mainHandler.post(() -> {
-                    if (destroyed || generation != openGeneration) {
-                        return;
-                    }
-                    temporaryStatus = null;
-                    showError("Remote FFmpeg probe failed", reported);
-                });
-            }
-        });
-    }
-
-    private MediaSize probeMedia(ParcelFileDescriptor descriptor) {
-        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-        try {
-            retriever.setDataSource(descriptor.getFileDescriptor());
-            return probeMedia(retriever);
-        } catch (RuntimeException ignored) {
-            return new MediaSize(0, 0);
-        } finally {
-            try {
-                retriever.release();
-            } catch (Exception ignored) {
-            }
-        }
-    }
-
-    private MediaSize probeMedia(MediaMetadataRetriever retriever) {
-        int width = parsePositive(
-                retriever.extractMetadata(
-                        MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
-        int height = parsePositive(
-                retriever.extractMetadata(
-                        MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
-        return new MediaSize(width, height);
+        knownDuration = 0;
+        resetVideoSurfaceLayout();
+        nativeOpenMedia(
+                nativeHandle,
+                address,
+                address,
+                -1);
     }
 
     private String displayName(Uri uri) {
@@ -618,6 +610,12 @@ public final class QtAVPlayerActivity extends Activity
                 .setMessage(detail)
                 .setPositiveButton("OK", null)
                 .show();
+    }
+
+    private void resetVideoSurfaceLayout() {
+        videoWidth = 0;
+        videoHeight = 0;
+        applyVideoSurfaceLayout();
     }
 
     private TextView timeText(String value) {
@@ -657,6 +655,16 @@ public final class QtAVPlayerActivity extends Activity
     private int dp(int value) {
         return Math.round(
                 value * getResources().getDisplayMetrics().density);
+    }
+
+    private int currentDisplayRotation() {
+        return getWindowManager().getDefaultDisplay().getRotation();
+    }
+
+    private void publishSurface(Surface surface) {
+        int rotation = currentDisplayRotation();
+        nativeSetSurface(nativeHandle, surface, rotation);
+        publishedDisplayRotation = rotation;
     }
 
     private void updatePreferredDisplayMode(
@@ -711,17 +719,6 @@ public final class QtAVPlayerActivity extends Activity
         preferredDisplayRefreshRate = nextRefreshRate;
     }
 
-    private static int parsePositive(String value) {
-        if (value == null) {
-            return 0;
-        }
-        try {
-            return Math.max(0, Integer.parseInt(value));
-        } catch (NumberFormatException ignored) {
-            return 0;
-        }
-    }
-
     private static String formatTime(long milliseconds) {
         long seconds = Math.max(0, milliseconds / 1000);
         long hours = seconds / 3600;
@@ -741,27 +738,17 @@ public final class QtAVPlayerActivity extends Activity
                         remainder);
     }
 
-    private static final class MediaSize {
-        final int width;
-        final int height;
-
-        MediaSize(int width, int height) {
-            this.width = width;
-            this.height = height;
-        }
-    }
-
     private native long nativeCreate(String caBundlePath);
     private native void nativeDestroy(long handle);
-    private native void nativeSetSurface(long handle, Surface surface);
+    private native void nativeSetSurface(
+            long handle,
+            Surface surface,
+            int displayRotation);
     private native void nativeOpenMedia(
             long handle,
             String label,
             String path,
-            int descriptor,
-            int videoWidth,
-            int videoHeight);
-    private native long nativeProbeVideoSize(String address);
+            int descriptor);
     private native void nativeSetOptions(
             long handle,
             boolean vulkan,
@@ -774,6 +761,8 @@ public final class QtAVPlayerActivity extends Activity
     private native void nativeSeek(long handle, long position);
     private native long nativeGetPosition(long handle);
     private native long nativeGetDuration(long handle);
+    private native long nativeGetVideoSize(long handle);
+    private native boolean nativeApplyPendingVideoFallback(long handle);
     private native boolean nativeIsPlaying(long handle);
     private native int nativeGetRequestedFrameRate(long handle);
     private native String nativeGetStatus(long handle);

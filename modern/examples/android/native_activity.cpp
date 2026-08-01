@@ -1213,8 +1213,6 @@ struct TestState {
             return;
         }
         qtav::MediaCodecVulkanInteropConfig interopConfig;
-        interopConfig.width = 160;
-        interopConfig.height = 90;
         interopConfig.maximumImages = 5;
         interopConfig.androidHardwareBufferExternalMemoryEnabled =
             vulkan->androidHardwareBufferExternalMemoryEnabled;
@@ -1849,8 +1847,6 @@ struct TestState {
 
         qtav::MediaCodecOpenGLInteropConfig interopConfig;
         interopConfig.javaVM = activity->vm;
-        interopConfig.width = 160;
-        interopConfig.height = 90;
         interopConfig.maximumPendingFrames = 4;
         interopConfig.redrawRetryMilliseconds = 2;
         mediaCodecOpenGLInterop =

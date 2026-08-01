@@ -17,6 +17,9 @@ namespace qtav {
 
 struct QTAV_INTEROP_MEDIACODEC_VULKAN_EXPORT
 MediaCodecVulkanInteropConfig {
+    // Optional default AImageReader dimensions. MediaCodec overrides these
+    // with the decoded output size; non-positive values use a 1x1 default.
+    // Imported frames always use their actual AImage dimensions and crop.
     int width = 0;
     int height = 0;
     // Must cover the renderer's in-flight ring plus at least one producer

@@ -463,11 +463,7 @@ public:
             return false;
         }
         if (open_) {
-            config_.surfaceSize = {
-                static_cast<int>(extent_.width),
-                static_cast<int>(extent_.height),
-            };
-            config_.viewport = {};
+            updateConfigForSurface();
             engineOpen_ = renderer_.open(config_);
             if (!engineOpen_) {
                 error =
@@ -484,11 +480,7 @@ public:
             return false;
         }
         if (open_ && !engineOpen_) {
-            config_.surfaceSize = {
-                static_cast<int>(extent_.width),
-                static_cast<int>(extent_.height),
-            };
-            config_.viewport = {};
+            updateConfigForSurface();
             engineOpen_ = renderer_.open(config_);
             if (!engineOpen_) {
                 error =
@@ -544,6 +536,16 @@ public:
             1,
             &swapchain_,
             &metadata);
+    }
+
+    void updateConfigForSurface() noexcept
+    {
+        config_.surfaceSize = {
+            static_cast<int>(extent_.width),
+            static_cast<int>(extent_.height),
+        };
+        config_.viewport = {};
+        config_.rotation = applicationRotation_;
     }
 
     bool present(std::string& error)
@@ -616,6 +618,7 @@ public:
     bool acquired_ = false;
     bool open_ = false;
     bool engineOpen_ = false;
+    VideoRotation applicationRotation_ = VideoRotation::Rotate0;
 };
 
 AndroidVulkanVideoRenderer::AndroidVulkanVideoRenderer(
@@ -664,11 +667,8 @@ bool AndroidVulkanVideoRenderer::open(
             opened = false;
         } else {
             impl_->config_ = config;
-            impl_->config_.surfaceSize = {
-                static_cast<int>(impl_->extent_.width),
-                static_cast<int>(impl_->extent_.height),
-            };
-            impl_->config_.viewport = {};
+            impl_->applicationRotation_ = config.rotation;
+            impl_->updateConfigForSurface();
             opened = impl_->renderer_.open(impl_->config_);
             impl_->engineOpen_ = opened;
             impl_->open_ = opened;
@@ -694,10 +694,8 @@ bool AndroidVulkanVideoRenderer::configure(
         return false;
     }
     impl_->config_ = config;
-    impl_->config_.surfaceSize = {
-        static_cast<int>(impl_->extent_.width),
-        static_cast<int>(impl_->extent_.height),
-    };
+    impl_->applicationRotation_ = config.rotation;
+    impl_->updateConfigForSurface();
     return impl_->renderer_.configure(impl_->config_);
 }
 
@@ -742,12 +740,7 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
                     if (impl_->window_
                         && impl_->createSwapchain(
                             recoveryError)) {
-                        impl_->config_.surfaceSize = {
-                            static_cast<int>(
-                                impl_->extent_.width),
-                            static_cast<int>(
-                                impl_->extent_.height),
-                        };
+                        impl_->updateConfigForSurface();
                         impl_->engineOpen_ =
                             impl_->renderer_.open(
                                 impl_->config_);
@@ -776,10 +769,7 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
                 std::string recoveryError;
                 if (impl_->window_
                     && impl_->createSwapchain(recoveryError)) {
-                    impl_->config_.surfaceSize = {
-                        static_cast<int>(impl_->extent_.width),
-                        static_cast<int>(impl_->extent_.height),
-                    };
+                    impl_->updateConfigForSurface();
                     impl_->engineOpen_ =
                         impl_->renderer_.open(impl_->config_);
                 }
@@ -820,32 +810,36 @@ bool AndroidVulkanVideoRenderer::setWindow(ANativeWindow* window)
     {
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
         if (window == impl_->window_) {
-            return window != nullptr;
-        }
-        if (impl_->context_.device.device) {
-            impl_->renderer_.close();
-            impl_->engineOpen_ = false;
-            vkDeviceWaitIdle(impl_->context_.device.device);
-        }
-        impl_->destroySurface();
-        if (impl_->window_) {
-            ANativeWindow_release(impl_->window_);
-        }
-        impl_->window_ = window;
-        if (impl_->window_) {
-            ANativeWindow_acquire(impl_->window_);
-            succeeded = impl_->createSwapchain(error);
-            if (succeeded && impl_->open_) {
-                impl_->config_.surfaceSize = {
-                    static_cast<int>(impl_->extent_.width),
-                    static_cast<int>(impl_->extent_.height),
-                };
-                impl_->config_.viewport = {};
-                succeeded = impl_->renderer_.open(impl_->config_);
-                impl_->engineOpen_ = succeeded;
+            if (!window) {
+                return false;
             }
+            // SurfaceView can publish a same-identity Surface whose new base
+            // geometry is not yet reflected by ANativeWindow_getWidth/Height.
+            // A same-window publication is therefore an explicit refresh
+            // signal, not a value-based no-op.
+            succeeded = impl_->recreate(error);
         } else {
-            succeeded = false;
+            if (impl_->context_.device.device) {
+                impl_->renderer_.close();
+                impl_->engineOpen_ = false;
+                vkDeviceWaitIdle(impl_->context_.device.device);
+            }
+            impl_->destroySurface();
+            if (impl_->window_) {
+                ANativeWindow_release(impl_->window_);
+            }
+            impl_->window_ = window;
+            if (impl_->window_) {
+                ANativeWindow_acquire(impl_->window_);
+                succeeded = impl_->createSwapchain(error);
+                if (succeeded && impl_->open_) {
+                    impl_->updateConfigForSurface();
+                    succeeded = impl_->renderer_.open(impl_->config_);
+                    impl_->engineOpen_ = succeeded;
+                }
+            } else {
+                succeeded = false;
+            }
         }
     }
     if (!succeeded) {

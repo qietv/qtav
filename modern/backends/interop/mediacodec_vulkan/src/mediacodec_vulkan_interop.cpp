@@ -1126,6 +1126,8 @@ public:
             state_->config.maximumImages,
             4,
             16);
+        state_->config.width = std::max(1, state_->config.width);
+        state_->config.height = std::max(1, state_->config.height);
         initialize();
     }
 
@@ -1134,12 +1136,6 @@ public:
         if (!state_->device.isValid()) {
             error_ =
                 "MediaCodec Vulkan interop requires a borrowed physical device, logical device, and queue";
-            return;
-        }
-        if (state_->config.width <= 0
-            || state_->config.height <= 0) {
-            error_ =
-                "MediaCodec Vulkan interop requires positive image dimensions";
             return;
         }
         if (!state_->config

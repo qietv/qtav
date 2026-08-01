@@ -52,8 +52,9 @@ public:
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
 
-    // The adapter acquires its own ANativeWindow reference. Passing nullptr
-    // invalidates the current surface generation.
+    // The adapter acquires its own ANativeWindow reference. Republishing the
+    // same window after its buffer geometry changes refreshes the swapchain;
+    // passing nullptr invalidates the current surface generation.
     bool setWindow(ANativeWindow* window);
     VideoSize surfaceSize() const noexcept;
     VkSurfaceFormatKHR surfaceFormat() const noexcept;
