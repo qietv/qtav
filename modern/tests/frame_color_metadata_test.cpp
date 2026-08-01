@@ -67,6 +67,8 @@ int main()
     assert(frame.height() == 2160);
     assert(frame.timestamp() == 42);
     assert(frame.duration() == 24);
+    assert(frame.format() == qtav::PixelFormat::YUV420P10);
+    assert(frame.formatName() == "yuv420p10le");
 
     const qtav::VideoColorSpace color = frame.colorSpaceInfo();
     assert(color.isSpecified());

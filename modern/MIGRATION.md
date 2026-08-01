@@ -21,7 +21,7 @@ range of the legacy root QtAV implementation.
 | Qt paint/update events | normally owned by a high-level output such as `D3D11VideoOutput`; `setRenderCallback()` for external-context integration |
 | renderer paint method | normally owned by a high-level output; `renderVideo()` and `VideoRenderAPI` for external-context integration |
 | `AudioOutput` | `onAudioFrame()` and optional `setAudioSink()` |
-| `QThread` playback workers | standard C++ demux/decode, audio-output, and presentation workers with bounded queues |
+| `QThread` playback workers | standard C++ demux, independent audio/video decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
 
 For ordinary Windows composition presentation, `QtAV::OutputD3D11` owns the
@@ -133,6 +133,11 @@ are rejected when the application validates the output against its current
 token. Retained MediaCodec frames keep their FFmpeg decoder context alive so
 queue invalidation, seek, stop, media replacement, and surface recreation
 cannot free the codec before its output buffers are released.
+For direct presentation, `setVideoFrameScheduler()` now supplies the target
+steady-clock deadline on the video-decode worker; accepting the frame bypasses
+the later `onVideoFrame()` and renderer callbacks so a small MediaCodec output
+pool is not retained until ordinary presentation. `playbackStatistics()`
+separates decoded/delivered video counts from queue-overflow and late drops.
 Applications that link `QtAV::InteropMediaCodecVulkan` can instead construct
 a `MediaCodecVulkanInterop` against their Vulkan device, pass its private
 surface to `mediaCodecHardwareDecodeConfig()`, and bind the same interop to
@@ -140,6 +145,13 @@ surface to `mediaCodecHardwareDecodeConfig()`, and bind the same interop to
 asynchronously acquired private `AImage` timestamps, imports retained
 `AHardwareBuffer` memory with driver-provided YCbCr/external-format sampling,
 and returns a Vulkan release sync fd through asynchronous image deletion.
+`MediaCodecVulkanInterop::queueFrame()` releases an output and performs a
+bounded wait for its matching AImage ownership transfer, allowing applications
+to reserve a render slot and schedule Vulkan presentation independently.
+Vulkan image, memory, view, and YCbCr-conversion objects are reused by retained
+`AHardwareBuffer` identity until AImageReader reports that allocation removed;
+the interop statistics now distinguish per-frame imports from persistent
+hardware-buffer imports, cache hits, removals, and the cache high-water mark.
 Visible crop coordinates are preserved when native codec allocations have
 padded dimensions. Pending images are bounded and the path has no implicit
 CPU mapping, software transfer, staging, or renderer-upload fallback.
@@ -384,13 +396,17 @@ are separate backend/product work.
 ## Threading rules
 
 - control methods are thread-safe;
-- demux, FFmpeg decode, asynchronous control, and state/status callbacks
-  normally run on the playback worker;
+- demux, asynchronous control, and state/status callbacks normally run on the
+  playback worker; selected audio/video packets cross bounded queues to
+  independent decode workers so one codec or output path cannot starve the
+  other stream;
+- `setVideoFrameScheduler()` runs on the video-decode worker before ordinary video
+  delivery; an accepted frame is not sent to `onVideoFrame()` or renderers;
 - decoded audio/video frame callbacks and `setRenderCallback()` run on the
   presentation worker; the bounded video queue drops obsolete late frames
   when application presentation falls behind;
-- media events normally run on the playback or audio-output worker; forwarded
-  audio-sink events run on the backend's event thread;
+- media events normally run on the playback, decode, or audio-output worker;
+  forwarded audio-sink events run on the backend's event thread;
 - callbacks may request another player state, but must not destroy the player;
 - `seek()` invalidates queued presentation generations without waiting on
   their queue locks; while a playing seek waits for actual output,
@@ -425,11 +441,13 @@ are separate backend/product work.
   backend event callbacks may request another player state;
 - audio-sink and video-render backend event callbacks run on the thread chosen
   by the backend and may request another player state;
-- decoded audio crosses a bounded queue to a dedicated audio-output worker;
+- compressed audio packets cross a bounded queue to their decode worker, then
+  decoded audio crosses a second bounded queue to the dedicated audio-output worker;
   ordinary conversion, sink writes, and primary device-clock sampling run
   there without the player mutex held and cannot be blocked by application
-  rendering; presentation performs only a non-blocking opportunistic clock
-  refresh and otherwise uses the cached sample;
+  rendering; when a playing seek awaits the first valid device timestamp, the
+  same audio-output worker polls it briefly while presentation uses only the
+  cached sample;
 - audio-sink/converter lifecycle and segment-end drain calls run on the
   playback worker, serialized with audio-output calls; `drain()` may block
   until queued audio is presented;

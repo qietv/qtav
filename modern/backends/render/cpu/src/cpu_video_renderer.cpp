@@ -142,6 +142,7 @@ VideoRenderCapabilities CpuVideoRenderer::capabilities() const
         PixelFormat::YUV420P,
         PixelFormat::YUV422P,
         PixelFormat::YUV444P,
+        PixelFormat::YUV420P10,
         PixelFormat::NV12,
         PixelFormat::NV21,
         PixelFormat::P010,

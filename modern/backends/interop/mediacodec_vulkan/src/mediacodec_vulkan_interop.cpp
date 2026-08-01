@@ -8,12 +8,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -24,6 +27,7 @@ namespace {
 constexpr std::int64_t TimestampToleranceNanoseconds = 2'000'000;
 constexpr std::int64_t MaximumPresentationLagNanoseconds =
     250'000'000;
+constexpr std::size_t MaximumRetiredFrameKeys = 64;
 
 const char* resultName(VkResult result) noexcept
 {
@@ -102,12 +106,18 @@ struct AtomicStatistics {
     std::atomic<std::uint64_t> releaseFenceFallbacks { 0 };
     std::atomic<std::uint64_t> staleImagesDropped { 0 };
     std::atomic<std::uint64_t> maximumPendingImages { 0 };
+    std::atomic<std::uint64_t> hardwareBufferImports { 0 };
+    std::atomic<std::uint64_t> hardwareBufferImportCacheHits { 0 };
+    std::atomic<std::uint64_t> hardwareBufferImportsRemoved { 0 };
+    std::atomic<std::uint64_t> maximumCachedHardwareBufferImports { 0 };
     std::atomic<std::uint32_t> lastHardwareBufferFormat { 0 };
     std::atomic<int> lastVulkanFormat {
         static_cast<int>(VK_FORMAT_UNDEFINED)
     };
     std::atomic<std::uint64_t> lastExternalFormat { 0 };
 };
+
+struct HardwareBufferResources;
 
 void updateMaximum(
     std::atomic<std::uint64_t>& maximum,
@@ -180,6 +190,8 @@ struct SharedState {
             shuttingDown = true;
             pending.swap(images);
             queuedFrames.clear();
+            retiredFrames.clear();
+            bufferImports.clear();
             frameAvailable = {};
         }
         for (auto& image : pending) {
@@ -204,13 +216,19 @@ struct SharedState {
     PFN_vkDestroySamplerYcbcrConversion destroyConversion = nullptr;
 
     mutable std::mutex mutex;
+    std::condition_variable imageChanged;
     std::deque<PendingImage> images;
     std::vector<FrameKey> queuedFrames;
+    std::deque<FrameKey> retiredFrames;
     std::vector<
         std::pair<
             ConversionKey,
             std::weak_ptr<ConversionResources>>>
         conversions;
+    std::unordered_map<
+        AHardwareBuffer*,
+        std::shared_ptr<HardwareBufferResources>>
+        bufferImports;
     VulkanHardwareFrameInterop::FrameAvailableCallback frameAvailable;
     std::string asyncError;
     std::string lastImportError;
@@ -219,13 +237,30 @@ struct SharedState {
 };
 
 void onBufferRemoved(
-    void*,
+    void* context,
     AImageReader*,
-    AHardwareBuffer*) noexcept
+    AHardwareBuffer* buffer) noexcept
 {
-    // Imports are not cached by AHardwareBuffer identity. Each live import
-    // owns an explicit AHardwareBuffer reference, so there is no cache entry
-    // to invalidate here.
+    auto* state = static_cast<SharedState*>(context);
+    if (!state || !buffer) {
+        return;
+    }
+    std::shared_ptr<HardwareBufferResources> retired;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto found = state->bufferImports.find(buffer);
+        if (found == state->bufferImports.end()) {
+            return;
+        }
+        retired = std::move(found->second);
+        state->bufferImports.erase(found);
+        state->statistics.hardwareBufferImportsRemoved.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+    // Existing submitted frames may still retain this import. Dropping the
+    // cache reference here destroys it only after the last submission fence
+    // releases its frame object.
 }
 
 void onImageAvailable(void* context, AImageReader* reader) noexcept
@@ -260,7 +295,7 @@ void onImageAvailable(void* context, AImageReader* reader) noexcept
                 pending.image,
                 &pending.timestampNanoseconds)
             != AMEDIA_OK
-            || pending.timestampNanoseconds <= 0) {
+            || pending.timestampNanoseconds < 0) {
             discardImage(pending);
             state->statistics.staleImagesDropped.fetch_add(
                 1,
@@ -302,6 +337,9 @@ void onImageAvailable(void* context, AImageReader* reader) noexcept
         std::lock_guard<std::mutex> lock(state->mutex);
         callback = state->frameAvailable;
         hasAsyncError = !state->asyncError.empty();
+    }
+    if (acquiredAny || hasAsyncError) {
+        state->imageChanged.notify_all();
     }
     if ((acquiredAny || hasAsyncError) && callback) {
         callback();
@@ -460,6 +498,257 @@ std::shared_ptr<ConversionResources> conversionResources(
     return result;
 }
 
+struct HardwareBufferResources {
+    static std::shared_ptr<HardwareBufferResources> create(
+        const std::shared_ptr<SharedState>& state,
+        AHardwareBuffer* hardwareBuffer,
+        const AHardwareBuffer_Desc& description,
+        std::string& error)
+    {
+        auto result = std::make_shared<HardwareBufferResources>();
+        result->device = state->device.device;
+        result->hardwareBuffer = hardwareBuffer;
+        AHardwareBuffer_acquire(result->hardwareBuffer);
+        if (!result->initialize(state, description, error)) {
+            return {};
+        }
+        return result;
+    }
+
+    ~HardwareBufferResources()
+    {
+        if (imageView) {
+            vkDestroyImageView(device, imageView, nullptr);
+        }
+        if (image) {
+            vkDestroyImage(device, image, nullptr);
+        }
+        if (memory) {
+            vkFreeMemory(device, memory, nullptr);
+        }
+        if (hardwareBuffer) {
+            AHardwareBuffer_release(hardwareBuffer);
+        }
+    }
+
+    bool initialize(
+        const std::shared_ptr<SharedState>& state,
+        const AHardwareBuffer_Desc& description,
+        std::string& error)
+    {
+        VkAndroidHardwareBufferFormatPropertiesANDROID formatProperties {
+            VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID,
+        };
+        VkAndroidHardwareBufferPropertiesANDROID properties {
+            VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
+        };
+        properties.pNext = &formatProperties;
+        VkResult result = state->getHardwareBufferProperties(
+            state->device.device,
+            hardwareBuffer,
+            &properties);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkGetAndroidHardwareBufferPropertiesANDROID",
+                result);
+            return false;
+        }
+        conversion = conversionResources(
+            state,
+            formatProperties,
+            error);
+        if (!conversion) {
+            return false;
+        }
+
+        VkExternalFormatANDROID externalFormatInfo {
+            VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID,
+        };
+        externalFormatInfo.externalFormat =
+            formatProperties.externalFormat;
+        VkExternalMemoryImageCreateInfo externalMemory {
+            VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        };
+        externalMemory.pNext =
+            formatProperties.format == VK_FORMAT_UNDEFINED
+            ? &externalFormatInfo
+            : nullptr;
+        externalMemory.handleTypes =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+        VkImageCreateInfo imageInfo {
+            VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        };
+        imageInfo.pNext = &externalMemory;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = formatProperties.format;
+        imageInfo.extent = {
+            description.width,
+            description.height,
+            1,
+        };
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        result = vkCreateImage(
+            state->device.device,
+            &imageInfo,
+            nullptr,
+            &image);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkCreateImage(AHardwareBuffer)",
+                result);
+            return false;
+        }
+
+        VkMemoryRequirements requirements {};
+        vkGetImageMemoryRequirements(
+            state->device.device,
+            image,
+            &requirements);
+        const std::uint32_t memoryType = firstMemoryType(
+            properties.memoryTypeBits
+                & requirements.memoryTypeBits);
+        if (memoryType
+            == std::numeric_limits<std::uint32_t>::max()) {
+            error =
+                "The Android hardware buffer exposes no compatible Vulkan memory type";
+            return false;
+        }
+        VkMemoryDedicatedAllocateInfo dedicated {
+            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        };
+        dedicated.image = image;
+        VkImportAndroidHardwareBufferInfoANDROID import {
+            VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+        };
+        import.pNext = &dedicated;
+        import.buffer = hardwareBuffer;
+        VkMemoryAllocateInfo allocation {
+            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        };
+        allocation.pNext = &import;
+        allocation.allocationSize = properties.allocationSize;
+        allocation.memoryTypeIndex = memoryType;
+        result = vkAllocateMemory(
+            state->device.device,
+            &allocation,
+            nullptr,
+            &memory);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkAllocateMemory(AHardwareBuffer)",
+                result);
+            return false;
+        }
+        result = vkBindImageMemory(
+            state->device.device,
+            image,
+            memory,
+            0);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkBindImageMemory(AHardwareBuffer)",
+                result);
+            return false;
+        }
+
+        VkSamplerYcbcrConversionInfo viewConversion {
+            VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+        };
+        viewConversion.conversion = conversion->conversion;
+        VkImageViewCreateInfo viewInfo {
+            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        };
+        viewInfo.pNext = &viewConversion;
+        viewInfo.image = image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = formatProperties.format;
+        viewInfo.components =
+            formatProperties.samplerYcbcrConversionComponents;
+        viewInfo.subresourceRange.aspectMask =
+            VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+        result = vkCreateImageView(
+            state->device.device,
+            &viewInfo,
+            nullptr,
+            &imageView);
+        if (result != VK_SUCCESS) {
+            error = resultError(
+                "vkCreateImageView(AHardwareBuffer)",
+                result);
+            return false;
+        }
+
+        hardwareBufferFormat = description.format;
+        vulkanFormat = formatProperties.format;
+        externalFormat = formatProperties.externalFormat;
+        return true;
+    }
+
+    VkDevice device = VK_NULL_HANDLE;
+    AHardwareBuffer* hardwareBuffer = nullptr;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView imageView = VK_NULL_HANDLE;
+    std::shared_ptr<ConversionResources> conversion;
+    std::atomic<bool> returnedToProducer { false };
+    std::uint32_t hardwareBufferFormat = 0;
+    VkFormat vulkanFormat = VK_FORMAT_UNDEFINED;
+    std::uint64_t externalFormat = 0;
+};
+
+std::shared_ptr<HardwareBufferResources> hardwareBufferResources(
+    const std::shared_ptr<SharedState>& state,
+    AHardwareBuffer* hardwareBuffer,
+    const AHardwareBuffer_Desc& description,
+    std::string& error)
+{
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto found = state->bufferImports.find(hardwareBuffer);
+        if (found != state->bufferImports.end()) {
+            state->statistics.hardwareBufferImportCacheHits.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            return found->second;
+        }
+    }
+
+    auto created = HardwareBufferResources::create(
+        state,
+        hardwareBuffer,
+        description,
+        error);
+    if (!created) {
+        return {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto found = state->bufferImports.find(hardwareBuffer);
+        if (found != state->bufferImports.end()) {
+            state->statistics.hardwareBufferImportCacheHits.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            return found->second;
+        }
+        state->bufferImports.emplace(hardwareBuffer, created);
+        state->statistics.hardwareBufferImports.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        updateMaximum(
+            state->statistics.maximumCachedHardwareBufferImports,
+            state->bufferImports.size());
+    }
+    return created;
+}
+
 class AndroidHardwareBufferTexture final
     : public VulkanTextureFrame {
 public:
@@ -516,18 +805,6 @@ public:
                 imageObject_ = nullptr;
             }
         }
-        if (imageView_) {
-            vkDestroyImageView(
-                state_->device.device,
-                imageView_,
-                nullptr);
-        }
-        if (image_) {
-            vkDestroyImage(state_->device.device, image_, nullptr);
-        }
-        if (memory_) {
-            vkFreeMemory(state_->device.device, memory_, nullptr);
-        }
         if (acquireSemaphore_) {
             vkDestroySemaphore(
                 state_->device.device,
@@ -549,10 +826,6 @@ public:
             }
             imageObject_ = nullptr;
         }
-        if (hardwareBuffer_) {
-            AHardwareBuffer_release(hardwareBuffer_);
-            hardwareBuffer_ = nullptr;
-        }
     }
 
     int width() const noexcept override
@@ -567,17 +840,19 @@ public:
 
     VkImage image() const noexcept override
     {
-        return image_;
+        return resources_ ? resources_->image : VK_NULL_HANDLE;
     }
 
     VkImageView imageView() const noexcept override
     {
-        return imageView_;
+        return resources_ ? resources_->imageView : VK_NULL_HANDLE;
     }
 
     VkSampler sampler() const noexcept override
     {
-        return conversion_ ? conversion_->sampler : VK_NULL_HANDLE;
+        return resources_ && resources_->conversion
+            ? resources_->conversion->sampler
+            : VK_NULL_HANDLE;
     }
 
     VkSemaphore acquireSemaphore() const noexcept override
@@ -588,6 +863,11 @@ public:
     VkSemaphore releaseSemaphore() const noexcept override
     {
         return releaseSemaphore_;
+    }
+
+    VkImageLayout initialLayout() const noexcept override
+    {
+        return initialLayout_;
     }
 
     VulkanNormalizedSourceRect
@@ -601,6 +881,13 @@ public:
         if (!imageObject_ || releaseAttempted_.exchange(true)) {
             return;
         }
+        // The renderer released this persistent VkImage to the foreign queue
+        // in GENERAL layout. A later AImage backed by the same buffer must
+        // acquire from that layout rather than treating a reused import as a
+        // newly created UNDEFINED image.
+        resources_->returnedToProducer.store(
+            true,
+            std::memory_order_release);
         VkSemaphoreGetFdInfoKHR descriptorInfo {
             VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
         };
@@ -644,18 +931,18 @@ private:
             error = "AImage returned invalid dimensions";
             return false;
         }
+        AHardwareBuffer* hardwareBuffer = nullptr;
         if (AImage_getHardwareBuffer(
                 imageObject_,
-                &hardwareBuffer_)
+                &hardwareBuffer)
             != AMEDIA_OK
-            || !hardwareBuffer_) {
+            || !hardwareBuffer) {
             error = "AImage_getHardwareBuffer failed";
             return false;
         }
-        AHardwareBuffer_acquire(hardwareBuffer_);
 
         AHardwareBuffer_Desc description {};
-        AHardwareBuffer_describe(hardwareBuffer_, &description);
+        AHardwareBuffer_describe(hardwareBuffer, &description);
         AImageCropRect crop {};
         if (AImage_getCropRect(imageObject_, &crop) != AMEDIA_OK
             || crop.left < 0 || crop.top < 0
@@ -707,156 +994,20 @@ private:
             return false;
         }
 
-        VkAndroidHardwareBufferFormatPropertiesANDROID formatProperties {
-            VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID,
-        };
-        VkAndroidHardwareBufferPropertiesANDROID properties {
-            VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
-        };
-        properties.pNext = &formatProperties;
-        VkResult result = state_->getHardwareBufferProperties(
-            state_->device.device,
-            hardwareBuffer_,
-            &properties);
-        if (result != VK_SUCCESS) {
-            error = resultError(
-                "vkGetAndroidHardwareBufferPropertiesANDROID",
-                result);
-            return false;
-        }
-        conversion_ = conversionResources(
+        resources_ = hardwareBufferResources(
             state_,
-            formatProperties,
+            hardwareBuffer,
+            description,
             error);
-        if (!conversion_) {
+        if (!resources_) {
             return false;
         }
+        initialLayout_ = resources_->returnedToProducer.load(
+            std::memory_order_acquire)
+            ? VK_IMAGE_LAYOUT_GENERAL
+            : VK_IMAGE_LAYOUT_UNDEFINED;
 
-        VkExternalFormatANDROID externalFormat {
-            VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID,
-        };
-        externalFormat.externalFormat =
-            formatProperties.externalFormat;
-        VkExternalMemoryImageCreateInfo externalMemory {
-            VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        };
-        externalMemory.pNext =
-            formatProperties.format == VK_FORMAT_UNDEFINED
-            ? &externalFormat
-            : nullptr;
-        externalMemory.handleTypes =
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
-        VkImageCreateInfo imageInfo {
-            VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        };
-        imageInfo.pNext = &externalMemory;
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = formatProperties.format;
-        imageInfo.extent = {
-            description.width,
-            description.height,
-            1,
-        };
-        imageInfo.mipLevels = 1;
-        imageInfo.arrayLayers = 1;
-        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        result = vkCreateImage(
-            state_->device.device,
-            &imageInfo,
-            nullptr,
-            &image_);
-        if (result != VK_SUCCESS) {
-            error = resultError(
-                "vkCreateImage(AHardwareBuffer)",
-                result);
-            return false;
-        }
-
-        VkMemoryRequirements requirements {};
-        vkGetImageMemoryRequirements(
-            state_->device.device,
-            image_,
-            &requirements);
-        const std::uint32_t memoryType = firstMemoryType(
-            properties.memoryTypeBits
-                & requirements.memoryTypeBits);
-        if (memoryType
-            == std::numeric_limits<std::uint32_t>::max()) {
-            error =
-                "The Android hardware buffer exposes no compatible Vulkan memory type";
-            return false;
-        }
-        VkMemoryDedicatedAllocateInfo dedicated {
-            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-        };
-        dedicated.image = image_;
-        VkImportAndroidHardwareBufferInfoANDROID import {
-            VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
-        };
-        import.pNext = &dedicated;
-        import.buffer = hardwareBuffer_;
-        VkMemoryAllocateInfo allocation {
-            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        };
-        allocation.pNext = &import;
-        allocation.allocationSize = properties.allocationSize;
-        allocation.memoryTypeIndex = memoryType;
-        result = vkAllocateMemory(
-            state_->device.device,
-            &allocation,
-            nullptr,
-            &memory_);
-        if (result != VK_SUCCESS) {
-            error = resultError(
-                "vkAllocateMemory(AHardwareBuffer)",
-                result);
-            return false;
-        }
-        result = vkBindImageMemory(
-            state_->device.device,
-            image_,
-            memory_,
-            0);
-        if (result != VK_SUCCESS) {
-            error = resultError(
-                "vkBindImageMemory(AHardwareBuffer)",
-                result);
-            return false;
-        }
-
-        VkSamplerYcbcrConversionInfo viewConversion {
-            VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
-        };
-        viewConversion.conversion = conversion_->conversion;
-        VkImageViewCreateInfo viewInfo {
-            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        };
-        viewInfo.pNext = &viewConversion;
-        viewInfo.image = image_;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = formatProperties.format;
-        viewInfo.components =
-            formatProperties.samplerYcbcrConversionComponents;
-        viewInfo.subresourceRange.aspectMask =
-            VK_IMAGE_ASPECT_COLOR_BIT;
-        viewInfo.subresourceRange.levelCount = 1;
-        viewInfo.subresourceRange.layerCount = 1;
-        result = vkCreateImageView(
-            state_->device.device,
-            &viewInfo,
-            nullptr,
-            &imageView_);
-        if (result != VK_SUCCESS) {
-            error = resultError(
-                "vkCreateImageView(AHardwareBuffer)",
-                result);
-            return false;
-        }
-
+        VkResult result = VK_SUCCESS;
         if (acquireFence_ >= 0) {
             VkSemaphoreCreateInfo semaphoreInfo {
                 VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
@@ -921,13 +1072,13 @@ private:
             1,
             std::memory_order_relaxed);
         state_->statistics.lastHardwareBufferFormat.store(
-            description.format,
+            resources_->hardwareBufferFormat,
             std::memory_order_relaxed);
         state_->statistics.lastVulkanFormat.store(
-            static_cast<int>(formatProperties.format),
+            static_cast<int>(resources_->vulkanFormat),
             std::memory_order_relaxed);
         state_->statistics.lastExternalFormat.store(
-            formatProperties.externalFormat,
+            resources_->externalFormat,
             std::memory_order_relaxed);
         return true;
     }
@@ -935,16 +1086,13 @@ private:
     std::shared_ptr<SharedState> state_;
     AImage* imageObject_ = nullptr;
     int acquireFence_ = -1;
-    AHardwareBuffer* hardwareBuffer_ = nullptr;
     int width_ = 0;
     int height_ = 0;
     VulkanNormalizedSourceRect normalizedSourceRect_;
-    VkImage image_ = VK_NULL_HANDLE;
-    VkDeviceMemory memory_ = VK_NULL_HANDLE;
-    VkImageView imageView_ = VK_NULL_HANDLE;
+    VkImageLayout initialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkSemaphore acquireSemaphore_ = VK_NULL_HANDLE;
     VkSemaphore releaseSemaphore_ = VK_NULL_HANDLE;
-    std::shared_ptr<ConversionResources> conversion_;
+    std::shared_ptr<HardwareBufferResources> resources_;
     std::atomic<bool> releaseAttempted_ { false };
 };
 
@@ -1114,6 +1262,7 @@ public:
 
         std::deque<PendingImage> discarded;
         bool alreadyQueued = false;
+        bool alreadyRetired = false;
         bool imageReady = false;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
@@ -1142,7 +1291,7 @@ public:
                         <= expected
                             + TimestampToleranceNanoseconds
                     && distance
-                        <= MaximumPresentationLagNanoseconds) {
+                        <= TimestampToleranceNanoseconds) {
                     imageReady = true;
                 }
                 ++iterator;
@@ -1154,21 +1303,30 @@ public:
                         state_->queuedFrames.end(),
                         key)
                     != state_->queuedFrames.end();
-                if (!alreadyQueued) {
-                    state_->queuedFrames.erase(
-                        std::remove_if(
-                            state_->queuedFrames.begin(),
-                            state_->queuedFrames.end(),
-                            [expected](const FrameKey& candidate) {
-                                return candidate.timestampMilliseconds
-                                        * 1'000'000LL
-                                    < expected
-                                        - MaximumPresentationLagNanoseconds;
-                            }),
-                        state_->queuedFrames.end());
+                alreadyRetired =
+                    std::find(
+                        state_->retiredFrames.begin(),
+                        state_->retiredFrames.end(),
+                        key)
+                    != state_->retiredFrames.end();
+                if (!alreadyQueued && !alreadyRetired) {
+                    for (auto iterator = state_->queuedFrames.begin();
+                         iterator != state_->queuedFrames.end();) {
+                        if (iterator->timestampMilliseconds
+                                * 1'000'000LL
+                            < expected
+                                - MaximumPresentationLagNanoseconds) {
+                            state_->retiredFrames.push_back(*iterator);
+                            iterator = state_->queuedFrames.erase(iterator);
+                        } else {
+                            ++iterator;
+                        }
+                    }
                     if (static_cast<int>(
                             state_->queuedFrames.size())
                         >= state_->config.maximumImages) {
+                        state_->retiredFrames.push_back(
+                            state_->queuedFrames.front());
                         state_->queuedFrames.erase(
                             state_->queuedFrames.begin());
                         state_->statistics.staleImagesDropped.fetch_add(
@@ -1176,6 +1334,10 @@ public:
                             std::memory_order_relaxed);
                     }
                     state_->queuedFrames.push_back(key);
+                    while (state_->retiredFrames.size()
+                           > MaximumRetiredFrameKeys) {
+                        state_->retiredFrames.pop_front();
+                    }
                 }
             }
         }
@@ -1185,13 +1347,15 @@ public:
         if (imageReady) {
             return VulkanHardwareImportStatus::Ready;
         }
-        if (alreadyQueued) {
+        if (alreadyQueued || alreadyRetired) {
             return VulkanHardwareImportStatus::Pending;
         }
 
         MediaCodecFrame output =
             mediaCodecFrame(frame, state_->surface);
-        if (!output || !output.isPending() || !output.present()) {
+        const bool released =
+            output && output.isPending() && output.present();
+        if (!released) {
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->queuedFrames.erase(
                 std::remove(
@@ -1255,6 +1419,7 @@ public:
                 if (iterator->timestampNanoseconds
                         <= expected
                             + TimestampToleranceNanoseconds
+                    && distance <= TimestampToleranceNanoseconds
                     && distance < closestDistance) {
                     closest = iterator;
                     closestDistance = distance;
@@ -1266,19 +1431,17 @@ public:
                     <= MaximumPresentationLagNanoseconds) {
                 matched = *closest;
                 state_->images.erase(closest);
-                const auto correlated =
-                    std::find_if(
-                        state_->queuedFrames.begin(),
-                        state_->queuedFrames.end(),
-                        [&matched](const FrameKey& candidate) {
-                            return std::llabs(
-                                matched.timestampNanoseconds
-                                - candidate.timestampMilliseconds
-                                    * 1'000'000LL)
-                                <= TimestampToleranceNanoseconds;
-                        });
+                const auto correlated = std::find(
+                    state_->queuedFrames.begin(),
+                    state_->queuedFrames.end(),
+                    key);
                 if (correlated
-                    == state_->queuedFrames.end()) {
+                        == state_->queuedFrames.end()
+                    || std::llabs(
+                           matched.timestampNanoseconds
+                           - correlated->timestampMilliseconds
+                               * 1'000'000LL)
+                        > TimestampToleranceNanoseconds) {
                     discarded.push_back(matched);
                     matched = {};
                     state_->statistics.staleImagesDropped.fetch_add(
@@ -1325,6 +1488,29 @@ public:
         };
     }
 
+    void waitForFrameImage(
+        const VideoFrame& frame,
+        std::chrono::milliseconds timeout)
+    {
+        const auto expected = frame.timestamp() * 1'000'000LL;
+        std::unique_lock<std::mutex> lock(state_->mutex);
+        state_->imageChanged.wait_for(
+            lock,
+            timeout,
+            [this, expected] {
+                return state_->shuttingDown
+                    || !state_->asyncError.empty()
+                    || std::any_of(
+                        state_->images.begin(),
+                        state_->images.end(),
+                        [expected](const PendingImage& image) {
+                            return std::llabs(
+                                image.timestampNanoseconds - expected)
+                                <= TimestampToleranceNanoseconds;
+                        });
+            });
+    }
+
     bool supports(const HardwareFrame& frame) const noexcept
     {
         if (!valid_ || !frame
@@ -1352,6 +1538,7 @@ public:
             std::lock_guard<std::mutex> lock(state_->mutex);
             pending.swap(state_->images);
             state_->queuedFrames.clear();
+            state_->retiredFrames.clear();
             state_->asyncError.clear();
         }
         for (auto& image : pending) {
@@ -1434,6 +1621,25 @@ bool MediaCodecVulkanInterop::supports(
     return impl_ && impl_->supports(frame);
 }
 
+bool MediaCodecVulkanInterop::queueFrame(
+    const VideoFrame& frame,
+    std::string& detail)
+{
+    if (!impl_) {
+        detail = "The MediaCodec Vulkan interop object is empty";
+        return false;
+    }
+    const auto status = impl_->prepareFrame(frame, detail);
+    if (status == VulkanHardwareImportStatus::Pending) {
+        // Confirm ownership transfer before queuing more codec output. Packet
+        // pacing in Player prevents the producer bursts that previously made
+        // this bounded wait visible in presentation timing.
+        impl_->waitForFrameImage(frame, std::chrono::milliseconds(100));
+    }
+    return status == VulkanHardwareImportStatus::Pending
+        || status == VulkanHardwareImportStatus::Ready;
+}
+
 VulkanHardwareImportStatus
 MediaCodecVulkanInterop::prepareFrame(
     const VideoFrame& frame,
@@ -1501,6 +1707,17 @@ MediaCodecVulkanInterop::statistics() const noexcept
         source.staleImagesDropped.load(std::memory_order_relaxed);
     result.maximumPendingImages =
         source.maximumPendingImages.load(std::memory_order_relaxed);
+    result.hardwareBufferImports =
+        source.hardwareBufferImports.load(std::memory_order_relaxed);
+    result.hardwareBufferImportCacheHits =
+        source.hardwareBufferImportCacheHits.load(
+            std::memory_order_relaxed);
+    result.hardwareBufferImportsRemoved =
+        source.hardwareBufferImportsRemoved.load(
+            std::memory_order_relaxed);
+    result.maximumCachedHardwareBufferImports =
+        source.maximumCachedHardwareBufferImports.load(
+            std::memory_order_relaxed);
     result.lastHardwareBufferFormat =
         source.lastHardwareBufferFormat.load(
             std::memory_order_relaxed);

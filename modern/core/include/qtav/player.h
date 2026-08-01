@@ -17,6 +17,19 @@ class AudioSink;
 class AudioFrameConverter;
 class VideoRenderAPI;
 
+// Video scheduling counters accumulated since the current media was set.
+// They distinguish decoded frames from frames discarded inside Player before
+// onVideoFrame() and rendering callbacks are reached.
+struct QTAV_CORE_EXPORT PlaybackStatistics {
+    std::uint64_t decodedVideoFrames = 0;
+    std::uint64_t videoQueueOverflowDrops = 0;
+    std::uint64_t lateVideoDrops = 0;
+    std::uint64_t deliveredVideoFrames = 0;
+    std::uint64_t maximumQueuedVideoFrames = 0;
+    std::uint64_t videoPresentationStarvations = 0;
+    std::uint64_t maximumVideoPresentationStarvationMilliseconds = 0;
+};
+
 class QTAV_CORE_EXPORT Player {
 public:
     using StateCallback = std::function<void(State)>;
@@ -26,6 +39,15 @@ public:
     using SeekCallback = std::function<void(std::int64_t)>;
     using VideoFrameCallback = std::function<void(const VideoFrame&, int)>;
     using AudioFrameCallback = std::function<void(const AudioFrame&, int)>;
+    // Runs on the video-decode worker as soon as a decoded video frame is within
+    // the bounded decode window. Returning true transfers presentation
+    // scheduling to the callback and suppresses the later
+    // onVideoFrame()/renderer delivery. monotonicNanoseconds is the target
+    // presentation time in the steady monotonic clock epoch.
+    using VideoFrameScheduler = std::function<bool(
+        const VideoFrame&,
+        int,
+        std::int64_t monotonicNanoseconds)>;
     using RenderCallback = std::function<void(void*)>;
     using VideoRenderer = std::function<void(const VideoFrame&, void*)>;
 
@@ -56,6 +78,7 @@ public:
     MediaStatus mediaStatus() const;
     MediaInfo mediaInfo() const;
     std::int64_t position() const;
+    PlaybackStatistics playbackStatistics() const noexcept;
 
     Player& onStateChanged(StateCallback callback);
     Player& onMediaStatus(StatusCallback callback);
@@ -68,6 +91,7 @@ public:
         std::shared_ptr<AudioFrameConverter> converter);
     Player& setHardwareDecodeConfig(HardwareDecodeConfig config);
     HardwareDecodeConfig hardwareDecodeConfig() const;
+    Player& setVideoFrameScheduler(VideoFrameScheduler scheduler);
     Player& setRenderCallback(RenderCallback callback);
     Player& setVideoRenderer(VideoRenderer renderer);
     Player& setVideoRenderAPI(

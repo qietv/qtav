@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <time.h>
 #include <utility>
 
 namespace qtav {
@@ -331,22 +332,46 @@ public:
             || deviceFormat_.sampleRate <= 0) {
             return {};
         }
+        const std::int64_t callbackFrame =
+            callbackFramePosition_.load(
+                std::memory_order_acquire);
+        std::int64_t estimatedFramePosition = framePosition;
+        timespec monotonicNow {};
+        if (timeNanoseconds > 0
+            && clock_gettime(CLOCK_MONOTONIC, &monotonicNow) == 0) {
+            const std::int64_t nowNanoseconds =
+                static_cast<std::int64_t>(monotonicNow.tv_sec)
+                    * 1'000'000'000LL
+                + monotonicNow.tv_nsec;
+            const std::int64_t timestampAge = std::clamp<std::int64_t>(
+                nowNanoseconds - timeNanoseconds,
+                0,
+                1'000'000'000LL);
+            const auto elapsedSinceTimestamp =
+                static_cast<std::int64_t>(
+                    static_cast<std::uint64_t>(timestampAge)
+                    * static_cast<std::uint64_t>(
+                        deviceFormat_.sampleRate)
+                    / 1'000'000'000ULL);
+            estimatedFramePosition = std::min(
+                callbackFrame,
+                framePosition + elapsedSinceTimestamp);
+        }
         const auto elapsedFrames =
             static_cast<std::uint64_t>(
-                framePosition - anchorFrame);
+                std::max<std::int64_t>(
+                    0,
+                    estimatedFramePosition - anchorFrame));
         const std::int64_t positionNanoseconds =
             anchorMediaNanoseconds
             + static_cast<std::int64_t>(
                 elapsedFrames * 1'000'000'000ULL
                 / static_cast<std::uint64_t>(
                     deviceFormat_.sampleRate));
-        const std::int64_t callbackFrame =
-            callbackFramePosition_.load(
-                std::memory_order_acquire);
         const auto pipelineFrames =
-            callbackFrame > framePosition
+            callbackFrame > estimatedFramePosition
             ? static_cast<std::uint64_t>(
-                callbackFrame - framePosition)
+                callbackFrame - estimatedFramePosition)
             : 0;
         const auto latencyFrames =
             pipelineFrames + queue_.queuedFrames();

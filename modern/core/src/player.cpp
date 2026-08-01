@@ -45,12 +45,21 @@ using Milliseconds = std::chrono::milliseconds;
 
 constexpr std::int64_t kMaximumQueuedAudioMilliseconds = 500;
 constexpr std::int64_t kMaximumVideoDecodeLeadMilliseconds = 250;
+// Encoded MediaCodec packets need enough lead for deep HEVC reordering, while
+// a decoded Surface frame owns a finite decoder output buffer until the
+// application presents or drops it. Keep those two windows independent: feed
+// the decoder ahead, but never retain a deep queue of Surface output tokens.
+// This follows legacy QtAV's packet-DTS pacing before decode without moving
+// the wait behind hardware-frame acquisition.
+constexpr std::int64_t kMaximumMediaCodecPacketDecodeLeadMilliseconds = 250;
+constexpr std::int64_t kMaximumMediaCodecOutputLeadMilliseconds = 80;
 constexpr std::int64_t kMaximumVideoPrerollWaitMilliseconds = 500;
 constexpr std::size_t kMinimumVideoPrerollFrames = 6;
 constexpr std::size_t kMaximumQueuedSoftwareVideoFrames = 8;
-constexpr std::size_t kMaximumQueuedHardwareVideoFrames = 16;
-constexpr std::int64_t kLateVideoFrameThresholdMilliseconds =
-    kMaximumVideoDecodeLeadMilliseconds;
+constexpr std::size_t kMaximumQueuedHardwareVideoFrames = 24;
+constexpr std::size_t kMaximumQueuedAudioPackets = 128;
+constexpr std::size_t kMaximumQueuedVideoPackets = 128;
+constexpr std::int64_t kLateVideoFrameThresholdMilliseconds = 250;
 constexpr std::int64_t kHttpReadTimeoutMicroseconds = 15'000'000;
 
 std::string ffmpegError(int error)
@@ -178,8 +187,12 @@ public:
     {
         audioSinkCallbackBridge_->owner = this;
         avformat_network_init();
+        audioDecodeWorker_ =
+            std::thread([this] { runAudioDecode(); });
         audioWorker_ = std::thread([this] { runAudioOutput(); });
         presentationWorker_ = std::thread([this] { runPresentation(); });
+        videoDecodeWorker_ =
+            std::thread([this] { runVideoDecode(); });
         worker_ = std::thread([this] { run(); });
     }
 
@@ -201,10 +214,22 @@ public:
         audioQueueSpace_.notify_all();
         audioQueueDrained_.notify_all();
         {
+            std::lock_guard<std::mutex> lock(audioPacketMutex_);
+        }
+        audioPacketChanged_.notify_all();
+        audioPacketSpace_.notify_all();
+        audioPacketDrained_.notify_all();
+        {
             std::lock_guard<std::mutex> lock(presentationMutex_);
         }
         presentationChanged_.notify_all();
         presentationDrained_.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(videoPacketMutex_);
+        }
+        videoPacketChanged_.notify_all();
+        videoPacketSpace_.notify_all();
+        videoPacketDrained_.notify_all();
         {
             std::lock_guard<std::mutex> lock(audioSinkCallbackBridge_->mutex);
             audioSinkCallbackBridge_->owner = nullptr;
@@ -212,11 +237,17 @@ public:
         if (worker_.joinable()) {
             worker_.join();
         }
+        if (audioDecodeWorker_.joinable()) {
+            audioDecodeWorker_.join();
+        }
         if (audioWorker_.joinable()) {
             audioWorker_.join();
         }
         if (presentationWorker_.joinable()) {
             presentationWorker_.join();
+        }
+        if (videoDecodeWorker_.joinable()) {
+            videoDecodeWorker_.join();
         }
         replaceAudioSink(nullptr, nullptr, audioSinkSerial_);
         media_.reset();
@@ -314,6 +345,14 @@ public:
         std::int64_t duration = 0;
     };
 
+    struct QueuedVideoPacket {
+        std::shared_ptr<AVPacket> packet;
+        std::uint64_t generation = 0;
+        bool end = false;
+    };
+
+    using QueuedAudioPacket = QueuedVideoPacket;
+
     struct PresentationItem {
         enum class Type {
             Audio,
@@ -353,6 +392,7 @@ public:
                 requestedState_ = State::Stopped;
             }
         }
+        resetPlaybackStatistics();
         resetPlaybackQueues();
         interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
         controlChanged_.notify_all();
@@ -435,6 +475,10 @@ public:
         audioQueueChanged_.notify_all();
         audioQueueSpace_.notify_all();
         presentationChanged_.notify_all();
+        audioPacketChanged_.notify_all();
+        audioPacketDrained_.notify_all();
+        videoPacketChanged_.notify_all();
+        videoPacketDrained_.notify_all();
     }
 
     State state() const
@@ -482,6 +526,21 @@ public:
         return clockPositionLocked();
     }
 
+    PlaybackStatistics playbackStatistics() const noexcept
+    {
+        return {
+            decodedVideoFrames_.load(std::memory_order_relaxed),
+            videoQueueOverflowDrops_.load(std::memory_order_relaxed),
+            lateVideoDrops_.load(std::memory_order_relaxed),
+            deliveredVideoFrames_.load(std::memory_order_relaxed),
+            maximumQueuedVideoFrames_.load(std::memory_order_relaxed),
+            videoPresentationStarvations_.load(
+                std::memory_order_relaxed),
+            maximumVideoPresentationStarvationMilliseconds_.load(
+                std::memory_order_relaxed),
+        };
+    }
+
     void onStateChanged(StateCallback callback)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -510,6 +569,12 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         audioFrameCallback_ = std::move(callback);
+    }
+
+    void setVideoFrameScheduler(VideoFrameScheduler scheduler)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        videoFrameScheduler_ = std::move(scheduler);
     }
 
     void setAudioSink(std::shared_ptr<AudioSink> sink)
@@ -840,9 +905,22 @@ private:
 
             lock.unlock();
             const auto result = readAndDecodeOnePacket();
-            if (result == DecodeResult::End || reachedRangeEnd_) {
-                reachedRangeEnd_ = false;
+            const bool reachedRangeEnd =
+                reachedRangeEnd_.exchange(
+                    false,
+                    std::memory_order_acq_rel);
+            if (result == DecodeResult::End) {
                 handlePlaybackEnd();
+            } else if (reachedRangeEnd) {
+                const auto generation =
+                    presentationGeneration_.load(
+                        std::memory_order_acquire);
+                if (finishQueuedDecoding(generation)) {
+                    reachedRangeEnd_.store(
+                        false,
+                        std::memory_order_release);
+                    handlePlaybackEnd();
+                }
             } else if (result == DecodeResult::Error) {
                 bool controlPending = false;
                 {
@@ -1103,6 +1181,14 @@ private:
                 avcodec_parameters_to_context(context, stream->codecpar);
             if (error >= 0) {
                 context->pkt_timebase = stream->time_base;
+            }
+            if (error >= 0 && !hardware && type == AVMEDIA_TYPE_VIDEO) {
+                // libavcodec defaults to a single decode thread. Match the
+                // legacy QtAV software decoder's "threads = 0" policy so
+                // codecs with frame or slice threading can select an
+                // appropriate worker count for the host.
+                context->thread_count = 0;
+                context->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
             }
             if (error >= 0 && hardware) {
                 result.hardwareDeviceType = requestedDevice;
@@ -1392,8 +1478,11 @@ private:
         const int error = av_read_frame(media_.format, packet);
         if (error == AVERROR_EOF) {
             av_packet_free(&packet);
-            flushDecoder(media_.video);
-            flushDecoder(media_.audio);
+            const auto generation =
+                presentationGeneration_.load(std::memory_order_acquire);
+            if (!finishQueuedDecoding(generation)) {
+                return DecodeResult::Error;
+            }
             return DecodeResult::End;
         }
         if (error < 0) {
@@ -1410,15 +1499,377 @@ private:
 
         bool ok = true;
         if (packet->stream_index == media_.video.streamIndex) {
-            ok = decodePacket(media_.video, packet);
+            AVPacket* copy = av_packet_clone(packet);
+            if (!copy) {
+                ok = false;
+            } else {
+                std::shared_ptr<AVPacket> retained(
+                    copy,
+                    [](AVPacket* owned) {
+                        av_packet_free(&owned);
+                    });
+                ok = enqueueVideoPacket(
+                    std::move(retained),
+                    presentationGeneration_.load(
+                        std::memory_order_acquire),
+                    false);
+            }
         } else if (packet->stream_index == media_.audio.streamIndex) {
-            ok = decodePacket(media_.audio, packet);
+            AVPacket* copy = av_packet_clone(packet);
+            if (!copy) {
+                ok = false;
+            } else {
+                std::shared_ptr<AVPacket> retained(
+                    copy,
+                    [](AVPacket* owned) {
+                        av_packet_free(&owned);
+                    });
+                ok = enqueueAudioPacket(
+                    std::move(retained),
+                    presentationGeneration_.load(
+                        std::memory_order_acquire),
+                    false);
+            }
         }
         av_packet_free(&packet);
+        {
+            std::lock_guard<std::mutex> lock(videoPacketMutex_);
+            if (videoDecodeFailed_
+                && videoDecodeFailureGeneration_
+                    == presentationGeneration_.load(
+                        std::memory_order_acquire)) {
+                ok = false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(audioPacketMutex_);
+            if (audioDecodeFailed_
+                && audioDecodeFailureGeneration_
+                    == presentationGeneration_.load(
+                        std::memory_order_acquire)) {
+                ok = false;
+            }
+        }
         return ok ? DecodeResult::Continue : DecodeResult::Error;
     }
 
-    bool decodePacket(Decoder& decoder, const AVPacket* packet)
+    bool decodeRequestValid(std::uint64_t generation) const
+    {
+        if (quitting_.load(std::memory_order_acquire)
+            || generation
+                != presentationGeneration_.load(
+                    std::memory_order_acquire)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return hasOpenMedia_
+            && requestedState_ == State::Playing;
+    }
+
+    bool enqueueVideoPacket(
+        std::shared_ptr<AVPacket> packet,
+        std::uint64_t generation,
+        bool end)
+    {
+        while (decodeRequestValid(generation)) {
+            std::unique_lock<std::mutex> lock(videoPacketMutex_);
+            if (videoPackets_.size() < kMaximumQueuedVideoPackets) {
+                videoPackets_.push_back({
+                    std::move(packet),
+                    generation,
+                    end,
+                });
+                lock.unlock();
+                videoPacketChanged_.notify_one();
+                return true;
+            }
+            videoPacketSpace_.wait_for(lock, Milliseconds(20));
+        }
+        return false;
+    }
+
+    bool enqueueAudioPacket(
+        std::shared_ptr<AVPacket> packet,
+        std::uint64_t generation,
+        bool end)
+    {
+        while (decodeRequestValid(generation)) {
+            std::unique_lock<std::mutex> lock(audioPacketMutex_);
+            if (audioPackets_.size() < kMaximumQueuedAudioPackets) {
+                audioPackets_.push_back({
+                    std::move(packet),
+                    generation,
+                    end,
+                });
+                lock.unlock();
+                audioPacketChanged_.notify_one();
+                return true;
+            }
+            audioPacketSpace_.wait_for(lock, Milliseconds(20));
+        }
+        return false;
+    }
+
+    bool waitForVideoPacketsDrained(std::uint64_t generation)
+    {
+        std::unique_lock<std::mutex> lock(videoPacketMutex_);
+        while (true) {
+            if (quitting_.load(std::memory_order_acquire)
+                || generation
+                    != presentationGeneration_.load(
+                        std::memory_order_acquire)) {
+                return false;
+            }
+            if (videoPackets_.empty() && !videoPacketInFlight_) {
+                return !videoDecodeFailed_;
+            }
+            videoPacketDrained_.wait_for(lock, Milliseconds(20));
+            lock.unlock();
+            const bool requestValid = decodeRequestValid(generation);
+            lock.lock();
+            if (!requestValid) {
+                return false;
+            }
+        }
+    }
+
+    bool waitForAudioPacketsDrained(std::uint64_t generation)
+    {
+        std::unique_lock<std::mutex> lock(audioPacketMutex_);
+        while (true) {
+            if (quitting_.load(std::memory_order_acquire)
+                || generation
+                    != presentationGeneration_.load(
+                        std::memory_order_acquire)) {
+                return false;
+            }
+            if (audioPackets_.empty() && !audioPacketInFlight_) {
+                return !audioDecodeFailed_;
+            }
+            audioPacketDrained_.wait_for(lock, Milliseconds(20));
+            lock.unlock();
+            const bool requestValid = decodeRequestValid(generation);
+            lock.lock();
+            if (!requestValid) {
+                return false;
+            }
+        }
+    }
+
+    bool finishQueuedDecoding(std::uint64_t generation)
+    {
+        const bool videoEndQueued = !media_.video.valid()
+            || enqueueVideoPacket({}, generation, true);
+        const bool audioEndQueued = !media_.audio.valid()
+            || enqueueAudioPacket({}, generation, true);
+        return videoEndQueued && audioEndQueued
+            && (!media_.video.valid()
+                || waitForVideoPacketsDrained(generation))
+            && (!media_.audio.valid()
+                || waitForAudioPacketsDrained(generation));
+    }
+
+    void resetVideoPacketQueue()
+    {
+        std::unique_lock<std::mutex> lock(videoPacketMutex_);
+        videoPackets_.clear();
+        videoPacketSpace_.notify_all();
+        videoPacketChanged_.notify_all();
+        videoPacketDrained_.wait(lock, [this] {
+            return quitting_.load(std::memory_order_acquire)
+                || !videoPacketInFlight_;
+        });
+        videoPackets_.clear();
+        videoDecodeFailed_ = false;
+        videoDecodeFailureGeneration_ = 0;
+    }
+
+    void resetAudioPacketQueue()
+    {
+        std::unique_lock<std::mutex> lock(audioPacketMutex_);
+        audioPackets_.clear();
+        audioPacketSpace_.notify_all();
+        audioPacketChanged_.notify_all();
+        audioPacketDrained_.wait(lock, [this] {
+            return quitting_.load(std::memory_order_acquire)
+                || !audioPacketInFlight_;
+        });
+        audioPackets_.clear();
+        audioDecodeFailed_ = false;
+        audioDecodeFailureGeneration_ = 0;
+    }
+
+    void runAudioDecode()
+    {
+        while (!quitting_.load(std::memory_order_acquire)) {
+            QueuedAudioPacket queued;
+            {
+                std::unique_lock<std::mutex> lock(audioPacketMutex_);
+                while (!quitting_.load(std::memory_order_acquire)) {
+                    audioPacketChanged_.wait(lock, [this] {
+                        return quitting_.load(std::memory_order_acquire)
+                            || !audioPackets_.empty();
+                    });
+                    if (quitting_.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    const auto generation =
+                        audioPackets_.front().generation;
+                    lock.unlock();
+                    const bool mayDecode =
+                        decodeRequestValid(generation);
+                    const bool stale = generation
+                        != presentationGeneration_.load(
+                            std::memory_order_acquire);
+                    lock.lock();
+                    if (stale || mayDecode) {
+                        break;
+                    }
+                    audioPacketChanged_.wait_for(
+                        lock,
+                        Milliseconds(20));
+                }
+                if (quitting_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                if (audioPackets_.empty()) {
+                    continue;
+                }
+                queued = std::move(audioPackets_.front());
+                audioPackets_.pop_front();
+                audioPacketInFlight_ = true;
+            }
+            audioPacketSpace_.notify_all();
+
+            bool ok = true;
+            if (queued.generation
+                == presentationGeneration_.load(
+                    std::memory_order_acquire)) {
+                if (queued.end) {
+                    flushDecoder(media_.audio, queued.generation);
+                } else if (queued.packet) {
+                    ok = decodePacket(
+                        media_.audio,
+                        queued.packet.get(),
+                        queued.generation);
+                }
+            }
+
+            const bool requestValid =
+                decodeRequestValid(queued.generation);
+            {
+                std::lock_guard<std::mutex> lock(audioPacketMutex_);
+                if (!ok && requestValid) {
+                    audioDecodeFailed_ = true;
+                    audioDecodeFailureGeneration_ = queued.generation;
+                }
+                audioPacketInFlight_ = false;
+            }
+            audioPacketSpace_.notify_all();
+            audioPacketDrained_.notify_all();
+            controlChanged_.notify_all();
+        }
+        {
+            std::lock_guard<std::mutex> lock(audioPacketMutex_);
+            audioPacketInFlight_ = false;
+            audioPackets_.clear();
+        }
+        audioPacketSpace_.notify_all();
+        audioPacketDrained_.notify_all();
+    }
+
+    void runVideoDecode()
+    {
+        while (!quitting_.load(std::memory_order_acquire)) {
+            QueuedVideoPacket queued;
+            {
+                std::unique_lock<std::mutex> lock(videoPacketMutex_);
+                while (!quitting_.load(std::memory_order_acquire)) {
+                    videoPacketChanged_.wait(lock, [this] {
+                        return quitting_.load(std::memory_order_acquire)
+                            || !videoPackets_.empty();
+                    });
+                    if (quitting_.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    const auto generation =
+                        videoPackets_.front().generation;
+                    lock.unlock();
+                    const bool mayDecode =
+                        decodeRequestValid(generation);
+                    const bool stale = generation
+                        != presentationGeneration_.load(
+                            std::memory_order_acquire);
+                    lock.lock();
+                    if (stale || mayDecode) {
+                        break;
+                    }
+                    videoPacketChanged_.wait_for(
+                        lock,
+                        Milliseconds(20));
+                }
+                if (quitting_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                if (videoPackets_.empty()) {
+                    continue;
+                }
+                queued = std::move(videoPackets_.front());
+                videoPackets_.pop_front();
+                videoPacketInFlight_ = true;
+            }
+            videoPacketSpace_.notify_all();
+
+            bool ok = true;
+            if (queued.generation
+                == presentationGeneration_.load(
+                    std::memory_order_acquire)) {
+                if (queued.end) {
+                    flushDecoder(media_.video, queued.generation);
+                } else if (queued.packet) {
+                    const bool paceBeforeDecode =
+                        media_.video.hardwareDeviceType
+                            == HardwareDeviceType::MediaCodec;
+                    if (!paceBeforeDecode
+                        || waitForMediaCodecPacketDecodeWindow(
+                            media_.video,
+                            queued.packet.get(),
+                            queued.generation)) {
+                        ok = decodePacket(
+                            media_.video,
+                            queued.packet.get(),
+                            queued.generation);
+                    }
+                }
+            }
+
+            const bool requestValid =
+                decodeRequestValid(queued.generation);
+            {
+                std::lock_guard<std::mutex> lock(videoPacketMutex_);
+                if (!ok && requestValid) {
+                    videoDecodeFailed_ = true;
+                    videoDecodeFailureGeneration_ = queued.generation;
+                }
+                videoPacketInFlight_ = false;
+            }
+            videoPacketSpace_.notify_all();
+            videoPacketDrained_.notify_all();
+            controlChanged_.notify_all();
+        }
+        {
+            std::lock_guard<std::mutex> lock(videoPacketMutex_);
+            videoPacketInFlight_ = false;
+            videoPackets_.clear();
+        }
+        videoPacketSpace_.notify_all();
+        videoPacketDrained_.notify_all();
+    }
+
+    bool decodePacket(
+        Decoder& decoder,
+        const AVPacket* packet,
+        std::uint64_t generation)
     {
         if (!decoder.valid()) {
             return true;
@@ -1426,7 +1877,7 @@ private:
 
         int error = avcodec_send_packet(decoder.context, packet);
         if (error == AVERROR(EAGAIN)) {
-            if (!receiveFrames(decoder)) {
+            if (!receiveFrames(decoder, generation)) {
                 return false;
             }
             error = avcodec_send_packet(decoder.context, packet);
@@ -1439,21 +1890,21 @@ private:
             });
             return false;
         }
-        return receiveFrames(decoder);
+        return receiveFrames(decoder, generation);
     }
 
-    void flushDecoder(Decoder& decoder)
+    void flushDecoder(Decoder& decoder, std::uint64_t generation)
     {
         if (!decoder.valid()) {
             return;
         }
         const int error = avcodec_send_packet(decoder.context, nullptr);
         if (error >= 0 || error == AVERROR_EOF) {
-            receiveFrames(decoder);
+            receiveFrames(decoder, generation);
         }
     }
 
-    bool receiveFrames(Decoder& decoder)
+    bool receiveFrames(Decoder& decoder, std::uint64_t generation)
     {
         AVFrame* frame = av_frame_alloc();
         if (!frame) {
@@ -1475,7 +1926,7 @@ private:
                 result = false;
                 break;
             }
-            if (!deliverFrame(decoder, frame)) {
+            if (!deliverFrame(decoder, frame, generation)) {
                 result = false;
                 break;
             }
@@ -1485,7 +1936,10 @@ private:
         return result;
     }
 
-    bool deliverFrame(Decoder& decoder, const AVFrame* frame)
+    bool deliverFrame(
+        Decoder& decoder,
+        const AVFrame* frame,
+        std::uint64_t generation)
     {
         if (decoder.hardwareFallbackUsed
             && !decoder.hardwareFallbackReported) {
@@ -1521,6 +1975,11 @@ private:
                 / frame->sample_rate;
         }
 
+        if (generation
+            != presentationGeneration_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
         std::int64_t rangeStart;
         std::int64_t rangeEnd;
         {
@@ -1532,15 +1991,30 @@ private:
             return true;
         }
         if (rangeEnd != MediaEnd && timestampMs >= rangeEnd) {
-            reachedRangeEnd_ = true;
+            reachedRangeEnd_.store(true, std::memory_order_release);
             return true;
         }
 
-        const auto generation =
-            presentationGeneration_.load(std::memory_order_acquire);
-
         if (decoder.type == MediaType::Video) {
-            if (!waitForVideoDecodeWindow(timestampMs, generation)) {
+            VideoFrameScheduler scheduler;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (generation
+                    == presentationGeneration_.load(
+                        std::memory_order_acquire)) {
+                    scheduler = videoFrameScheduler_;
+                }
+            }
+            decodedVideoFrames_.fetch_add(1, std::memory_order_relaxed);
+            const bool scheduledMediaCodecOutput = scheduler
+                && decoder.hardwareDeviceType
+                    == HardwareDeviceType::MediaCodec;
+            if (!scheduledMediaCodecOutput
+                && !waitForVideoDecodeWindow(
+                    timestampMs,
+                    generation,
+                    decoder.hardwareDeviceType
+                        == HardwareDeviceType::MediaCodec)) {
                 return false;
             }
             const auto hardwareDeviceType =
@@ -1564,6 +2038,45 @@ private:
                         != HardwareDeviceType::Unknown
                     ? decoder.contextLifetime
                     : std::shared_ptr<void> {});
+            completeVideoPreroll(generation);
+            if (scheduler) {
+                const auto current = position();
+                float rate = 1.0F;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    rate = playbackRate_;
+                }
+                const auto lead = std::max<std::int64_t>(
+                    0,
+                    timestampMs - current);
+                const auto deadline = Clock::now()
+                    + std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double, std::milli>(
+                            static_cast<double>(lead)
+                            / static_cast<double>(rate)));
+                const auto deadlineNanoseconds =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        deadline.time_since_epoch())
+                        .count();
+                if (scheduler(
+                        video,
+                        decoder.streamIndex,
+                        deadlineNanoseconds)) {
+                    deliveredVideoFrames_.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    // A consumed scheduled frame is the first usable output
+                    // just like present(). Without this transition the
+                    // startup output-wait bypasses the decode lead bound and
+                    // can flood an asynchronous hardware-frame queue.
+                    if (!hasActiveAudioDeviceClock()) {
+                        resumeClockAfterOutput(
+                            generation,
+                            video.timestamp());
+                    }
+                    return true;
+                }
+            }
             enqueuePresentation(PresentationItem {
                 PresentationItem::Type::Video,
                 {},
@@ -1617,7 +2130,6 @@ private:
                 return PresentationWaitResult::Cancelled;
             }
             lock.unlock();
-            refreshAudioClock(generation);
             const auto audioPosition = audioClockPosition();
             const bool earlierItemQueued =
                 yieldToEarlierItem
@@ -1681,7 +2193,8 @@ private:
 
     bool waitForVideoDecodeWindow(
         std::int64_t timestampMs,
-        std::uint64_t generation)
+        std::uint64_t generation,
+        bool ownsMediaCodecOutput)
     {
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
@@ -1692,7 +2205,6 @@ private:
                 return false;
             }
             lock.unlock();
-            refreshAudioClock(generation);
             const auto audioPosition = audioClockPosition();
             lock.lock();
             if (quitting_.load(std::memory_order_acquire)
@@ -1708,15 +2220,77 @@ private:
                 audioPosition ? clampPositionLocked(*audioPosition)
                               : clockPositionLocked();
             const auto lead = timestampMs - current;
-            if (lead <= kMaximumVideoDecodeLeadMilliseconds) {
+            const auto maximumLead = ownsMediaCodecOutput
+                ? kMaximumMediaCodecOutputLeadMilliseconds
+                : kMaximumVideoDecodeLeadMilliseconds;
+            if (lead <= maximumLead) {
                 return true;
             }
             controlChanged_.wait_for(
                 lock,
                 Milliseconds(std::clamp<std::int64_t>(
-                    lead - kMaximumVideoDecodeLeadMilliseconds,
+                    lead - maximumLead,
                     1,
                     50)));
+        }
+    }
+
+    bool waitForMediaCodecPacketDecodeWindow(
+        const Decoder& decoder,
+        const AVPacket* packet,
+        std::uint64_t generation)
+    {
+        if (!packet || !decoder.stream) {
+            return true;
+        }
+        const std::int64_t packetTimestamp =
+            packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
+        if (packetTimestamp == AV_NOPTS_VALUE) {
+            return true;
+        }
+        const auto absoluteUs = av_rescale_q(
+            packetTimestamp,
+            decoder.stream->time_base,
+            AV_TIME_BASE_Q);
+        const auto timestampMs = std::max<std::int64_t>(
+            0,
+            (absoluteUs - media_.startTimeUs) / 1000);
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true) {
+            if (quitting_.load(std::memory_order_acquire)
+                || generation
+                    != presentationGeneration_.load(std::memory_order_acquire)
+                || requestedState_ != State::Playing || seekRequest_) {
+                return false;
+            }
+            lock.unlock();
+            const auto audioPosition = audioClockPosition();
+            lock.lock();
+            if (quitting_.load(std::memory_order_acquire)
+                || generation
+                    != presentationGeneration_.load(std::memory_order_acquire)
+                || requestedState_ != State::Playing || seekRequest_) {
+                return false;
+            }
+            if (waitingForOutput_ && !outputWaitPrimed_) {
+                return true;
+            }
+            const auto current =
+                audioPosition ? clampPositionLocked(*audioPosition)
+                              : clockPositionLocked();
+            const auto lead = timestampMs - current;
+            if (lead
+                <= kMaximumMediaCodecPacketDecodeLeadMilliseconds) {
+                return true;
+            }
+            controlChanged_.wait_for(
+                lock,
+                Milliseconds(std::clamp<std::int64_t>(
+                    lead
+                        - kMaximumMediaCodecPacketDecodeLeadMilliseconds,
+                    1,
+                    20)));
         }
     }
 
@@ -1767,10 +2341,6 @@ private:
             != presentationGeneration_.load(std::memory_order_acquire)) {
             return;
         }
-        if (item.type == PresentationItem::Type::Video) {
-            completeVideoPreroll(item.generation);
-        }
-
         std::lock_guard<std::mutex> lock(presentationMutex_);
         const auto maximumQueuedVideoFrames =
             item.type == PresentationItem::Type::Video
@@ -1782,6 +2352,9 @@ private:
             // Keep the contiguous near-term presentation window. Evicting its
             // oldest frame lets decode bursts, especially after seek, replace
             // frames that are about to be shown with farther-future frames.
+            videoQueueOverflowDrops_.fetch_add(
+                1,
+                std::memory_order_relaxed);
             return;
         }
         const auto insertion = std::upper_bound(
@@ -1793,6 +2366,14 @@ private:
             });
         if (item.type == PresentationItem::Type::Video) {
             ++queuedVideoFrames_;
+            auto maximum = maximumQueuedVideoFrames_.load(
+                std::memory_order_relaxed);
+            while (maximum < queuedVideoFrames_
+                   && !maximumQueuedVideoFrames_.compare_exchange_weak(
+                       maximum,
+                       queuedVideoFrames_,
+                       std::memory_order_relaxed)) {
+            }
         }
         presentationQueue_.insert(insertion, std::move(item));
         presentationChanged_.notify_one();
@@ -1811,6 +2392,13 @@ private:
         return audioSinkOpen_ && audioSinkHasClock_;
     }
 
+    bool needsAudioPresentation() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !audioSinkOpen_ || !audioSinkHasClock_
+            || static_cast<bool>(audioFrameCallback_);
+    }
+
     void runAudioOutput()
     {
         while (!quitting_.load(std::memory_order_acquire)) {
@@ -1819,10 +2407,28 @@ private:
                 std::unique_lock<std::mutex> lock(audioQueueMutex_);
                 audioQueueChanged_.wait(lock, [this] {
                     return quitting_.load(std::memory_order_acquire)
-                        || !audioQueue_.empty();
+                        || !audioQueue_.empty()
+                        || outputClockPollRequested_.load(
+                            std::memory_order_acquire);
                 });
                 if (quitting_.load(std::memory_order_acquire)) {
                     break;
+                }
+                if (audioQueue_.empty()) {
+                    lock.unlock();
+                    refreshAudioClockWhileWaiting();
+                    lock.lock();
+                    audioQueueChanged_.wait_for(
+                        lock,
+                        Milliseconds(20),
+                        [this] {
+                            return quitting_.load(
+                                       std::memory_order_acquire)
+                                || !audioQueue_.empty()
+                                || !outputClockPollRequested_.load(
+                                    std::memory_order_acquire);
+                        });
+                    continue;
                 }
                 if (!requestedPlaying()) {
                     audioQueueChanged_.wait_for(lock, Milliseconds(20));
@@ -1858,7 +2464,8 @@ private:
             if (accepted
                 && queued.generation
                     == presentationGeneration_.load(
-                        std::memory_order_acquire)) {
+                        std::memory_order_acquire)
+                && needsAudioPresentation()) {
                 enqueuePresentation(PresentationItem {
                     PresentationItem::Type::Audio,
                     std::move(queued.frame),
@@ -1962,6 +2569,7 @@ private:
         if (frameCallback) {
             frameCallback(item.video, item.track);
         }
+        deliveredVideoFrames_.fetch_add(1, std::memory_order_relaxed);
         if (!renderCallback
             || item.generation
                 != presentationGeneration_.load(std::memory_order_acquire)) {
@@ -1992,10 +2600,33 @@ private:
             PresentationItem item;
             {
                 std::unique_lock<std::mutex> lock(presentationMutex_);
+                const auto queueWaitStart = Clock::now();
                 presentationChanged_.wait(lock, [this] {
                     return quitting_.load(std::memory_order_acquire)
                         || !presentationQueue_.empty();
                 });
+                const auto queueWait =
+                    std::chrono::duration_cast<Milliseconds>(
+                        Clock::now() - queueWaitStart)
+                        .count();
+                if (queueWait > 60
+                    && deliveredVideoFrames_.load(
+                        std::memory_order_relaxed) > 0) {
+                    videoPresentationStarvations_.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    auto maximum =
+                        maximumVideoPresentationStarvationMilliseconds_.load(
+                            std::memory_order_relaxed);
+                    while (maximum
+                               < static_cast<std::uint64_t>(queueWait)
+                           && !maximumVideoPresentationStarvationMilliseconds_
+                                   .compare_exchange_weak(
+                                       maximum,
+                                       static_cast<std::uint64_t>(queueWait),
+                                       std::memory_order_relaxed)) {
+                    }
+                }
                 if (quitting_.load(std::memory_order_acquire)) {
                     break;
                 }
@@ -2025,6 +2656,10 @@ private:
                         item.generation);
                 if (!dropLateVideo) {
                     present(item);
+                } else {
+                    lateVideoDrops_.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
                 }
             }
 
@@ -2061,11 +2696,23 @@ private:
         audioQueueDrained_.notify_all();
         presentationChanged_.notify_all();
         presentationDrained_.notify_all();
+        videoPacketChanged_.notify_all();
+        videoPacketSpace_.notify_all();
+        videoPacketDrained_.notify_all();
+        audioPacketChanged_.notify_all();
+        audioPacketSpace_.notify_all();
+        audioPacketDrained_.notify_all();
     }
 
     void resetPlaybackQueues()
     {
         invalidatePlaybackQueues();
+        resetVideoPacketQueue();
+        resetAudioPacketQueue();
+        reachedRangeEnd_.store(false, std::memory_order_release);
+        outputClockPollRequested_.store(
+            false,
+            std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(audioQueueMutex_);
             audioQueue_.clear();
@@ -2092,6 +2739,19 @@ private:
         audioQueueDrained_.notify_all();
         presentationChanged_.notify_all();
         presentationDrained_.notify_all();
+    }
+
+    void resetPlaybackStatistics() noexcept
+    {
+        decodedVideoFrames_.store(0, std::memory_order_relaxed);
+        videoQueueOverflowDrops_.store(0, std::memory_order_relaxed);
+        lateVideoDrops_.store(0, std::memory_order_relaxed);
+        deliveredVideoFrames_.store(0, std::memory_order_relaxed);
+        maximumQueuedVideoFrames_.store(0, std::memory_order_relaxed);
+        videoPresentationStarvations_.store(0, std::memory_order_relaxed);
+        maximumVideoPresentationStarvationMilliseconds_.store(
+            0,
+            std::memory_order_relaxed);
     }
 
     void beginOutputWait(
@@ -2135,6 +2795,12 @@ private:
         outputWaitPrimed_ = false;
         outputWaitGeneration_ = generation;
         outputWaitRequiresDeviceClock_ = requireDeviceClock;
+        outputClockPollRequested_.store(
+            requireDeviceClock,
+            std::memory_order_release);
+        if (requireDeviceClock) {
+            audioQueueChanged_.notify_all();
+        }
         videoPrerollPending_ = waitForVideo;
         videoPrerollGeneration_ = waitForVideo ? generation : 0;
         videoPrerollFrameCount_ = 0;
@@ -2209,6 +2875,9 @@ private:
             outputWaitPrimed_ = false;
             outputWaitGeneration_ = 0;
             outputWaitRequiresDeviceClock_ = false;
+            outputClockPollRequested_.store(
+                false,
+                std::memory_order_release);
             videoPrerollPending_ = false;
             videoPrerollGeneration_ = 0;
             videoPrerollFrameCount_ = 0;
@@ -2345,6 +3014,38 @@ private:
         }
         controlChanged_.notify_all();
         presentationChanged_.notify_all();
+    }
+
+    void refreshAudioClockWhileWaiting()
+    {
+        std::shared_ptr<AudioSink> sink;
+        std::uint64_t serial = 0;
+        std::uint64_t generation = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!waitingForOutput_ || !outputWaitRequiresDeviceClock_
+                || !audioSinkOpen_ || !audioSinkHasClock_) {
+                outputClockPollRequested_.store(
+                    false,
+                    std::memory_order_release);
+                return;
+            }
+            sink = activeAudioSink_;
+            serial = appliedAudioSinkSerial_;
+            generation = outputWaitGeneration_;
+        }
+        if (!sink) {
+            outputClockPollRequested_.store(
+                false,
+                std::memory_order_release);
+            return;
+        }
+        AudioSinkClock clock;
+        {
+            std::lock_guard<std::mutex> sinkLock(audioSinkCallMutex_);
+            clock = sink->clock();
+        }
+        cacheAudioClockSample(clock, serial, 0, generation);
     }
 
     void replaceAudioSink(
@@ -2823,41 +3524,6 @@ private:
         return drained;
     }
 
-    void refreshAudioClock(std::uint64_t generation)
-    {
-        std::shared_ptr<AudioSink> sink;
-        std::uint64_t serial = 0;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!audioSinkOpen_ || !audioSinkHasClock_
-                || generation
-                    != presentationGeneration_.load(
-                        std::memory_order_acquire)) {
-                return;
-            }
-            sink = activeAudioSink_;
-            serial = appliedAudioSinkSerial_;
-        }
-        if (!sink) {
-            return;
-        }
-
-        AudioSinkClock value;
-        {
-            // A device write may legitimately wait for backend queue space
-            // while holding this serialization lock. Presentation must keep
-            // using the cached clock instead of stalling behind that write.
-            std::unique_lock<std::mutex> sinkLock(
-                audioSinkCallMutex_,
-                std::try_to_lock);
-            if (!sinkLock.owns_lock()) {
-                return;
-            }
-            value = sink->clock();
-        }
-        cacheAudioClockSample(value, serial, 0, generation);
-    }
-
     std::optional<std::int64_t> audioClockPosition() const
     {
         CachedAudioClock cached;
@@ -3124,7 +3790,9 @@ private:
     mutable std::mutex audioSinkCallMutex_;
     mutable std::mutex audioClockMutex_;
     mutable std::mutex audioQueueMutex_;
+    mutable std::mutex audioPacketMutex_;
     mutable std::mutex presentationMutex_;
+    mutable std::mutex videoPacketMutex_;
     std::shared_ptr<AudioSinkCallbackBridge> audioSinkCallbackBridge_ =
         std::make_shared<AudioSinkCallbackBridge>();
     std::condition_variable controlChanged_;
@@ -3132,26 +3800,51 @@ private:
     std::condition_variable audioQueueChanged_;
     std::condition_variable audioQueueSpace_;
     std::condition_variable audioQueueDrained_;
+    std::condition_variable audioPacketChanged_;
+    std::condition_variable audioPacketSpace_;
+    std::condition_variable audioPacketDrained_;
     std::condition_variable presentationChanged_;
     std::condition_variable presentationDrained_;
+    std::condition_variable videoPacketChanged_;
+    std::condition_variable videoPacketSpace_;
+    std::condition_variable videoPacketDrained_;
     std::thread worker_;
+    std::thread audioDecodeWorker_;
     std::thread audioWorker_;
     std::thread presentationWorker_;
+    std::thread videoDecodeWorker_;
     std::atomic<bool> quitting_ { false };
     std::atomic<std::uint64_t> interruptEpoch_ { 1 };
     std::atomic<std::uint64_t> presentationGeneration_ { 1 };
+    std::atomic<std::uint64_t> decodedVideoFrames_ { 0 };
+    std::atomic<std::uint64_t> videoQueueOverflowDrops_ { 0 };
+    std::atomic<std::uint64_t> lateVideoDrops_ { 0 };
+    std::atomic<std::uint64_t> deliveredVideoFrames_ { 0 };
+    std::atomic<std::uint64_t> maximumQueuedVideoFrames_ { 0 };
+    std::atomic<std::uint64_t> videoPresentationStarvations_ { 0 };
+    std::atomic<std::uint64_t>
+        maximumVideoPresentationStarvationMilliseconds_ { 0 };
+    std::atomic<bool> outputClockPollRequested_ { false };
     InterruptContext interrupt_;
 
     std::deque<QueuedAudioFrame> audioQueue_;
     std::int64_t queuedAudioDuration_ = 0;
     bool audioFrameInFlight_ = false;
+    std::deque<QueuedAudioPacket> audioPackets_;
+    bool audioPacketInFlight_ = false;
+    bool audioDecodeFailed_ = false;
+    std::uint64_t audioDecodeFailureGeneration_ = 0;
     std::deque<PresentationItem> presentationQueue_;
     std::size_t queuedVideoFrames_ = 0;
     bool presentationInFlight_ = false;
+    std::deque<QueuedVideoPacket> videoPackets_;
+    bool videoPacketInFlight_ = false;
+    bool videoDecodeFailed_ = false;
+    std::uint64_t videoDecodeFailureGeneration_ = 0;
     CachedAudioClock cachedAudioClock_;
     MediaContext media_;
     bool hasOpenMedia_ = false;
-    bool reachedRangeEnd_ = false;
+    std::atomic<bool> reachedRangeEnd_ { false };
     std::string url_;
     std::uint64_t mediaSerial_ = 1;
     std::uint64_t loadedSerial_ = 0;
@@ -3187,6 +3880,7 @@ private:
     EventCallback eventCallback_;
     VideoFrameCallback videoFrameCallback_;
     AudioFrameCallback audioFrameCallback_;
+    VideoFrameScheduler videoFrameScheduler_;
     std::shared_ptr<AudioSink> audioSink_;
     std::shared_ptr<AudioSink> activeAudioSink_;
     std::shared_ptr<AudioFrameConverter> audioFrameConverter_;
@@ -3269,6 +3963,11 @@ std::int64_t Player::position() const
     return impl_->position();
 }
 
+PlaybackStatistics Player::playbackStatistics() const noexcept
+{
+    return impl_->playbackStatistics();
+}
+
 Player& Player::onStateChanged(StateCallback callback)
 {
     impl_->onStateChanged(std::move(callback));
@@ -3321,6 +4020,12 @@ Player& Player::setHardwareDecodeConfig(HardwareDecodeConfig config)
 HardwareDecodeConfig Player::hardwareDecodeConfig() const
 {
     return impl_->hardwareDecodeConfig();
+}
+
+Player& Player::setVideoFrameScheduler(VideoFrameScheduler scheduler)
+{
+    impl_->setVideoFrameScheduler(std::move(scheduler));
+    return *this;
 }
 
 Player& Player::setRenderCallback(RenderCallback callback)

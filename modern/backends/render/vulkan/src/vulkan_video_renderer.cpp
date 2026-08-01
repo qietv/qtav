@@ -34,6 +34,7 @@ enum class ShaderPixelFormat : std::uint32_t {
     BGRA,
     ARGB,
     Gray8,
+    YUV420P10,
 };
 
 enum class ShaderColorMatrix : std::uint32_t {
@@ -245,6 +246,13 @@ bool pixelFormat(
         verticalDivisors = { 1, 2, 1 };
         bytesPerElement = { 2, 4, 1 };
         return true;
+    case PixelFormat::YUV420P10:
+        destination = ShaderPixelFormat::YUV420P10;
+        planeCount = 3;
+        horizontalDivisors = { 1, 2, 2 };
+        verticalDivisors = { 1, 2, 2 };
+        bytesPerElement = { 2, 2, 2 };
+        return true;
     case PixelFormat::RGB24:
         destination = ShaderPixelFormat::RGB24;
         planeCount = 1;
@@ -434,9 +442,13 @@ bool packFrame(
         error = "The Vulkan renderer does not support this software pixel format";
         return false;
     }
-    if (frame.format() == PixelFormat::P010
-        && frame.formatName().find("p010le") == std::string::npos) {
-        error = "The Vulkan renderer currently supports little-endian P010";
+    if ((frame.format() == PixelFormat::P010
+         && frame.formatName().find("p010le") == std::string::npos)
+        || (frame.format() == PixelFormat::YUV420P10
+            && frame.formatName().find("yuv420p10le")
+                == std::string::npos)) {
+        error =
+            "The Vulkan renderer currently supports little-endian 10-bit YUV";
         return false;
     }
 
@@ -1914,6 +1926,7 @@ VideoRenderCapabilities VulkanVideoRenderer::capabilities() const
         PixelFormat::YUV420P,
         PixelFormat::YUV422P,
         PixelFormat::YUV444P,
+        PixelFormat::YUV420P10,
         PixelFormat::NV12,
         PixelFormat::NV21,
         PixelFormat::P010,

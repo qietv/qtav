@@ -330,17 +330,33 @@ void main()
     vec3 rgb;
     uint format = source.z;
 #if defined(QTAV_EXTERNAL_OES)
-    if (format == 12U) {
+    if (format == 13U) {
         vec4 transformed =
             externalTransform * vec4(coordinate, 0.0, 1.0);
         rgb = texture(externalImage, transformed.xy).rgb;
     } else
 #endif
-    if (format <= 5U) {
+    if (format <= 5U || format == 12U) {
         float luma;
         float chromaU;
         float chromaV;
-        if (format == 5U) {
+        if (format == 12U) {
+            luma = float(
+                texelFetch(p010Luma, position, 0).r & 1023U)
+                / 1023.0;
+            ivec2 chromaPosition =
+                ivec2(int(x / 2U), int(y / 2U));
+            uvec2 chroma =
+                texelFetch(p010Chroma, chromaPosition, 0).rg;
+            chromaU = float(chroma.r & 1023U) / 1023.0;
+            chromaV = float(chroma.g & 1023U) / 1023.0;
+            rgb = p010ToRgb(
+                luma * (65472.0 / 65535.0),
+                chromaU * (65472.0 / 65535.0),
+                chromaV * (65472.0 / 65535.0),
+                presentation.z,
+                presentation.w);
+        } else if (format == 5U) {
             luma = float(texelFetch(p010Luma, position, 0).r) / 65535.0;
             ivec2 chromaPosition =
                 ivec2(int(x / 2U), int(y / 2U));
@@ -412,6 +428,7 @@ enum class ShaderPixelFormat : std::uint32_t {
     BGRA,
     ARGB,
     Gray8,
+    YUV420P10,
     ExternalOES,
 };
 
@@ -585,6 +602,46 @@ bool copyPlane(
     return true;
 }
 
+bool interleavePlanar10Chroma(
+    const VideoFrame& frame,
+    const PlaneLayout& layout,
+    std::vector<std::uint8_t>& destination) noexcept
+{
+    const int sourceRowBytes = layout.width * 2;
+    const int destinationRowBytes = layout.width * 4;
+    const int uLineSize = frame.lineSize(1);
+    const int vLineSize = frame.lineSize(2);
+    const auto* u = frame.data(1);
+    const auto* v = frame.data(2);
+    if (!u || !v || uLineSize == 0 || vLineSize == 0
+        || sourceRowBytes <= 0 || destinationRowBytes <= 0
+        || layout.height <= 0
+        || std::abs(static_cast<long long>(uLineSize)) < sourceRowBytes
+        || std::abs(static_cast<long long>(vLineSize)) < sourceRowBytes) {
+        return false;
+    }
+    const std::size_t rowSize =
+        static_cast<std::size_t>(destinationRowBytes);
+    const std::size_t height = static_cast<std::size_t>(layout.height);
+    if (height > std::numeric_limits<std::size_t>::max() / rowSize) {
+        return false;
+    }
+    destination.resize(rowSize * height);
+    for (int row = 0; row < layout.height; ++row) {
+        const auto* uRow =
+            u + static_cast<std::ptrdiff_t>(row) * uLineSize;
+        const auto* vRow =
+            v + static_cast<std::ptrdiff_t>(row) * vLineSize;
+        auto* output = destination.data()
+            + static_cast<std::size_t>(row) * rowSize;
+        for (int column = 0; column < layout.width; ++column) {
+            std::memcpy(output + column * 4, uRow + column * 2, 2);
+            std::memcpy(output + column * 4 + 2, vRow + column * 2, 2);
+        }
+    }
+    return true;
+}
+
 bool packFrame(
     const VideoFrame& frame,
     PackedFrame& result,
@@ -652,6 +709,29 @@ bool packFrame(
             {},
         }};
         break;
+    case PixelFormat::YUV420P10:
+        if (frame.formatName().find("yuv420p10le") == std::string::npos) {
+            error = "The OpenGL ES renderer currently supports little-endian "
+                    "10-bit planar YUV";
+            return false;
+        }
+        result.format = ShaderPixelFormat::YUV420P10;
+        result.planeCount = 2;
+        result.layouts = {{
+            { width, height, 2, GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT },
+            { halfWidth, halfHeight, 4, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT },
+            {},
+        }};
+        if (!copyPlane(frame, 0, result.layouts[0], result.bytes[0])
+            || !interleavePlanar10Chroma(
+                frame,
+                result.layouts[1],
+                result.bytes[1])) {
+            error = "The OpenGL ES renderer could not pack a 10-bit planar "
+                    "YUV frame";
+            return false;
+        }
+        return true;
     case PixelFormat::RGB24:
     case PixelFormat::BGR24:
         result.format = frame.format() == PixelFormat::RGB24
@@ -1264,6 +1344,7 @@ VideoRenderCapabilities OpenGLVideoRenderer::capabilities() const
         PixelFormat::YUV420P,
         PixelFormat::YUV422P,
         PixelFormat::YUV444P,
+        PixelFormat::YUV420P10,
         PixelFormat::NV12,
         PixelFormat::NV21,
         PixelFormat::P010,
@@ -1446,7 +1527,8 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
         glBindTexture(
             GL_TEXTURE_EXTERNAL_OES,
             externalTexture.texture);
-    } else if (packed.format == ShaderPixelFormat::P010) {
+    } else if (packed.format == ShaderPixelFormat::P010
+               || packed.format == ShaderPixelFormat::YUV420P10) {
         impl_->uploadTexture(
             3, packed.layouts[0], packed.bytes[0].data());
         impl_->uploadTexture(

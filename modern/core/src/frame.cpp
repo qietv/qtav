@@ -31,6 +31,9 @@ PixelFormat pixelFormatFromFFmpeg(AVPixelFormat value) noexcept
         return PixelFormat::YUV422P;
     case AV_PIX_FMT_YUV444P:
         return PixelFormat::YUV444P;
+    case AV_PIX_FMT_YUV420P10LE:
+    case AV_PIX_FMT_YUV420P10BE:
+        return PixelFormat::YUV420P10;
     case AV_PIX_FMT_NV12:
         return PixelFormat::NV12;
     case AV_PIX_FMT_NV21:

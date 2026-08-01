@@ -43,6 +43,13 @@ float ushortValue(uint offset, uint stride, uint x, uint y)
     return float(value) / 65535.0;
 }
 
+float ushort10Value(uint offset, uint stride, uint x, uint y)
+{
+    const uint index = offset + y * stride + x * 2U;
+    const uint value = byteAt(index) | (byteAt(index + 1U) << 8U);
+    return float(value & 1023U) / 1023.0;
+}
+
 vec3 yuvToRgb(float y, float u, float v, uint matrix, uint range)
 {
     if (range == 1U) {
@@ -300,11 +307,32 @@ void main()
 
     vec3 rgb;
     const uint format = parameters.source.z;
-    if (format <= 5U) {
+    if (format <= 5U || format == 12U) {
         float luma;
         float chromaU;
         float chromaV;
-        if (format == 5U) {
+        if (format == 12U) {
+            luma = ushort10Value(
+                parameters.offsets.x, parameters.strides.x, x, y);
+            const uint chromaX = x / 2U;
+            const uint chromaY = y / 2U;
+            chromaU = ushort10Value(
+                parameters.offsets.y,
+                parameters.strides.y,
+                chromaX,
+                chromaY);
+            chromaV = ushort10Value(
+                parameters.offsets.z,
+                parameters.strides.z,
+                chromaX,
+                chromaY);
+            rgb = p010ToRgb(
+                luma * (65472.0 / 65535.0),
+                chromaU * (65472.0 / 65535.0),
+                chromaV * (65472.0 / 65535.0),
+                parameters.presentation.z,
+                parameters.presentation.w);
+        } else if (format == 5U) {
             luma = ushortValue(
                 parameters.offsets.x, parameters.strides.x, x, y);
             const uint chromaX = x / 2U;

@@ -405,6 +405,63 @@ map/transfer/staging/upload calls. The
 accepted shared Android/OHOS responsibility and lifecycle design is documented
 in [`MOBILE.md`](MOBILE.md).
 
+### Android user player demo
+
+The manual final-test and user-facing player is under
+[`examples/android_player/`](examples/android_player/). It is separate from
+the automated NativeActivity harness and provides a standard Android UI with
+an upper `SurfaceView`, current time/seek/duration controls, local document
+selection, direct FFmpeg HTTP/HTTPS URL opening, play/pause/stop, and live
+Vulkan, HDR, ZeroCopy, hardware-decode, and Vulkan validation-layer switches.
+ZeroCopy and hardware decode occupy their own second option row so the full
+controls remain touchable on a portrait phone.
+
+The option matrix exercises software decode through Vulkan or OpenGL ES,
+MediaCodec direct-Surface output, MediaCodec/AImageReader Vulkan ZeroCopy, and
+MediaCodec/SurfaceTexture OpenGL ES ZeroCopy. Changing an option rebuilds the
+affected native pipeline at the current position. Remote URLs go directly to
+QtAVCore/FFmpeg networking; the example cross-builds OpenSSL, explicitly
+verifies HTTPS peers and host names against an app-private PEM bundle assembled
+from Android's public system trust store, and does not download through Java
+or the Android networking stack. This is remote-file playback, not adaptive
+streaming.
+
+Hardware decode with direct-Surface presentation is the example's smooth
+playback default; ZeroCopy is an explicit interop/application-processing
+option. The core paces MediaCodec packets by DTS before decode, independently
+of audio decode and device submission, and retains only a small bounded window
+of decoded Surface outputs for the presentation worker. This avoids both
+demux starvation and exhaustion of the codec output pool. The dedicated
+Vulkan render thread reserves a
+bounded slot before releasing each ZeroCopy output and waits only for the
+private AImageReader ownership transfer, preventing producer bursts from
+silently coalescing images without waiting for the render deadline. Its
+diagnostics separate core queue/late drops, application render drops,
+frames-in-flight, AHardwareBuffer cache reuse, and interop queue/acquire/import
+progress. SurfaceTexture drops only an ambiguous zero-PTS first output;
+AImageReader accepts zero as a valid timestamp.
+
+Build and sign the arm64 debug APK without installing it:
+
+```sh
+modern/examples/android_player/build-android-player.sh
+```
+
+The output is `build/android-player/qtav-core-player.apk`. The connected-device
+launcher has an explicit pre-install confirmation gate because modern Android
+releases may require manual approval on the physical device:
+
+```sh
+modern/examples/android_player/run-connected-device.sh
+QTAV_ANDROID_INSTALL_CONFIRMED=1 \
+  modern/examples/android_player/run-connected-device.sh
+```
+
+The first command stops before `adb install`; run the second only after the
+device is unlocked and ready for the manual prompt. See the example's
+[`README.md`](examples/android_player/README.md) for codec scope, exact option
+semantics, validation-layer requirements, and manual test guidance.
+
 ## API shape
 
 ```cpp
@@ -556,21 +613,19 @@ qtav::MediaCodecSurface surface(nativeWindow);
 qtav::MediaCodecHardwareDecodeOptions options;
 options.allowSoftwareFallback = false;
 
+player
+    .setHardwareDecodeConfig(
+        qtav::mediaCodecHardwareDecodeConfig(surface, options))
+    .setVideoFrameScheduler(
+        [&surface](
+            const qtav::VideoFrame& frame,
+            int,
+            std::int64_t monotonicNanoseconds) {
+            auto output = qtav::mediaCodecFrame(frame, surface);
+            return output
+                && output.presentAt(monotonicNanoseconds);
+        });
 player.setMedia(path);
-player.setHardwareDecodeConfig(
-    qtav::mediaCodecHardwareDecodeConfig(surface, options));
-player.onVideoFrame(
-    [&surface](const qtav::VideoFrame& frame, int) {
-        auto output = qtav::mediaCodecFrame(frame, surface);
-        if (!output) {
-            return;
-        }
-        if (isLate(frame.timestamp())) {
-            output.drop();
-        } else {
-            output.presentAt(applicationMonotonicNowNanoseconds());
-        }
-    });
 player.setState(qtav::State::Playing);
 ```
 
@@ -582,6 +637,12 @@ timestamp, and `drop()` releases without display. Destroying an undecided last
 frame copy lets FFmpeg drop it. Hardware-frame storage retains the decoder
 context until all copied outputs are released, including across seek, stop,
 media replacement, and asynchronous decoder reopen.
+
+`setVideoFrameScheduler()` runs on the video-decode worker once a decoded frame
+is inside its bounded lead window and supplies the target monotonic presentation
+time. Returning `true` means the application consumed that frame and suppresses
+the later `onVideoFrame()`/renderer path. This is the preferred direct-Surface
+integration because the codec owns only a small output pool.
 
 On surface loss, pause playback, publish an empty hardware-decode
 configuration, and release the old token only after application-held frame
@@ -626,6 +687,20 @@ renderer->setWindow(nativeWindow);
 
 player
     .setVideoRenderAPI(renderer)
+    .setVideoFrameScheduler(
+        [interop](
+            const qtav::VideoFrame& frame,
+            int,
+            std::int64_t monotonicNanoseconds) {
+            std::string detail;
+            if (!interop->queueFrame(frame, detail)) {
+                return false;
+            }
+            retain_and_schedule_render(
+                frame,
+                monotonicNanoseconds);
+            return true;
+        })
     .setHardwareDecodeConfig(
         qtav::mediaCodecHardwareDecodeConfig(interop->surface()))
     .setState(qtav::State::Playing);
@@ -634,7 +709,14 @@ player
 The interop creates an `AIMAGE_FORMAT_PRIVATE` reader with
 `AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE`. Releasing a MediaCodec token to that
 surface produces an asynchronous `AImage`; codec and image timestamps are
-matched before its retained `AHardwareBuffer` is imported. Vulkan uses the
+matched before its retained `AHardwareBuffer` is imported. Timestamp zero is
+valid and is correlated normally; only negative image timestamps are rejected.
+`queueFrame()` performs a bounded wait for the matching asynchronous image to
+be acquired, serializing producer ownership transfer without waiting for the
+playback deadline or Vulkan submission. Applications should reserve their own
+bounded render slot before calling it, retain the exact `VideoFrame`, and
+render at the scheduler-provided deadline.
+Vulkan uses the
 driver-reported format or external format and suggested YCbCr conversion. The
 renderer also applies the `AImage` crop rectangle, so codec-aligned native
 allocations may be larger than the visible decoded frame.
@@ -643,14 +725,18 @@ When an acquire sync fd is present it is imported into a temporary Vulkan
 semaphore. Submission waits on that semaphore and transfers ownership from
 the foreign queue family; completion signals an exportable semaphore whose
 sync fd is returned with `AImage_deleteAsync()`. The imported object retains
-the image, hardware buffer, Vulkan resources, and decoder output through the
-submission fence. Call `flush()` before seek, decoder/media replacement, or
+the image and decoder output through the submission fence. Vulkan image,
+memory, view, and YCbCr-conversion resources are cached by retained
+`AHardwareBuffer` identity and retired by the AImageReader buffer-removed
+callback; per-frame acquire/release semaphores remain synchronized with the
+individual image. Call `flush()` before seek, decoder/media replacement, or
 explicit stop to retire queued images and timestamp associations that have
 not entered a submission.
 
 `statistics()` exposes queue depth, import/fence counts, last native/Vulkan
-format, and decoded-source map/transfer/staging/upload counters. Unsupported
-or protected images fail explicitly. The implementation never calls
+format, decoded-source map/transfer/staging/upload counters, and persistent
+hardware-buffer import/cache-hit/removal/high-water counters. Unsupported or
+protected images fail explicitly. The implementation never calls
 `AHardwareBuffer_lock*()` and has no implicit software-frame fallback; decoder
 fallback and renderer/API fallback remain application policies.
 
@@ -788,10 +874,13 @@ Passing an empty `std::shared_ptr` removes the renderer for that key. The
 existing `setVideoRenderer()` callback remains available and is used when no
 `VideoRenderAPI` is registered for the requested key.
 
-State/status callbacks are normally invoked from the playback worker. Decoded
-audio/video frame notifications and `setRenderCallback()` run on a separate
-presentation worker, so a slow application redraw path cannot stall demux,
-decode, or device audio submission. The video presentation queue is bounded;
+State/status callbacks are normally invoked from the playback worker. The
+playback worker only demuxes selected packets; independent audio- and
+video-decode workers prevent codec work or output backpressure on one stream
+from starving packet delivery to the other. Decoded audio/video frame
+notifications and `setRenderCallback()` run on a separate presentation
+worker, so a slow application redraw path cannot stall demux, decode, or
+device audio submission. The video presentation queue is bounded;
 when the application falls behind, it preserves the imminent queued frame and
 discards an incoming farther-future frame instead of accumulating unbounded
 latency or repeatedly replacing the next presentable frame. `renderVideo()`
@@ -803,6 +892,15 @@ retry on a later redraw rather than block its native/UI thread. A/V startup
 and playing seeks use a bounded video preroll before releasing device audio,
 avoiding an audio-first clock sprint while the first video frames are still
 being decoded.
+
+`setVideoFrameScheduler()` is the earlier, opt-in hardware-presentation hook.
+It runs on the video-decode worker inside the bounded video decode window and
+receives a steady-clock target in nanoseconds. Returning `true` makes the
+application responsible for that exact frame and suppresses normal video
+delivery; returning `false` keeps the presentation-worker path. Use
+`playbackStatistics()` to distinguish decoded/delivered frames, bounded queue
+overflow drops, late drops, the video-queue high-water mark, and presentation
+queue starvation count/maximum duration.
 
 An accepted seek while playing changes the media status to `Buffering` and
 holds `position()` at the requested position until output really resumes. A
@@ -1502,20 +1600,19 @@ device, while `latencyMilliseconds` is informational and must not already be
 folded into that position. A sink that advertises a device clock becomes the
 playback master whenever `clock()` returns a valid value; otherwise the player
 falls back to its monotonic software clock. Ordinary sink writes and their
-clock samples run on the dedicated audio-output worker. Presentation may
-opportunistically refresh that sample only when the sink-call serialization
-lock is immediately available; a blocking backend write is never allowed to
-stall video scheduling. Repeated device samples are monotonically extrapolated,
-bounded by submitted audio, and published as a generation-checked cache, so
+clock samples run on the dedicated audio-output worker. When a playing seek or
+underrun recovery is waiting for the first valid post-flush timestamp, that
+same worker polls the sink until it becomes valid; presentation never calls the
+backend. A blocking backend write is therefore never allowed to stall video
+scheduling. Repeated device samples are monotonically extrapolated, bounded by
+submitted audio, and published as a generation-checked cache, so
 `Player::position()` never waits for a sink write or calls into a platform
 backend. Sink lifecycle and segment-end `drain()` run on the playback worker,
 serialized with writes and without the player mutex held; `drain()` may block
 until the backend queue is presented. Shutdown synchronizes the quitting
 predicate with each worker condition-variable mutex before notification so
 worker joins cannot lose the wake-up. On initial playback, a clock-capable sink
-whose first sample is invalid falls back after the first delivered buffer;
-playing seek and underrun recovery continue waiting for a valid post-flush
-device-clock sample.
+whose first sample is invalid falls back after the first delivered buffer.
 
 `HardwareDecodeConfig` is copied by `Player` and applied the next time the
 video decoder opens. Changing it while media is loaded interrupts the current
@@ -1608,7 +1705,10 @@ when a Windows session exposes no endpoint.
 
 ```text
 Player facade
-  ├─ async control + FFmpeg demux/decode worker
+  ├─ async control + FFmpeg demux worker
+  ├─ bounded compressed-packet queues
+  │    ├─ audio-decode worker
+  │    └─ video-decode worker
   ├─ bounded decoded-audio queue
   │    └─ audio-output worker + device-clock snapshots
   ├─ bounded timestamp-ordered presentation queue

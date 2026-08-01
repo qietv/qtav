@@ -18,6 +18,7 @@ enum class PixelFormat {
     ARGB,
     Gray8,
     Native,
+    YUV420P10,
 };
 
 enum class SampleFormat {

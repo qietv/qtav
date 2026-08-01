@@ -43,6 +43,12 @@ MediaCodecVulkanInteropStatistics {
     std::uint64_t releaseFenceFallbacks = 0;
     std::uint64_t staleImagesDropped = 0;
     std::uint64_t maximumPendingImages = 0;
+    // imagesImported counts frame imports. The following counters describe
+    // the persistent Vulkan image/memory/view cache keyed by AHardwareBuffer.
+    std::uint64_t hardwareBufferImports = 0;
+    std::uint64_t hardwareBufferImportCacheHits = 0;
+    std::uint64_t hardwareBufferImportsRemoved = 0;
+    std::uint64_t maximumCachedHardwareBufferImports = 0;
     std::uint64_t cpuMapCalls = 0;
     std::uint64_t softwareTransferCalls = 0;
     std::uint64_t stagingCopies = 0;
@@ -82,6 +88,11 @@ public:
     BorrowedVulkanDevice device() const noexcept override;
     HardwareInteropCapabilities capabilities() const override;
     bool supports(const HardwareFrame& frame) const noexcept override;
+    // Registers the frame/timestamp association, releases its MediaCodec
+    // output into the private AImageReader, and waits for at most 100 ms for
+    // the matching asynchronous image acquisition. The application may retain
+    // the VideoFrame and render it later at its playback deadline.
+    bool queueFrame(const VideoFrame& frame, std::string& detail);
     VulkanHardwareImportStatus prepareFrame(
         const VideoFrame& frame,
         std::string& detail) override;

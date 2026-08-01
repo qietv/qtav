@@ -146,5 +146,71 @@ int main(int argc, char** argv)
     assert(renderedFrames.load() == videoFrames.load() * 3);
     assert(rejectedRenderAttempts.load() == videoFrames.load());
     assert(player.state() == qtav::State::Stopped);
+
+    qtav::Player scheduledPlayer;
+    std::mutex scheduledMutex;
+    std::condition_variable scheduledFinished;
+    bool scheduledReachedEnd = false;
+    bool scheduledFailed = false;
+    std::atomic<int> scheduledFrames { 0 };
+    std::atomic<int> fallbackFrames { 0 };
+    scheduledPlayer
+        .onMediaStatus(
+            [&](qtav::MediaStatus, qtav::MediaStatus status) {
+                if (status == qtav::MediaStatus::EndOfMedia
+                    || status == qtav::MediaStatus::Invalid) {
+                    {
+                        std::lock_guard<std::mutex> scheduledLock(
+                            scheduledMutex);
+                        scheduledReachedEnd =
+                            status == qtav::MediaStatus::EndOfMedia;
+                        scheduledFailed =
+                            status == qtav::MediaStatus::Invalid;
+                    }
+                    scheduledFinished.notify_all();
+                }
+                return false;
+            })
+        .setVideoFrameScheduler(
+            [&](const qtav::VideoFrame& frame,
+                int,
+                std::int64_t monotonicNanoseconds) {
+                assert(frame);
+                assert(frame.width() == 160);
+                assert(frame.height() == 90);
+                assert(monotonicNanoseconds > 0);
+                ++scheduledFrames;
+                return true;
+            })
+        .onVideoFrame(
+            [&](const qtav::VideoFrame&, int) {
+                ++fallbackFrames;
+            });
+    scheduledPlayer.setPlaybackRate(4.0F);
+    scheduledPlayer.setMedia(argv[1]);
+    scheduledPlayer.setState(qtav::State::Playing);
+
+    std::unique_lock<std::mutex> scheduledLock(scheduledMutex);
+    const bool scheduledCompleted = scheduledFinished.wait_for(
+        scheduledLock,
+        std::chrono::seconds(10),
+        [&] { return scheduledReachedEnd || scheduledFailed; });
+    scheduledLock.unlock();
+
+    const qtav::PlaybackStatistics statistics =
+        scheduledPlayer.playbackStatistics();
+    assert(scheduledCompleted);
+    assert(!scheduledFailed);
+    assert(scheduledReachedEnd);
+    assert(scheduledFrames.load() >= 10);
+    assert(fallbackFrames.load() == 0);
+    assert(statistics.decodedVideoFrames
+        >= statistics.deliveredVideoFrames);
+    assert(statistics.deliveredVideoFrames
+        == static_cast<std::uint64_t>(scheduledFrames.load()));
+    assert(statistics.videoQueueOverflowDrops == 0);
+    assert(statistics.lateVideoDrops == 0);
+    assert(statistics.maximumQueuedVideoFrames == 0);
+    assert(scheduledPlayer.state() == qtav::State::Stopped);
     return 0;
 }
