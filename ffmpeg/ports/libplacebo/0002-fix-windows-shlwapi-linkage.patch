@@ -1,12 +1,13 @@
 diff --git a/src/meson.build b/src/meson.build
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -7,9 +7,14 @@ conf_internal.set('PL_HAVE_DBGHELP', dbghelp)
+@@ -7,9 +7,15 @@ conf_internal.set('PL_HAVE_DBGHELP', dbghelp)
  conf_internal.set('PL_HAVE_UNWIND', unwind.found())
  conf_internal.set('PL_HAVE_EXECINFO', has_execinfo)
  if dbghelp
 -  build_deps += cc.find_library('shlwapi', required: true)
 +  if cc.get_id() == 'msvc'
++    add_project_arguments('/experimental:c11atomics', language: 'c')
 +    # link.exe resolves Windows SDK import libraries through its LIB paths.
 +    build_deps += declare_dependency(link_args: 'shlwapi.lib')
 +  else
