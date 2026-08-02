@@ -21,7 +21,7 @@ jobs:
     runs-on: [self-hosted, macOS]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Initialize pinned vcpkg
         run: git submodule update --init ffmpeg/vcpkg
@@ -59,7 +59,7 @@ jobs:
           echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/vcpkg/archives
           key: vcpkg-android-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
@@ -68,7 +68,7 @@ jobs:
         run: ./ffmpeg/scripts/build-android.sh
 
       - name: Upload Android package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qtav-ffmpeg-arm64-android-24-static
           path: |
@@ -81,14 +81,14 @@ jobs:
     runs-on: [self-hosted, Windows]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Initialize pinned vcpkg
         shell: pwsh
         run: git submodule update --init ffmpeg/vcpkg
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/AppData/Local/vcpkg/archives
           key: vcpkg-windows-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
@@ -113,7 +113,7 @@ jobs:
           }
 
       - name: Upload Windows package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qtav-ffmpeg-x64-windows-static-md
           path: |
@@ -126,7 +126,7 @@ jobs:
     runs-on: [self-hosted, macOS]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Initialize pinned vcpkg
         run: git submodule update --init ffmpeg/vcpkg
@@ -149,7 +149,7 @@ jobs:
           fi
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/vcpkg/archives
           key: vcpkg-ohos-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
@@ -158,7 +158,7 @@ jobs:
         run: ./ffmpeg/scripts/build-ohos.sh
 
       - name: Upload OHOS package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qtav-ffmpeg-arm64-ohos-23-static
           path: |
