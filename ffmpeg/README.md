@@ -55,23 +55,37 @@ to add project-specific features.
 
 ## Android on macOS
 
-Install Android NDK r29 and export its path:
+Install Android NDK r29. The script automatically checks Android Studio's
+standard path (`$HOME/Library/Android/sdk/ndk/29.0.14206865`), so the normal
+local invocation is:
 
 ```sh
-export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/29.0.14206865"
 ./ffmpeg/scripts/build-android.sh
+```
+
+For a non-standard installation, pass the NDK root directly or set
+`ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT`:
+
+```sh
+./ffmpeg/scripts/build-android.sh /absolute/path/to/android-ndk
 ```
 
 ## OHOS on macOS
 
-Set the SDK directory that contains `native/`. A macOS-native `patchelf` is
-also required because vcpkg currently models the OHOS target as Linux during
-packaging.
+The script automatically checks `$HOME/Library/OpenHarmony/Sdk/23`. A
+macOS-native `patchelf` is also required because vcpkg currently models the
+OHOS target as Linux during packaging.
 
 ```sh
 brew install patchelf
-export OHOS_SDK_ROOT="$HOME/Library/OpenHarmony/Sdk/23"
 ./ffmpeg/scripts/build-ohos.sh
+```
+
+For a non-standard installation, pass the SDK root containing `native/`
+directly or set `OHOS_SDK_ROOT`:
+
+```sh
+./ffmpeg/scripts/build-ohos.sh /absolute/path/to/openharmony-sdk
 ```
 
 The OpenHarmony compiler target and CMake platform are fixed to OHOS API 23.
@@ -118,6 +132,10 @@ cmake -S modern -B build/modern-android \
 Use the corresponding OHOS or Windows triplet for those targets. The build
 scripts accept `QTAV_FFMPEG_INSTALL_ROOT` on macOS and `-InstallRoot` on
 Windows when a different artifact directory is needed.
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the subproject's layering,
+dependency graph, target model, and parent-project integration contract.
+Maintenance rules for agents and contributors are in [`AGENTS.md`](AGENTS.md).
 
 ## CI
 
