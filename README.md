@@ -13,6 +13,46 @@ core independently with `cmake -S modern -B build/modern`; it does not link Qt
 or require a Qt event loop. Platform claims later in this file describe the
 legacy root QtAV implementation, not QtAVCore.
 
+### Pinned FFmpeg dependencies
+
+QtAVCore builds must use FFmpeg and its dependency closure produced by this
+repository's [`ffmpeg/`](ffmpeg/ARCHITECTURE.md) vcpkg subproject, rather than
+a system/Homebrew or unrelated prebuilt target FFmpeg. The local mobile target
+prefixes and their GitHub Actions artifacts are:
+
+| Target | Local target prefix | Artifact |
+| --- | --- | --- |
+| Android arm64/API 24 | `ffmpeg/build/arm64-android-24-static/vcpkg_installed/arm64-android-24-static` | `qtav-ffmpeg-arm64-android-24-static` |
+| OHOS arm64/API 23 | `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static` | `qtav-ffmpeg-arm64-ohos-23-static` |
+
+If a local package is absent, build it on macOS with
+`ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh`. To download
+both packages from the latest successful `main` run instead:
+
+```sh
+run_id="$(gh run list \
+  --repo qietv/qtav \
+  --workflow ffmpeg-dependencies.yml \
+  --branch main \
+  --status success \
+  --limit 1 \
+  --json databaseId \
+  --jq '.[0].databaseId')"
+test -n "$run_id"
+
+gh run download "$run_id" \
+  --repo qietv/qtav \
+  --name qtav-ffmpeg-arm64-android-24-static \
+  --dir ffmpeg/build/arm64-android-24-static/vcpkg_installed
+gh run download "$run_id" \
+  --repo qietv/qtav \
+  --name qtav-ffmpeg-arm64-ohos-23-static \
+  --dir ffmpeg/build/arm64-ohos-23-static/vcpkg_installed
+```
+
+The same artifacts can be downloaded manually from the
+[FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml).
+
 
 **I'm not developing QtAV, patches are still welcome.** You can try my new [sdk](https://sourceforge.net/projects/mdk-sdk/files/nightly/) [which is actively developed](https://github.com/wang-bin/mdk-sdk)
 

@@ -29,6 +29,35 @@ macOS/iOS implementation is preserved under `archived_apple/` as unmaintained
 historical material and is not part of the active build, package, test, or
 support matrix. Linux is outside the active target matrix and roadmap.
 
+## FFmpeg dependency source
+
+Supported-target QtAVCore builds must consume FFmpeg and its transitive
+dependencies from this repository's `ffmpeg/` vcpkg subproject. Do not use a
+system/Homebrew FFmpeg or an independently downloaded target FFmpeg as a
+fallback. A host `ffmpeg` executable may be used only to generate test media.
+
+When locating an existing mobile package, check these target prefixes first:
+
+- Android arm64/API 24:
+  `ffmpeg/build/arm64-android-24-static/vcpkg_installed/arm64-android-24-static`
+- OHOS arm64/API 23:
+  `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static`
+
+Each prefix contains the target `include/`, `lib/`, and `share/` directories;
+the associated vcpkg status database is the sibling `vcpkg/` directory under
+`vcpkg_installed/`. If a local prefix is missing, either run
+`ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh` on macOS,
+or download the matching artifact from the latest successful `main` run of
+the [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml):
+
+- Android artifact: `qtav-ffmpeg-arm64-android-24-static`
+- OHOS artifact: `qtav-ffmpeg-arm64-ohos-23-static`
+
+Extract the artifact directly into the corresponding triplet's
+`vcpkg_installed/` directory so the target prefix and sibling status database
+retain the layout above. See the root README and `ffmpeg/ARCHITECTURE.md` for
+download commands and the complete consumption contract.
+
 ## Non-negotiable architecture rules
 
 - `modern/` must not include or link Qt.
