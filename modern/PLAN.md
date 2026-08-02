@@ -129,8 +129,9 @@ Continuation checkpoint:
   Windows x64/Visual Studio builds. Its FFmpeg 8.1.2 policy enables OpenSSL,
   libsmb2, Vulkan, libass, libplacebo, dav1d and native VVC decode while
   avoiding the unrelated desktop dependencies pulled by `ffmpeg[all]`; the
-  Android and OHOS dependency packages have been built and verified locally,
-  while Windows remains configured for Windows-native CI/validation;
+  Android, OHOS, and Windows dependency packages have been built, verified,
+  and uploaded by self-hosted CI; the Windows validation uses Visual Studio
+  18's clang-cl 22.1.3 with lld-link and preserves FFmpeg LTO;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
   FFmpeg 8 minimum; legacy build guidance remains unchanged;
 - Homebrew CMake 4.4.1 is installed at `/opt/homebrew/bin/cmake`;
