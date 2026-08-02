@@ -124,6 +124,13 @@ Continuation checkpoint:
   mapping the retired frame;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
+- `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
+  Android arm64/API 24 and OHOS arm64/API 12 cross-builds on macOS plus native
+  Windows x64/Visual Studio builds. Its FFmpeg 8.1.2 policy enables OpenSSL,
+  libsmb2, Vulkan, libass, libplacebo, dav1d and native VVC decode while
+  avoiding the unrelated desktop dependencies pulled by `ffmpeg[all]`; the
+  Android and OHOS dependency packages have been built and verified locally,
+  while Windows remains configured for Windows-native CI/validation;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
   FFmpeg 8 minimum; legacy build guidance remains unchanged;
 - Homebrew CMake 4.4.1 is installed at `/opt/homebrew/bin/cmake`;
@@ -1406,8 +1413,10 @@ Target clarification gate:
 
 ### Toolchain and application shell
 
-- [ ] Reproducible OHOS native build for QtAVCore and FFmpeg 8+,
-  initially targeting arm64.
+- [~] A reproducible OHOS arm64/API 12 FFmpeg 8+ dependency cross-build is
+  implemented and locally verified under `../ffmpeg/`; the QtAVCore target
+  build, CI execution on an SDK-equipped runner, and device validation remain
+  pending.
 - [~] Add the `modern/platform/ohos/` root; small shared helpers are still
   pending, and media, graphics, and audio implementations remain in their
   responsibility-specific backend targets.

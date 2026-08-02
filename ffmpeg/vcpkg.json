@@ -1,0 +1,27 @@
+{
+  "name": "qtavcore-ffmpeg-dependencies",
+  "version-string": "1.0.0",
+  "description": "Pinned FFmpeg 8 dependency closure for QtAVCore",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "ass",
+        "avcodec",
+        "avfilter",
+        "avformat",
+        "dav1d",
+        "gpl",
+        "libplacebo",
+        "libsmb2",
+        "openssl",
+        "qtav-player",
+        "swresample",
+        "swscale",
+        "version3",
+        "vulkan"
+      ]
+    }
+  ]
+}

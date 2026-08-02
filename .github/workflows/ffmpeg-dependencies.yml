@@ -1,0 +1,121 @@
+name: FFmpeg dependencies
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ohos:
+        description: Build OHOS on the self-hosted macOS arm64 runner
+        required: false
+        type: boolean
+        default: false
+  push:
+    paths:
+      - .github/workflows/ffmpeg-dependencies.yml
+      - ffmpeg/**
+  pull_request:
+    paths:
+      - .github/workflows/ffmpeg-dependencies.yml
+      - ffmpeg/**
+
+concurrency:
+  group: ffmpeg-dependencies-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android arm64 / API 24
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize pinned vcpkg
+        run: git submodule update --init ffmpeg/vcpkg
+
+      - name: Install Android NDK r29
+        run: |
+          sdkmanager "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-android-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
+
+      - name: Build and verify dependencies
+        run: ./ffmpeg/scripts/build-android.sh
+
+      - name: Upload Android package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtav-ffmpeg-arm64-android-24-static
+          path: |
+            ffmpeg/build/arm64-android-24-static/vcpkg_installed/arm64-android-24-static
+            ffmpeg/build/arm64-android-24-static/vcpkg_installed/vcpkg
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 / Visual Studio
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize pinned vcpkg
+        shell: pwsh
+        run: git submodule update --init ffmpeg/vcpkg
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-windows-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
+
+      - name: Build and verify dependencies
+        shell: pwsh
+        run: ./ffmpeg/scripts/build-windows.ps1
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtav-ffmpeg-x64-windows-static-md
+          path: |
+            ffmpeg/build/x64-windows-static-md/vcpkg_installed/x64-windows-static-md
+            ffmpeg/build/x64-windows-static-md/vcpkg_installed/vcpkg
+          if-no-files-found: error
+
+  ohos:
+    name: OHOS arm64 / API 12
+    if: github.event_name == 'workflow_dispatch' && inputs.build_ohos
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize pinned vcpkg
+        run: git submodule update --init ffmpeg/vcpkg
+
+      - name: Check OHOS host tools
+        run: |
+          test -n "$OHOS_SDK_ROOT"
+          test -f "$OHOS_SDK_ROOT/native/build/cmake/ohos.toolchain.cmake"
+          command -v patchelf
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-ohos-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
+
+      - name: Build and verify dependencies
+        run: ./ffmpeg/scripts/build-ohos.sh
+
+      - name: Upload OHOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtav-ffmpeg-arm64-ohos-12-static
+          path: |
+            ffmpeg/build/arm64-ohos-12-static/vcpkg_installed/arm64-ohos-12-static
+            ffmpeg/build/arm64-ohos-12-static/vcpkg_installed/vcpkg
+          if-no-files-found: error

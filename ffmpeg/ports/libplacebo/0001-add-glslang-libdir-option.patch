@@ -1,0 +1,86 @@
+diff --git a/meson_options.txt b/meson_options.txt
+index 1978088..7d4dfa8 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -20,5 +20,8 @@ option('glslang', type: 'feature', value: 'auto',
+        description: 'glslang SPIR-V compiler')
+ 
++option('glslang-libdir', type: 'string', value: '',
++       description: 'Explicit directory containing glslang static libraries')
++
+ option('shaderc', type: 'feature', value: 'auto',
+        description: 'libshaderc SPIR-V compiler')
+ 
+diff --git a/src/glsl/meson.build b/src/glsl/meson.build
+index f31f445..59a2a5d 100644
+--- a/src/glsl/meson.build
++++ b/src/glsl/meson.build
+@@ -16,8 +16,12 @@ if glslang_req.auto() and shaderc.found()
+ 
+ elif not glslang_req.disabled()
+ 
++  glslang_libdir = get_option('glslang-libdir')
++  glslang_dirs = glslang_libdir == '' ? [] : [glslang_libdir]
++
+   glslang_deps = [
+-    cxx.find_library('glslang-default-resource-limits', required: false)
++    cxx.find_library('glslang-default-resource-limits', required: false,
++                     dirs: glslang_dirs)
+   ]
+ 
+   # meson doesn't respect generator expressions in INTERFACE_LINK_LIBRARIES
+@@ -31,7 +35,8 @@ elif not glslang_req.disabled()
+     static   = arg[0]
+     required = arg[1]
+ 
+-    spirv = cxx.find_library('SPIRV', required: required, static: static)
++    spirv = cxx.find_library('SPIRV', required: required, static: static,
++                             dirs: glslang_dirs)
+ 
+     if not spirv.found()
+       continue
+@@ -42,17 +47,24 @@ elif not glslang_req.disabled()
+     # Glslang 15.0.0 moved some code around, add also linking to glslang, while
+     # this is not needed for older versions, it will still work.
+-    glslang_deps += cxx.find_library('glslang', required: required, static: static)
++    glslang_deps += cxx.find_library('glslang', required: required,
++                                     static: static, dirs: glslang_dirs)
+ 
+     if static
+       glslang_deps += [
+         # Always required for static linking
+-        cxx.find_library('MachineIndependent', required: false, static: true),
+-        cxx.find_library('OSDependent',        required: false, static: true),
+-        cxx.find_library('OGLCompiler',        required: false, static: true),
+-        cxx.find_library('GenericCodeGen',     required: false, static: true),
++        cxx.find_library('MachineIndependent', required: false, static: true,
++                         dirs: glslang_dirs),
++        cxx.find_library('OSDependent', required: false, static: true,
++                         dirs: glslang_dirs),
++        cxx.find_library('OGLCompiler', required: false, static: true,
++                         dirs: glslang_dirs),
++        cxx.find_library('GenericCodeGen', required: false, static: true,
++                         dirs: glslang_dirs),
+         # SPIRV-Tools are required only if optimizer is enabled in glslang build
+-        cxx.find_library('SPIRV-Tools',        required: false, static: true),
+-        cxx.find_library('SPIRV-Tools-opt',    required: false, static: true),
++        cxx.find_library('SPIRV-Tools', required: false, static: true,
++                         dirs: glslang_dirs),
++        cxx.find_library('SPIRV-Tools-opt', required: false, static: true,
++                         dirs: glslang_dirs),
+       ]
+     endif
+ 
+diff --git a/src/vulkan/utils_gen.py b/src/vulkan/utils_gen.py
+index aac84d3..64d76f5 100755
+--- a/src/vulkan/utils_gen.py
++++ b/src/vulkan/utils_gen.py
+@@ -202,7 +202,7 @@ if __name__ == '__main__':
+     if not xmlfile or xmlfile == '':
+         xmlfile = find_registry_xml(datadir)
+ 
+-    registry = VkXML(ET.parse(xmlfile))
++    registry = VkXML(ET.parse(xmlfile).getroot())
+     with open(outfile, 'w') as f:
+         f.write(TEMPLATE.render(
+             vkresults = get_vkenum(registry, 'VkResult'),

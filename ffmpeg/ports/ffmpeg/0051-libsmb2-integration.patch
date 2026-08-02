@@ -1,0 +1,77 @@
+diff --git a/configure b/configure
+index d518099..6de6784 100755
+--- a/configure
++++ b/configure
+@@ -274,7 +274,8 @@ External library support:
+   --enable-librubberband   enable rubberband needed for rubberband filter [no]
+   --enable-librtmp         enable RTMP[E] support via librtmp [no]
++  --enable-libsmb2         enable SMB2/SMB3 protocol via libsmb2 [no]
+   --enable-libshaderc      enable runtime GLSL->SPIRV compilation via libshaderc [no]
+   --enable-libshine        enable fixed-point MP3 encoding via libshine [no]
+   --enable-libsmbclient    enable Samba protocol via libsmbclient [no]
+   --enable-libsnappy       enable Snappy compression, needed for hap encoding [no]
+   --enable-libsoxr         enable Include libsoxr resampling [no]
+@@ -2090,7 +2091,8 @@ EXTERNAL_LIBRARY_LIST="
+     librsvg
+     librtmp
+     libshaderc
+     libshine
++    libsmb2
+     libsmbclient
+     libsnappy
+     libsoxr
+@@ -4112,6 +4114,7 @@ ipfs_gateway_protocol_select="https_protocol"
+ ipns_gateway_protocol_select="https_protocol"
+ 
+ # external library protocols
++libsmb2_protocol_deps="libsmb2"
+ libamqp_protocol_deps="librabbitmq"
+ libamqp_protocol_select="network"
+ librist_protocol_deps="librist"
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 2f85e8a..a3b84b3 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -741,6 +741,7 @@ OBJS-$(CONFIG_LIBRTMPE_PROTOCOL)         += librtmp.o
+ OBJS-$(CONFIG_LIBRTMPS_PROTOCOL)         += librtmp.o
+ OBJS-$(CONFIG_LIBRTMPT_PROTOCOL)         += librtmp.o
+ OBJS-$(CONFIG_LIBRTMPTE_PROTOCOL)        += librtmp.o
++OBJS-$(CONFIG_LIBSMB2_PROTOCOL)          += libsmb2.o libsmb2url.o
+ OBJS-$(CONFIG_LIBSMBCLIENT_PROTOCOL)     += libsmbclient.o
+ OBJS-$(CONFIG_LIBSRT_PROTOCOL)           += libsrt.o
+ OBJS-$(CONFIG_LIBSSH_PROTOCOL)           += libssh.o
+@@ -790,6 +791,7 @@ TESTPROGS-$(CONFIG_FIFO_MUXER)           += $(FIFO-MUXER-TESTPROGS-yes)
+ TESTPROGS-$(CONFIG_FFRTMPCRYPT_PROTOCOL) += rtmpdh
+ TESTPROGS-$(CONFIG_MOV_MUXER)            += movenc
+ TESTPROGS-$(CONFIG_NETWORK)              += noproxy
++TESTPROGS-$(CONFIG_LIBSMB2_PROTOCOL)     += libsmb2url
+ TESTPROGS-$(CONFIG_SRTP)                 += srtp
+ TESTPROGS-$(CONFIG_IMF_DEMUXER)          += imf
+ 
+diff --git a/libavformat/protocols.c b/libavformat/protocols.c
+index 257b419..22909f0 100644
+--- a/libavformat/protocols.c
++++ b/libavformat/protocols.c
+@@ -73,6 +73,7 @@ extern const URLProtocol ff_librtmpe_protocol;
+ extern const URLProtocol ff_librtmps_protocol;
+ extern const URLProtocol ff_librtmpt_protocol;
+ extern const URLProtocol ff_librtmpte_protocol;
++extern const URLProtocol ff_libsmb2_protocol;
+ extern const URLProtocol ff_libsrt_protocol;
+ extern const URLProtocol ff_libssh_protocol;
+ extern const URLProtocol ff_libsmbclient_protocol;
+diff --git a/tests/fate/libavformat.mak b/tests/fate/libavformat.mak
+index 989515a..a829c30 100644
+--- a/tests/fate/libavformat.mak
++++ b/tests/fate/libavformat.mak
+@@ -11,6 +11,10 @@ FATE_LIBAVFORMAT-$(CONFIG_NETWORK) += fate-noproxy
+ fate-noproxy: libavformat/tests/noproxy$(EXESUF)
+ fate-noproxy: CMD = run libavformat/tests/noproxy$(EXESUF)
+ 
++FATE_LIBAVFORMAT-$(CONFIG_LIBSMB2_PROTOCOL) += fate-libsmb2url
++fate-libsmb2url: libavformat/tests/libsmb2url$(EXESUF)
++fate-libsmb2url: CMD = run libavformat/tests/libsmb2url$(EXESUF)
++
+ FATE_LIBAVFORMAT-$(CONFIG_FFRTMPCRYPT_PROTOCOL) += fate-rtmpdh
+ fate-rtmpdh: libavformat/tests/rtmpdh$(EXESUF)
+ fate-rtmpdh: CMD = run libavformat/tests/rtmpdh$(EXESUF)

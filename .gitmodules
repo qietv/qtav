@@ -10,3 +10,6 @@
 [submodule "src/jmi"]
 	path = src/jmi
 	url = https://github.com/wang-bin/JMI.git
+[submodule "ffmpeg/vcpkg"]
+	path = ffmpeg/vcpkg
+	url = https://github.com/microsoft/vcpkg.git

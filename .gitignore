@@ -16,6 +16,8 @@ contrib/include
 !/.editorconfig
 !/.github
 !/.gitmodules
+!/ffmpeg/.gitignore
+!/ffmpeg/ports/**/*.patch
 !/.qmake.conf
 !/.travis.yml
 !/modern/examples/winui3_player/.gitignore
