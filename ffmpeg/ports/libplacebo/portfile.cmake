@@ -6,6 +6,7 @@ vcpkg_from_git(
     HEAD_REF master
     PATCHES
         0001-add-glslang-libdir-option.patch
+        0002-fix-windows-shlwapi-linkage.patch
 )
 
 x_vcpkg_get_python_packages(

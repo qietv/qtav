@@ -1,0 +1,16 @@
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -7,9 +7,11 @@ conf_internal.set('PL_HAVE_DBGHELP', dbghelp)
+ conf_internal.set('PL_HAVE_UNWIND', unwind.found())
+ conf_internal.set('PL_HAVE_EXECINFO', has_execinfo)
+ if dbghelp
+-  build_deps += cc.find_library('shlwapi', required: true)
++  # shlwapi is a Windows DLL even when libplacebo itself is built statically.
++  # Force Meson to accept the Windows SDK import library in static builds.
++  build_deps += cc.find_library('shlwapi', required: true, static: false)
+ elif unwind.found()
+   build_deps += [unwind, cc.find_library('dl', required : false)]
+ elif has_execinfo
+   build_deps += libexecinfo
+ endif
