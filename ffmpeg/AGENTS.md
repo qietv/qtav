@@ -92,6 +92,9 @@ an alternate package location is required.
   compatibility for the `msvc:lld-link` pair.
 - Never reuse one target's install tree, pkg-config path, or binary cache as a
   different target's installed prefix.
+- Fixed self-hosted runners rely on vcpkg's persistent local binary cache. Do
+  not add `actions/cache` for the whole archive directory unless the runners
+  become ephemeral and measurements show that remote transfer is beneficial.
 
 ## Overlay ownership
 

@@ -177,3 +177,11 @@ The root GitHub Actions workflow runs automatically for changes to
 Windows uses a self-hosted Visual Studio runner. Successful target prefixes
 and the vcpkg status database are uploaded as artifacts for parent-project
 builds and inspection.
+
+These fixed self-hosted runners retain vcpkg's default local binary archive
+directory between jobs. CI intentionally does not use `actions/cache` for that
+directory: restoring and uploading the complete archive duplicates persistent
+runner storage and can transfer roughly a gigabyte even when very little was
+rebuilt. If the runners become ephemeral, reevaluate this policy using measured
+transfer and build times, preferably with an incremental vcpkg binary source
+instead of archiving the entire shared cache.

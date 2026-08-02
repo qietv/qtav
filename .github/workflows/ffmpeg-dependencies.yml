@@ -58,12 +58,6 @@ jobs:
           echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
 
-      - name: Restore vcpkg binary cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/vcpkg/archives
-          key: vcpkg-android-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
-
       - name: Build and verify dependencies
         run: ./ffmpeg/scripts/build-android.sh
 
@@ -86,12 +80,6 @@ jobs:
       - name: Initialize pinned vcpkg
         shell: pwsh
         run: git submodule update --init ffmpeg/vcpkg
-
-      - name: Restore vcpkg binary cache
-        uses: actions/cache@v6
-        with:
-          path: ~/AppData/Local/vcpkg/archives
-          key: vcpkg-windows-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
 
       - name: Build and verify dependencies
         shell: pwsh
@@ -147,12 +135,6 @@ jobs:
             echo "::error::macOS-native patchelf is required; install it with: brew install patchelf"
             exit 1
           fi
-
-      - name: Restore vcpkg binary cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/vcpkg/archives
-          key: vcpkg-ohos-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
 
       - name: Build and verify dependencies
         run: ./ffmpeg/scripts/build-ohos.sh
