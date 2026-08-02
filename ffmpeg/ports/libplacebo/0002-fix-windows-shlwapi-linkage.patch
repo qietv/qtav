@@ -18,3 +18,15 @@ diff --git a/src/meson.build b/src/meson.build
  elif has_execinfo
    build_deps += libexecinfo
  endif
+@@ -46,6 +52,10 @@ int main(void) {
+   atomic_init(&x32, 0);
+ }'''
+ 
+-if not cc.links(atomic_test)
++atomic_args = []
++if cc.get_id() == 'msvc'
++  atomic_args += ['/experimental:c11atomics']
++endif
++if not cc.links(atomic_test, args: atomic_args)
+   build_deps += cc.find_library('atomic')
+ endif
