@@ -27,7 +27,9 @@ prefixes and their GitHub Actions artifacts are:
 
 If a local package is absent, build it on macOS with
 `ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh`. To download
-both packages from the latest successful `main` run instead:
+both packages from the latest successful completed `main` run instead, query
+Actions at download time as shown below. Do not hardcode a run ID, commit SHA,
+or artifact URL:
 
 ```sh
 run_id="$(gh run list \

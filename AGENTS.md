@@ -53,6 +53,10 @@ the [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflo
 - Android artifact: `qtav-ffmpeg-arm64-android-24-static`
 - OHOS artifact: `qtav-ffmpeg-arm64-ohos-23-static`
 
+Resolve the workflow run at download time and select the newest successful
+completed `main` run. Never pin or reuse a run ID, commit SHA, artifact URL, or
+an older successful run when a newer successful build is available.
+
 Extract the artifact directly into the corresponding triplet's
 `vcpkg_installed/` directory so the target prefix and sibling status database
 retain the layout above. See the root README and `ffmpeg/ARCHITECTURE.md` for
