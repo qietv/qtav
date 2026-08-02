@@ -103,6 +103,21 @@ jobs:
         shell: pwsh
         run: ./ffmpeg/scripts/build-windows.ps1
 
+      - name: Print Windows compiler probe logs
+        if: failure()
+        shell: pwsh
+        run: |
+          $logRoot = 'ffmpeg/vcpkg/buildtrees/detect_compiler'
+          if (Test-Path $logRoot) {
+            Get-ChildItem $logRoot -File -Filter '*.log' |
+              Sort-Object Name |
+              ForEach-Object {
+                Write-Host "::group::$($_.Name)"
+                Get-Content -LiteralPath $_.FullName
+                Write-Host '::endgroup::'
+              }
+          }
+
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
