@@ -8,11 +8,19 @@ The UI contains:
 
 - a `SurfaceView` video area;
 - current time, seek slider, and total duration;
-- local-file, remote-URL, play/pause, and stop controls;
-- live Vulkan, HDR, ZeroCopy, hardware-decode, and Vulkan debug-layer
-  switches, with rendering controls on the first row and ZeroCopy/hardware
-  decode on a separate second row so every switch remains touchable;
-- a status line showing the active native path or the exact failure.
+- local-file, remote-URL, play/pause, stop, and full-screen controls;
+- live Vulkan, HDR, ZeroCopy, hardware-decode, and Debug switches, with
+  rendering controls on the first row and ZeroCopy/hardware decode on a
+  separate second row so every switch remains touchable;
+- a Debug-controlled top-left status window showing the active native path,
+  current presentation FPS, or the exact failure.
+
+The full-screen button or a rotation into landscape moves the complete control
+panel onto the bottom of the video. It remains visible for five seconds after
+the last touch and then disappears without hiding the independent Debug
+window. Tap the video once to reveal the controls again; that reveal gesture
+does not activate a newly exposed button. Rotating back to portrait exits
+full-screen mode.
 
 ## Build
 
@@ -85,12 +93,19 @@ Hardware decode is enabled and ZeroCopy is disabled by default, selecting
 MediaCodec direct-Surface presentation. On the connected 4K test device this
 path keeps every player callback (`callbacks/presented N/N`); enable ZeroCopy
 explicitly when testing GPU texture interop or application-side video
-processing. While direct-Surface presentation is selected, the Vulkan, HDR,
-and debug-layer controls are disabled because no application renderer exists;
-Android controls the surface color/HDR presentation.
+processing. While direct-Surface presentation is selected, changing the
+Vulkan switch only preserves the renderer preference for the next
+application-rendered path: enabled selects Vulkan and disabled selects OpenGL
+ES. The Debug control remains available because it only shows or hides the
+top-left diagnostics. HDR remains independent: MediaCodec/Android supplies
+the decoded HDR surface and, on Android 15 or newer, the switch controls that
+`SurfaceView` layer's desired HDR headroom directly. This headroom request
+does not convert MediaCodec's direct-Surface PQ/HLG buffers to SDR.
 
-Changing an option preserves the current position, rebuilds the affected
-decoder/renderer resources, and resumes only if playback was active.
+Changing an option that affects the active path preserves the current
+position, rebuilds the affected decoder/renderer resources, and resumes only
+if playback was active. Renderer preferences changed while direct-Surface
+presentation is active are retained without interrupting playback.
 
 All non-direct video rendering runs on one native render thread. The player
 hands MediaCodec frames to the application inside the bounded decode window,
@@ -108,7 +123,16 @@ render deadline. Renderer `RedrawRequested` events are routed back to the
 native render thread. A pending frame older than the 250 ms timestamp
 correlation window is retired instead of being presented in a recovery burst.
 
-The status line reports application callbacks/presented, render-queue drops,
+The Debug switch shows or hides the top-left status window without rebuilding
+the playback pipeline. Its first lines report the actual Vulkan swapchain or
+EGL surface color space; direct-Surface mode instead reports the color metadata
+of the buffer being passed through MediaCodec because Android's public
+`ANativeWindow` getter does not expose the producer's final per-buffer
+dataspace. They also report the effective HDR-switch policy, Android's current
+HDR/SDR headroom ratio when available, and the display's desired maximum HDR
+content luminance. The remaining status reports application
+callbacks/presented, the rolling rate of successful application presents
+(`present fps`), render-queue drops,
 core decoded/delivered, queue/late drops, maximum queue depth, presentation
 starvations/maximum starvation time, render timing, AHardwareBuffer cache
 imports/hits, and interop queued/acquired/imported/stale counts. During active
@@ -125,25 +149,39 @@ mode; the status line reports the source-rate hint and requested display
 target. Playback has no per-frame application logcat output; normal logging is
 limited to setup, first presentation, and errors.
 
-`HDR` selects `PreferHdr`; disabling it selects deterministic SDR output.
-The status line reports whether the actual Vulkan/EGL surface is HDR or SDR.
-In direct-Surface mode Android/MediaCodec owns composition, so the application
-renderer selection and explicit HDR output switch are inactive. Disable
-hardware decode or enable ZeroCopy to activate those renderer controls.
+`HDR` selects `PreferHdr`; disabling it selects deterministic SDR output on an
+application renderer. The status line reports whether the actual Vulkan/EGL
+surface is HDR or SDR. In direct-Surface mode Android/MediaCodec owns the
+decoded surface, so the Vulkan/OpenGL selection does not affect current frames,
+but it remains selectable for the next application-rendered path. HDR remains
+available. On Android 15 or newer, enabling HDR lets Android choose suitable
+headroom for the `SurfaceView`; disabling it requests no headroom above SDR
+white. Neither request retags or tone maps direct MediaCodec output, so a PQ
+source can remain a BT.2020/PQ HDR compositor layer with this switch disabled;
+the Debug window labels this behavior as codec dataspace passthrough. Earlier
+Android releases still pass through direct-surface HDR automatically but do
+not expose this per-`SurfaceView` headroom control.
 
-`Debug layer` is an exact Vulkan validation request. It enables
-`VK_LAYER_KHRONOS_validation` plus `VK_EXT_debug_utils` and sends validation
-messages to the `QtAVCorePlayer` logcat tag. If the device has no validation
-layer installed or enabled, pipeline creation fails visibly; turn the switch
-off to continue. It is inactive on the OpenGL ES path.
+`present fps` is measured from successful direct-Surface releases or successful
+application-renderer presents over a rolling wall-clock window. It is distinct
+from the inferred source `rate hint` and Android's requested `display target`;
+it falls to `0.0` when presentation stops.
 
-The OpenGL ES MediaCodec ZeroCopy path keeps HDR external-OES source sampling
-disabled because that capability requires separate device/codec/driver color
-validation. HDR output selection still applies to supported sources and the
-software path. If a P010/HDR source reaches this guarded path, the demo stops
-retrying the rejected frame, switches ZeroCopy off, and resumes at the same
-position through MediaCodec direct-Surface presentation instead of leaving a
-black surface.
+The OpenGL ES MediaCodec ZeroCopy path probes HDR external-OES source sampling
+natively on the first P010/HDR image. It requires the external-YUV GL
+extensions plus Android 13+ SurfaceTexture dataspace reporting that matches
+the decoded BT.2020/PQ or BT.2020/HLG frame. A successful result is cached for
+that interop instance and reported in the status line. If the device path does
+not pass the probe, the demo stops retrying the rejected frame, switches
+ZeroCopy off, and resumes at the same position through MediaCodec
+direct-Surface presentation instead of leaving a black surface.
+The external-OES SurfaceTexture matrix is converted to the renderer's
+top-left source-coordinate convention, so OpenGL ES and Vulkan present the
+same picture orientation in portrait and after an EGL surface resize.
+For SDR output, the renderer also detects the Android EGL window's sRGB
+framebuffer encoding and leaves the final linear-to-sRGB conversion to GL.
+This prevents the HDR-off OpenGL ES path from applying sRGB encoding twice and
+lifting midtones compared with Vulkan.
 
 SurfaceTexture cannot distinguish a legitimate zero presentation timestamp
 from its initial no-image timestamp. That path therefore drops only a
@@ -218,13 +256,14 @@ background/foreground Surface recreation:
 4. hardware decode + ZeroCopy + Vulkan;
 5. hardware decode + ZeroCopy + OpenGL ES;
 6. hardware decode + ZeroCopy off (direct Surface);
-7. Vulkan debug layer off;
-8. Vulkan debug layer on, either with validation messages or the documented
-   unavailable-layer error followed by a successful off-state recovery.
+7. Debug off hides the top-left status window without interrupting playback;
+8. Debug on restores the status window and reports a stable `present fps`;
+9. the full-screen button and landscape rotation both overlay the controls,
+   auto-hide them after five seconds, and leave Debug visible.
 
 Also open one file through the Storage Access Framework and one remote file
 through both HTTP and HTTPS where test hosting permits. Treat unsupported
-device HDR/validation/codec capabilities as explicit unavailable results, not
+device HDR/codec capabilities as explicit unavailable results, not
 as successful coverage. For long-form 4K Vulkan ZeroCopy playback, let the
 sample run for at least one minute and verify core queue/late drops `0/0`, zero
 render-queue drops, equal interop queued/acquired counts, and no unbounded

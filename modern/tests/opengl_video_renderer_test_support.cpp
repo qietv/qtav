@@ -174,6 +174,95 @@ bool containsVisiblePixel(const std::vector<Pixel>& pixels) noexcept
         > 16;
 }
 
+bool pixelsClose(
+    const std::vector<Pixel>& left,
+    const std::vector<Pixel>& right,
+    int tolerance = 2) noexcept
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+    return std::equal(
+        left.begin(),
+        left.end(),
+        right.begin(),
+        [tolerance](const Pixel& first, const Pixel& second) {
+            return std::abs(
+                       static_cast<int>(first.red)
+                       - static_cast<int>(second.red))
+                    <= tolerance
+                && std::abs(
+                       static_cast<int>(first.green)
+                       - static_cast<int>(second.green))
+                    <= tolerance
+                && std::abs(
+                       static_cast<int>(first.blue)
+                       - static_cast<int>(second.blue))
+                    <= tolerance
+                && std::abs(
+                       static_cast<int>(first.alpha)
+                       - static_cast<int>(second.alpha))
+                    <= tolerance;
+        });
+}
+
+class SrgbFramebuffer {
+public:
+    ~SrgbFramebuffer()
+    {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (framebuffer_ != 0) {
+            glDeleteFramebuffers(1, &framebuffer_);
+        }
+        if (texture_ != 0) {
+            glDeleteTextures(1, &texture_);
+        }
+    }
+
+    bool create(int width, int height, std::string& error)
+    {
+        glGenTextures(1, &texture_);
+        glBindTexture(GL_TEXTURE_2D, texture_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_SRGB8_ALPHA8,
+            width,
+            height,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            nullptr);
+        glGenFramebuffers(1, &framebuffer_);
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            texture_,
+            0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                != GL_FRAMEBUFFER_COMPLETE
+            || glGetError() != GL_NO_ERROR) {
+            error = "The OpenGL ES sRGB test framebuffer is unavailable";
+            return false;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return true;
+    }
+
+    GLuint handle() const noexcept
+    {
+        return framebuffer_;
+    }
+
+private:
+    GLuint framebuffer_ = 0;
+    GLuint texture_ = 0;
+};
+
 double pqSignalForNits(double nits) noexcept
 {
     constexpr double M1 = 2610.0 / 16384.0;
@@ -338,11 +427,12 @@ bool runOpenGLOffscreenRendererChecks(
     }
 
     std::uint64_t generation = 1;
+    GLuint framebuffer = 0;
     OpenGLOutputColorSpace outputColorSpace =
         OpenGLOutputColorSpace::SdrSrgb;
     OpenGLVideoRenderer renderer([&] {
         return OpenGLRenderTarget {
-            0,
+            framebuffer,
             context.size(),
             generation,
             outputColorSpace,
@@ -478,6 +568,30 @@ bool runOpenGLOffscreenRendererChecks(
         }
         renderer.close();
         return false;
+    }
+
+    const std::vector<Pixel> explicitSrgbPixels = pixels;
+    {
+        SrgbFramebuffer srgbFramebuffer;
+        if (!srgbFramebuffer.create(Width, Height, error)) {
+            renderer.close();
+            return false;
+        }
+        framebuffer = srgbFramebuffer.handle();
+        ++generation;
+        if (!renderer.render(hdrFrame)
+            || !readPixels(context.size(), pixels, error)
+            || !pixelsClose(explicitSrgbPixels, pixels)) {
+            if (error.empty()) {
+                error =
+                    "The OpenGL ES sRGB framebuffer encoded SDR output twice";
+            }
+            framebuffer = 0;
+            renderer.close();
+            return false;
+        }
+        framebuffer = 0;
+        ++generation;
     }
 
     const auto validateHdrOutput =

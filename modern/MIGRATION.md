@@ -340,7 +340,12 @@ frame. Android Vulkan now uses private GPU-sampled
 `AImageReader`/`AHardwareBuffer` import; Android GLES now uses a detached
 `SurfaceTexture` with timestamp/generation correlation and
 `GL_TEXTURE_EXTERNAL_OES`. Its SDR 8-bit path is enabled, while P010/HDR
-sampling remains capability-gated behind explicit application confirmation.
+sampling is accepted automatically only after native GL-extension checks and
+Android 13+ reports a dataspace matching the exact latched HDR image. The
+explicit trust override remains available for independently validated paths.
+The SurfaceTexture matrix is normalized from conventional OpenGL coordinates
+to QtAV's top-left source convention without discarding producer crop, scale,
+or rotation, keeping its picture orientation consistent with Vulkan.
 Both Android presentation adapters also treat a republished identical
 `ANativeWindow` with changed buffer geometry as a resize and refresh their
 swapchain/EGL target without reopening the decoder.

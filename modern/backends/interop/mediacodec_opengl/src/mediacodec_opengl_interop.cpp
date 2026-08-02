@@ -4,6 +4,7 @@
 
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
+#include <android/data_space.h>
 #include <android/surface_texture.h>
 #include <android/surface_texture_jni.h>
 
@@ -134,6 +135,11 @@ struct AtomicStatistics {
     std::atomic<std::uint64_t> maximumPendingFrames { 0 };
     std::atomic<std::int64_t> lastTimestampNanoseconds { 0 };
     std::atomic<std::uint32_t> textureName { 0 };
+    std::atomic<int> hdrSamplingStatus {
+        static_cast<int>(
+            MediaCodecOpenGLHdrSamplingStatus::Disabled)
+    };
+    std::atomic<std::int32_t> lastDataSpace { ADATASPACE_UNKNOWN };
 };
 
 void updateMaximum(
@@ -146,6 +152,22 @@ void updateMaximum(
                current,
                value,
                std::memory_order_relaxed)) {
+    }
+}
+
+void convertSurfaceTextureTransformToTopLeft(
+    std::array<float, 16>& transform) noexcept
+{
+    // SurfaceTexture's matrix expects the conventional OpenGL texture
+    // coordinate origin. QtAV renderers use the same top-left source
+    // coordinate convention as Vulkan and software video frames. Compose a
+    // vertical origin conversion on the input side (M * flipY), preserving
+    // any crop, scale, or producer rotation already present in M.
+    const std::array<float, 16> original = transform;
+    for (std::size_t row = 0; row < 4; ++row) {
+        transform[4 + row] = -original[4 + row];
+        transform[12 + row] =
+            original[4 + row] + original[12 + row];
     }
 }
 
@@ -166,6 +188,12 @@ public:
             16);
         config_.width = std::max(1, config_.width);
         config_.height = std::max(1, config_.height);
+        setHdrSamplingStatus(
+            config_.hdrExternalOesSamplingEnabled
+                ? MediaCodecOpenGLHdrSamplingStatus::Supported
+                : config_.autoDetectHdrExternalOesSampling
+                    ? MediaCodecOpenGLHdrSamplingStatus::Unchecked
+                    : MediaCodecOpenGLHdrSamplingStatus::Disabled);
         initialize();
     }
 
@@ -238,6 +266,16 @@ public:
                 "The Android SurfaceTexture detached constructor or buffer-size API is unavailable";
             return;
         }
+        if (!config_.hdrExternalOesSamplingEnabled
+            && config_.autoDetectHdrExternalOesSampling) {
+            getDataSpace_ =
+                env->GetMethodID(type, "getDataSpace", "()I");
+            if (!getDataSpace_ || clearJavaException(env)) {
+                getDataSpace_ = nullptr;
+                setHdrSamplingStatus(
+                    MediaCodecOpenGLHdrSamplingStatus::Unsupported);
+            }
+        }
         jobject local =
             env->NewObject(type, constructor, JNI_FALSE);
         if (!local || clearJavaException(env)) {
@@ -298,6 +336,118 @@ public:
         valid_ = true;
         retryWorker_ =
             std::thread([this] { retryLoop(); });
+    }
+
+    MediaCodecOpenGLHdrSamplingStatus hdrSamplingStatus() const noexcept
+    {
+        return static_cast<MediaCodecOpenGLHdrSamplingStatus>(
+            statistics_.hdrSamplingStatus.load(
+                std::memory_order_relaxed));
+    }
+
+    void setHdrSamplingStatus(
+        MediaCodecOpenGLHdrSamplingStatus status) noexcept
+    {
+        statistics_.hdrSamplingStatus.store(
+            static_cast<int>(status),
+            std::memory_order_relaxed);
+    }
+
+    bool mayAttemptHdrSampling() const noexcept
+    {
+        const MediaCodecOpenGLHdrSamplingStatus status =
+            hdrSamplingStatus();
+        return status == MediaCodecOpenGLHdrSamplingStatus::Unchecked
+            || status == MediaCodecOpenGLHdrSamplingStatus::Supported;
+    }
+
+    bool validateHdrSamplingContext(std::string& detail) noexcept
+    {
+        const MediaCodecOpenGLHdrSamplingStatus status =
+            hdrSamplingStatus();
+        if (status == MediaCodecOpenGLHdrSamplingStatus::Supported) {
+            return true;
+        }
+        if (status != MediaCodecOpenGLHdrSamplingStatus::Unchecked) {
+            detail =
+                "P010/HDR SurfaceTexture sampling is unavailable because "
+                "native automatic capability detection is disabled or unsupported";
+            return false;
+        }
+        if (!getDataSpace_) {
+            setHdrSamplingStatus(
+                MediaCodecOpenGLHdrSamplingStatus::Unsupported);
+            detail =
+                "P010/HDR SurfaceTexture sampling requires Android 13 "
+                "SurfaceTexture dataspace reporting";
+            return false;
+        }
+        if (!hasExtension("GL_OES_EGL_image_external_essl3")
+            || !hasExtension("GL_EXT_YUV_target")) {
+            setHdrSamplingStatus(
+                MediaCodecOpenGLHdrSamplingStatus::Unsupported);
+            detail =
+                "P010/HDR SurfaceTexture sampling requires "
+                "GL_OES_EGL_image_external_essl3 and GL_EXT_YUV_target";
+            return false;
+        }
+        return true;
+    }
+
+    bool currentDataSpace(std::int32_t& dataSpace) noexcept
+    {
+        if (!getDataSpace_ || !surfaceTextureObject_) {
+            return false;
+        }
+        ScopedJNIEnv scoped(config_.javaVM);
+        JNIEnv* env = scoped.get();
+        if (!env) {
+            return false;
+        }
+        const jint value = env->CallIntMethod(
+            surfaceTextureObject_,
+            getDataSpace_);
+        if (clearJavaException(env)) {
+            return false;
+        }
+        dataSpace = static_cast<std::int32_t>(value);
+        statistics_.lastDataSpace.store(
+            dataSpace,
+            std::memory_order_relaxed);
+        return true;
+    }
+
+    bool dataSpaceMatchesFrame(
+        const VideoFrame& frame,
+        std::int32_t dataSpace) const noexcept
+    {
+        if (dataSpace == ADATASPACE_UNKNOWN) {
+            return false;
+        }
+        const std::int32_t standard =
+            dataSpace & ADATASPACE_STANDARD_MASK;
+        const std::int32_t transfer =
+            dataSpace & ADATASPACE_TRANSFER_MASK;
+        const VideoColorSpace color = frame.colorSpaceInfo();
+        if (color.primaries == ColorPrimaries::BT2020
+            && standard != ADATASPACE_STANDARD_BT2020
+            && standard
+                != ADATASPACE_STANDARD_BT2020_CONSTANT_LUMINANCE) {
+            return false;
+        }
+        if (color.transfer == ColorTransfer::PQ) {
+            return transfer == ADATASPACE_TRANSFER_ST2084;
+        }
+        if (color.transfer == ColorTransfer::HLG) {
+            return transfer == ADATASPACE_TRANSFER_HLG;
+        }
+        // P010 can carry SDR or incomplete container metadata. In that case a
+        // concrete SurfaceTexture dataspace still proves that Android and the
+        // codec preserved the information needed by the external sampler.
+        return frame.hardwareFrame().softwareFormat()
+                == PixelFormat::P010
+            && standard != ADATASPACE_STANDARD_UNSPECIFIED
+            && transfer != ADATASPACE_TRANSFER_UNSPECIFIED;
     }
 
     void stopRetryWorker() noexcept
@@ -460,7 +610,7 @@ public:
             return false;
         }
         if (frame.softwareFormat() == PixelFormat::P010
-            && !config_.hdrExternalOesSamplingEnabled) {
+            && !mayAttemptHdrSampling()) {
             return false;
         }
         const NativeHandle output =
@@ -494,15 +644,19 @@ public:
                 "The frame is not a MediaCodec direct-surface output",
             };
         }
-        if ((frame.colorSpaceInfo().isHdr()
-                || frame.hardwareFrame().softwareFormat()
-                    == PixelFormat::P010)
-            && !config_.hdrExternalOesSamplingEnabled) {
-            return {
-                OpenGLHardwareImportStatus::Unsupported,
-                {},
-                "P010/HDR SurfaceTexture sampling is capability-gated until the application confirms external-OES color control",
-            };
+        const bool p010OrHdr =
+            frame.colorSpaceInfo().isHdr()
+            || frame.hardwareFrame().softwareFormat()
+                == PixelFormat::P010;
+        if (p010OrHdr) {
+            std::string capabilityDetail;
+            if (!validateHdrSamplingContext(capabilityDetail)) {
+                return {
+                    OpenGLHardwareImportStatus::Unsupported,
+                    {},
+                    std::move(capabilityDetail),
+                };
+            }
         }
         if (!supports(frame.hardwareFrame())) {
             return {
@@ -682,6 +836,26 @@ public:
             };
         }
 
+        if (p010OrHdr
+            && hdrSamplingStatus()
+                == MediaCodecOpenGLHdrSamplingStatus::Unchecked) {
+            std::int32_t dataSpace = ADATASPACE_UNKNOWN;
+            if (!currentDataSpace(dataSpace)
+                || !dataSpaceMatchesFrame(frame, dataSpace)) {
+                setHdrSamplingStatus(
+                    MediaCodecOpenGLHdrSamplingStatus::Unsupported);
+                return {
+                    OpenGLHardwareImportStatus::Unsupported,
+                    {},
+                    "P010/HDR SurfaceTexture sampling reported an "
+                    "unknown or incompatible dataspace "
+                        + std::to_string(dataSpace),
+                };
+            }
+            setHdrSamplingStatus(
+                MediaCodecOpenGLHdrSamplingStatus::Supported);
+        }
+
         OpenGLExternalTextureFrame texture;
         texture.texture = texture_;
         texture.timestampNanoseconds = timestamp;
@@ -689,6 +863,7 @@ public:
         ASurfaceTexture_getTransformMatrix(
             surfaceTexture_,
             texture.transform.data());
+        convertSurfaceTextureTransformToTopLeft(texture.transform);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             currentFrameKey_ = key;
@@ -717,6 +892,7 @@ public:
     MediaCodecOpenGLInteropConfig config_;
     ASurfaceTexture* surfaceTexture_ = nullptr;
     jobject surfaceTextureObject_ = nullptr;
+    jmethodID getDataSpace_ = nullptr;
     MediaCodecSurface surface_;
     mutable std::mutex mutex_;
     std::condition_variable retryChanged_;
@@ -863,6 +1039,12 @@ MediaCodecOpenGLInterop::statistics() const noexcept
             std::memory_order_relaxed);
     result.textureName =
         source.textureName.load(std::memory_order_relaxed);
+    result.hdrSamplingStatus =
+        static_cast<MediaCodecOpenGLHdrSamplingStatus>(
+            source.hdrSamplingStatus.load(
+                std::memory_order_relaxed));
+    result.lastDataSpace =
+        source.lastDataSpace.load(std::memory_order_relaxed);
     return result;
 }
 

@@ -21,10 +21,12 @@ enum class OpenGLOutputPreference {
     SdrOnly,
 };
 
-// Defines the encoding written by OpenGLVideoRenderer. Platform adapters must
-// ensure that the framebuffer and presentation surface use the same color
-// space. HDR10PQ and HDR10HLG contain BT.2020 primaries with the named
-// transfer function; SdrSrgb contains BT.709/sRGB output.
+// Defines the presentation encoding produced by OpenGLVideoRenderer. Platform
+// adapters must ensure that the framebuffer and presentation surface use the
+// same color space. For SdrSrgb the renderer queries the framebuffer attachment
+// encoding and supplies linear BT.709 to an sRGB attachment or explicitly
+// encodes sRGB for a linear attachment. HDR10PQ and HDR10HLG contain BT.2020
+// primaries with the named transfer function.
 enum class OpenGLOutputColorSpace {
     SdrSrgb,
     HDR10PQ,
@@ -69,6 +71,8 @@ enum class OpenGLHardwareImportStatus {
 // asking the interop to advance it.
 struct QTAV_RENDER_OPENGL_EXPORT OpenGLExternalTextureFrame {
     std::uint32_t texture = 0;
+    // Column-major matrix mapping the renderer's top-left normalized source
+    // coordinates into the external texture's sampling coordinates.
     std::array<float, 16> transform {
         1.0F, 0.0F, 0.0F, 0.0F,
         0.0F, 1.0F, 0.0F, 0.0F,

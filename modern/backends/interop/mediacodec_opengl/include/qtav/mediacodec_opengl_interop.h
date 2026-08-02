@@ -30,10 +30,22 @@ MediaCodecOpenGLInteropConfig {
     // A native retry worker only schedules redraws. SurfaceTexture and GL
     // calls remain on the renderer thread with its context current.
     int redrawRetryMilliseconds = 2;
-    // Keep false unless the selected Android device, codec, GL driver, and
-    // output path have independently verified P010/HDR external-OES sampling
-    // with the required color control. SDR 8-bit output remains available.
+    // Explicitly trusts P010/HDR external-OES sampling without the runtime
+    // dataspace probe below. Keep false unless the complete device path was
+    // independently validated.
     bool hdrExternalOesSamplingEnabled = false;
+    // When no explicit trust override is supplied, provisionally accepts an
+    // HDR frame only when the current GL context exposes the external-YUV
+    // extensions and Android 13+ reports matching BT.2020/PQ or BT.2020/HLG
+    // dataspace for the exact image latched from SurfaceTexture.
+    bool autoDetectHdrExternalOesSampling = true;
+};
+
+enum class MediaCodecOpenGLHdrSamplingStatus {
+    Disabled,
+    Unchecked,
+    Supported,
+    Unsupported,
 };
 
 struct QTAV_INTEROP_MEDIACODEC_OPENGL_EXPORT
@@ -52,6 +64,9 @@ MediaCodecOpenGLInteropStatistics {
     std::uint64_t softwareTransferCalls = 0;
     std::uint64_t stagingCopies = 0;
     std::uint64_t rendererUploads = 0;
+    MediaCodecOpenGLHdrSamplingStatus hdrSamplingStatus =
+        MediaCodecOpenGLHdrSamplingStatus::Disabled;
+    std::int32_t lastDataSpace = 0;
 };
 
 // Owns a detached android.graphics.SurfaceTexture and exposes its producer

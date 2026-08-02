@@ -225,8 +225,9 @@ native YCbCr/external formats, and acquire/release fences. OpenGL ES consumes
 a detached MediaCodec `SurfaceTexture` through
 `GL_TEXTURE_EXTERNAL_OES`, with explicit timestamp/generation correlation,
 single-current-image lifetime, surface recreation, and seek/flush coverage.
-P010/HDR external-OES sampling remains disabled unless the application
-explicitly confirms device/codec/driver color control; private
+P010/HDR external-OES sampling is enabled automatically only when the current
+GL context exposes the required external-YUV extensions and Android reports a
+BT.2020/PQ or BT.2020/HLG dataspace matching the exact latched image; private
 `AImageReader` plus `AHardwareBuffer`/`EGLImage` remains a future optional
 alternative. On OHOS, the confirmed GLES path uses
 `OH_NativeImage` plus an external-OES texture. OHOS Vulkan additionally needs
@@ -412,7 +413,18 @@ The manual final-test and user-facing player is under
 the automated NativeActivity harness and provides a standard Android UI with
 an upper `SurfaceView`, current time/seek/duration controls, local document
 selection, direct FFmpeg HTTP/HTTPS URL opening, play/pause/stop, and live
-Vulkan, HDR, ZeroCopy, hardware-decode, and Vulkan validation-layer switches.
+Vulkan, HDR, ZeroCopy, hardware-decode, and debug-overlay switches. The
+top-left diagnostics include a rolling successful-presentation FPS alongside
+the source-rate hint and requested display refresh rate. They also show the
+actual Vulkan/EGL output color space (or the MediaCodec buffer color metadata
+on direct-Surface output), the active HDR policy, the current HDR/SDR headroom
+ratio, and the panel's desired maximum HDR content luminance. In MediaCodec
+direct-Surface mode the HDR switch changes the Android 15+
+`SurfaceView` headroom request but does not convert a PQ/HLG codec buffer to
+SDR; application-rendered paths use the switch as their `PreferHdr`/`SdrOnly`
+output policy. A full-screen button or landscape rotation overlays all
+controls on the video; five seconds without touch input hides only the
+controls, leaving the Debug window independent.
 ZeroCopy and hardware decode occupy their own second option row so the full
 controls remain touchable on a portrait phone.
 
@@ -460,7 +472,7 @@ QTAV_ANDROID_INSTALL_CONFIRMED=1 \
 The first command stops before `adb install`; run the second only after the
 device is unlocked and ready for the manual prompt. See the example's
 [`README.md`](examples/android_player/README.md) for codec scope, exact option
-semantics, validation-layer requirements, and manual test guidance.
+semantics, diagnostics, and manual test guidance.
 
 ## API shape
 
@@ -780,8 +792,11 @@ retains its producer `ANativeWindow`. On the renderer thread it attaches the
 consumer to the current OpenGL ES context, releases each MediaCodec output
 exactly once, calls `ASurfaceTexture_updateTexImage()`, and accepts only the
 timestamp-correlated surface generation. The renderer samples the returned
-external texture with its SurfaceTexture transform, submits the draw, and
-calls `glFlush()` before a later update advances the single current image.
+external texture with its SurfaceTexture transform. The Android interop
+right-composes the conventional OpenGL vertical-origin conversion so the
+matrix consumes QtAV's top-left source coordinates while retaining producer
+crop, scale, and rotation. The renderer submits the draw and calls `glFlush()`
+before a later update advances the single current image.
 A configured `width` and `height` only set the SurfaceTexture's default buffer
 size; omitted values use `1x1`, and MediaCodec video output overrides that
 default with the decoded size.
@@ -794,12 +809,16 @@ made current so the SurfaceTexture detaches cleanly. Same-context Android
 window loss/recreation does not replace the decoder surface or map the native
 frame.
 
-The default contract accepts SDR 8-bit external-OES sampling. P010 or HDR
-input is rejected unless
-`MediaCodecOpenGLInteropConfig::hdrExternalOesSamplingEnabled` is explicitly
-set after independent device/codec/driver color validation. There is no
-implicit hardware-frame mapping or software upload. `statistics()` reports
-codec decisions, latches, GL texture attach/detach/update counts, redraws,
+The default contract accepts SDR 8-bit external-OES sampling and probes
+P010/HDR support on first use. Automatic acceptance requires Android 13+
+`SurfaceTexture.getDataSpace()`, `GL_OES_EGL_image_external_essl3`,
+`GL_EXT_YUV_target`, and a dataspace compatible with the frame's BT.2020/PQ
+or BT.2020/HLG metadata. An unsupported result remains rejected so the
+application can select direct-Surface or software fallback without mapping the
+hardware frame. `hdrExternalOesSamplingEnabled` is an explicit trust override;
+set `autoDetectHdrExternalOesSampling` false as well to force-disable this
+path. `statistics()` reports the probe status and last dataspace in addition
+to codec decisions, latches, GL texture attach/detach/update counts, redraws,
 pending depth, timestamps, and the zero CPU-map/transfer/staging/upload
 counters.
 
@@ -1067,10 +1086,14 @@ framebuffer. The context must be current for `open()`, `render()`, and
 YUV420/422/444, NV12/NV21, little-endian P010, RGB/BGR,
 RGBA/BGRA/ARGB, and Gray8 software frames. It applies structured
 range/matrix/transfer/primaries metadata, Fit/Fill/Stretch, custom viewports,
-and all right-angle rotations. The current baseline writes SDR sRGB-coded
-output with PQ/HLG tone mapping for `SdrSrgb`, or preserves HDR luminance and
-converts primaries/transfer explicitly for BT.2020 `HDR10PQ` and `HDR10HLG`
-targets. Hardware-frame interop remains separate work.
+and all right-angle rotations. For `SdrSrgb`, it queries the bound framebuffer
+attachment's color encoding: an sRGB attachment receives linear BT.709 and
+performs the fixed-function sRGB conversion exactly once, while a linear or
+UNORM attachment receives explicitly sRGB-encoded shader output. This keeps
+Android's sRGB EGL window and application-owned linear FBOs visually
+consistent, including PQ/HLG tone mapping to SDR. BT.2020 `HDR10PQ` and
+`HDR10HLG` targets preserve HDR luminance and convert primaries/transfer
+explicitly. Hardware-frame interop remains separate work.
 
 ### Mobile renderer selector
 

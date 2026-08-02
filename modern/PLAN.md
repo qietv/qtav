@@ -216,6 +216,13 @@ Current implementation:
 - `modern/examples/android/native_activity.cpp`
 - `modern/examples/android/build-android.sh`
 - `modern/examples/android/run-connected-device.sh`
+- `modern/examples/android_player/AndroidManifest.xml`
+- `modern/examples/android_player/CMakeLists.txt`
+- `modern/examples/android_player/java/org/qtav/core/player/QtAVPlayerActivity.java`
+- `modern/examples/android_player/native/player_jni.cpp`
+- `modern/examples/android_player/native/android_vulkan_context.cpp`
+- `modern/examples/android_player/build-android-player.sh`
+- `modern/examples/android_player/run-connected-device.sh`
 
 Current verification:
 
@@ -600,9 +607,78 @@ Completed file-output checkpoint:
 - deterministic tests verify header fields, sample byte order, invalid planar
   negotiation, and an exact 64,000-byte converted player capture.
 
+## Android manual final-test player gate
+
+Complete the user-requested Android player validation before resuming the
+Milestone 7 OHOS clarification gate:
+
+1. [x] Add a user-facing standard Android activity under
+   `modern/examples/android_player/` with an upper video surface, current
+   time/seek/duration row, local and remote file opening, play/pause/stop, and
+   live Vulkan, HDR, ZeroCopy, software/hardware decode, and Vulkan validation
+   layer controls.
+2. [x] Connect the switches to real native paths: software decode through
+   Vulkan/OpenGL ES, MediaCodec direct-Surface output, private-AImageReader
+   Vulkan ZeroCopy, SurfaceTexture external-OES OpenGL ES ZeroCopy, explicit
+   SDR/HDR output policy, and exact optional
+   `VK_LAYER_KHRONOS_validation` enablement.
+3. [x] Add a reproducible arm64 NDK, OpenSSL 3.5.7, and FFmpeg 8.1.2 build,
+   Java/D8 packaging, debug signing, 16 KB ELF alignment, and an install
+   script that stops before `adb install` unless the user explicitly confirms
+   the device is ready.
+4. [x] Cross-build and package
+   `build/android-player/qtav-core-player.apk`; verify the API
+   28/target-36 manifest, launchable activity, DEX/native payload, system-only
+   dynamic linkage, 16 KB load-segment alignment, v3 debug signature, and the
+   default pre-install stop. No device installation was performed.
+5. [x] Rebuild the player with checksum-pinned OpenSSL 3.5.7 and FFmpeg
+   networking enabled, pass HTTP/HTTPS URLs directly to QtAVCore/FFmpeg,
+   enforce HTTPS peer/host verification against Android's system CA
+   directory, and re-run the APK/package checks without installing it. The
+   packaged static backend reports OpenSSL 3.5.7 and FFmpeg
+   `file/http/https/tcp/tls/udp`, has system-only dynamic dependencies and
+   16 KB ELF load alignment, includes the third-party license texts, passes
+   the API 28/target-36 manifest and v3-signature checks, and stops at the
+   pre-install gate. No device installation was performed.
+6. [x] After the user confirmed that only the first physical-device approval
+   was required, install once and run the local/remote, seek/lifecycle,
+   renderer, HDR, ZeroCopy, software/hardware decode, and debug-layer matrix.
+   The connected Android 16/Adreno 830 device opened the 4.93 GB
+   `Download/legend.mkv` through the SAF `fd:` protocol and streamed the same
+   3840x2160, 45:44 HDR file directly from
+   `https://2dland.cn/test/legend_of_the_magnate.mkv` through FFmpeg/OpenSSL.
+   OpenSSL peer/host verification succeeded with an app-private PEM bundle
+   assembled from Android's system roots. Vulkan/AImageReader ZeroCopy showed
+   visible video and a native RGB10/BT.2020-PQ compositor layer with HDR
+   metadata; a remote sample reached 874 decoded/436 presented frames, while
+   MediaCodec direct-Surface reached 186/186. The 8-bit H.264 sample passed
+   SurfaceTexture/OpenGL ES ZeroCopy at 180/179, software OpenGL ES at 180/180,
+   and software Vulkan at 103/103 when paused mid-file. HDR-off rebuilt an SDR
+   Vulkan surface, pause/resume, slider seek, stop/replay, SAF descriptor
+   rewind, and background/foreground surface recreation passed. The device has
+   no `VK_LAYER_KHRONOS_validation`; enabling Debug layer produced the exact
+   unavailable-layer error, and disabling it recovered. P010/HDR
+   SurfaceTexture and planar `yuv420p10le` software decode now stop with clear
+   capability errors instead of continuing behind a black surface.
+7. [x] Diagnose and fix the long-form 4K frame-loss path. MediaCodec sustained
+   the source rate, but the demo rendered inline on the playback worker,
+   ignored the interop `RedrawRequested` event, and later replaced an
+   AImageReader-pending frame with the player's newer current frame. The demo
+   now owns a serialized native render thread, queues reference-counted frames,
+   retains the exact active frame across asynchronous import retries, and
+   reports callback, presentation, and render-attempt counters separately.
+   AImageReader now accepts the valid zero timestamp used by the first frame;
+   SurfaceTexture explicitly drops that one ambiguous output rather than
+   retrying forever. On the connected Android 16/Adreno 830 device,
+   `suzume.mkv` reached 1292/1292 callbacks/presentations at 00:57 and
+   `legend.mkv` reached 1307/1307 at 00:52 through 4K MediaCodec/AImageReader
+   Vulkan HDR ZeroCopy, with about 4% app CPU. The H.264 SurfaceTexture
+   regression completed at 180/179 after its documented zero-PTS drop.
+
 ## Next task
 
-Begin the OHOS production path after the completed Android reference:
+After the Android manual player gate is complete, begin the OHOS production
+path after the completed Android reference:
 
 Windows Advanced Color validation is complete: on a PHL 27B1U7903,
 `qtav_render_d3d11_advanced_color_test` passed with
@@ -1644,3 +1720,32 @@ rendering.
 - [ ] Define a C ABI only when runtime-loaded plugins become necessary.
 - [ ] Split a backend into another repository only when it has an independent
   license, team, release cycle, or closed-source delivery requirement.
+
+## Deferred final task — guarded Android HDR external-OES fallback
+
+Do not begin this task until every preceding milestone, acceptance item, and
+release/plugin-strategy item in this plan is complete.
+
+- [ ] Evaluate an experimental
+  `MediaCodecOpenGLInteropConfig::hdrExternalOesSamplingEnabled = true` path
+  for Android P010/HDR `SurfaceTexture`/`GL_TEXTURE_EXTERNAL_OES` input.
+- [ ] Treat the flag as a guarded trial only when the application has selected
+  that policy. If the first HDR frame produces an explicit capability,
+  import, sampling, or presentation failure, disable HDR external-OES for the
+  current device/codec/session and perform exactly one one-way pipeline
+  fallback.
+- [ ] Reconfigure MediaCodec at the current playback position to direct-Surface
+  presentation so Android composition preserves HDR. Do not merely set the
+  flag back to `false`, retry the retired SurfaceTexture generation, map the
+  failed hardware frame, or enter a rebuild loop.
+- [ ] Preserve pause/play intent, seek position, audio synchronization, HDR
+  metadata, and surface lifecycle across the fallback, and report the selected
+  fallback explicitly in player status and diagnostics.
+- [ ] Keep explicit runtime failure detection separate from color validation:
+  successful external-OES presentation does not prove correct P010 precision,
+  range, BT.2020 primaries, PQ/HLG transfer, luminance, or absence of duplicate
+  conversion. Enable a persistent device/codec allowlist only after independent
+  color golden and Android compositor dataspace/HDR-metadata validation.
+- [ ] Add deterministic policy tests plus connected-device coverage for trial
+  success, each explicit failure class, single fallback, stale-generation
+  rejection, seek, background/foreground recreation, and clean shutdown.

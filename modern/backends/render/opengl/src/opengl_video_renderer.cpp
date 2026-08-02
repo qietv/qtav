@@ -60,7 +60,7 @@ uniform samplerExternalOES externalImage;
 uniform mat4 externalTransform;
 #endif
 
-// width, height, format, output color space
+// width, height, format, output color space/attachment encoding
 uniform uvec4 source;
 // surface width, height, transfer, primaries
 uniform uvec4 surface;
@@ -247,7 +247,10 @@ vec3 presentColor(vec3 rgb)
     if (maximum > sourceWhite) {
         linear = linear / (vec3(1.0) + linear / maximum);
     }
-    return linearToSrgb(clamp(linear / sourceWhite, 0.0, 1.0));
+    vec3 normalized = clamp(linear / sourceWhite, 0.0, 1.0);
+    // An sRGB framebuffer converts linear fragment output to sRGB during the
+    // fixed-function write. Linear/UNORM attachments need explicit encoding.
+    return outputMode == 3U ? normalized : linearToSrgb(normalized);
 }
 
 bool sourceCoordinate(out vec2 coordinate)
@@ -452,7 +455,8 @@ enum class ShaderColorPrimaries : std::uint32_t {
 };
 
 std::uint32_t shaderOutputColorSpace(
-    OpenGLOutputColorSpace colorSpace) noexcept
+    OpenGLOutputColorSpace colorSpace,
+    bool framebufferSrgb) noexcept
 {
     switch (colorSpace) {
     case OpenGLOutputColorSpace::HDR10PQ:
@@ -460,8 +464,19 @@ std::uint32_t shaderOutputColorSpace(
     case OpenGLOutputColorSpace::HDR10HLG:
         return 2;
     default:
-        return 0;
+        return framebufferSrgb ? 3 : 0;
     }
+}
+
+bool framebufferUsesSrgbEncoding(std::uint32_t framebuffer) noexcept
+{
+    GLint encoding = GL_LINEAR;
+    glGetFramebufferAttachmentParameteriv(
+        GL_FRAMEBUFFER,
+        framebuffer == 0 ? GL_BACK : GL_COLOR_ATTACHMENT0,
+        GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING,
+        &encoding);
+    return encoding == GL_SRGB;
 }
 
 struct PlaneLayout {
@@ -1545,12 +1560,17 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
     const VideoColorSpace color = frame.colorSpaceInfo();
     const VideoViewport viewport = effectiveViewport(config);
     glUseProgram(program->program);
+    const bool framebufferSrgb =
+        target.colorSpace == OpenGLOutputColorSpace::SdrSrgb
+        && framebufferUsesSrgbEncoding(target.framebuffer);
     glUniform4ui(
         program->source,
         static_cast<GLuint>(frame.width()),
         static_cast<GLuint>(frame.height()),
         static_cast<GLuint>(shaderFormat),
-        shaderOutputColorSpace(target.colorSpace));
+        shaderOutputColorSpace(
+            target.colorSpace,
+            framebufferSrgb));
     glUniform4ui(
         program->surface,
         static_cast<GLuint>(config.surfaceSize.width),

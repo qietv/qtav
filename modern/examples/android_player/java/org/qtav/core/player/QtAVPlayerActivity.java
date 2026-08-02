@@ -5,9 +5,11 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -18,7 +20,9 @@ import android.view.Display;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
@@ -42,6 +46,7 @@ public final class QtAVPlayerActivity extends Activity
         implements SurfaceHolder.Callback {
     private static final int OPEN_DOCUMENT_REQUEST = 1001;
     private static final int SEEK_SCALE = 10_000;
+    private static final long FULLSCREEN_CONTROLS_TIMEOUT_MILLIS = 5_000;
 
     static {
         System.loadLibrary("qtav_android_player");
@@ -50,13 +55,16 @@ public final class QtAVPlayerActivity extends Activity
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private long nativeHandle;
+    private LinearLayout rootLayout;
     private FrameLayout playerArea;
+    private LinearLayout controlsPanel;
     private SurfaceView surfaceView;
     private SeekBar seekBar;
     private TextView currentTimeView;
     private TextView durationView;
     private TextView statusView;
     private Button playPauseButton;
+    private Button fullscreenButton;
     private Switch vulkanSwitch;
     private Switch hdrSwitch;
     private Switch zeroCopySwitch;
@@ -70,6 +78,8 @@ public final class QtAVPlayerActivity extends Activity
     private int videoWidth;
     private int videoHeight;
     private int publishedDisplayRotation = -1;
+    private boolean fullscreenMode;
+    private boolean consumeFullscreenRevealGesture;
 
     private final Runnable pollPlayback = new Runnable() {
         @Override
@@ -89,6 +99,7 @@ public final class QtAVPlayerActivity extends Activity
             if (nativeApplyPendingVideoFallback(nativeHandle)) {
                 zeroCopySwitch.setChecked(false);
                 updateOptionAvailability();
+                applyHdrPreference();
                 applyVideoSurfaceLayout();
             }
             long packedVideoSize = nativeGetVideoSize(nativeHandle);
@@ -124,13 +135,15 @@ public final class QtAVPlayerActivity extends Activity
                     != lastRequestedFrameRateMilliHertz) {
                 updatePreferredDisplayMode(requestedFrameRate);
             }
-            String nextStatus = nativeGetStatus(nativeHandle);
+            String playbackStatus = nativeGetStatus(nativeHandle);
             if (preferredDisplayRefreshRate > 0.0f) {
-                nextStatus += String.format(
+                playbackStatus += String.format(
                         Locale.US,
                         " · display target %.3gfps",
                         preferredDisplayRefreshRate);
             }
+            String nextStatus = buildOutputDiagnostics()
+                    + "\n" + playbackStatus;
             if (!nextStatus.contentEquals(statusView.getText())) {
                 statusView.setText(nextStatus);
             }
@@ -149,8 +162,13 @@ public final class QtAVPlayerActivity extends Activity
                     vulkanSwitch.isChecked(),
                     hdrSwitch.isChecked(),
                     zeroCopySwitch.isChecked(),
-                    hardwareSwitch.isChecked(),
-                    debugSwitch.isChecked());
+                    hardwareSwitch.isChecked());
+        }
+    };
+
+    private final Runnable hideFullscreenControls = () -> {
+        if (fullscreenMode && !userSeeking && controlsPanel != null) {
+            controlsPanel.setVisibility(View.GONE);
         }
     };
 
@@ -159,8 +177,56 @@ public final class QtAVPlayerActivity extends Activity
         super.onCreate(savedInstanceState);
         nativeHandle = nativeCreate(createSystemCaBundle());
         buildUserInterface();
+        if (getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_LANDSCAPE) {
+            setFullscreenMode(true);
+        }
         surfaceView.getHolder().addCallback(this);
         mainHandler.post(pollPlayback);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        if (configuration.orientation
+                == Configuration.ORIENTATION_LANDSCAPE) {
+            setFullscreenMode(true);
+        } else if (configuration.orientation
+                   == Configuration.ORIENTATION_PORTRAIT) {
+            setFullscreenMode(false);
+        }
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        if (fullscreenMode && controlsPanel != null) {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN
+                    && controlsPanel.getVisibility() != View.VISIBLE) {
+                showFullscreenControls();
+                consumeFullscreenRevealGesture = true;
+                return true;
+            }
+            if (consumeFullscreenRevealGesture) {
+                if (action == MotionEvent.ACTION_UP
+                        || action == MotionEvent.ACTION_CANCEL) {
+                    consumeFullscreenRevealGesture = false;
+                }
+                return true;
+            }
+            if (action == MotionEvent.ACTION_DOWN) {
+                showFullscreenControls();
+            }
+        }
+        return super.dispatchTouchEvent(event);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && fullscreenMode) {
+            applyFullscreenSystemUi();
+        }
     }
 
     private String createSystemCaBundle() {
@@ -196,6 +262,10 @@ public final class QtAVPlayerActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        if (fullscreenMode) {
+            applyFullscreenSystemUi();
+            showFullscreenControls();
+        }
         if (nativeHandle != 0 && surfaceView != null) {
             Surface surface = surfaceView.getHolder().getSurface();
             if (surface != null && surface.isValid()) {
@@ -251,21 +321,25 @@ public final class QtAVPlayerActivity extends Activity
 
     private void buildUserInterface() {
         final int padding = dp(8);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.BLACK);
-        root.setOnApplyWindowInsetsListener((view, insets) -> {
-            view.setPadding(
-                    insets.getSystemWindowInsetLeft(),
-                    insets.getSystemWindowInsetTop(),
-                    insets.getSystemWindowInsetRight(),
-                    insets.getSystemWindowInsetBottom());
+        rootLayout = new LinearLayout(this);
+        rootLayout.setOrientation(LinearLayout.VERTICAL);
+        rootLayout.setBackgroundColor(Color.BLACK);
+        rootLayout.setOnApplyWindowInsetsListener((view, insets) -> {
+            if (fullscreenMode) {
+                view.setPadding(0, 0, 0, 0);
+            } else {
+                view.setPadding(
+                        insets.getSystemWindowInsetLeft(),
+                        insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(),
+                        insets.getSystemWindowInsetBottom());
+            }
             return insets;
         });
 
         playerArea = new FrameLayout(this);
         playerArea.setBackgroundColor(Color.BLACK);
-        root.addView(
+        rootLayout.addView(
                 playerArea,
                 new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
@@ -290,7 +364,7 @@ public final class QtAVPlayerActivity extends Activity
         statusView = new TextView(this);
         statusView.setTextColor(Color.WHITE);
         statusView.setTextSize(12.0f);
-        statusView.setMaxLines(6);
+        statusView.setMaxLines(8);
         statusView.setEllipsize(android.text.TextUtils.TruncateAt.END);
         statusView.setGravity(Gravity.TOP | Gravity.START);
         statusView.setPadding(dp(6), dp(4), dp(6), dp(4));
@@ -300,17 +374,17 @@ public final class QtAVPlayerActivity extends Activity
         FrameLayout.LayoutParams statusLayout =
                 new FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
-                        dp(132),
+                        dp(180),
                         Gravity.TOP | Gravity.START);
         statusLayout.setMargins(padding, padding, padding, 0);
         playerArea.addView(statusView, statusLayout);
 
-        LinearLayout controls = new LinearLayout(this);
-        controls.setOrientation(LinearLayout.VERTICAL);
-        controls.setPadding(padding, padding, padding, padding);
-        controls.setBackgroundColor(Color.rgb(32, 32, 32));
-        root.addView(
-                controls,
+        controlsPanel = new LinearLayout(this);
+        controlsPanel.setOrientation(LinearLayout.VERTICAL);
+        controlsPanel.setPadding(padding, padding, padding, padding);
+        controlsPanel.setBackgroundColor(Color.rgb(32, 32, 32));
+        rootLayout.addView(
+                controlsPanel,
                 new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -328,7 +402,7 @@ public final class QtAVPlayerActivity extends Activity
                 seekBar,
                 new LinearLayout.LayoutParams(0, dp(44), 1.0f));
         timeline.addView(durationView);
-        controls.addView(timeline);
+        controlsPanel.addView(timeline);
 
         seekBar.setOnSeekBarChangeListener(
                 new SeekBar.OnSeekBarChangeListener() {
@@ -347,6 +421,8 @@ public final class QtAVPlayerActivity extends Activity
                     @Override
                     public void onStartTrackingTouch(SeekBar bar) {
                         userSeeking = true;
+                        mainHandler.removeCallbacks(
+                                hideFullscreenControls);
                     }
 
                     @Override
@@ -359,6 +435,7 @@ public final class QtAVPlayerActivity extends Activity
                                             * bar.getProgress()
                                             / SEEK_SCALE);
                         }
+                        scheduleFullscreenControlsHide();
                     }
                 });
 
@@ -368,11 +445,13 @@ public final class QtAVPlayerActivity extends Activity
         Button openRemoteButton = actionButton("Open URL");
         playPauseButton = actionButton("Play");
         Button stopButton = actionButton("Stop");
+        fullscreenButton = actionButton("Full screen");
         addWeighted(buttons, openLocalButton);
         addWeighted(buttons, openRemoteButton);
         addWeighted(buttons, playPauseButton);
         addWeighted(buttons, stopButton);
-        controls.addView(buttons);
+        addWeighted(buttons, fullscreenButton);
+        controlsPanel.addView(buttons);
 
         openLocalButton.setOnClickListener(view -> openLocalMedia());
         openRemoteButton.setOnClickListener(view -> showRemoteDialog());
@@ -386,6 +465,8 @@ public final class QtAVPlayerActivity extends Activity
                 nativeStop(nativeHandle);
             }
         });
+        fullscreenButton.setOnClickListener(
+                view -> setFullscreenMode(!fullscreenMode));
 
         LinearLayout renderOptions = new LinearLayout(this);
         renderOptions.setOrientation(LinearLayout.HORIZONTAL);
@@ -397,17 +478,18 @@ public final class QtAVPlayerActivity extends Activity
         // AImageReader/SurfaceTexture paths remain an explicit interop test.
         zeroCopySwitch = optionSwitch("ZeroCopy", false);
         hardwareSwitch = optionSwitch("Hardware decode", true);
-        debugSwitch = optionSwitch("Debug layer", false);
+        debugSwitch = optionSwitch("Debug", true);
         addWeighted(renderOptions, vulkanSwitch);
         addWeighted(renderOptions, hdrSwitch);
         addWeighted(renderOptions, debugSwitch);
         addWeighted(decodeOptions, zeroCopySwitch);
         addWeighted(decodeOptions, hardwareSwitch);
-        controls.addView(renderOptions);
-        controls.addView(decodeOptions);
+        controlsPanel.addView(renderOptions);
+        controlsPanel.addView(decodeOptions);
 
         View.OnClickListener optionListener = view -> {
             updateOptionAvailability();
+            applyHdrPreference();
             applyVideoSurfaceLayout();
             mainHandler.removeCallbacks(applyOptions);
             mainHandler.postDelayed(applyOptions, 250);
@@ -416,19 +498,181 @@ public final class QtAVPlayerActivity extends Activity
         hdrSwitch.setOnClickListener(optionListener);
         zeroCopySwitch.setOnClickListener(optionListener);
         hardwareSwitch.setOnClickListener(optionListener);
-        debugSwitch.setOnClickListener(optionListener);
+        debugSwitch.setOnClickListener(view -> applyDebugVisibility());
         updateOptionAvailability();
+        applyHdrPreference();
+        applyDebugVisibility();
 
-        setContentView(root);
+        setContentView(rootLayout);
+    }
+
+    private void setFullscreenMode(boolean fullscreen) {
+        if (fullscreenMode == fullscreen
+                || rootLayout == null
+                || playerArea == null
+                || controlsPanel == null) {
+            return;
+        }
+        fullscreenMode = fullscreen;
+        consumeFullscreenRevealGesture = false;
+        ViewGroup parent = (ViewGroup) controlsPanel.getParent();
+        if (parent != null) {
+            parent.removeView(controlsPanel);
+        }
+        if (fullscreenMode) {
+            controlsPanel.setBackgroundColor(Color.argb(192, 24, 24, 24));
+            playerArea.addView(
+                    controlsPanel,
+                    new FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT,
+                            FrameLayout.LayoutParams.WRAP_CONTENT,
+                            Gravity.BOTTOM));
+            fullscreenButton.setText("Exit full");
+            showFullscreenControls();
+        } else {
+            mainHandler.removeCallbacks(hideFullscreenControls);
+            controlsPanel.setVisibility(View.VISIBLE);
+            controlsPanel.setBackgroundColor(Color.rgb(32, 32, 32));
+            rootLayout.addView(
+                    controlsPanel,
+                    new LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT));
+            fullscreenButton.setText("Full screen");
+        }
+        applyFullscreenSystemUi();
+        rootLayout.requestApplyInsets();
+        playerArea.post(this::applyVideoSurfaceLayout);
+    }
+
+    private void showFullscreenControls() {
+        if (!fullscreenMode || controlsPanel == null) {
+            return;
+        }
+        controlsPanel.setVisibility(View.VISIBLE);
+        scheduleFullscreenControlsHide();
+    }
+
+    private void scheduleFullscreenControlsHide() {
+        mainHandler.removeCallbacks(hideFullscreenControls);
+        if (fullscreenMode && !userSeeking) {
+            mainHandler.postDelayed(
+                    hideFullscreenControls,
+                    FULLSCREEN_CONTROLS_TIMEOUT_MILLIS);
+        }
+    }
+
+    private void applyFullscreenSystemUi() {
+        if (fullscreenMode) {
+            getWindow().addFlags(
+                    WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            getWindow().getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        } else {
+            getWindow().clearFlags(
+                    WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            getWindow().getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_VISIBLE);
+        }
     }
 
     private void updateOptionAvailability() {
-        boolean appRendererActive =
-                !hardwareSwitch.isChecked() || zeroCopySwitch.isChecked();
-        vulkanSwitch.setEnabled(appRendererActive);
-        hdrSwitch.setEnabled(appRendererActive);
-        debugSwitch.setEnabled(
-                appRendererActive && vulkanSwitch.isChecked());
+        // Vulkan off selects OpenGL ES. Keep that renderer preference
+        // selectable even while MediaCodec is temporarily presenting directly
+        // because ZeroCopy is off; it takes effect as soon as an application
+        // renderer is selected again.
+        vulkanSwitch.setEnabled(true);
+        // Direct MediaCodec output bypasses the application renderer, but it
+        // does not bypass Android's HDR Surface composition. HDR therefore
+        // remains independent of the ZeroCopy interop choice.
+        hdrSwitch.setEnabled(true);
+        debugSwitch.setEnabled(true);
+    }
+
+    private void applyDebugVisibility() {
+        if (statusView == null || debugSwitch == null) {
+            return;
+        }
+        statusView.setVisibility(
+                debugSwitch.isChecked() ? View.VISIBLE : View.GONE);
+    }
+
+    private void applyHdrPreference() {
+        if (surfaceView == null || hdrSwitch == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= 35) {
+            // Zero asks Android to choose suitable HDR headroom for HDR
+            // content. One requests no headroom above SDR white. Neither value
+            // converts or retags a MediaCodec direct-Surface PQ/HLG buffer.
+            // This API is specific to the SurfaceView layer and therefore also
+            // applies when MediaCodec presents without Vulkan/OpenGL.
+            surfaceView.setDesiredHdrHeadroom(
+                    hdrSwitch.isChecked() ? 0.0f : 1.0f);
+        }
+    }
+
+    private String buildOutputDiagnostics() {
+        String output = nativeGetOutputColorSpace(nativeHandle);
+        boolean directSurface = hardwareSwitch.isChecked()
+                && !zeroCopySwitch.isChecked();
+        String hdrPolicy;
+        if (directSurface) {
+            hdrPolicy = hdrSwitch.isChecked()
+                    ? "auto headroom; codec passthrough"
+                    : "1x headroom; codec passthrough";
+        } else {
+            hdrPolicy = hdrSwitch.isChecked() ? "PreferHdr" : "SdrOnly";
+        }
+
+        String firstLine = "Output " + output + " · HDR " + hdrPolicy;
+        Display display = surfaceView.getDisplay();
+        if (display == null) {
+            return firstLine;
+        }
+
+        StringBuilder secondLine = new StringBuilder();
+        if (Build.VERSION.SDK_INT >= 34
+                && display.isHdrSdrRatioAvailable()) {
+            try {
+                float ratio = display.getHdrSdrRatio();
+                if (!Float.isNaN(ratio)
+                        && !Float.isInfinite(ratio)
+                        && ratio >= 1.0f) {
+                    secondLine.append(String.format(
+                            Locale.US,
+                            "HDR headroom %.2fx",
+                            ratio));
+                }
+            } catch (IllegalStateException ignored) {
+                // Availability can change while the display or Surface is
+                // being recreated. The next 250 ms poll will try again.
+            }
+        }
+
+        Display.HdrCapabilities capabilities = display.getHdrCapabilities();
+        if (capabilities != null) {
+            float targetMaxNits = capabilities.getDesiredMaxLuminance();
+            if (!Float.isNaN(targetMaxNits)
+                    && !Float.isInfinite(targetMaxNits)
+                    && targetMaxNits > 0.0f) {
+                if (secondLine.length() > 0) {
+                    secondLine.append(" · ");
+                }
+                secondLine.append(String.format(
+                        Locale.US,
+                        "panel max target %.0f nits",
+                        targetMaxNits));
+            }
+        }
+        return secondLine.length() > 0
+                ? firstLine + "\n" + secondLine
+                : firstLine;
     }
 
     private void applyVideoSurfaceLayout() {
@@ -631,6 +875,7 @@ public final class QtAVPlayerActivity extends Activity
     private Button actionButton(String label) {
         Button button = new Button(this);
         button.setText(label);
+        button.setTextSize(12.0f);
         button.setAllCaps(false);
         button.setMinWidth(0);
         button.setPadding(dp(2), 0, dp(2), 0);
@@ -754,8 +999,7 @@ public final class QtAVPlayerActivity extends Activity
             boolean vulkan,
             boolean hdr,
             boolean zeroCopy,
-            boolean hardwareDecode,
-            boolean debugLayer);
+            boolean hardwareDecode);
     private native void nativeTogglePlayback(long handle);
     private native void nativeStop(long handle);
     private native void nativeSeek(long handle, long position);
@@ -766,4 +1010,5 @@ public final class QtAVPlayerActivity extends Activity
     private native boolean nativeIsPlaying(long handle);
     private native int nativeGetRequestedFrameRate(long handle);
     private native String nativeGetStatus(long handle);
+    private native String nativeGetOutputColorSpace(long handle);
 }

@@ -50,8 +50,95 @@ constexpr std::size_t MaximumQueuedRenderFrames = 4;
 constexpr std::size_t MaximumPendingRenderFrames = 4;
 constexpr std::int64_t MaximumPendingRenderAgeMilliseconds = 250;
 constexpr std::size_t FrameRateSampleCount = 32;
+constexpr std::chrono::milliseconds PresentationFpsWindow { 1'500 };
+constexpr std::chrono::milliseconds PresentationFpsStaleAfter { 750 };
 JavaVM* GlobalJavaVM = nullptr;
 std::string GlobalCaBundlePath;
+
+std::string describeVideoColorSpace(qtav::VideoColorSpace color)
+{
+    const char* primaries = "unknown primaries";
+    switch (color.primaries) {
+    case qtav::ColorPrimaries::BT709:
+        primaries = "BT.709";
+        break;
+    case qtav::ColorPrimaries::BT2020:
+        primaries = "BT.2020";
+        break;
+    case qtav::ColorPrimaries::SMPTE431:
+        primaries = "DCI-P3";
+        break;
+    case qtav::ColorPrimaries::SMPTE432:
+        primaries = "Display-P3";
+        break;
+    default:
+        break;
+    }
+
+    const char* transfer = "unknown transfer";
+    switch (color.transfer) {
+    case qtav::ColorTransfer::BT709:
+    case qtav::ColorTransfer::SMPTE170M:
+        transfer = "BT.709";
+        break;
+    case qtav::ColorTransfer::SRGB:
+        transfer = "sRGB";
+        break;
+    case qtav::ColorTransfer::Linear:
+        transfer = "linear";
+        break;
+    case qtav::ColorTransfer::PQ:
+        transfer = "PQ";
+        break;
+    case qtav::ColorTransfer::HLG:
+        transfer = "HLG";
+        break;
+    default:
+        break;
+    }
+
+    const char* range = "unknown range";
+    if (color.range == qtav::ColorRange::Limited) {
+        range = "limited";
+    } else if (color.range == qtav::ColorRange::Full) {
+        range = "full";
+    }
+    return std::string(primaries) + "/" + transfer + "/" + range;
+}
+
+const char* describeVulkanColorSpace(VkColorSpaceKHR colorSpace) noexcept
+{
+    switch (colorSpace) {
+    case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+        return "sRGB";
+    case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
+        return "BT.709";
+    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+        return "extended-sRGB/linear";
+    case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+        return "BT.2020/linear";
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+        return "BT.2020/PQ";
+    case VK_COLOR_SPACE_HDR10_HLG_EXT:
+        return "BT.2020/HLG";
+    default:
+        return "unknown";
+    }
+}
+
+const char* describeOpenGLColorSpace(
+    qtav::OpenGLOutputColorSpace colorSpace) noexcept
+{
+    switch (colorSpace) {
+    case qtav::OpenGLOutputColorSpace::SdrSrgb:
+        return "sRGB";
+    case qtav::OpenGLOutputColorSpace::HDR10PQ:
+        return "BT.2020/PQ";
+    case qtav::OpenGLOutputColorSpace::HDR10HLG:
+        return "BT.2020/HLG";
+    }
+    return "unknown";
+}
 
 int32_t setWindowFrameRate(
     ANativeWindow* window,
@@ -158,15 +245,13 @@ struct PlayerOptions {
     bool hdr = true;
     bool zeroCopy = false;
     bool hardwareDecode = true;
-    bool debugLayer = false;
 
     bool operator==(const PlayerOptions& other) const noexcept
     {
         return vulkan == other.vulkan
             && hdr == other.hdr
             && zeroCopy == other.zeroCopy
-            && hardwareDecode == other.hardwareDecode
-            && debugLayer == other.debugLayer;
+            && hardwareDecode == other.hardwareDecode;
     }
 
     bool operator!=(const PlayerOptions& other) const noexcept
@@ -297,17 +382,26 @@ public:
         if (options == options_) {
             return;
         }
-        openGLDirectFallbackPending_.store(false);
-        openGLDirectFallbackActive_ = false;
+        const bool directSurfaceActive =
+            options_.hardwareDecode && !options_.zeroCopy;
+        const bool directSurfaceRemainsActive =
+            options.hardwareDecode && !options.zeroCopy;
         const std::int64_t resumePosition = resumePositionLocked();
         options_ = options;
         savedPosition_ = resumePosition;
+        // Vulkan/OpenGL and the native HDR-output policy are application-
+        // renderer preferences. Preserve them while Direct Surface is active
+        // without interrupting playback. Java independently applies the HDR
+        // switch as this SurfaceView layer's requested Android headroom.
+        // Changing ZeroCopy or hardware decode still leaves this branch and
+        // rebuilds the appropriate renderer below.
+        if (directSurfaceActive && directSurfaceRemainsActive) {
+            return;
+        }
+        openGLDirectFallbackPending_.store(false);
+        openGLDirectFallbackActive_ = false;
         if (!mediaPath_.empty() && window_) {
             rebuildPlayer(savedPosition_, userWantsPlaying_.load());
-        } else if (options_.debugLayer && !options_.vulkan) {
-            setStatus(
-                "Debug layer is a Vulkan validation option and is inactive "
-                "while OpenGL ES is selected");
         }
     }
 
@@ -435,6 +529,31 @@ public:
         return requestedFrameRateMilliHertz_.load();
     }
 
+    std::string outputColorSpace() const
+    {
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (directEnabled_.load()) {
+            std::lock_guard<std::mutex> outputLock(outputMutex_);
+            return directOutputColorSpace_.empty()
+                ? "codec pending"
+                : "codec " + directOutputColorSpace_;
+        }
+        if (vulkanRenderer_) {
+            const VkSurfaceFormatKHR format =
+                vulkanRenderer_->surfaceFormat();
+            return format.format == VK_FORMAT_UNDEFINED
+                ? "Vulkan pending"
+                : std::string("Vulkan swapchain ")
+                    + describeVulkanColorSpace(format.colorSpace);
+        }
+        if (openGLRenderer_) {
+            return std::string("EGL surface ")
+                + describeOpenGLColorSpace(
+                    openGLRenderer_->outputColorSpace());
+        }
+        return "unavailable";
+    }
+
     std::string status() const
     {
         std::string result;
@@ -449,6 +568,24 @@ public:
         if (decoded > 0 || presented > 0) {
             result += " · callbacks/presented " + std::to_string(decoded)
                 + "/" + std::to_string(presented);
+        }
+        if (presented > 0) {
+            int frameRateMilliHertz = 0;
+            {
+                std::lock_guard<std::mutex> lock(timingMutex_);
+                const auto now = std::chrono::steady_clock::now();
+                if (lastPresentationTime_
+                        != std::chrono::steady_clock::time_point {}
+                    && now - lastPresentationTime_
+                        <= PresentationFpsStaleAfter) {
+                    frameRateMilliHertz = presentationFpsMilliHertz_;
+                }
+            }
+            const int frameRateTenths =
+                (frameRateMilliHertz + 50) / 100;
+            result += " · present fps "
+                + std::to_string(frameRateTenths / 10)
+                + "." + std::to_string(frameRateTenths % 10);
         }
         const std::uint64_t queueDrops = renderQueueDrops_.load();
         if (queueDrops > 0) {
@@ -527,6 +664,17 @@ public:
                 + " pending max "
                 + std::to_string(interopMaximumPendingImages_.load());
         }
+        const auto openGLHdrStatus =
+            static_cast<qtav::MediaCodecOpenGLHdrSamplingStatus>(
+                openGLHdrSamplingStatus_.load());
+        if (openGLHdrStatus
+            == qtav::MediaCodecOpenGLHdrSamplingStatus::Supported) {
+            result += " · OES HDR verified ds "
+                + std::to_string(openGLLastDataSpace_.load());
+        } else if (openGLHdrStatus
+                   == qtav::MediaCodecOpenGLHdrSamplingStatus::Unsupported) {
+            result += " · OES HDR unsupported";
+        }
         const int frameRate = requestedFrameRateMilliHertz_.load();
         if (frameRate > 0) {
             result += " · rate hint "
@@ -574,6 +722,16 @@ private:
             | static_cast<std::uint32_t>(height));
     }
 
+    void recordDirectOutputColorSpace(const qtav::VideoFrame& frame)
+    {
+        const qtav::VideoColorSpace color = frame.colorSpaceInfo();
+        if (!color.isSpecified()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        directOutputColorSpace_ = describeVideoColorSpace(color);
+    }
+
     void requestOpenGLDirectFallback(
         std::uint64_t generation,
         const std::string& message)
@@ -615,6 +773,8 @@ private:
         lastCallbackTimestamp_ = InvalidTimestamp;
         lastPresentedTimestamp_ = InvalidTimestamp;
         lastPresentationTime_ = {};
+        presentationTimes_.clear();
+        presentationFpsMilliHertz_ = 0;
     }
 
     void resetPresentationTiming(std::uint64_t generation)
@@ -631,6 +791,8 @@ private:
         lastCallbackTimestamp_ = InvalidTimestamp;
         lastPresentedTimestamp_ = InvalidTimestamp;
         lastPresentationTime_ = {};
+        presentationTimes_.clear();
+        presentationFpsMilliHertz_ = 0;
         sourceFramesSkipped_.store(0);
         presentationStalls_.store(0);
         presentationCatchups_.store(0);
@@ -643,6 +805,8 @@ private:
         lastCallbackTimestamp_ = InvalidTimestamp;
         lastPresentedTimestamp_ = InvalidTimestamp;
         lastPresentationTime_ = {};
+        presentationTimes_.clear();
+        presentationFpsMilliHertz_ = 0;
     }
 
     void observeVideoCallback(
@@ -778,6 +942,28 @@ private:
                 }
             }
         }
+        presentationTimes_.push_back(now);
+        const auto windowStart = now - PresentationFpsWindow;
+        while (presentationTimes_.size() > 1
+               && presentationTimes_.front() < windowStart) {
+            presentationTimes_.pop_front();
+        }
+        if (presentationTimes_.size() > 1) {
+            const double elapsedSeconds =
+                std::chrono::duration<double>(
+                    presentationTimes_.back()
+                    - presentationTimes_.front())
+                    .count();
+            if (elapsedSeconds > 0.0) {
+                presentationFpsMilliHertz_ = static_cast<int>(
+                    std::llround(
+                        static_cast<double>(
+                            presentationTimes_.size() - 1)
+                        * 1'000.0 / elapsedSeconds));
+            }
+        } else {
+            presentationFpsMilliHertz_ = 0;
+        }
         lastPresentedTimestamp_ = frame.timestamp();
         lastPresentationTime_ = now;
     }
@@ -870,6 +1056,7 @@ private:
                         return;
                     }
                     if (directEnabled_.load()) {
+                        recordDirectOutputColorSpace(frame);
                         presentDirectSurfaceFrame(frame, generation);
                     } else if (discardZeroTimestampOpenGLFrame(
                                    frame,
@@ -891,7 +1078,7 @@ private:
         if (!vulkanContext_->create(
                 window_,
                 useHardwareZeroCopy,
-                options_.debugLayer,
+                false,
                 error)) {
             return false;
         }
@@ -969,9 +1156,6 @@ private:
         mode += vulkanRenderer_->hdrOutputActive()
             ? " · HDR output"
             : " · SDR output";
-        if (vulkanContext_->debugLayerEnabled()) {
-            mode += " · validation layer";
-        }
         setActiveMode(std::move(mode));
         return true;
     }
@@ -1002,7 +1186,7 @@ private:
                 const std::string message =
                     "OpenGL ES renderer: " + event.detail;
                 if (event.detail.find(
-                        "P010/HDR SurfaceTexture sampling is capability-gated")
+                        "P010/HDR SurfaceTexture sampling")
                     != std::string::npos) {
                     requestOpenGLDirectFallback(generation, message);
                     return;
@@ -1016,10 +1200,6 @@ private:
             qtav::MediaCodecOpenGLInteropConfig interopConfig;
             interopConfig.javaVM = javaVM_;
             interopConfig.maximumPendingFrames = 4;
-            // HDR external-OES input sampling remains deliberately disabled:
-            // output HDR selection is independent and the source path must be
-            // validated per device/codec/driver before enabling it.
-            interopConfig.hdrExternalOesSamplingEnabled = false;
             openGLInterop_ =
                 std::make_shared<qtav::MediaCodecOpenGLInterop>(
                     interopConfig);
@@ -1054,12 +1234,12 @@ private:
         std::string mode = options_.hardwareDecode
             ? "MediaCodec → SurfaceTexture → OpenGL ES ZeroCopy"
             : "software decode → OpenGL ES";
+        if (useHardwareZeroCopy) {
+            mode += " · HDR OES auto-detect";
+        }
         mode += openGLRenderer_->hdrOutputActive()
             ? " · HDR output"
             : " · SDR output";
-        if (options_.debugLayer) {
-            mode += " · Vulkan validation inactive";
-        }
         setActiveMode(std::move(mode));
         return true;
     }
@@ -1092,8 +1272,8 @@ private:
             setActiveMode(
                 openGLDirectFallbackActive_
                     ? "MediaCodec direct Surface · OpenGL ES HDR ZeroCopy "
-                      "unavailable; Android controls color/HDR"
-                    : "MediaCodec direct Surface · Android controls color/HDR");
+                      "unavailable; codec dataspace passthrough"
+                    : "MediaCodec direct Surface · codec dataspace passthrough");
         } else {
             const bool hardwareZeroCopy =
                 options_.hardwareDecode && options_.zeroCopy;
@@ -1166,6 +1346,10 @@ private:
         }
         unsupportedSoftwareFrame_.store(false);
         zeroTimestampOpenGLDropLogged_.store(false);
+        {
+            std::lock_guard<std::mutex> lock(outputMutex_);
+            directOutputColorSpace_.clear();
+        }
 
         auto nextPlayer = std::make_shared<qtav::Player>();
         const std::uint64_t generation = playerGeneration_.load();
@@ -1205,6 +1389,10 @@ private:
         interopImagesImported_.store(0);
         interopStaleImagesDropped_.store(0);
         interopMaximumPendingImages_.store(0);
+        openGLHdrSamplingStatus_.store(static_cast<int>(
+            qtav::MediaCodecOpenGLHdrSamplingStatus::Disabled));
+        openGLLastDataSpace_.store(0);
+        openGLHdrSupportLogged_.store(false);
         resetPresentationTiming(generation);
         setStatus(
             "Opening " + mediaLabel_ + " · " + activeMode());
@@ -1513,6 +1701,7 @@ private:
         for (;;) {
             std::shared_ptr<qtav::VideoRenderAPI> renderer;
             std::shared_ptr<qtav::MediaCodecVulkanInterop> vulkanInterop;
+            std::shared_ptr<qtav::MediaCodecOpenGLInterop> openGLInterop;
             std::uint64_t generation = 0;
             bool retryPending = false;
             bool startQueuedFrame = false;
@@ -1534,6 +1723,7 @@ private:
                 renderFrameQueued_ = false;
                 renderer = scheduledRenderer_;
                 vulkanInterop = scheduledVulkanInterop_;
+                openGLInterop = scheduledOpenGLInterop_;
                 generation = renderGeneration_;
             }
 
@@ -1543,7 +1733,7 @@ private:
                 Presented,
             };
             const auto attemptFrame =
-                [this, &renderer, &vulkanInterop, generation](
+                [this, &renderer, &vulkanInterop, &openGLInterop, generation](
                     qtav::VideoFrame& frame) {
                 if (!renderEnabled_.load()
                     || unsupportedSoftwareFrame_.load()
@@ -1645,6 +1835,31 @@ private:
                         statistics.staleImagesDropped);
                     interopMaximumPendingImages_.store(
                         statistics.maximumPendingImages);
+                }
+                if (openGLInterop) {
+                    const auto statistics = openGLInterop->statistics();
+                    interopCodecOutputsQueued_.store(
+                        statistics.codecOutputsQueued);
+                    interopImagesAcquired_.store(
+                        statistics.imagesLatched);
+                    interopImagesImported_.store(
+                        statistics.imagesLatched);
+                    interopStaleImagesDropped_.store(
+                        statistics.staleFramesDropped);
+                    interopMaximumPendingImages_.store(
+                        statistics.maximumPendingFrames);
+                    openGLHdrSamplingStatus_.store(
+                        static_cast<int>(statistics.hdrSamplingStatus));
+                    openGLLastDataSpace_.store(statistics.lastDataSpace);
+                    if (statistics.hdrSamplingStatus
+                            == qtav::MediaCodecOpenGLHdrSamplingStatus::Supported
+                        && !openGLHdrSupportLogged_.exchange(true)) {
+                        logMessage(
+                            ANDROID_LOG_INFO,
+                            "OpenGL HDR external-OES auto-detection accepted "
+                            "SurfaceTexture dataspace "
+                                + std::to_string(statistics.lastDataSpace));
+                    }
                 }
                 const std::uint64_t renderedCount =
                     renderedVideoFrames_.fetch_add(1) + 1;
@@ -1877,10 +2092,11 @@ private:
     JavaVM* javaVM_ = nullptr;
     mutable std::mutex commandMutex_;
     mutable std::mutex statusMutex_;
+    mutable std::mutex outputMutex_;
     std::mutex renderMutex_;
     std::mutex directMutex_;
     std::mutex renderScheduleMutex_;
-    std::mutex timingMutex_;
+    mutable std::mutex timingMutex_;
     std::condition_variable renderScheduleChanged_;
     std::thread renderThread_;
     std::shared_ptr<qtav::VideoRenderAPI> scheduledRenderer_;
@@ -1899,6 +2115,7 @@ private:
     bool renderThreadStopping_ = false;
     std::shared_ptr<qtav::Player> player_;
     ANativeWindow* window_ = nullptr;
+    std::string directOutputColorSpace_;
     PlayerOptions options_;
     std::atomic<bool> userWantsPlaying_ { false };
     std::atomic<bool> renderEnabled_ { false };
@@ -1928,6 +2145,12 @@ private:
     std::atomic<std::uint64_t> interopImagesImported_ { 0 };
     std::atomic<std::uint64_t> interopStaleImagesDropped_ { 0 };
     std::atomic<std::uint64_t> interopMaximumPendingImages_ { 0 };
+    std::atomic<int> openGLHdrSamplingStatus_ {
+        static_cast<int>(
+            qtav::MediaCodecOpenGLHdrSamplingStatus::Disabled)
+    };
+    std::atomic<std::int32_t> openGLLastDataSpace_ { 0 };
+    std::atomic<bool> openGLHdrSupportLogged_ { false };
     std::atomic<int> requestedFrameRateMilliHertz_ { 0 };
     std::atomic<int> frameRateRequestResult_ { 0 };
     std::atomic<std::uint64_t> sourceFramesSkipped_ { 0 };
@@ -1944,6 +2167,9 @@ private:
     std::int64_t lastCallbackTimestamp_ = InvalidTimestamp;
     std::int64_t lastPresentedTimestamp_ = InvalidTimestamp;
     std::chrono::steady_clock::time_point lastPresentationTime_;
+    std::deque<std::chrono::steady_clock::time_point>
+        presentationTimes_;
+    int presentationFpsMilliHertz_ = 0;
     std::int64_t savedPosition_ = 0;
     int displayRotation_ = 0;
     int mediaDescriptor_ = -1;
@@ -2060,8 +2286,7 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeSetOptions(
     jboolean vulkan,
     jboolean hdr,
     jboolean zeroCopy,
-    jboolean hardwareDecode,
-    jboolean debugLayer)
+    jboolean hardwareDecode)
 {
     if (AndroidPlayerController* controller =
             controllerFromHandle(handle)) {
@@ -2070,7 +2295,6 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeSetOptions(
             hdr == JNI_TRUE,
             zeroCopy == JNI_TRUE,
             hardwareDecode == JNI_TRUE,
-            debugLayer == JNI_TRUE,
         });
     }
 }
@@ -2204,4 +2428,18 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetStatus(
         status = controller->status();
     }
     return environment->NewStringUTF(status.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetOutputColorSpace(
+    JNIEnv* environment,
+    jobject,
+    jlong handle)
+{
+    std::string colorSpace = "unavailable";
+    if (AndroidPlayerController* controller =
+            controllerFromHandle(handle)) {
+        colorSpace = controller->outputColorSpace();
+    }
+    return environment->NewStringUTF(colorSpace.c_str());
 }
