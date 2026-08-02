@@ -44,4 +44,10 @@ if(NOT _QTAV_WINDOWS_CLANG_CL_TOOLCHAIN)
     set(CMAKE_CXX_COMPILER "${QTAV_CLANG_CL}" CACHE FILEPATH "" FORCE)
 
     include("${CMAKE_CURRENT_LIST_DIR}/../../vcpkg/scripts/toolchains/windows.cmake")
+
+    # CMake's cmcldeps passes resource-compiler flags through clang-cl while
+    # scanning .rc dependencies. clang-cl treats rc.exe's /c65001 option as a
+    # file name, so retain the Windows define without that RC-only codepage
+    # switch. C and C++ sources still receive vcpkg's /utf-8 option.
+    set(CMAKE_RC_FLAGS "/DWIN32" CACHE STRING "" FORCE)
 endif()

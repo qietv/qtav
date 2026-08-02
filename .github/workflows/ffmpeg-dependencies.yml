@@ -131,11 +131,22 @@ jobs:
       - name: Initialize pinned vcpkg
         run: git submodule update --init ffmpeg/vcpkg
 
+      - name: Locate OHOS SDK 23
+        run: |
+          sdk_root="${OHOS_SDK_ROOT:-$HOME/Library/OpenHarmony/Sdk/23}"
+          toolchain="$sdk_root/native/build/cmake/ohos.toolchain.cmake"
+          if [[ ! -f "$toolchain" ]]; then
+            echo "::error::OHOS SDK 23 toolchain not found at $toolchain"
+            exit 1
+          fi
+          echo "OHOS_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+
       - name: Check OHOS host tools
         run: |
-          test -n "$OHOS_SDK_ROOT"
-          test -f "$OHOS_SDK_ROOT/native/build/cmake/ohos.toolchain.cmake"
-          command -v patchelf
+          if ! command -v patchelf >/dev/null 2>&1; then
+            echo "::error::macOS-native patchelf is required; install it with: brew install patchelf"
+            exit 1
+          fi
 
       - name: Restore vcpkg binary cache
         uses: actions/cache@v4

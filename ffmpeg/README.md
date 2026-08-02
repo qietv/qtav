@@ -123,5 +123,5 @@ Windows when a different artifact directory is needed.
 
 `.github/workflows/ffmpeg-dependencies.yml` builds Android and OHOS on a
 self-hosted macOS arm64 runner and Windows on a self-hosted Visual Studio
-runner. The macOS runner service environment must provide `OHOS_SDK_ROOT` and
-macOS-native `patchelf`.
+runner. The OHOS job uses `OHOS_SDK_ROOT` when set and otherwise checks
+`$HOME/Library/OpenHarmony/Sdk/23`; macOS-native `patchelf` must be installed.
