@@ -2,12 +2,6 @@ name: FFmpeg dependencies
 
 on:
   workflow_dispatch:
-    inputs:
-      build_ohos:
-        description: Build OHOS on the self-hosted macOS arm64 runner
-        required: false
-        type: boolean
-        default: false
   push:
     paths:
       - .github/workflows/ffmpeg-dependencies.yml
@@ -128,8 +122,7 @@ jobs:
           if-no-files-found: error
 
   ohos:
-    name: OHOS arm64 / API 12
-    if: github.event_name == 'workflow_dispatch' && inputs.build_ohos
+    name: OHOS arm64 / API 23
     runs-on: [self-hosted, macOS]
     timeout-minutes: 360
     steps:
@@ -156,8 +149,8 @@ jobs:
       - name: Upload OHOS package
         uses: actions/upload-artifact@v4
         with:
-          name: qtav-ffmpeg-arm64-ohos-12-static
+          name: qtav-ffmpeg-arm64-ohos-23-static
           path: |
-            ffmpeg/build/arm64-ohos-12-static/vcpkg_installed/arm64-ohos-12-static
-            ffmpeg/build/arm64-ohos-12-static/vcpkg_installed/vcpkg
+            ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static
+            ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/vcpkg
           if-no-files-found: error

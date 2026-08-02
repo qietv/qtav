@@ -10,7 +10,7 @@ Supported build hosts and targets:
 | Host | Target | Triplet |
 | --- | --- | --- |
 | macOS | Android arm64-v8a, API 24 | `arm64-android-24-static` |
-| macOS | OHOS arm64-v8a, API 12 | `arm64-ohos-12-static` |
+| macOS | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows with Visual Studio and Clang tools | Windows x64 | `x64-windows-static-md` |
 
 macOS itself is not a QtAVCore target. Windows dependencies must be built and
@@ -74,8 +74,7 @@ export OHOS_SDK_ROOT="$HOME/Library/OpenHarmony/Sdk/23"
 ./ffmpeg/scripts/build-ohos.sh
 ```
 
-The OpenHarmony compiler target and CMake platform are fixed to OHOS API 12.
-The host SDK may be newer as long as it still supplies that native platform.
+The OpenHarmony compiler target and CMake platform are fixed to OHOS API 23.
 
 ## Windows with Visual Studio
 
@@ -122,8 +121,7 @@ Windows when a different artifact directory is needed.
 
 ## CI
 
-`.github/workflows/ffmpeg-dependencies.yml` builds Android on a self-hosted
-macOS arm64 runner and Windows on a self-hosted Visual Studio runner. OHOS is
-manual: enable the
-`build_ohos` workflow input and provide a self-hosted macOS arm64 runner with
-the `ohos` label, `OHOS_SDK_ROOT`, and macOS-native `patchelf`.
+`.github/workflows/ffmpeg-dependencies.yml` builds Android and OHOS on a
+self-hosted macOS arm64 runner and Windows on a self-hosted Visual Studio
+runner. The macOS runner service environment must provide `OHOS_SDK_ROOT` and
+macOS-native `patchelf`.

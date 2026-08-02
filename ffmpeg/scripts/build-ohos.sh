@@ -23,4 +23,4 @@ if ! command -v patchelf >/dev/null 2>&1; then
 fi
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-exec "$script_dir/install-unix.sh" arm64-ohos-12-static
+exec "$script_dir/install-unix.sh" arm64-ohos-23-static

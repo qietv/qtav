@@ -125,7 +125,7 @@ Continuation checkpoint:
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
-  Android arm64/API 24 and OHOS arm64/API 12 cross-builds on macOS plus native
+  Android arm64/API 24 and OHOS arm64/API 23 cross-builds on macOS plus native
   Windows x64/Visual Studio builds. Its FFmpeg 8.1.2 policy enables OpenSSL,
   libsmb2, Vulkan, libass, libplacebo, dav1d and native VVC decode while
   avoiding the unrelated desktop dependencies pulled by `ffmpeg[all]`; the
@@ -1413,7 +1413,7 @@ Target clarification gate:
 
 ### Toolchain and application shell
 
-- [~] A reproducible OHOS arm64/API 12 FFmpeg 8+ dependency cross-build is
+- [~] A reproducible OHOS arm64/API 23 FFmpeg 8+ dependency cross-build is
   implemented and locally verified under `../ffmpeg/`; the QtAVCore target
   build, CI execution on an SDK-equipped runner, and device validation remain
   pending.
