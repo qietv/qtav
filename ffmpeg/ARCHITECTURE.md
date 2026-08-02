@@ -81,9 +81,9 @@ not FFmpeg executables or one combined shared object.
 ### Android
 
 - Build host: macOS.
-- Target: arm64-v8a, API 24.
+- Target: arm64-v8a, API 28.
 - Toolchain: Android NDK r29 (`29.0.14206865`).
-- vcpkg triplet: `arm64-android-24-static`.
+- vcpkg triplet: `arm64-android-28-static`.
 - Dependencies: release-only static archives with the static C++ runtime.
 - Default SDK discovery:
   `$ANDROID_SDK_ROOT/ndk/29.0.14206865`, falling back to Android Studio's

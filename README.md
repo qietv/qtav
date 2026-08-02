@@ -22,7 +22,7 @@ prefixes and their GitHub Actions artifacts are:
 
 | Target | Local target prefix | Artifact |
 | --- | --- | --- |
-| Android arm64/API 24 | `ffmpeg/build/arm64-android-24-static/vcpkg_installed/arm64-android-24-static` | `qtav-ffmpeg-arm64-android-24-static` |
+| Android arm64/API 28 | `ffmpeg/build/arm64-android-28-static/vcpkg_installed/arm64-android-28-static` | `qtav-ffmpeg-arm64-android-28-static` |
 | OHOS arm64/API 23 | `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static` | `qtav-ffmpeg-arm64-ohos-23-static` |
 
 If a local package is absent, build it on macOS with
@@ -44,8 +44,8 @@ test -n "$run_id"
 
 gh run download "$run_id" \
   --repo qietv/qtav \
-  --name qtav-ffmpeg-arm64-android-24-static \
-  --dir ffmpeg/build/arm64-android-24-static/vcpkg_installed
+  --name qtav-ffmpeg-arm64-android-28-static \
+  --dir ffmpeg/build/arm64-android-28-static/vcpkg_installed
 gh run download "$run_id" \
   --repo qietv/qtav \
   --name qtav-ffmpeg-arm64-ohos-23-static \

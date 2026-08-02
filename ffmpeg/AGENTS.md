@@ -7,7 +7,7 @@ It builds FFmpeg 8.1.2 and the player dependency closure for these targets:
 
 | Build host | Target | vcpkg triplet |
 | --- | --- | --- |
-| macOS | Android arm64-v8a, API 24 | `arm64-android-24-static` |
+| macOS | Android arm64-v8a, API 28 | `arm64-android-28-static` |
 | macOS | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows | Windows x64, Visual Studio ABI | `x64-windows-static-md` |
 
@@ -83,7 +83,7 @@ an alternate package location is required.
 
 ## Toolchain invariants
 
-- Android is arm64-v8a/API 24 with NDK r29 and static dependency libraries.
+- Android is arm64-v8a/API 28 with NDK r29 and static dependency libraries.
 - OHOS is arm64-v8a/API 23. vcpkg's Linux compatibility model is an
   implementation detail; all compilation must use the OHOS SDK toolchain and
   must never resolve host headers or libraries.

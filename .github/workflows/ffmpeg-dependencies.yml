@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   android:
-    name: Android arm64 / API 24
+    name: Android arm64 / API 28
     runs-on: [self-hosted, macOS]
     timeout-minutes: 360
     steps:
@@ -64,10 +64,10 @@ jobs:
       - name: Upload Android package
         uses: actions/upload-artifact@v7
         with:
-          name: qtav-ffmpeg-arm64-android-24-static
+          name: qtav-ffmpeg-arm64-android-28-static
           path: |
-            ffmpeg/build/arm64-android-24-static/vcpkg_installed/arm64-android-24-static
-            ffmpeg/build/arm64-android-24-static/vcpkg_installed/vcpkg
+            ffmpeg/build/arm64-android-28-static/vcpkg_installed/arm64-android-28-static
+            ffmpeg/build/arm64-android-28-static/vcpkg_installed/vcpkg
           if-no-files-found: error
 
   windows:

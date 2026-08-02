@@ -9,7 +9,7 @@ Supported build hosts and targets:
 
 | Host | Target | Triplet |
 | --- | --- | --- |
-| macOS | Android arm64-v8a, API 24 | `arm64-android-24-static` |
+| macOS | Android arm64-v8a, API 28 | `arm64-android-28-static` |
 | macOS | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows with Visual Studio and Clang tools | Windows x64 | `x64-windows-static-md` |
 
@@ -124,9 +124,9 @@ Point a QtAVCore target build at the same install root and overlay triplet:
 ```sh
 cmake -S modern -B build/modern-android \
   -DCMAKE_TOOLCHAIN_FILE="$PWD/ffmpeg/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-  -DVCPKG_TARGET_TRIPLET=arm64-android-24-static \
+  -DVCPKG_TARGET_TRIPLET=arm64-android-28-static \
   -DVCPKG_OVERLAY_TRIPLETS="$PWD/ffmpeg/triplets" \
-  -DVCPKG_INSTALLED_DIR="$PWD/ffmpeg/build/arm64-android-24-static/vcpkg_installed"
+  -DVCPKG_INSTALLED_DIR="$PWD/ffmpeg/build/arm64-android-28-static/vcpkg_installed"
 ```
 
 Use the corresponding OHOS or Windows triplet for those targets. The build

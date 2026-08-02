@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 usage: build-android.sh [android-ndk-root]
 
-Build the Android arm64/API 24 FFmpeg dependency package on macOS.
+Build the Android arm64/API 28 FFmpeg dependency package on macOS.
 The NDK path may also be supplied through ANDROID_NDK_HOME or
 ANDROID_NDK_ROOT. With no override, Android Studio's standard NDK r29 path is
 used.
@@ -45,4 +45,4 @@ export ANDROID_NDK_HOME="$ndk_root"
 export ANDROID_NDK_ROOT="$ndk_root"
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-exec "$script_dir/install-unix.sh" arm64-android-24-static
+exec "$script_dir/install-unix.sh" arm64-android-28-static

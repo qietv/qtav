@@ -38,8 +38,8 @@ fallback. A host `ffmpeg` executable may be used only to generate test media.
 
 When locating an existing mobile package, check these target prefixes first:
 
-- Android arm64/API 24:
-  `ffmpeg/build/arm64-android-24-static/vcpkg_installed/arm64-android-24-static`
+- Android arm64/API 28:
+  `ffmpeg/build/arm64-android-28-static/vcpkg_installed/arm64-android-28-static`
 - OHOS arm64/API 23:
   `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static`
 
@@ -50,7 +50,7 @@ the associated vcpkg status database is the sibling `vcpkg/` directory under
 or download the matching artifact from the latest successful `main` run of
 the [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml):
 
-- Android artifact: `qtav-ffmpeg-arm64-android-24-static`
+- Android artifact: `qtav-ffmpeg-arm64-android-28-static`
 - OHOS artifact: `qtav-ffmpeg-arm64-ohos-23-static`
 
 Resolve the workflow run at download time and select the newest successful
