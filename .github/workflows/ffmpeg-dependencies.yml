@@ -43,6 +43,19 @@ jobs:
               echo "::error::Android SDK Command-line Tools are not installed: $sdkmanager"
               exit 1
             fi
+
+            java_home="${JAVA_HOME:-}"
+            if [[ -z "$java_home" || ! -x "$java_home/bin/java" ]]; then
+              android_studio_jbr="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+              if [[ ! -x "$android_studio_jbr/bin/java" ]]; then
+                echo "::error::Java was not found in JAVA_HOME or the Android Studio JBR"
+                exit 1
+              fi
+              java_home="$android_studio_jbr"
+            fi
+
+            export JAVA_HOME="$java_home"
+            export PATH="$JAVA_HOME/bin:$PATH"
             "$sdkmanager" --sdk_root="$sdk_root" "ndk;29.0.14206865"
           fi
 
