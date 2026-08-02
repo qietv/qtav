@@ -1,0 +1,16 @@
+diff --git a/configure b/configure
+index ec01ed9..aa1b0a1 100755
+--- a/configure
++++ b/configure
+@@ -7998,7 +7998,10 @@ check_optflags -fno-math-errno
+ check_optflags -fno-signed-zeros
+ 
+ if [ -n "$lto" ]; then
+-    test "$cc_type" != "$ld_type" && die "LTO requires same compiler and linker"
++    if test "$cc_type" != "$ld_type"; then
++        test "$cc_type:$ld_type" = "msvc:lld-link" ||
++            die "LTO requires same compiler and linker"
++    fi
+     check_cflags  $lto
+     check_ldflags $lto $cpuflags
+     disable inline_asm_direct_symbol_refs

@@ -20,6 +20,7 @@ vcpkg_from_github(
         0049-fix-twolame-pkgconfig.patch
         0050-fix-test-ld-absolute-lib-paths.patch
         0051-libsmb2-integration.patch
+        0052-allow-clang-cl-lld-link-lto.patch
 )
 
 file(COPY
@@ -165,22 +166,16 @@ if(VCPKG_DETECTED_CMAKE_RC_COMPILER)
     list(APPEND prog_env "${RC_path}")
 endif()
 
-# FFmpeg requires the compiler and linker driver types to match when LTO is
-# enabled. clang-cl produces LLVM bitcode, so invoke lld-link through the
-# clang-cl driver instead of exposing lld-link as a different driver type.
-# A GNU-frontend clang already links through its compiler driver.
-if(VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW)
-    if(CC_filename MATCHES "^clang-cl(\\.exe)?$")
-        set(ENV{LD} "${CC_filename} -fuse-ld=lld")
-        string(APPEND OPTIONS " --ld='${CC_filename} -fuse-ld=lld'")
-    elseif(VCPKG_DETECTED_CMAKE_LINKER
-           AND NOT VCPKG_DETECTED_CMAKE_C_COMPILER MATCHES "clang(-[0-9]+)?(\\.exe)?$")
-        get_filename_component(LD_path "${VCPKG_DETECTED_CMAKE_LINKER}" DIRECTORY)
-        get_filename_component(LD_filename "${VCPKG_DETECTED_CMAKE_LINKER}" NAME)
-        set(ENV{LD} "${LD_filename}")
-        string(APPEND OPTIONS " --ld=${LD_filename}")
-        list(APPEND prog_env "${LD_path}")
-    endif()
+# A GNU-frontend clang links through the compiler driver (the detected
+# CMAKE_LINKER flags are driver-style, not lld-link-style), so leave
+# configure's default LD=CC in place there.
+if(VCPKG_DETECTED_CMAKE_LINKER AND VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW
+   AND NOT VCPKG_DETECTED_CMAKE_C_COMPILER MATCHES "clang(-[0-9]+)?(\\.exe)?$")
+    get_filename_component(LD_path "${VCPKG_DETECTED_CMAKE_LINKER}" DIRECTORY)
+    get_filename_component(LD_filename "${VCPKG_DETECTED_CMAKE_LINKER}" NAME)
+    set(ENV{LD} "${LD_filename}")
+    string(APPEND OPTIONS " --ld=${LD_filename}")
+    list(APPEND prog_env "${LD_path}")
 endif()
 
 if(VCPKG_DETECTED_CMAKE_NM)
