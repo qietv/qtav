@@ -1,14 +1,13 @@
 diff --git a/src/meson.build b/src/meson.build
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -7,9 +7,15 @@ conf_internal.set('PL_HAVE_DBGHELP', dbghelp)
+@@ -7,9 +7,14 @@ conf_internal.set('PL_HAVE_DBGHELP', dbghelp)
  conf_internal.set('PL_HAVE_UNWIND', unwind.found())
  conf_internal.set('PL_HAVE_EXECINFO', has_execinfo)
  if dbghelp
 -  build_deps += cc.find_library('shlwapi', required: true)
-+  if cc.get_id() == 'msvc'
-+    add_project_arguments('/experimental:c11atomics', language: 'c')
-+    # link.exe resolves Windows SDK import libraries through its LIB paths.
++  if ['msvc', 'clang-cl'].contains(cc.get_id())
++    # link.exe and lld-link resolve Windows SDK import libraries through LIB.
 +    build_deps += declare_dependency(link_args: 'shlwapi.lib')
 +  else
 +    build_deps += cc.find_library('shlwapi', required: true)
@@ -17,33 +16,4 @@ diff --git a/src/meson.build b/src/meson.build
    build_deps += [unwind, cc.find_library('dl', required : false)]
  elif has_execinfo
    build_deps += libexecinfo
- endif
-@@ -46,6 +52,10 @@ int main(void) {
-   atomic_init(&x32, 0);
- }'''
- 
--if not cc.links(atomic_test)
-+atomic_args = []
-+if cc.get_id() == 'msvc'
-+  atomic_args += ['/experimental:c11atomics']
-+endif
-+if not cc.links(atomic_test, args: atomic_args)
-  build_deps += cc.find_library('atomic')
- endif
-diff --git a/meson.build b/meson.build
---- a/meson.build
-+++ b/meson.build
-@@ -411,6 +411,12 @@ c_opts = [
-   # Warnings to treat as errors
-   '-Werror=implicit-function-declaration',
- ]
- 
-+if cc.get_id() == 'msvc'
-+  # These options use GCC syntax and are not accepted by cl.exe.
-+  build_opts = []
-+  c_opts = []
-+endif
-+
- if cc.has_argument('-Wincompatible-pointer-types')
-   c_opts += ['-Werror=incompatible-pointer-types']
  endif

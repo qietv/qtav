@@ -11,7 +11,7 @@ Supported build hosts and targets:
 | --- | --- | --- |
 | macOS | Android arm64-v8a, API 24 | `arm64-android-24-static` |
 | macOS | OHOS arm64-v8a, API 12 | `arm64-ohos-12-static` |
-| 64-bit Windows with Visual Studio | Windows x64 | `x64-windows-static-md` |
+| 64-bit Windows with Visual Studio and Clang tools | Windows x64 | `x64-windows-static-md` |
 
 macOS itself is not a QtAVCore target. Windows dependencies must be built and
 validated on Windows; the PowerShell entry point is not a cross-compiler.
@@ -79,15 +79,18 @@ The host SDK may be newer as long as it still supplies that native platform.
 
 ## Windows with Visual Studio
 
-Run from 64-bit PowerShell on a Windows machine with Visual Studio C++ tools:
+Run from 64-bit PowerShell on a Windows machine with Visual Studio C++ tools
+and the **C++ Clang tools for Windows** component installed:
 
 ```powershell
 git submodule update --init ffmpeg/vcpkg
 ./ffmpeg/scripts/build-windows.ps1
 ```
 
-The Windows triplet produces release static libraries using the dynamic MSVC
-runtime (`/MD`).
+libplacebo does not support the MSVC `cl.exe` C compiler. The Windows triplet
+therefore uses Visual Studio's `clang-cl` compiler with the Windows SDK and
+MSVC ABI. It produces release static libraries using the dynamic MSVC runtime
+(`/MD`).
 
 ## Outputs and parent-project consumption
 
@@ -119,8 +122,8 @@ Windows when a different artifact directory is needed.
 
 ## CI
 
-`.github/workflows/ffmpeg-dependencies.yml` builds Android on a GitHub-hosted
-macOS arm64 runner and Windows on a GitHub-hosted Visual Studio runner. OHOS is
-manual because the SDK is not installed on public runners: enable the
+`.github/workflows/ffmpeg-dependencies.yml` builds Android on a self-hosted
+macOS arm64 runner and Windows on a self-hosted Visual Studio runner. OHOS is
+manual: enable the
 `build_ohos` workflow input and provide a self-hosted macOS arm64 runner with
 the `ohos` label, `OHOS_SDK_ROOT`, and macOS-native `patchelf`.
