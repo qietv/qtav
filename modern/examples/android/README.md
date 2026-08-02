@@ -12,9 +12,10 @@ background/foreground surface recreation on one connected device.
 
 Requirements:
 
-- macOS host;
+- a Darwin cross-compilation host; macOS is not a supported QtAVCore target
+  and its former native backends are archived and unmaintained;
 - Android SDK under `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or the standard
-  macOS user SDK directory;
+  host user SDK directory;
 - NDK `28.2.13676358`, platform 36, and build-tools 37.0.0 by default;
 - SDK CMake 4.1.2/Ninja and Android Studio's bundled JBR;
 - CMake, Ninja, curl, and host FFmpeg;

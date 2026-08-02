@@ -14,12 +14,9 @@ namespace qtav {
 enum class HardwareDeviceType {
     Unknown,
     D3D11,
-    VideoToolbox,
-    VAAPI,
     MediaCodec,
     OpenGL,
     Vulkan,
-    Metal,
 };
 
 enum class HardwareHandleType {

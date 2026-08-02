@@ -12,10 +12,7 @@
 #  include <qtav/d3d11va_hardware_decoder.h>
 #endif
 
-#if defined(QTAV_CORE_CONSOLE_HAS_COREAUDIO)
-#  include <qtav/coreaudio_audio_sink.h>
-#  include <qtav/swresample_audio_converter.h>
-#elif defined(QTAV_CORE_CONSOLE_HAS_WASAPI)
+#if defined(QTAV_CORE_CONSOLE_HAS_WASAPI)
 #  include <qtav/swresample_audio_converter.h>
 #  include <qtav/wasapi_audio_sink.h>
 #endif
@@ -185,13 +182,7 @@ int main(int argc, char** argv)
         false;
 #endif
     bool d3d11VideoConfigured = false;
-#if defined(QTAV_CORE_CONSOLE_HAS_COREAUDIO)
-    player
-        .setAudioFrameConverter(
-            std::make_shared<qtav::SwresampleAudioConverter>())
-        .setAudioSink(
-            std::make_shared<qtav::CoreAudioAudioSink>());
-#elif defined(QTAV_CORE_CONSOLE_HAS_WASAPI)
+#if defined(QTAV_CORE_CONSOLE_HAS_WASAPI)
     player
         .setAudioFrameConverter(
             std::make_shared<qtav::SwresampleAudioConverter>())

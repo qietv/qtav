@@ -365,15 +365,6 @@ public:
         if (!frame_) {
             return { type, 0, 0 };
         }
-        if (deviceType_ == HardwareDeviceType::VideoToolbox
-            && (type == HardwareHandleType::Frame
-                || type == HardwareHandleType::Surface)) {
-            return {
-                type,
-                reinterpret_cast<std::uintptr_t>(frame_->data[3]),
-                0,
-            };
-        }
         if (deviceType_ == HardwareDeviceType::D3D11
             && type == HardwareHandleType::Texture) {
             return {

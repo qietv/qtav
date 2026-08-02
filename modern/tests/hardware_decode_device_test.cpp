@@ -22,8 +22,8 @@ AVHWDeviceType ffmpegDeviceType(qtav::HardwareDeviceType type)
     switch (type) {
     case qtav::HardwareDeviceType::D3D11:
         return AV_HWDEVICE_TYPE_D3D11VA;
-    case qtav::HardwareDeviceType::VideoToolbox:
-        return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+    case qtav::HardwareDeviceType::MediaCodec:
+        return AV_HWDEVICE_TYPE_MEDIACODEC;
     default:
         return AV_HWDEVICE_TYPE_NONE;
     }
@@ -67,7 +67,7 @@ void testTokenLifetimeAndIdentity()
         1,
         context));
     assert(!qtav::detail::HardwareDecodeDevicePrivate::create(
-        qtav::HardwareDeviceType::VideoToolbox,
+        qtav::HardwareDeviceType::MediaCodec,
         1,
         context));
     assert(!qtav::detail::HardwareDecodeDevicePrivate::create(
@@ -147,7 +147,7 @@ void testMismatchedSuppliedDeviceFallsBack(const char* media)
         .setHardwareDecodeConfig({
             qtav::HardwareDeviceType::D3D11,
             true,
-            makeDevice(qtav::HardwareDeviceType::VideoToolbox, 0x5678),
+            makeDevice(qtav::HardwareDeviceType::MediaCodec, 0x5678),
         })
         .onEvent([&](const qtav::MediaEvent& event) {
             if (event.category == "decoder.hardware.fallback") {
@@ -199,7 +199,7 @@ void testMismatchedSuppliedDeviceErrors(const char* media)
         .setHardwareDecodeConfig({
             qtav::HardwareDeviceType::D3D11,
             false,
-            makeDevice(qtav::HardwareDeviceType::VideoToolbox, 0x9abc),
+            makeDevice(qtav::HardwareDeviceType::MediaCodec, 0x9abc),
         })
         .onEvent([&](const qtav::MediaEvent& event) {
             if (event.category == "decoder.hardware.error") {

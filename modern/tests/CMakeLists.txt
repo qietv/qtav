@@ -156,29 +156,6 @@ if(TARGET qtav_audio_file)
     )
 endif()
 
-if(TARGET qtav_audio_coreaudio)
-    add_executable(
-        qtav_audio_coreaudio_test
-        coreaudio_audio_sink_test.cpp
-    )
-    target_link_libraries(
-        qtav_audio_coreaudio_test
-        PRIVATE QtAV::AudioCoreAudio
-    )
-    target_compile_features(
-        qtav_audio_coreaudio_test
-        PRIVATE cxx_std_17
-    )
-    add_test(
-        NAME qtav_audio_coreaudio
-        COMMAND qtav_audio_coreaudio_test
-    )
-    set_tests_properties(
-        qtav_audio_coreaudio
-        PROPERTIES TIMEOUT 15
-    )
-endif()
-
 if(TARGET qtav_audio_wasapi)
     add_executable(
         qtav_audio_wasapi_test
@@ -211,62 +188,6 @@ if(TARGET qtav_render_cpu)
         PRIVATE QtAV::RenderCPU
     )
     target_compile_features(qtav_render_cpu_test PRIVATE cxx_std_17)
-endif()
-
-if(TARGET qtav_render_metal)
-    enable_language(OBJCXX)
-    add_executable(
-        qtav_render_metal_test
-        metal_video_renderer_test.mm
-    )
-    target_link_libraries(
-        qtav_render_metal_test
-        PRIVATE
-            QtAV::RenderMetal
-            FFmpeg::avutil
-    )
-    target_include_directories(
-        qtav_render_metal_test
-        PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
-    )
-    target_compile_features(qtav_render_metal_test PRIVATE cxx_std_17)
-    target_compile_options(qtav_render_metal_test PRIVATE -fobjc-arc)
-
-    if(NOT CMAKE_SYSTEM_NAME MATCHES "iOS|tvOS|watchOS|visionOS")
-        add_executable(
-            qtav_render_metal_edr_display_test
-            metal_edr_display_test.mm
-        )
-        target_link_libraries(
-            qtav_render_metal_edr_display_test
-            PRIVATE
-                QtAV::RenderMetal
-                FFmpeg::avutil
-        )
-        target_include_directories(
-            qtav_render_metal_edr_display_test
-            PRIVATE "${PROJECT_SOURCE_DIR}/core/src"
-        )
-        target_compile_features(
-            qtav_render_metal_edr_display_test
-            PRIVATE cxx_std_17
-        )
-        target_compile_options(
-            qtav_render_metal_edr_display_test
-            PRIVATE -fobjc-arc
-        )
-        add_test(
-            NAME qtav_render_metal_edr_display
-            COMMAND qtav_render_metal_edr_display_test
-        )
-        set_tests_properties(
-            qtav_render_metal_edr_display
-            PROPERTIES
-                RUN_SERIAL TRUE
-                SKIP_RETURN_CODE 77
-                TIMEOUT 15
-        )
-    endif()
 endif()
 
 if(TARGET qtav_render_d3d11)
@@ -380,44 +301,6 @@ if(TARGET qtav_platform_windows)
     set_tests_properties(
         qtav_platform_windows_device_access
         PROPERTIES TIMEOUT 10
-    )
-endif()
-
-if(TARGET qtav_interop_cvmetal)
-    enable_language(OBJCXX)
-    find_library(QTAV_TEST_CVMETAL_COREVIDEO_FRAMEWORK CoreVideo)
-    add_executable(
-        qtav_interop_cvmetal_test
-        cvmetal_frame_interop_test.mm
-    )
-    target_link_libraries(
-        qtav_interop_cvmetal_test
-        PRIVATE
-            QtAV::InteropCVMetal
-            "${QTAV_TEST_CVMETAL_COREVIDEO_FRAMEWORK}"
-    )
-    target_compile_features(
-        qtav_interop_cvmetal_test
-        PRIVATE cxx_std_17
-    )
-    target_compile_options(
-        qtav_interop_cvmetal_test
-        PRIVATE -fobjc-arc
-    )
-endif()
-
-if(TARGET qtav_hw_videotoolbox)
-    add_executable(
-        qtav_hw_videotoolbox_test
-        videotoolbox_hardware_decoder_test.cpp
-    )
-    target_link_libraries(
-        qtav_hw_videotoolbox_test
-        PRIVATE QtAV::HWVideoToolbox
-    )
-    target_compile_features(
-        qtav_hw_videotoolbox_test
-        PRIVATE cxx_std_17
     )
 endif()
 
@@ -701,83 +584,6 @@ if(FFMPEG_EXECUTABLE)
         )
     endif()
 
-    if(TARGET qtav_render_metal_test)
-        set(
-            QTAV_RENDER_METAL_RGB_MEDIA
-            "${CMAKE_CURRENT_BINARY_DIR}/qtav-metal-rgb.nut"
-        )
-        set(
-            QTAV_RENDER_METAL_YUV_MEDIA
-            "${CMAKE_CURRENT_BINARY_DIR}/qtav-metal-yuv420p.nut"
-        )
-        set(
-            QTAV_RENDER_METAL_NV12_MEDIA
-            "${CMAKE_CURRENT_BINARY_DIR}/qtav-metal-nv12.nut"
-        )
-        add_test(
-            NAME qtav_render_metal_generate_rgb
-            COMMAND
-                "${FFMPEG_EXECUTABLE}"
-                -loglevel error
-                -y
-                -f lavfi
-                -i
-                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=rgb24"
-                -frames:v 1
-                -c:v rawvideo
-                -pix_fmt rgb24
-                "${QTAV_RENDER_METAL_RGB_MEDIA}"
-        )
-        add_test(
-            NAME qtav_render_metal_generate_yuv
-            COMMAND
-                "${FFMPEG_EXECUTABLE}"
-                -loglevel error
-                -y
-                -f lavfi
-                -i
-                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=yuv420p"
-                -frames:v 1
-                -c:v rawvideo
-                -pix_fmt yuv420p
-                "${QTAV_RENDER_METAL_YUV_MEDIA}"
-        )
-        add_test(
-            NAME qtav_render_metal_generate_nv12
-            COMMAND
-                "${FFMPEG_EXECUTABLE}"
-                -loglevel error
-                -y
-                -f lavfi
-                -i
-                "color=c=red:s=4x2:r=1:d=1,drawbox=x=2:y=0:w=2:h=2:color=blue:t=fill,format=nv12"
-                -frames:v 1
-                -c:v rawvideo
-                -pix_fmt nv12
-                "${QTAV_RENDER_METAL_NV12_MEDIA}"
-        )
-        set_tests_properties(
-            qtav_render_metal_generate_rgb
-            qtav_render_metal_generate_yuv
-            qtav_render_metal_generate_nv12
-            PROPERTIES FIXTURES_SETUP qtav_render_metal_media
-        )
-        add_test(
-            NAME qtav_render_metal_software_frames
-            COMMAND
-                qtav_render_metal_test
-                "${QTAV_RENDER_METAL_RGB_MEDIA}"
-                "${QTAV_RENDER_METAL_YUV_MEDIA}"
-                "${QTAV_RENDER_METAL_NV12_MEDIA}"
-        )
-        set_tests_properties(
-            qtav_render_metal_software_frames
-            PROPERTIES
-                FIXTURES_REQUIRED qtav_render_metal_media
-                TIMEOUT 20
-        )
-    endif()
-
     if(TARGET qtav_render_vulkan_test)
         set(
             QTAV_RENDER_VULKAN_TEST_MEDIA
@@ -893,44 +699,6 @@ if(FFMPEG_EXECUTABLE)
         )
     endif()
 
-    if(TARGET qtav_hw_videotoolbox_test)
-        set(
-            QTAV_HW_VIDEOTOOLBOX_TEST_MEDIA
-            "${CMAKE_CURRENT_BINARY_DIR}/qtav-videotoolbox-test.mp4"
-        )
-        add_test(
-            NAME qtav_hw_videotoolbox_generate_media
-            COMMAND
-                "${FFMPEG_EXECUTABLE}"
-                -hide_banner
-                -loglevel error
-                -y
-                -f lavfi
-                -i testsrc2=size=160x90:rate=12
-                -t 2
-                -c:v libx264
-                -pix_fmt yuv420p
-                -g 12
-                "${QTAV_HW_VIDEOTOOLBOX_TEST_MEDIA}"
-        )
-        set_tests_properties(
-            qtav_hw_videotoolbox_generate_media
-            PROPERTIES FIXTURES_SETUP qtav_hw_videotoolbox_media
-        )
-        add_test(
-            NAME qtav_hw_videotoolbox_lifecycle
-            COMMAND
-                qtav_hw_videotoolbox_test
-                "${QTAV_HW_VIDEOTOOLBOX_TEST_MEDIA}"
-        )
-        set_tests_properties(
-            qtav_hw_videotoolbox_lifecycle
-            PROPERTIES
-                FIXTURES_REQUIRED qtav_hw_videotoolbox_media
-                TIMEOUT 15
-        )
-    endif()
-
     if(TARGET qtav_hw_d3d11va_test)
         set(
             QTAV_HW_D3D11VA_TEST_MEDIA
@@ -965,44 +733,6 @@ if(FFMPEG_EXECUTABLE)
             qtav_hw_d3d11va_lifecycle
             PROPERTIES
                 FIXTURES_REQUIRED qtav_hw_d3d11va_media
-                TIMEOUT 20
-        )
-    endif()
-
-    if(TARGET qtav_interop_cvmetal_test)
-        set(
-            QTAV_INTEROP_CVMETAL_TEST_MEDIA
-            "${CMAKE_CURRENT_BINARY_DIR}/qtav-cvmetal-test.mp4"
-        )
-        add_test(
-            NAME qtav_interop_cvmetal_generate_media
-            COMMAND
-                "${FFMPEG_EXECUTABLE}"
-                -hide_banner
-                -loglevel error
-                -y
-                -f lavfi
-                -i
-                "color=c=red:s=64x32:r=1:d=1,drawbox=x=32:y=0:w=32:h=32:color=blue:t=fill,format=yuv420p"
-                -frames:v 1
-                -c:v libx264
-                -pix_fmt yuv420p
-                "${QTAV_INTEROP_CVMETAL_TEST_MEDIA}"
-        )
-        set_tests_properties(
-            qtav_interop_cvmetal_generate_media
-            PROPERTIES FIXTURES_SETUP qtav_interop_cvmetal_media
-        )
-        add_test(
-            NAME qtav_interop_cvmetal_zero_copy
-            COMMAND
-                qtav_interop_cvmetal_test
-                "${QTAV_INTEROP_CVMETAL_TEST_MEDIA}"
-        )
-        set_tests_properties(
-            qtav_interop_cvmetal_zero_copy
-            PROPERTIES
-                FIXTURES_REQUIRED qtav_interop_cvmetal_media
                 TIMEOUT 20
         )
     endif()

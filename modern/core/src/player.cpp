@@ -110,17 +110,12 @@ AVHWDeviceType ffmpegHardwareDeviceType(HardwareDeviceType type) noexcept
     switch (type) {
     case HardwareDeviceType::D3D11:
         return AV_HWDEVICE_TYPE_D3D11VA;
-    case HardwareDeviceType::VideoToolbox:
-        return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-    case HardwareDeviceType::VAAPI:
-        return AV_HWDEVICE_TYPE_VAAPI;
     case HardwareDeviceType::MediaCodec:
         return AV_HWDEVICE_TYPE_MEDIACODEC;
     case HardwareDeviceType::Vulkan:
         return AV_HWDEVICE_TYPE_VULKAN;
     case HardwareDeviceType::Unknown:
     case HardwareDeviceType::OpenGL:
-    case HardwareDeviceType::Metal:
         return AV_HWDEVICE_TYPE_NONE;
     }
     return AV_HWDEVICE_TYPE_NONE;

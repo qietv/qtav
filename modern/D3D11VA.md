@@ -101,9 +101,9 @@ between core and in-tree hardware backends carries a referenced FFmpeg
 
 `Player` takes an `av_buffer_ref()` of that supplied device context before
 `avcodec_open2()`. If no device token is supplied, the existing
-FFmpeg-created-device behavior remains available for generic hardware
-selection and for the VideoToolbox path. A supplied token whose type differs
-from `HardwareDecodeConfig::deviceType` is rejected before decoder open.
+FFmpeg-created-device behavior remains available for supported generic
+hardware selection. A supplied token whose type differs from
+`HardwareDecodeConfig::deviceType` is rejected before decoder open.
 
 The D3D11VA options include a bounded `extraHardwareFrames` value. It is copied
 to `AVCodecContext::extra_hw_frames` before opening the codec so FFmpeg can size
@@ -185,8 +185,8 @@ serialization.
 ## Interop and final rendering
 
 `qtav_render_d3d11` defines decoder-independent
-`D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces,
-parallel to the Metal renderer contracts. The renderer advertises D3D11
+`D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces. The
+renderer advertises D3D11
 hardware-frame support only while a compatible interop object is installed.
 
 `qtav_interop_d3d11` implements the interface as follows:

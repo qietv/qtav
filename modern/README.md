@@ -9,6 +9,15 @@ application-owned rendering callback, inspired by the public shape of
 It is not source- or binary-compatible with `mdk-sdk`, and no `mdk-sdk` source
 code is used.
 
+## Supported targets
+
+QtAVCore is maintained for Windows, Android, and OHOS targets only. The former
+macOS and iOS backends, tests, and integration notes were moved to
+[`../archived_apple/`](../archived_apple/) and are no longer maintained,
+built, tested, packaged, or installed. A macOS machine may still be used as a
+cross-compilation host for Android/OHOS; that does not make macOS a supported
+QtAVCore target. Linux is not part of the active target matrix or roadmap.
+
 ## Current scope
 
 - no Qt headers, libraries, meta-object compiler, or event loop;
@@ -33,20 +42,14 @@ code is used.
   HDR-aware FP16 scRGB or SDR swap chain, render target, display tracking,
   redraw-coalescing thread, D3D11VA/interop wiring, `renderVideo()`,
   `Present()`, resize, and teardown;
-- optional Metal renderer for borrowed Apple devices, command queues, and
-  current render targets, including complete macOS/iOS extended-linear
-  BT.2020 EDR layer presentation;
 - optional libswresample converter for negotiated interleaved PCM output;
 - optional RIFF/WAVE PCM diagnostic file sink;
-- optional macOS CoreAudio device sink with native playback timing;
 - optional Windows WASAPI shared-mode device sink with native playback timing;
 - optional Android AAudio device sink with callback-safe bounded buffering,
   device timing, latency reporting, and disconnect recovery;
 - optional D3D11VA hardware decoding on an application-selected retained
   D3D11 device, with reference-counted decoder texture-array slices and
   explicit software fallback;
-- optional VideoToolbox hardware decoding with reference-counted
-  `CVPixelBuffer` frames and explicit software fallback;
 - optional Android MediaCodec H.264/HEVC hardware decoding into an
   application-supplied, versioned `ANativeWindow`, with explicit present,
   monotonic-time present, drop, stale-generation rejection, and software
@@ -57,8 +60,6 @@ code is used.
 - optional Android MediaCodec-to-OpenGL ES zero-CPU-copy texture interop
   through a detached `SurfaceTexture`, timestamp-correlated
   `updateTexImage()`, and `GL_TEXTURE_EXTERNAL_OES` sampling;
-- optional CVMetalTextureCache interop for zero-copy limited/full-range
-  VideoToolbox-frame rendering through Metal;
 - optional platform-neutral Vulkan software-frame renderer using borrowed
   application-selected device/queue and current-image resources, with SDR,
   HDR10/PQ, HDR10/HLG, and extended-linear output contracts;
@@ -79,7 +80,7 @@ code is used.
 - an accepted Android/OHOS mobile rendering policy that prefers Vulkan and
   uses a separate OpenGL ES/EGL backend after Vulkan is unavailable or fails
   fatally, while keeping recoverable surface recreation within the active API;
-- a reproducible macOS-to-Android arm64 build and connected-device
+- a reproducible Android arm64 cross-build and connected-device
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
   decoding, Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback,
   AAudio output, MediaCodec H.264/HEVC direct-surface validation, and
@@ -89,9 +90,8 @@ code is used.
 
 The core does not open a platform audio device by default. Applications can
 keep consuming decoded frames through `onAudioFrame()` and can optionally bind
-an `AudioSink`; the macOS CoreAudio, Windows WASAPI, and Android AAudio
-implementations remain separate backend targets so the core acquires no Qt or
-platform dependency.
+an `AudioSink`; the Windows WASAPI and Android AAudio implementations remain
+separate backend targets so the core acquires no Qt or platform dependency.
 
 Current backend integration boundary:
 
@@ -109,9 +109,6 @@ Current backend integration boundary:
   `QtAV::AudioResample` supplies the portable libswresample implementation;
 - `QtAV::AudioFile` writes negotiated interleaved PCM to a standard RIFF/WAVE
   file for diagnostics without becoming a playback clock;
-- `QtAV::AudioCoreAudio` negotiates Float32 mono/stereo PCM against the macOS
-  output device, owns its AudioQueue buffers, and supplies a device-backed
-  playback clock and latency;
 - `QtAV::AudioWASAPI` negotiates shared-mode Float32 mono/stereo PCM against a
   Windows render endpoint, owns an event-driven queue on a dedicated COM
   thread, and supplies an `IAudioClock`-backed playback clock and latency;
@@ -123,8 +120,6 @@ Current backend integration boundary:
   its optional reference-counted `HardwareDecodeDevice` lets an in-tree
   backend supply a pre-created native device without exposing FFmpeg or
   platform SDK types;
-  `QtAV::HWVideoToolbox` supplies the Apple configuration helper and produces
-  `HardwareFrame` values backed by retained `CVPixelBuffer` storage;
   `QtAV::HWMediaCodec` explicitly selects FFmpeg's MediaCodec wrapper decoder,
   binds it to a versioned application `ANativeWindow`, and turns each decoded
   output into a single-decision direct-surface present/drop token;
@@ -159,14 +154,6 @@ Current backend integration boundary:
   the application supplies a swap-chain binding callback, surface size, and
   normally its hosting HWND, then the output owns display/HDR tracking,
   render scheduling, and presentation;
-- `QtAV::RenderMetal` uploads software YUV420/422/444, NV12/NV21, P010,
-  RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders into the application's
-  current Metal texture or drawable, accepts an optional hardware-frame
-  interop provider, and applies structured range/matrix/transfer/primaries
-  metadata;
-- `QtAV::InteropCVMetal` imports supported VideoToolbox `CVPixelBuffer` planes
-  as retained Metal textures without mapping or copying through CPU memory,
-  preserving whether the native pixel buffer is limited or full range;
 - `QtAV::RenderVulkan` packs supported software planes into a Vulkan storage
   buffer and draws through an application-supplied current image, applying
   structured color metadata and the common viewport/aspect/rotation contract;
@@ -194,9 +181,9 @@ Current backend integration boundary:
   hardware-frame fallback callback selects OpenGL ES native interop,
   direct-surface presentation, software decode, or no video for subsequent
   output; cross-API fallback never retries or maps the retired native frame;
-- no Linux native backend or OHOS hardware decoder has been implemented yet;
-  Android is the completed reference for the mobile renderer/hardware-interop
-  fallback policy.
+- no OHOS hardware decoder or platform adapter has been implemented yet;
+  Android is the completed reference for the shared mobile
+  renderer/hardware-interop fallback policy.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -260,14 +247,13 @@ enables a backend when its implementation and host requirements are available,
 clear error. Current switches are:
 
 - render: `QTAV_RENDER_CPU`, `QTAV_RENDER_MOBILE`, `QTAV_RENDER_OPENGL`,
-  `QTAV_RENDER_VULKAN`, `QTAV_RENDER_D3D11`, and `QTAV_RENDER_METAL`;
-- audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_COREAUDIO`, `QTAV_AUDIO_ALSA`,
-  `QTAV_AUDIO_PULSEAUDIO`, `QTAV_AUDIO_AAUDIO`, `QTAV_AUDIO_RESAMPLE`, and
-  `QTAV_AUDIO_FILE`;
-- hardware decode: `QTAV_HW_D3D11VA`, `QTAV_HW_VIDEOTOOLBOX`,
-  `QTAV_HW_VAAPI`, and `QTAV_HW_MEDIACODEC`;
-- interop: `QTAV_INTEROP_D3D11`, `QTAV_INTEROP_CVMETAL`,
-  `QTAV_INTEROP_MEDIACODEC_VULKAN`, and `QTAV_INTEROP_VAAPI`.
+  `QTAV_RENDER_VULKAN`, and `QTAV_RENDER_D3D11`;
+- audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_AAUDIO`,
+  `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
+- hardware decode: `QTAV_HW_D3D11VA` and `QTAV_HW_MEDIACODEC`;
+- interop: `QTAV_INTEROP_D3D11`,
+  `QTAV_INTEROP_MEDIACODEC_VULKAN`, and
+  `QTAV_INTEROP_MEDIACODEC_OPENGL`;
 - output: `QTAV_OUTPUT_D3D11`.
 
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
@@ -277,16 +263,10 @@ and libraries are available and adds the Android EGL adapter on Android,
 `QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader and
 `glslc` are available (the Android harness requires it explicitly),
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
-`QTAV_RENDER_METAL=AUTO` builds the native renderer on Apple hosts with Metal,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
 `QTAV_AUDIO_WASAPI=AUTO` builds the shared-mode device sink on Windows,
-`QTAV_AUDIO_COREAUDIO=AUTO` builds the macOS device sink when AudioToolbox
-and CoreAudio are available, and `QTAV_HW_VIDEOTOOLBOX=AUTO` builds the Apple
-hardware-decode selection and native-frame access target when VideoToolbox and
-CoreVideo are available. `QTAV_INTEROP_CVMETAL=AUTO` builds the Apple
-VideoToolbox/Metal interop target when the Metal renderer and CoreVideo are
-available. `QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
+`QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
 selection and native-frame access target. `QTAV_INTEROP_D3D11=AUTO` builds the
 Windows Video Processor adapter when the D3D11 renderer and D3D11VA decoder
 targets are available. `QTAV_OUTPUT_D3D11=AUTO` builds the high-level Windows
@@ -315,12 +295,11 @@ Visual Studio multi-config builds place executables and project DLLs together
 under `build/modern/bin/<Config>`, for example
 `build/modern/bin/Release/qtav_core_console.exe`.
 
-On macOS, when `QtAV::AudioCoreAudio` and `QtAV::AudioResample` are available,
-the console example sends decoded audio to the default output device. On
-Windows it does the same through `QtAV::AudioWASAPI` and, when the D3D11
+On Windows the console example sends decoded audio through
+`QtAV::AudioWASAPI` and, when the D3D11
 targets are available, exercises D3D11VA plus `QtAV::InteropD3D11` into an
-offscreen D3D11 render target. Other hosts retain callback-only audio
-inspection.
+offscreen D3D11 render target. Android and OHOS applications provide their
+own platform shells rather than using this headless native-device example.
 
 Windows CTest runs the example against generated H.264/AAC media with
 `QTAV_CORE_REQUIRE_NATIVE_WINDOWS_AV=1`. In that strict mode the example
@@ -521,31 +500,6 @@ player
         std::make_shared<qtav::SwresampleAudioConverter>())
     .setAudioSink(sink);
 ```
-
-### CoreAudio device sink
-
-Link `QtAV::AudioCoreAudio` and `QtAV::AudioResample`, then bind the macOS
-device sink:
-
-```cpp
-#include <qtav/coreaudio_audio_sink.h>
-#include <qtav/swresample_audio_converter.h>
-
-player
-    .setAudioFrameConverter(
-        std::make_shared<qtav::SwresampleAudioConverter>())
-    .setAudioSink(
-        std::make_shared<qtav::CoreAudioAudioSink>());
-```
-
-The default configuration follows the current default output device. A
-backend-specific `CoreAudioDevice` may select an explicit `AudioDeviceID`.
-The initial implementation negotiates the device's nominal sample rate and
-one or two interleaved Float32 channels; `SwresampleAudioConverter` converts
-decoded planar PCM, sample rate, or channel layout as needed. AudioQueue owns
-the native playback schedule while queued data is copied into backend-owned
-buffers. `clock()` maps AudioQueue sample time to the media timeline and
-reports queued plus device latency.
 
 ### WASAPI device sink
 
@@ -822,65 +776,6 @@ to codec decisions, latches, GL texture attach/detach/update counts, redraws,
 pending depth, timestamps, and the zero CPU-map/transfer/staging/upload
 counters.
 
-### VideoToolbox hardware decode
-
-Link `QtAV::HWVideoToolbox` and select it before opening media:
-
-```cpp
-#include <qtav/player.h>
-#include <qtav/videotoolbox_hardware_decoder.h>
-
-player
-    .setHardwareDecodeConfig(
-        qtav::videoToolboxHardwareDecodeConfig())
-    .onVideoFrame([](const qtav::VideoFrame& frame, int) {
-        if (!frame.hasHardwareFrame()) {
-            return; // Explicit software fallback may be active.
-        }
-        const auto hardware = frame.hardwareFrame();
-        CVPixelBufferRef pixelBuffer =
-            qtav::videoToolboxPixelBuffer(hardware);
-        // pixelBuffer is borrowed and remains valid while hardware is alive.
-    });
-```
-
-The default backend configuration allows software fallback when the codec has
-no VideoToolbox configuration, device creation fails, or hardware pixel-format
-negotiation cannot complete. Set
-`VideoToolboxHardwareDecodeConfig::allowSoftwareFallback` to `false` when the
-hardware path is mandatory. A hardware `VideoFrame` reports its underlying
-software pixel format but exposes no software plane pointers; use its
-`HardwareFrame`, retain the returned `CVPixelBuffer` if needed independently,
-or call `HardwareFrame::map()` for an explicit CPU copy.
-
-To render supported VideoToolbox frames without that CPU copy, also link
-`QtAV::InteropCVMetal` and attach its importer to `MetalVideoRenderer`:
-
-```objective-c++
-#include <qtav/cvmetal_frame_interop.h>
-#include <qtav/metal_video_renderer.h>
-
-auto interop = std::make_shared<qtav::CVMetalFrameInterop>(
-    qtav::BorrowedMetalDevice(device));
-auto renderer = std::make_shared<qtav::MetalVideoRenderer>(
-    qtav::BorrowedMetalDevice(device),
-    qtav::BorrowedMetalCommandQueue(commandQueue),
-    currentTargetCallback,
-    interop);
-
-player
-    .setHardwareDecodeConfig(
-        qtav::videoToolboxHardwareDecodeConfig())
-    .setVideoRenderAPI(renderer);
-```
-
-`CVMetalFrameInterop` accepts limited- and full-range bi-planar NV12 and P010
-`CVPixelBuffer` values. It creates luma and chroma texture views through
-`CVMetalTextureCache`; the renderer retains the imported frame until its Metal
-command buffer completes. The associated `VideoFrame` carries range,
-primaries, transfer, matrix, chroma location, HDR10 mastering-display, and
-content-light metadata without exposing FFmpeg or CoreVideo types.
-
 Multiple `VideoRenderAPI` instances can be associated with one player by using
 an application-owned opaque key:
 
@@ -907,7 +802,7 @@ device audio submission. The video presentation queue is bounded;
 when the application falls behind, it preserves the imminent queued frame and
 discards an incoming farther-future frame instead of accumulating unbounded
 latency or repeatedly replacing the next presentable frame. `renderVideo()`
-runs on the caller's thread, so an OpenGL, Vulkan, Metal, or D3D integration
+runs on the caller's thread, so an OpenGL, Vulkan, or D3D integration
 can keep ownership of its native context and surface. It returns the rendered
 timestamp in seconds, or a negative value when no frame is ready or a
 real-time render attempt is temporarily declined; the render scheduler should
@@ -1443,98 +1338,6 @@ HLG/BT.2020 prefers FP16 scRGB and can fall back to RGB10/PQ. The final
 renderer then performs display-specific tone and gamut mapping without a CPU
 map.
 
-### Metal renderer
-
-`QtAV::RenderMetal` is an Objective-C++ API. Include
-`<qtav/metal_video_renderer.h>` from a `.mm` file and pass strongly typed
-borrowed resources:
-
-```objective-c++
-auto renderer = std::make_shared<qtav::MetalVideoRenderer>(
-    qtav::BorrowedMetalDevice(device),
-    qtav::BorrowedMetalCommandQueue(commandQueue),
-    [&] {
-        qtav::MetalRenderTarget target;
-        target.drawable = currentDrawable;
-        return target;
-    });
-
-qtav::VideoRenderConfig config;
-config.surfaceSize = {
-    static_cast<int>(currentDrawable.texture.width),
-    static_cast<int>(currentDrawable.texture.height),
-};
-renderer->open(config);
-player.setVideoRenderAPI(renderer);
-```
-
-The application owns the device, queue, callback, texture, and drawable.
-Device and queue must outlive the renderer; objects returned by the target
-callback must remain valid for that `render()` call. The renderer owns its
-shader and pipeline resources, copies software frame planes into a Metal
-buffer or binds textures supplied by an optional `MetalHardwareFrameInterop`,
-commits the command buffer, and presents a returned drawable. Set
-`MetalRenderTarget::waitUntilCompleted` only for deterministic offscreen
-readback or diagnostics.
-
-The SDR software path supports YUV420P, YUV422P, YUV444P, NV12, NV21,
-little-endian P010, RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8. It supports
-custom viewports, Fit/Fill/Stretch, all right-angle rotations, resize, and
-BGRA/RGBA 8-bit or RGBA16-float render targets. With
-`QtAV::InteropCVMetal`, the hardware path supports limited- and full-range
-NV12 and P010 VideoToolbox frames without a CPU copy.
-
-`MetalRenderTarget::outputColorSpace` defaults to `SDR`. In this mode the
-renderer preserves ordinary SDR presentation and maps PQ/HLG input into the
-target range. For complete Apple EDR presentation, return the application-owned
-`CAMetalLayer` and its active display instead of obtaining the drawable first:
-
-```objective-c++
-qtav::MetalRenderTarget target;
-target.layer = metalLayer;
-#if TARGET_OS_OSX
-target.display = view.window.screen;
-#else
-target.display = view.window.windowScene.screen;
-#endif
-target.outputColorSpace =
-    qtav::MetalOutputColorSpace::ExtendedLinearBT2020;
-target.edrToneMapping = qtav::MetalEDRToneMapping::System;
-```
-
-The renderer configures that layer before calling `nextDrawable`: device and
-drawable size, `MTLPixelFormatRGBA16Float`,
-`kCGColorSpaceExtendedLinearITUR_2020`,
-`wantsExtendedDynamicRangeContent = YES`, and frame-derived HDR10 or HLG
-`CAEDRMetadata`. PQ/HLG input is decoded into display-referred linear light
-where `1.0` equals `MetalRenderTarget::referenceWhiteNits`; BT.2020 input
-remains in BT.2020 primaries instead of being reduced to BT.709. This preserves
-the source HDR luminance and gamut representation through the render target;
-it is a color-managed linear representation, not bit-identical compressed
-HDR10 data.
-
-`MetalEDRToneMapping::System` lets Core Animation adapt the layer using
-`CAEDRMetadata`. `DisplayAdaptive` instead samples
-`NSScreen.maximumExtendedDynamicRangeColorComponentValue` on macOS or
-`UIScreen.currentEDRHeadroom` on iOS for every render call, clears layer EDR
-metadata to avoid double tone mapping, and compresses HDR into the live
-display headroom. It preserves values through SDR white when headroom is
-greater than `1.0`; at `1.0` it uses an HDR-to-SDR shoulder instead of clipping
-all highlights. `None` preserves unmodified extended-linear values for
-reference displays and offscreen processing.
-`MetalRenderTarget::currentEDRHeadroom` can provide a positive explicit
-override for deterministic tests; zero uses the live display query.
-`metalCurrentEDRHeadroom()` and `metalPotentialEDRHeadroom()` expose the same
-screen queries to Objective-C++ applications.
-
-`ExtendedLinearSRGB` remains available for applications that deliberately use
-BT.709/sRGB primaries, but it does not preserve the complete BT.2020 gamut.
-For onscreen EDR, returning `layer` is required so metadata is installed before
-the drawable is acquired. Deterministic GPU readback verifies HDR pixels above
-`1.0`, BT.2020 preservation, and adaptive 2x/4x headroom. A separate macOS
-display test presents through a real EDR-capable screen and reports a CTest
-skip when no screen has live EDR headroom.
-
 `VideoFrame::colorSpaceInfo()` returns structured range, primaries, transfer,
 matrix, and chroma location. `masteringDisplayMetadata()` and
 `contentLightMetadata()` return copied HDR10 static metadata, so their values
@@ -1580,15 +1383,6 @@ playback; applications normally inject `QtAV::AudioResample` when decoded PCM
 is planar or otherwise differs from the requested file format. Seek flushes
 the stream but preserves already captured samples, so subsequent playback is
 appended to the same diagnostic timeline.
-
-`QtAV::AudioCoreAudio` implements `CoreAudioAudioSink` on macOS. Its
-backend-specific public header exposes the strong, non-owning
-`CoreAudioDevice` wrapper, while no Apple SDK type reaches the core headers.
-The sink follows the default output device unless an explicit device is
-selected, negotiates interleaved Float32 PCM at the device's nominal rate,
-copies accepted buffers into a bounded AudioQueue pool, implements
-pause/flush/drain, and reports a media-timeline device clock plus hardware and
-queued latency.
 
 `QtAV::AudioWASAPI` implements `WasapiAudioSink` on Windows. Its
 backend-specific public header uses an owning `WasapiEndpointId` value rather
@@ -1670,9 +1464,9 @@ device behavior.
 storage. A native handle is an opaque integer tagged by its role and remains
 valid while the frame is alive. CPU mapping returns a reference-counted
 `HardwareFrameMapping`, whose destructor ends the mapping. Backend-specific
-headers are responsible for converting opaque handles to strong D3D, Metal,
-VAAPI, or Android types. `HardwareFrameInterop` describes source/target support
-and imports frames without committing to a runtime plugin ABI.
+headers are responsible for converting opaque handles to strong D3D, Vulkan,
+OpenGL, Android, or OHOS types. `HardwareFrameInterop` describes source/target
+support and imports frames without committing to a runtime plugin ABI.
 
 These are compile-time C++ contracts for targets built with a compatible
 toolchain. They are not a stable cross-compiler dynamic-plugin boundary.
@@ -1754,15 +1548,11 @@ Player facade
        ├─ mobile Vulkan/OpenGL ES selection and bounded recovery policy
        ├─ libswresample interleaved PCM converter
        ├─ RIFF/WAVE diagnostic PCM file sink
-       ├─ CoreAudio device sink with AudioQueue clocking
        ├─ WASAPI shared-mode device sink with IAudioClock clocking
        ├─ AAudio device sink with callback-safe SPSC buffering
        ├─ D3D11VA decoder producing retained texture-array slices
        ├─ MediaCodec decoder producing direct-surface present/drop tokens
        ├─ MediaCodec/AImageReader Vulkan hardware-buffer interop
-       ├─ Metal software/hardware-frame renderer with borrowed native resources
-       ├─ VideoToolbox decoder producing retained CVPixelBuffer frames
-       ├─ CVMetalTextureCache zero-copy frame interop
        ├─ lifecycle-connected AudioSink
        └─ HardwareFrame + HardwareFrameInterop
 ```

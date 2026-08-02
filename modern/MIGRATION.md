@@ -8,6 +8,18 @@ QtAVCore requires FFmpeg 8.0 or newer. Compatibility code for FFmpeg 5–7 is
 intentionally not carried in `modern/`; this does not change the dependency
 range of the legacy root QtAV implementation.
 
+QtAVCore migration targets Windows, Android, and OHOS only. The former macOS
+and iOS backends and their migration notes are preserved under
+[`../archived_apple/`](../archived_apple/) as unmaintained historical material;
+they are no longer part of the active API, build, package, or support matrix.
+Linux is also outside the active target matrix.
+
+This support change removes the former Apple CMake targets and options plus
+`HardwareDeviceType::VideoToolbox` and `HardwareDeviceType::Metal`. The unused
+Linux `HardwareDeviceType::VAAPI` value and ALSA/PulseAudio/VAAPI placeholder
+options were removed at the same time. Consumers must not probe or request
+those identifiers from the active headers.
+
 ## API mapping
 
 | Legacy QtAV | QtAVCore |
@@ -54,8 +66,6 @@ already own a graphics context or require multiple/custom render targets:
 - optional audio-sink playback output with device-master clock fallback;
 - optional libswresample conversion to negotiated interleaved PCM;
 - optional `WavAudioSink` diagnostic output through `QtAV::AudioFile`;
-- optional macOS `CoreAudioAudioSink` device output through
-  `QtAV::AudioCoreAudio`;
 - optional Windows `WasapiAudioSink` shared-mode device output through
   `QtAV::AudioWASAPI`;
 - optional Android `AAudioAudioSink` output through `QtAV::AudioAAudio`, with
@@ -68,8 +78,6 @@ already own a graphics context or require multiple/custom render targets:
 - optional D3D11VA hardware decode through `QtAV::HWD3D11VA`, using the
   application-selected `D3D11DeviceAccess` and retained decoder texture-array
   slices;
-- optional VideoToolbox hardware decode through `QtAV::HWVideoToolbox`, with
-  reference-counted `CVPixelBuffer` frames and explicit software fallback;
 - optional Android H.264/HEVC MediaCodec hardware decode through
   `QtAV::HWMediaCodec`, using an application-supplied versioned
   `ANativeWindow` and move-only direct-surface present/drop tokens;
@@ -81,8 +89,6 @@ already own a graphics context or require multiple/custom render targets:
   `QtAV::InteropMediaCodecOpenGL`, using a detached `SurfaceTexture`,
   timestamp-correlated `GL_TEXTURE_EXTERNAL_OES` sampling, and no decoded
   source mapping or upload;
-- optional `QtAV::InteropCVMetal` import of limited/full-range VideoToolbox
-  NV12/P010 pixel-buffer planes into Metal textures without a CPU map or copy;
 - optional platform-neutral `QtAV::RenderVulkan` software-frame rendering and
   Android `QtAV::RenderVulkanAndroid` surface/swapchain adaptation using
   application-owned Vulkan context objects and NativeActivity lifecycle;
@@ -102,28 +108,23 @@ already own a graphics context or require multiple/custom render targets:
   Advanced Color SDR, FP16 scRGB, and RGB10 HDR10 presentation;
 - shared retained D3D11 device/immediate-context access and recursive
   synchronization through `QtAV::PlatformWindows`;
-- Metal rendering of decoded software frames into an application-provided
-  current texture or drawable;
 - media and track information;
 - interruptible FFmpeg I/O when media changes or playback stops;
 - standalone static/shared CMake builds and installable package metadata;
-- a macOS-hosted Android arm64 cross-build and NativeActivity
+- an Android arm64 cross-build and NativeActivity
   connected-device harness proving QtAVCore/FFmpeg 8 software A/V decode,
   Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback, AAudio
   output, MediaCodec H.264/HEVC direct-surface decode, and private-AImageReader
   Vulkan texture import without Qt.
 
 The `VideoRenderAPI` and `AudioSink` contracts are connected to `Player`.
-The default decode path remains software-only. Applications can pass the
-backend-provided VideoToolbox `HardwareDecodeConfig` before opening media to
-select FFmpeg's VideoToolbox hardware path. Hardware video frames attach a
-reference-counted `HardwareFrame`; the Apple-specific accessor returns its
-borrowed `CVPixelBufferRef`, while the generic contract can perform an
-explicit read mapping to CPU memory. Device creation and pixel-format
-negotiation failures either report `decoder.hardware.fallback` and continue
-in software or report `decoder.hardware.error`, according to the selected
-fallback policy.
-Android applications can instead create a backend-specific
+The default decode path remains software-only. Hardware video frames attach a
+reference-counted `HardwareFrame`; supported backend-specific accessors expose
+strong native views while the generic contract can perform an explicit read
+mapping to CPU memory. Device creation and pixel-format negotiation failures
+either report `decoder.hardware.fallback` and continue in software or report
+`decoder.hardware.error`, according to the selected fallback policy. Android
+applications can create a backend-specific
 `MediaCodecSurface`, pass `mediaCodecHardwareDecodeConfig()` before playback,
 and turn each MediaCodec hardware frame into a `MediaCodecFrame`.
 `present()`, monotonic-time `presentAt()`, and `drop()` are mutually exclusive
@@ -166,25 +167,11 @@ the backend's FFmpeg hardware-device context. This is the common bridge for
 decoding on an application-selected native device; changing the token while
 media is open causes the same asynchronous decoder reopen as changing the
 requested hardware type.
-Applications that link `QtAV::InteropCVMetal` can bind a
-`CVMetalFrameInterop` to `MetalVideoRenderer`. Supported limited- and
-full-range bi-planar NV12 and P010 `CVPixelBuffer` planes are exposed to the
-render command as retained Metal textures, without calling
-`HardwareFrame::map()` or staging through CPU memory. Imported frame resources
-remain alive until asynchronous Metal execution completes.
 `VideoFrame::colorSpaceInfo()` replaces string parsing for range, primaries,
 transfer, matrix, and chroma location. HDR10 mastering-display and content
-light side data are copied into toolkit-independent value types. Metal uses
-that metadata for limited/full-range YUV conversion, BT.601/BT.709/BT.2020
-matrix selection, PQ/HLG handling, and source-primary conversion. The complete
-Apple EDR path accepts an application-owned `CAMetalLayer` and active
-`NSScreen`/`UIScreen`, configures `RGBA16Float`, extended-linear BT.2020,
-`wantsExtendedDynamicRangeContent`, and HDR10/HLG `CAEDRMetadata` before
-acquiring each drawable, and preserves BT.2020 primaries plus linear HDR
-values above reference white. System tone mapping and renderer-controlled
-live-headroom adaptation are explicit modes. The older
-`ExtendedLinearSRGB` output remains available, but deliberately converts into
-the narrower BT.709/sRGB gamut and is not the full HDR10/BT.2020 path.
+light side data are copied into toolkit-independent value types. Active
+renderers use that metadata for range, matrix, transfer, primaries, and HDR
+output decisions without exposing FFmpeg types.
 `AudioSink` can use an injected `AudioFrameConverter` when decoded and device
 PCM formats differ. Applications link `QtAV::AudioResample` and pass a
 `SwresampleAudioConverter` through `Player::setAudioFrameConverter()`.
@@ -192,19 +179,7 @@ PCM formats differ. Applications link `QtAV::AudioResample` and pass a
 a loop boundary, after the converter is drained and before the final sink
 close; the default implementation is a no-op for existing synchronous or
 non-queuing sinks. The CPU renderer currently supports full-surface `Stretch`
-rendering with no rotation. The Apple-only
-Objective-C++ Metal renderer supports Fit, Fill, Stretch, custom viewports,
-resize, and all right-angle rotations for software YUV, NV12/NV21, P010, and
-RGB-family frames. Its strongly typed device and command queue are borrowed,
-and the application supplies the current texture or drawable for each render
-call.
-
-On macOS, `CoreAudioAudioSink` follows the default output device or accepts an
-explicit backend-specific `CoreAudioDevice`. It negotiates Float32
-mono/stereo PCM at the device's nominal sample rate, so decoded formats
-normally use the injected `SwresampleAudioConverter`. The sink copies PCM into
-its native AudioQueue pool, implements pause/flush/natural-end drain, and
-provides the device-master clock and latency consumed by `Player`.
+rendering with no rotation.
 
 On Windows, `WasapiAudioSink` follows the default multimedia render endpoint
 or accepts an explicit owning `WasapiEndpointId`. It negotiates interleaved
@@ -303,10 +278,9 @@ or pace playback. Decoded planar audio therefore normally uses
 
 ## Deliberately deferred
 
-- remaining platform audio device implementations (ALSA/PulseAudio, OHAudio);
-- the OHOS EGL adapter and Vulkan OHOS/Linux validation;
-- remaining hardware decoders (VAAPI and OHCodec) plus Linux and OHOS GPU
-  zero-CPU-copy interop;
+- the OHAudio device implementation;
+- the OHOS EGL adapter and Vulkan device validation;
+- OHCodec hardware decode plus OHOS GPU zero-CPU-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;
@@ -389,8 +363,8 @@ replacement, stale-token rejection, and clean shutdown. Android
 MediaCodec/Vulkan interop now passes H.264 and HEVC private-AImageReader
 import with native YCbCr/external-format sampling, one returned release fence
 per import, bounded pending images, and zero decoded-source
-map/transfer/staging/upload counters. OHOS and Linux texture interop remain
-separate backend work under the responsibility and lifecycle boundaries in
+map/transfer/staging/upload counters. OHOS texture interop remains separate
+backend work under the responsibility and lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and
@@ -487,11 +461,11 @@ are separate backend/product work.
    software path.
 2. Use the interleaved PCM libswresample backend when a sink negotiates a
    different format.
-3. Complete the Apple production path by adding CoreAudio, then VideoToolbox
-   and CVPixelBuffer/Metal interop.
-4. Add hardware decode and zero-copy frame handles for that path.
-5. Implement the accepted Windows D3D11VA device/frame contract, then add
-   zero-CPU-copy texture rendering through D3D11 interop.
+3. Use the completed Windows D3D11VA device/frame and zero-CPU-copy interop
+   contracts as the native desktop reference.
+4. Use the completed Android renderer, audio, MediaCodec, and interop paths as
+   the mobile reference.
+5. Implement the OHOS production path using the shared mobile contracts.
 6. Add subtitle and multi-track switching.
 7. Add live-stream buffering and recovery policies.
 
