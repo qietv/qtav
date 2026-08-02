@@ -92,6 +92,7 @@ jobs:
         with:
           path: ~/AppData/Local/vcpkg/archives
           key: vcpkg-windows-${{ hashFiles('ffmpeg/vcpkg.json', 'ffmpeg/vcpkg-configuration.json', 'ffmpeg/triplets/**', 'ffmpeg/ports/**') }}
+          save-always: true
 
       - name: Build and verify dependencies
         shell: pwsh

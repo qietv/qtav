@@ -71,6 +71,14 @@ foreach(GLSLANG_LIBRARY IN ITEMS
         "${LIBPLACEBO_PC_CONTENT}"
     )
 endforeach()
+if(VCPKG_TARGET_IS_WINDOWS)
+    string(REGEX REPLACE
+        "(^|[ \t])shlwapi\\.lib"
+        "\\1-lshlwapi"
+        LIBPLACEBO_PC_CONTENT
+        "${LIBPLACEBO_PC_CONTENT}"
+    )
+endif()
 file(WRITE "${LIBPLACEBO_PC}" "${LIBPLACEBO_PC_CONTENT}")
 
 # FFmpeg's configure probes libplacebo with the C compiler. Static libplacebo
