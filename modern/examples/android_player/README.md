@@ -24,7 +24,9 @@ full-screen mode.
 
 ## Build
 
-The build is Gradle-free and reproducible from macOS. By default it uses the
+The build is Gradle-free and reproducible from the recorded Darwin
+cross-compilation host. macOS is not a supported QtAVCore target; its former
+native backends are archived and unmaintained. By default this script uses the
 same NDK/API/tool versions as the Android regression harness and builds
 checksum-pinned OpenSSL 3.5.7 plus FFmpeg 8.1.2. The FFmpeg configuration has
 networking and its OpenSSL TLS backend enabled, together with common MP4/MOV,

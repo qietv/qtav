@@ -7,6 +7,15 @@ project(
     LANGUAGES CXX
 )
 
+if(NOT WIN32
+   AND NOT ANDROID
+   AND NOT CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$")
+    message(FATAL_ERROR
+        "QtAVCore supports Windows, Android, and OHOS targets only. "
+        "The former macOS/iOS implementation is archived under "
+        "archived_apple/ and is no longer maintained.")
+endif()
+
 # Keep project DLLs and their consumers together in multi-config Windows
 # builds. This makes the shared-library tests and examples runnable without
 # modifying PATH while leaving the install layout unchanged.

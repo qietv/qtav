@@ -40,7 +40,7 @@ class MockHardwareFrameData final : public qtav::HardwareFrameData {
 public:
     qtav::HardwareDeviceType deviceType() const noexcept override
     {
-        return qtav::HardwareDeviceType::Metal;
+        return qtav::HardwareDeviceType::Vulkan;
     }
     int width() const noexcept override { return 2; }
     int height() const noexcept override { return 2; }
@@ -73,15 +73,15 @@ public:
     qtav::HardwareInteropCapabilities capabilities() const override
     {
         return {
-            { qtav::HardwareDeviceType::Metal },
-            qtav::HardwareDeviceType::Metal,
+            { qtav::HardwareDeviceType::Vulkan },
+            qtav::HardwareDeviceType::Vulkan,
             true,
             true,
         };
     }
     bool supports(const qtav::HardwareFrame& frame) const noexcept override
     {
-        return frame.deviceType() == qtav::HardwareDeviceType::Metal;
+        return frame.deviceType() == qtav::HardwareDeviceType::Vulkan;
     }
     qtav::HardwareFrame importFrame(
         const qtav::HardwareFrame& frame) override
@@ -96,7 +96,7 @@ public:
     {
         return {
             { qtav::PixelFormat::RGBA },
-            { qtav::HardwareDeviceType::Metal },
+            { qtav::HardwareDeviceType::Vulkan },
             true,
             true,
             false,

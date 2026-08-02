@@ -5,8 +5,13 @@
 An incremental Qt-free rewrite now lives in [`modern/`](modern/README.md).
 It provides a standalone C++17/FFmpeg 8+ playback core with an asynchronous
 `Player` API, decoded frame callbacks, and application-owned render scheduling.
-Build it independently with `cmake -S modern -B build/modern`; it does not link
-Qt or require a Qt event loop.
+It is maintained for Windows, Android, and OHOS targets only. The former
+QtAVCore macOS/iOS implementation is preserved under
+[`archived_apple/`](archived_apple/README.md) and is no longer maintained,
+built, tested, packaged, or installed. On a supported target, build the modern
+core independently with `cmake -S modern -B build/modern`; it does not link Qt
+or require a Qt event loop. Platform claims later in this file describe the
+legacy root QtAV implementation, not QtAVCore.
 
 
 **I'm not developing QtAV, patches are still welcome.** You can try my new [sdk](https://sourceforge.net/projects/mdk-sdk/files/nightly/) [which is actively developed](https://github.com/wang-bin/mdk-sdk)

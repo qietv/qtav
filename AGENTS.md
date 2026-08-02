@@ -24,6 +24,11 @@ Before changing the rewrite, read:
 implementation task. Update it whenever a milestone or meaningful subtask is
 completed.
 
+QtAVCore is maintained for Windows, Android, and OHOS targets only. The former
+macOS/iOS implementation is preserved under `archived_apple/` as unmaintained
+historical material and is not part of the active build, package, test, or
+support matrix. Linux is outside the active target matrix and roadmap.
+
 ## Non-negotiable architecture rules
 
 - `modern/` must not include or link Qt.
@@ -45,7 +50,8 @@ completed.
   - `backends/hwaccel/`
   - `backends/interop/`
   - shared operating-system helpers under `platform/`
-- Keep Objective-C++ (`.mm`) inside Apple backends.
+- Do not reconnect, modify, or present `archived_apple/` as supported code
+  unless the user explicitly requests revival of Apple platform support.
 - Keep Windows SDK, COM, WRL, D3D, DXGI, and WASAPI headers inside Windows
   backends.
 - Before starting implementation that depends on Windows platform features,
@@ -81,11 +87,11 @@ modern/
 │   ├── include/qtav/
 │   └── src/
 ├── backends/
-│   ├── render/{cpu,mobile,opengl,vulkan,d3d11,metal}/
-│   ├── audio/{resample,file,wasapi,coreaudio,alsa,pulseaudio,aaudio}/
-│   ├── hwaccel/{d3d11va,videotoolbox,vaapi,mediacodec}/
-│   └── interop/{d3d11,cvmetal,mediacodec_vulkan,mediacodec_opengl,vaapi}/
-├── platform/{windows,apple,linux,android}/
+│   ├── render/{cpu,mobile,opengl,vulkan,d3d11}/
+│   ├── audio/{resample,file,wasapi,aaudio,ohaudio}/
+│   ├── hwaccel/{d3d11va,mediacodec,ohcodec}/
+│   └── interop/{d3d11,mediacodec_vulkan,mediacodec_opengl,ohcodec_vulkan,ohcodec_opengl}/
+├── platform/{windows,android,ohos}/
 ├── examples/
 └── tests/
 ```
@@ -102,16 +108,13 @@ qtav_render_mobile
 qtav_render_opengl
 qtav_render_vulkan
 qtav_render_d3d11
-qtav_render_metal
 qtav_audio_resample
 qtav_audio_file
 qtav_audio_wasapi
-qtav_audio_coreaudio
+qtav_audio_aaudio
 qtav_hw_d3d11va
-qtav_hw_videotoolbox
 qtav_hw_mediacodec
 qtav_interop_d3d11
-qtav_interop_cvmetal
 qtav_interop_mediacodec_vulkan
 qtav_interop_mediacodec_opengl
 ```
@@ -170,9 +173,6 @@ Implemented under `modern/`:
 - Windows PQ/HLG EOTF, BT.2020 conversion, display-aware tone mapping,
   per-frame `IDXGIOutput6` capability/display switching, and system SDR
   reference-white handling;
-- Metal software-frame rendering into borrowed textures or drawables;
-- CoreAudio device output with playback clock and latency reporting;
-- VideoToolbox hardware decoding into retained `CVPixelBuffer` frames;
 - MediaCodec H.264/HEVC hardware decoding into an application-supplied,
   versioned Android surface, with explicit present/drop output tokens;
 - private GPU-sampled Android `AImageReader`/`AHardwareBuffer` MediaCodec
@@ -183,7 +183,6 @@ Implemented under `modern/`:
   `GL_TEXTURE_EXTERNAL_OES`, with timestamp/generation correlation,
   single-current-image lifetime, seek/flush and EGL surface-recreation
   coverage, and zero decoded-source CPU map/transfer/staging/upload;
-- zero-copy VideoToolbox/CVMetal plane import and Metal rendering;
 - platform-neutral Vulkan software-frame rendering with structured color and
   geometry shaders, explicit SDR/HDR10/extended-linear output color spaces,
   plus an Android `ANativeWindow` adapter with native HDR swapchain selection
@@ -199,8 +198,7 @@ Implemented under `modern/`:
   decoder output for compatible OpenGL ES interop, direct-surface
   presentation, software decode, or no video without retrying or mapping a
   frame from the retired Vulkan surface;
-- structured video color-space/HDR10 metadata and Metal
-  SDR/extended-linear output;
+- structured video color-space/HDR10 metadata across active renderers;
 - libswresample conversion to negotiated interleaved PCM;
 - RIFF/WAVE diagnostic output through an optional PCM file sink;
 - headless console example;
@@ -209,9 +207,8 @@ Implemented under `modern/`:
 
 Known intentional limitations:
 
-- no native audio-device sink outside macOS and Windows yet;
-- no OHOS or Linux platform adapters/device coverage yet;
-- no Linux or OHOS hardware decoder yet;
+- no OHOS platform adapter or native audio-device coverage yet;
+- no OHOS hardware decoder yet;
 - no subtitles or post-load track switching;
 - no production network buffering/recovery policy;
 - no compressed Dolby passthrough, Atmos object rendering, Dolby Vision, or
@@ -225,7 +222,11 @@ Dolby codec status:
 
 ## Build and validation
 
-Normal build:
+Run native builds only on Windows or with an Android/OHOS target toolchain.
+Configuring `modern/` for a macOS/iOS or Linux target must fail at the platform
+support gate.
+
+Normal supported-target build:
 
 ```sh
 cmake -S modern -B build/modern \
@@ -245,43 +246,26 @@ cmake --build build/modern-shared --parallel
 ctest --test-dir build/modern-shared --output-on-failure
 ```
 
-Sanitizer build on Clang:
+Sanitizer build on a supported Clang target:
 
 ```sh
 cmake -S modern -B build/modern-asan \
   -DCMAKE_BUILD_TYPE=Debug \
   -DQTAV_CORE_BUILD_EXAMPLES=OFF \
   -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-  -DCMAKE_OBJCXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 cmake --build build/modern-asan --parallel
-ASAN_OPTIONS=detect_leaks=0 \
-  ctest --test-dir build/modern-asan --output-on-failure
+ctest --test-dir build/modern-asan --output-on-failure
 ```
-
-`detect_leaks=0` is required by the AddressSanitizer shipped on the macOS
-development host; explicit leak detection aborts as unsupported.
 
 Last verified baseline:
 
-- current macOS recheck builds successfully and passes 29/29 CTest after the
-  scheduling-isolation audio tests were updated to wait explicitly for frame
-  callbacks and to expect one sink drain per completed loop segment, including
-  the mobile renderer selector state-machine coverage;
-- static build: passed;
-- shared build: passed;
-- CTest: 29/29 passed;
-- ASan/UBSan: 29/29 passed;
-- all-backends-disabled macOS CTest: 10/10 passed;
-- install plus external `find_package(QtAVCore)` consumption of
-  `QtAV::Core`, `QtAV::RenderCPU`, `QtAV::RenderMetal`,
-  `QtAV::AudioResample`, `QtAV::AudioFile`, `QtAV::AudioCoreAudio`,
-  `QtAV::HWVideoToolbox`, and `QtAV::InteropCVMetal`: passed;
-- configuration without `pkg-config`: passed;
-- runtime linkage inspection: FFmpeg, Apple frameworks, C++ runtime, and
-  system libraries only; no Qt dependency;
-- MPEG-4/AAC generated-media playback: passed;
-- AC-3, E-AC-3, and TrueHD audio-only decoding: passed.
+- the former macOS/iOS validation record is historical and retained only in
+  `archived_apple/README.md`;
+- after archival, the Android arm64 NativeActivity harness and user-player
+  native library both reconfigure and link; changed generic tests compile with
+  the Android toolchain, and native macOS configuration fails at the intended
+  supported-target gate;
 - Android arm64 FFmpeg 8.1.2/QtAVCore/Vulkan build, APK packaging, and
   connected Adreno 830 device playback: passed with 180 decoded and
   Vulkan-presented video frames through a required HDR10/PQ swapchain, 282
@@ -352,6 +336,8 @@ Before finishing any implementation turn:
 1. Read this file and `modern/PLAN.md`.
 2. Inspect `git status --short`; existing changes may be intentional.
 3. Do not discard or overwrite the existing uncommitted `modern/` rewrite.
-4. Re-run the normal build and CTest baseline before a large refactor.
+4. Re-run the appropriate Windows, Android, or OHOS build/test baseline before
+   a large refactor; do not use a macOS/iOS or Linux target as active support
+   validation.
 5. Start from the first unchecked item in the `Next task` section of
    `modern/PLAN.md`, unless the user gives a different priority.

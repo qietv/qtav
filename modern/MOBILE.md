@@ -74,8 +74,8 @@ from the image format.
 
 Shader input structures, color conversion constants, geometry generation,
 staging layout, capability decisions, and golden pixel vectors are shared
-between Android, OHOS, and later Linux coverage. Deterministic engine tests use
-offscreen images and do not require a window system.
+between Android and OHOS. Deterministic engine tests use offscreen images and
+do not require a window system.
 
 ## OpenGL ES fallback renderer
 

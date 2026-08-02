@@ -19,10 +19,6 @@ HardwareDeviceType hardwareDeviceType(AVHWDeviceType type) noexcept
     switch (type) {
     case AV_HWDEVICE_TYPE_D3D11VA:
         return HardwareDeviceType::D3D11;
-    case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-        return HardwareDeviceType::VideoToolbox;
-    case AV_HWDEVICE_TYPE_VAAPI:
-        return HardwareDeviceType::VAAPI;
     case AV_HWDEVICE_TYPE_MEDIACODEC:
         return HardwareDeviceType::MediaCodec;
     case AV_HWDEVICE_TYPE_VULKAN:

@@ -361,7 +361,7 @@ void testRetainedTextureFrame(ID3D11Device* device)
             texture,
             0,
             qtav::PixelFormat::NV12,
-            qtav::HardwareDeviceType::VAAPI))));
+            qtav::HardwareDeviceType::MediaCodec))));
     assert(!qtav::d3d11vaFrame(qtav::HardwareFrame(
         std::make_shared<TextureFrameData>(
             texture,

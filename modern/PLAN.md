@@ -1,12 +1,26 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-07-31
+Last updated: 2026-08-02
 
 Status legend:
 
 - `[x]` complete and verified
 - `[~]` implemented partially or suitable only as a development baseline
 - `[ ]` not implemented
+
+## Target support policy
+
+QtAVCore is maintained for Windows, Android, and OHOS targets only. The former
+macOS/iOS implementation, tests, and historical notes are preserved under
+[`../archived_apple/`](../archived_apple/) and are no longer maintained,
+built, tested, packaged, or installed. Linux is not part of the active target
+matrix or roadmap. A macOS development machine may still act only as a
+cross-compilation host for Android/OHOS.
+
+The archival removes the former Apple backend options/targets and the
+`VideoToolbox`/`Metal` public hardware-device identifiers. The unused Linux
+backend placeholders and `VAAPI` identifier are removed as part of the same
+three-platform support cleanup.
 
 ## Current baseline
 
@@ -21,21 +35,10 @@ Continuation checkpoint:
 
 - baseline implementation commit: `62e84956` (`Add Qt-free QtAVCore rewrite`);
 - the latest completed scope connects `AudioSink` to `Player`, promotes a
-  valid device clock to playback master, adds the portable render/audio
-  reference backends, the Apple Metal software renderer and CoreAudio sink,
-  and an optional VideoToolbox decode path that produces reference-counted
-  `CVPixelBuffer` hardware frames with explicit software fallback, then imports
-  limited/full-range NV12/P010 pixel-buffer planes into Metal without a CPU
-  copy and applies structured SDR/HDR color metadata, plus the Windows D3D11
-  software-frame renderer using borrowed native resources and the Windows
-  WASAPI shared-mode device sink with event-driven playback and native
-  clocking;
-- the Apple reference path, including full extended-linear BT.2020 Metal EDR
-  layer configuration, HDR10/HLG `CAEDRMetadata`, real-time display-headroom
-  adaptation, HDR FP16 pixel validation, and a conditional real-screen EDR
-  test, and the Windows D3D11 software-frame and WASAPI audio paths are
-  complete;
-  the D3D11VA device/frame/interop design and supplied-device core bridge are
+  valid device clock to playback master, adds portable render/audio reference
+  backends, and completes the Windows D3D11/WASAPI and Android
+  Vulkan/OpenGL ES/AAudio/MediaCodec production paths;
+- the D3D11VA device/frame/interop design and supplied-device core bridge are
   complete; the native `qtav_hw_d3d11va` decoder backend and
   `qtav_interop_d3d11` Video Processor path are complete, including
   same-device validation, SDR BGRA8 plus HDR RGB10/FP16 conversion, native
@@ -80,7 +83,7 @@ Continuation checkpoint:
   its progress slider observes already-handled thumb pointer events and
   commits only one seek when a drag ends instead of issuing intermediate seeks;
   Milestones 5 and 6 are complete and the active next platform task is the
-  OHOS production path, followed by Linux; the shared Android/OHOS
+  OHOS production path; the shared Android/OHOS
   responsibility and lifecycle design is now recorded in `MOBILE.md`, and the
   Android arm64 Vulkan checkpoint cross-builds FFmpeg 8.1.2 plus QtAVCore,
   packages a minimal NativeActivity APK, verifies generated software A/V
@@ -138,10 +141,8 @@ Current public entry points:
 - `modern/core/include/qtav/hardware_decoder.h`
 - `modern/core/include/qtav/hardware_frame.h`
 - `modern/backends/audio/file/include/qtav/wav_audio_sink.h`
-- `modern/backends/audio/coreaudio/include/qtav/coreaudio_audio_sink.h`
 - `modern/backends/audio/wasapi/include/qtav/wasapi_audio_sink.h`
 - `modern/backends/audio/aaudio/include/qtav/aaudio_audio_sink.h`
-- `modern/backends/render/metal/include/qtav/metal_video_renderer.h`
 - `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
 - `modern/backends/output/d3d11/include/qtav/d3d11_video_output.h`
 - `modern/backends/render/vulkan/include/qtav/vulkan_video_renderer.h`
@@ -150,11 +151,9 @@ Current public entry points:
 - `modern/backends/render/opengl/android/include/qtav/android_opengl_video_renderer.h`
 - `modern/backends/render/mobile/include/qtav/mobile_video_renderer.h`
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
-- `modern/backends/hwaccel/videotoolbox/include/qtav/videotoolbox_hardware_decoder.h`
 - `modern/backends/hwaccel/mediacodec/include/qtav/mediacodec_hardware_decoder.h`
 - `modern/backends/interop/mediacodec_vulkan/include/qtav/mediacodec_vulkan_interop.h`
 - `modern/backends/interop/mediacodec_opengl/include/qtav/mediacodec_opengl_interop.h`
-- `modern/backends/interop/cvmetal/include/qtav/cvmetal_frame_interop.h`
 - `modern/backends/interop/d3d11/include/qtav/d3d11_frame_interop.h`
 - `modern/MOBILE.md`
 
@@ -170,10 +169,8 @@ Current implementation:
 - `modern/backends/audio/resample/src/swresample_audio_converter.cpp`
 - `modern/backends/audio/file/include/qtav/wav_audio_sink.h`
 - `modern/backends/audio/file/src/wav_audio_sink.cpp`
-- `modern/backends/audio/coreaudio/src/coreaudio_audio_sink.cpp`
 - `modern/backends/audio/wasapi/src/wasapi_audio_sink.cpp`
 - `modern/backends/audio/aaudio/src/aaudio_audio_sink.cpp`
-- `modern/backends/render/metal/src/metal_video_renderer.mm`
 - `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
 - `modern/backends/render/vulkan/src/vulkan_video_renderer.cpp`
 - `modern/backends/render/vulkan/android/src/android_vulkan_video_renderer.cpp`
@@ -181,11 +178,9 @@ Current implementation:
 - `modern/backends/render/opengl/android/src/android_opengl_video_renderer.cpp`
 - `modern/backends/render/mobile/src/mobile_video_renderer.cpp`
 - `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
-- `modern/backends/hwaccel/videotoolbox/src/videotoolbox_hardware_decoder.cpp`
 - `modern/backends/hwaccel/mediacodec/src/mediacodec_hardware_decoder.cpp`
 - `modern/backends/interop/mediacodec_vulkan/src/mediacodec_vulkan_interop.cpp`
 - `modern/backends/interop/mediacodec_opengl/src/mediacodec_opengl_interop.cpp`
-- `modern/backends/interop/cvmetal/src/cvmetal_frame_interop.mm`
 - `modern/backends/interop/d3d11/src/d3d11_frame_interop.cpp`
 - `modern/backends/output/d3d11/src/d3d11_video_output.cpp`
 - `modern/tests/audio_sink_player_test.cpp`
@@ -197,11 +192,8 @@ Current implementation:
 - `modern/tests/audio_resample_player_test.cpp`
 - `modern/tests/wav_audio_sink_test.cpp`
 - `modern/tests/wav_audio_sink_player_test.cpp`
-- `modern/tests/coreaudio_audio_sink_test.cpp`
 - `modern/tests/wasapi_audio_sink_test.cpp`
 - `modern/tests/aaudio_pcm_queue_test.cpp`
-- `modern/tests/metal_video_renderer_test.mm`
-- `modern/tests/metal_edr_display_test.mm`
 - `modern/tests/d3d11_video_renderer_test.cpp`
 - `modern/tests/vulkan_video_renderer_test.cpp`
 - `modern/tests/vulkan_video_renderer_test_support.cpp`
@@ -210,8 +202,6 @@ Current implementation:
 - `modern/tests/d3d11va_hardware_decoder_test.cpp`
 - `modern/tests/d3d11_frame_interop_test.cpp`
 - `modern/tests/d3d11_video_output_test.cpp`
-- `modern/tests/videotoolbox_hardware_decoder_test.cpp`
-- `modern/tests/cvmetal_frame_interop_test.mm`
 - `modern/tests/hardware_decode_device_test.cpp`
 - `modern/examples/android/native_activity.cpp`
 - `modern/examples/android/build-android.sh`
@@ -226,6 +216,11 @@ Current implementation:
 
 Current verification:
 
+- after the 2026-08-02 Apple archival, both the Android arm64 NativeActivity
+  harness and user-player native library reconfigure and link successfully;
+  the changed generic backend/hardware-device tests compile with the Android
+  toolchain, and a native macOS target is rejected by the new support gate
+  with the archive location in its diagnostic;
 - the current static and shared Windows builds pass 34/34 CTest tests,
   including the high-level D3D11 composition-output lifecycle test, Advanced
   Color test, WASAPI device test, and strict native H.264/AAC playback;
@@ -249,26 +244,14 @@ Current verification:
   memory was 965.6 MiB before the seek run, 986.8 MiB after four seeks, and
   984.8 MiB after eight more seeks, while working set returned from a
   transient 886.4 MiB to 332.6 MiB, showing no per-seek linear growth;
-- static and shared macOS builds plus ASan/UBSan pass 29/29 CTest tests,
-  including the portable AAudio SPSC queue test; the mobile
-  renderer selector state machine and numeric
-  FP16 HDR/BT.2020/headroom checks and real-screen EDR presentation on the
-  active EDR-capable display; the scheduling-isolation audio tests wait for
-  frame callbacks explicitly and expect one sink drain per completed loop
-  segment, and both corrected audio-player executables pass 100 consecutive
-  Release runs; the short-range control/loop regression also passes 20
-  consecutive static and shared runs plus 10 sanitizer runs;
-- ASan/UBSan passes 29/29 macOS-applicable tests with leak detection disabled;
-- the Metal renderer passes an iOS 16 arm64 Objective-C++ syntax build;
-- the all-backends-disabled build passes 10/10 tests on macOS and 11/11 on
-  Windows, including the Windows platform device-access contract test;
+- the former macOS/iOS validation record is preserved only in
+  `archived_apple/README.md`; it is not current support evidence;
+- the all-backends-disabled build passes 11/11 tests on Windows, including the
+  Windows platform device-access contract test;
 - forcing an unimplemented backend to `ON` fails with a clear diagnostic;
 - invalid backend option values are rejected;
-- installation and external `QtAV::RenderCPU`, `QtAV::RenderMetal` including
-  the EDR API,
-  `QtAV::AudioResample`, `QtAV::AudioFile`, plus
-  `QtAV::AudioCoreAudio`, `QtAV::HWVideoToolbox`, and
-  `QtAV::InteropCVMetal` CMake consumption pass;
+- installation and external `QtAV::RenderCPU`, `QtAV::AudioResample`, and
+  `QtAV::AudioFile` CMake consumption pass;
 - FFmpeg 8 minimum enforcement passes in the source and installed package;
 - configuration without `pkg-config` passes;
 - runtime linkage contains no Qt;
@@ -302,7 +285,7 @@ Current verification:
   core, render, and audio targets passes for static and shared builds; the
   installed core token links without installing its private FFmpeg bridge
   header.
-- on the macOS arm64 host, NDK r28c cross-builds the pinned FFmpeg 8.1.2
+- on the recorded arm64 development host, NDK r28c cross-builds the pinned FFmpeg 8.1.2
   minimal libraries and QtAVCore for Android `arm64-v8a`; the signed
   NativeActivity APK passes 16 KB ELF segment-alignment checks and installs on
   an Android 16/API 36 device with an Adreno 830;
@@ -459,8 +442,8 @@ renderer or audio device.
 
 - [x] Add a generic hardware-frame handle/lifetime representation.
 - [x] Define CPU-map and native-handle queries.
-- [x] Define interop capabilities without including D3D, Metal, VAAPI, or
-  Android headers in the core API.
+- [x] Define interop capabilities without including D3D, Vulkan, OpenGL,
+  Android, or OHOS headers in the core API.
 
 Acceptance:
 
@@ -490,7 +473,7 @@ Completed scope:
 3. [x] Add a libswresample conversion backend that can satisfy a negotiated
    interleaved PCM `AudioFormat`.
 4. [x] Connect that conversion path between decoded frames and `AudioSink`.
-5. [x] Keep Metal and D3D deferred until the portable reference paths pass
+5. [x] Keep native renderers deferred until the portable reference paths pass
    tests.
 
 Completed CPU rendering checkpoint:
@@ -566,7 +549,7 @@ Completed playback scheduling isolation checkpoint:
 
 ## Completed deterministic portable audio validation
 
-Completed before starting Apple production backends:
+Completed before starting production platform backends:
 
 1. [x] Add a test-only simulated `AudioSink` with configurable negotiated
    format, queue capacity, latency, and device-clock position.
@@ -689,7 +672,7 @@ passed 34/34.
 
 1. [x] Complete the shared Android/OHOS mobile design checkpoint below before
    adding either platform's hardware decoder.
-2. [x] Establish reproducible macOS-hosted Android NDK and FFmpeg 8+
+2. [x] Establish reproducible Android NDK and FFmpeg 8+
    cross-builds, package a minimal native test application, and run it on a
    connected arm64 Android device.
 3. [x] Add the reusable Vulkan renderer engine and Android surface adapter,
@@ -756,7 +739,7 @@ Complete this checkpoint once and reuse it for both mobile production paths:
    platform ABI.
 6. [x] Create reusable device-test media and lifecycle scenarios, plus thin
    platform-specific APK/HAP launch, signing, deployment, log collection, and
-   result adapters for connected-device validation from macOS.
+   result adapters for connected-device validation from development hosts.
 7. [x] Define Vulkan as the preferred Android/OHOS software renderer and
    OpenGL ES/EGL as its required fallback. Keep recoverable surface recreation
    within the active API, switch one-way to OpenGL ES after fatal Vulkan
@@ -987,121 +970,19 @@ Completed Android MediaCodec/Vulkan interop checkpoint:
   external `find_package(QtAVCore)` consumption of
   `QtAV::InteropMediaCodecVulkan` pass.
 
-Completed Metal software-frame checkpoint:
-
-- `QtAV::RenderMetal` is Apple-only, optional under
-  `QTAV_RENDER_METAL=AUTO/ON/OFF`, and keeps Objective-C++ and Apple framework
-  types inside its backend target and backend-specific public header;
-- `BorrowedMetalDevice` and `BorrowedMetalCommandQueue` make native resource
-  roles explicit, while `MetalCurrentTargetCallback` obtains the current
-  application-owned texture or drawable for each render;
-- the renderer uploads decoded YUV420/422/444, NV12/NV21, little-endian P010,
-  RGB/BGR/RGBA/BGRA/ARGB, and Gray8 planes into a command-buffer-retained Metal
-  buffer and performs SDR conversion in a Metal fragment shader;
-- Fit, Fill, Stretch, custom viewports, all right-angle rotations, resize,
-  surface-loss reporting, drawable presentation, and redraw notification are
-  implemented;
-- deterministic offscreen GPU readback tests exercise RGB24, YUV420P, and NV12
-  decoding plus viewport, aspect, rotation, resize, surface loss, and redraw.
-
-Completed CoreAudio checkpoint:
-
-- `QtAV::AudioCoreAudio` is macOS-only, optional under
-  `QTAV_AUDIO_COREAUDIO=AUTO/ON/OFF`, and keeps AudioToolbox/CoreAudio types
-  inside its backend target and backend-specific public header;
-- `CoreAudioDevice` strongly identifies a non-owning `AudioDeviceID`; an empty
-  device selection follows the default output device;
-- the sink negotiates interleaved Float32 mono/stereo PCM at the output
-  device's nominal sample rate, allowing `QtAV::AudioResample` to convert the
-  decoded format;
-- a bounded AudioQueue buffer pool implements playback pacing, pause, flush,
-  and natural-end drain while keeping accepted PCM lifetime independent of
-  decoded frames;
-- AudioQueue sample time is anchored to media timestamps and supplies the
-  `Player` device-master clock; reported latency combines queued media and HAL
-  device, safety-offset, and I/O-buffer frames;
-- the console example uses CoreAudio and libswresample automatically on
-  macOS, and the native playback path was exercised with generated MPEG-4/AAC
-  media;
-- a silent device test covers capability reporting, format negotiation,
-  pause/resume, queued playback, clock bounds, drain, flush, and close. It
-  skips only the device portion when a headless runner cannot create an output
-  queue.
-
-Completed VideoToolbox hardware-decode checkpoint:
-
-1. [x] Add `qtav_hw_videotoolbox` as an optional FFmpeg hardware-decoder
-   selection path.
-2. [x] Attach reference-counted `CVPixelBuffer` storage to `HardwareFrame`
-   without exposing Apple or FFmpeg types through core headers.
-3. [x] Keep software decode as an explicit fallback when device creation or
-   pixel-format negotiation fails.
-4. [x] Add lifecycle tests for seek, media replacement, stop, and shutdown.
-5. [x] Add `qtav_interop_cvmetal` only after VideoToolbox hardware-frame
-   lifetime is stable.
-
-VideoToolbox implementation notes:
-
-- `HardwareDecodeConfig` selects a generic FFmpeg hardware device without
-  exposing FFmpeg types; changing it while media is open asynchronously
-  reopens the decode path;
-- `QtAV::HWVideoToolbox` supplies the Apple-specific configuration helper and
-  borrowed `CVPixelBufferRef` accessor, while Core public headers remain free
-  of Apple SDK types;
-- codec hardware capabilities, device creation, and hardware pixel-format
-  negotiation are checked independently, with a caller-controlled software
-  fallback and distinct fallback/error media events;
-- a decoded hardware `VideoFrame` exposes no fake software planes; its
-  `HardwareFrame` retains the FFmpeg frame/CVPixelBuffer, reports the
-  underlying software format, and supports read mapping through
-  `av_hwframe_transfer_data`;
-- H.264 integration tests exercise native hardware output, CPU mapping,
-  explicit fallback policy, seek, media replacement, stop, and retained frame
-  lifetime after player shutdown.
-
-Completed CVMetal interop checkpoint:
-
-- `QtAV::InteropCVMetal` is Apple-only, optional under
-  `QTAV_INTEROP_CVMETAL=AUTO/ON/OFF`, and depends on the Metal renderer without
-  coupling VideoToolbox decode to rendering;
-- `CVMetalFrameInterop` owns a `CVMetalTextureCache` for a borrowed device and
-  imports limited/full-range bi-planar NV12/P010 `CVPixelBuffer` planes as
-  retained R/RG Metal texture views without calling the CPU mapping path;
-- `MetalVideoRenderer` accepts an optional backend-specific hardware interop,
-  advertises its source hardware device, selects a texture-sampling shader for
-  hardware frames, and retains each imported frame until its command buffer
-  completes;
-- deterministic tests verify direct plane import, zero CPU mapping, texture
-  and source lifetime, capability reporting, and actual
-  VideoToolbox-to-CVMetal-to-Metal H.264 rendering.
-
-Completed HDR and color-space checkpoint:
+Completed structured color metadata checkpoint:
 
 - `VideoFrame` exposes toolkit-independent structured range, primaries,
   transfer, matrix, and chroma-location values while retaining the diagnostic
   `colorSpace()` string;
 - HDR10 mastering-display chromaticities/luminance and content-light levels
   are copied from FFmpeg frame side data into reference-counted public values;
-- CVMetal imports limited- and full-range NV12/P010 pixel buffers and reports
-  their native range to the renderer;
-- Metal selects BT.601, BT.709, or BT.2020 YUV conversion, handles full versus
-  limited code values, and processes PQ/HLG transfer plus BT.2020/Display-P3
-  source primaries;
-- `MetalRenderTarget` can return an application-owned `CAMetalLayer` for
-  renderer configuration before `nextDrawable`: `RGBA16Float`,
-  extended-linear BT.2020, `wantsExtendedDynamicRangeContent`, and
-  frame-derived HDR10/HLG `CAEDRMetadata`;
-- extended-linear BT.2020 output preserves BT.2020 source primaries and linear
-  HDR brightness above `1.0`; the older extended-linear sRGB mode remains an
-  explicit narrower-gamut option;
-- system tone mapping and shader-based display-adaptive tone mapping are
-  explicit modes. The adaptive path samples live `NSScreen`/`UIScreen`
-  headroom for every frame and avoids double tone mapping;
-- deterministic FP16 readback verifies HDR pixels above `1.0`, BT.2020 gamut
-  preservation, and changing 2x/4x headroom; a macOS onscreen test presents
-  through a real EDR display and skips when live EDR headroom is unavailable;
-- structured HDR10 side-data lifetime and full-range CVMetal import remain
-  covered.
+- active Windows and Android renderers consume the same values for
+  limited/full range, BT.601/709/2020 conversion, PQ/HLG, target encoding, and
+  deterministic HDR validation.
+
+The completed former Apple checkpoints were moved to
+[`../archived_apple/`](../archived_apple/) and are no longer active milestones.
 
 Next active implementation order:
 
@@ -1350,12 +1231,9 @@ Following platform slice:
 
 Platform implementation order after the contracts are stable:
 
-1. Apple reference path on the current macOS host.
-2. Windows reference path.
-3. Android production path from macOS with connected-device validation.
-4. OHOS production path from macOS with connected-device validation.
-5. Linux production path, beginning in WSL and moving to native Linux at the
-   mandatory environment gate defined in Milestone 8.
+1. Windows reference path.
+2. Android production path with connected-device validation.
+3. OHOS production path with connected-device validation.
 
 ## Milestone 3 — Portable reference backends
 
@@ -1374,33 +1252,12 @@ Acceptance:
 
 Status: complete and verified.
 
-## Milestone 4 — Apple production path
+## Milestone 4 — archived Apple production path
 
-### Metal
-
-- [x] `qtav_render_metal` target using Objective-C++ only inside the backend.
-- [x] Borrowed `MTLDevice`, command queue, and current-target callback.
-- [x] NV12/P010/YUV/RGB upload and shader conversion.
-- [x] Resize, viewport, aspect ratio, rotation, and redraw.
-- [x] HDR metadata and color-space plumbing after the SDR path is stable.
-- [x] Complete `CAMetalLayer` EDR configuration and extended-linear BT.2020
-  output with HDR10/HLG `CAEDRMetadata`.
-- [x] Adapt to live macOS/iOS EDR headroom and validate HDR FP16 pixels plus a
-  conditional real-screen EDR presentation path.
-
-### Audio and hardware decode
-
-- [x] `qtav_audio_coreaudio`.
-- [x] Device format negotiation and latency/clock reporting.
-- [x] `qtav_hw_videotoolbox`.
-- [x] `qtav_interop_cvmetal` for `CVPixelBuffer`/Metal zero copy.
-
-Acceptance:
-
-- macOS native example plays A/V without Qt;
-- software and VideoToolbox decode both work;
-- renderer survives resize, pause, seek, media replacement, and shutdown;
-- no Apple type leaks into core public headers.
+Archived and no longer maintained. Its former implementation, tests,
+acceptance record, and integration notes live under
+[`../archived_apple/`](../archived_apple/) and are outside the active target
+matrix.
 
 ## Milestone 5 — Windows production path
 
@@ -1455,7 +1312,7 @@ target clarification gate.
 
 ### Toolchain and application shell
 
-- [x] Reproducible macOS-hosted Android NDK build for QtAVCore and the required
+- [x] Reproducible Android NDK build for QtAVCore and the required
   FFmpeg 8+ libraries, initially targeting arm64.
 - [x] Minimal APK/native application shell that owns activity, lifecycle,
   permissions, and current rendering surfaces without adding Android types to
@@ -1515,7 +1372,7 @@ target clarification gate.
 
 Acceptance:
 
-- a macOS-hosted build installs and runs on at least one connected arm64
+- a cross-build installs and runs on at least one connected arm64
   Android device;
 - software decode prefers Vulkan, falls back to OpenGL ES for unavailable or
   fatally failed Vulkan, and AAudio produces synchronized audible output;
@@ -1549,11 +1406,11 @@ Target clarification gate:
 
 ### Toolchain and application shell
 
-- [ ] Reproducible macOS-hosted OHOS native build for QtAVCore and FFmpeg 8+,
+- [ ] Reproducible OHOS native build for QtAVCore and FFmpeg 8+,
   initially targeting arm64.
-- [ ] Add `modern/platform/ohos/` for small shared OHOS helpers while keeping
-  media, graphics, and audio implementations in their responsibility-specific
-  backend targets.
+- [~] Add the `modern/platform/ohos/` root; small shared helpers are still
+  pending, and media, graphics, and audio implementations remain in their
+  responsibility-specific backend targets.
 - [ ] Minimal HAP/native application shell using ArkUI/XComponent only at the
   integration boundary.
 - [ ] Connected-device deployment, signing, logging, generated-media playback,
@@ -1610,7 +1467,7 @@ Target clarification gate:
 
 Acceptance:
 
-- a macOS-hosted build installs and runs on the recorded connected arm64 OHOS
+- a cross-build installs and runs on the recorded connected arm64 OHOS
   target;
 - software decode prefers Vulkan, falls back to OpenGL ES for unavailable or
   fatally failed Vulkan, and OHAudio produces synchronized audible output;
@@ -1631,55 +1488,6 @@ Acceptance:
   platform SDK types or incorrectly treating their native lifecycles as ABI
   compatible;
 - OHOS SDK types remain outside core public headers.
-
-## Milestone 8 — Linux production path
-
-### WSL development and mandatory native-Linux migration gate
-
-- [ ] Begin with WSL/WSLg for Linux cross-platform compilation, all-backends-off
-  tests, reusable Vulkan/OpenGL code, deterministic offscreen tests, and
-  integration work that does not require authoritative physical Linux device
-  behavior.
-- [ ] Before starting work whose result depends on native Linux graphics,
-  audio, hardware decode, driver, device-loss, or display-server behavior,
-  explicitly remind the user that migration to a native Linux installation is
-  now required and wait for confirmation of the new environment.
-- [ ] Do not mark native Linux rendering, audio, VAAPI, or the milestone
-  acceptance complete from WSL-only results. At the latest, migrate before
-  real Wayland/X11 presentation, physical ALSA/PulseAudio device validation,
-  VAAPI zero-copy validation, or GPU/display driver recovery testing.
-- [ ] After migration, record the Linux distribution, compositor/display
-  server, GPU, driver, audio stack, and FFmpeg 8+ build used for validation.
-
-### Rendering
-
-- [ ] Reuse the Android/OHOS-proven Vulkan renderer engine, shaders, color
-  conversion, geometry, upload helpers, synchronization rules, and tests.
-- [ ] Add native Linux Vulkan surface/swapchain adapters without coupling core
-  to Wayland or X11.
-- [ ] Adapt the shared OpenGL ES renderer internals to the selected native
-  Linux OpenGL/EGL path, keeping display-server context and surface ownership
-  in Linux-specific code.
-- [ ] Validate resize, viewport, aspect ratio, rotation, redraw, surface loss,
-  display-server recreation, and SDR/HDR capability reporting on native Linux.
-
-### Audio and hardware decode
-
-- [ ] ALSA and/or PulseAudio sink with negotiated PCM, device clock, latency,
-  pause, flush, drain, route/device loss, and recovery.
-- [ ] VAAPI hardware decode.
-- [ ] VAAPI/Vulkan or VAAPI/OpenGL interop with explicit software mapping
-  fallback and no default CPU copy.
-
-Acceptance:
-
-- native Linux software playback produces synchronized A/V without Qt;
-- Vulkan and the selected OpenGL path reuse the mobile-proven implementation
-  where appropriate while Linux window-system code remains isolated;
-- native audio-device timing and VAAPI zero-copy behavior are validated on a
-  real Linux installation, not only WSL;
-- no Linux, Wayland, X11, ALSA, PulseAudio, or VAAPI type leaks into core public
-  headers.
 
 ## Milestone 9 — Playback feature parity
 
@@ -1703,7 +1511,6 @@ Acceptance:
 - [ ] Multichannel PCM device-output validation.
 - [ ] IEC 61937 compressed passthrough contract.
 - [ ] Windows HDMI/WASAPI passthrough.
-- [ ] Apple platform capability investigation.
 - [ ] Atmos object-metadata preservation/rendering feasibility.
 - [x] HDR10 metadata propagation.
 - [ ] Dolby Vision metadata and rendering feasibility.
