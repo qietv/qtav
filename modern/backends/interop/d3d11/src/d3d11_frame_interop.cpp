@@ -37,6 +37,8 @@ bool supportedSource(
         && description.MipLevels == 1
         && description.SampleDesc.Count == 1
         && frame.arraySlice() < description.ArraySize
+        && static_cast<UINT>(frame.width()) <= description.Width
+        && static_cast<UINT>(frame.height()) <= description.Height
         && (description.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
 }
 

@@ -16,8 +16,10 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <mutex>
+#include <string>
 
 int main(int argc, char** argv)
 {
@@ -46,6 +48,15 @@ int main(int argc, char** argv)
             return S_OK;
         };
 
+    qtav::D3D11VideoOutput invalidOutput;
+    qtav::D3D11VideoOutputOptions invalidOptions;
+    invalidOptions.hdrPresentationMode =
+        qtav::D3D11HdrPresentationMode::HDR10;
+    assert(!invalidOutput.open(surface, invalidOptions));
+    assert(
+        invalidOutput.lastError().find("opaque")
+        != std::string::npos);
+
     qtav::D3D11VideoOutputOptions options;
     options.outputPreference =
         qtav::D3D11OutputPreference::SdrOnly;
@@ -69,7 +80,14 @@ int main(int argc, char** argv)
             }
             changed.notify_all();
         });
-    assert(output.open(surface, options));
+    const bool opened = output.open(surface, options);
+    if (!opened) {
+        std::fprintf(
+            stderr,
+            "D3D11 output open failed: %s\n",
+            output.lastError().c_str());
+    }
+    assert(opened);
     assert(output.isOpen());
     assert(output.deviceAccess());
     const auto initialColorInfo = output.colorInfo();

@@ -143,6 +143,7 @@ public:
         std::atomic<std::uint64_t> presentedFrames { 0 };
         std::atomic<std::uint64_t> busyPresents { 0 };
         std::atomic<std::uint64_t> skippedRenders { 0 };
+        std::atomic<std::uint64_t> decoderSurfaceCopies { 0 };
         std::atomic<std::uint64_t> longRenderGaps { 0 };
         std::atomic<std::int64_t> previousRenderMicroseconds { 0 };
         std::atomic<std::int64_t> maximumRenderGapMicroseconds { 0 };
@@ -189,6 +190,14 @@ public:
                 E_INVALIDARG);
             return false;
         }
+        if (options.hdrPresentationMode
+                == D3D11HdrPresentationMode::HDR10
+            && options.alphaMode != DXGI_ALPHA_MODE_IGNORE) {
+            setError(
+                "RGB10/PQ presentation requires an opaque composition surface",
+                E_INVALIDARG);
+            return false;
+        }
         if (options.outputPreference
                 == D3D11OutputPreference::RequireHdr
             && !surface.window
@@ -208,7 +217,10 @@ public:
             && (surface_.window
                 || static_cast<bool>(surface_.currentMonitor));
         selectedFormat_ = advancedColorEnabled_
-            ? DXGI_FORMAT_R16G16B16A16_FLOAT
+            ? options_.hdrPresentationMode
+                    == D3D11HdrPresentationMode::HDR10
+                ? DXGI_FORMAT_R10G10B10A2_UNORM
+                : DXGI_FORMAT_R16G16B16A16_FLOAT
             : DXGI_FORMAT_B8G8R8A8_UNORM;
         hdrRequirementFailed_.store(
             false,
@@ -428,6 +440,7 @@ public:
                 status = updateSwapChainTransform();
             } else {
                 auto guard = deviceAccess_->contextGuard();
+                renderer_->flush();
                 ID3D11RenderTargetView* noTarget = nullptr;
                 context_->OMSetRenderTargets(1, &noTarget, nullptr);
                 context_->Flush();
@@ -560,6 +573,8 @@ public:
         result.busyPresents = state->busyPresents.exchange(0);
         result.skippedRenders =
             state->skippedRenders.exchange(0);
+        result.decoderSurfaceCopies =
+            state->decoderSurfaceCopies.exchange(0);
         result.longRenderGaps = state->longRenderGaps.exchange(0);
         result.maximumRenderGapMicroseconds =
             state->maximumRenderGapMicroseconds.exchange(0);
@@ -848,6 +863,9 @@ private:
                 if (renderer_) {
                     const auto rendererStatistics =
                         renderer_->takeStatistics();
+                    state->decoderSurfaceCopies.fetch_add(
+                        rendererStatistics.decoderSurfaceCopies,
+                        std::memory_order_relaxed);
                     updateMaximum(
                         state->maximumColorSetupMicroseconds,
                         rendererStatistics

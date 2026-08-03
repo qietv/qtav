@@ -50,6 +50,7 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11AdvancedColorInfo {
 
 struct QTAV_RENDER_D3D11_EXPORT D3D11VideoRendererStatistics {
     // Per-stage maxima accumulated since the previous takeStatistics() call.
+    std::uint64_t decoderSurfaceCopies = 0;
     std::int64_t maximumColorSetupMicroseconds = 0;
     std::int64_t maximumInteropMicroseconds = 0;
     std::int64_t maximumBufferUpdateMicroseconds = 0;
@@ -141,6 +142,10 @@ public:
     bool configure(const VideoRenderConfig& config) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
+
+    // Completes submitted rendering and releases references to borrowed
+    // targets and decoder slices. Call before resizing or replacing a target.
+    void flush() noexcept;
 
     BorrowedD3D11Device device() const noexcept;
     BorrowedD3D11DeviceContext context() const noexcept;

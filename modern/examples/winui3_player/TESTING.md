@@ -62,7 +62,7 @@ requests.
 | Seek | Drag backward and forward several times. | One seek is logged per drag; status transitions through Buffering as needed; new-generation audio/video resume in sync. |
 | Stop/replay | Stop during playback, then press Play. | Workers do not leak stale media; playback can restart according to Player state semantics. |
 | Resize | Repeatedly resize, minimize/restore, and change DPI if available. | Surface resize succeeds; no black/stretched persistent frame or surface-lost loop. |
-| Monitor/HDR | Move between SDR/HDR monitors or toggle Windows HDR when supported. | Debug output color follows the active monitor; HDR is preserved only when the actual layer is HDR. |
+| Monitor/HDR | Play ordinary HDR10 and Dolby Vision while Windows HDR is active; compare the same frames with a trusted native-PQ player, then move between SDR/HDR monitors or toggle Windows HDR when supported. | Debug reports RGB10/PQ only while the layer is HDR; highlights and diffuse white are comparable to the reference player, and SDR fallback remains viewable. |
 | Invalid input | Enter an unreachable or invalid URL. | A bounded error/status transition appears; UI, Debug toggle, and close remain responsive. |
 | Shutdown | Close the main window while local playback, URL loading, URL playback, pause, and seek are active. | No crash or callback after window destruction; process exits after deterministic worker teardown. |
 

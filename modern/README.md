@@ -292,8 +292,8 @@ available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
 `QTAV_AUDIO_WASAPI=AUTO` builds the shared-mode device sink on Windows,
 `QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
 selection and native-frame access target. `QTAV_INTEROP_D3D11=AUTO` builds the
-Windows Video Processor adapter when the D3D11 renderer and D3D11VA decoder
-targets are available. `QTAV_OUTPUT_D3D11=AUTO` builds the high-level Windows
+Windows raw NV12/P010 plane adapter when the D3D11 renderer and D3D11VA
+decoder targets are available. `QTAV_OUTPUT_D3D11=AUTO` builds the high-level Windows
 composition output when the D3D11 renderer, D3D11VA decoder, and interop
 targets are available. `QTAV_AUDIO_AAUDIO=AUTO` builds the AAudio sink on
 Android API 26 or newer; the current Android harness targets API 28 and does
@@ -1155,7 +1155,7 @@ For ordinary Windows presentation, link `QtAV::OutputD3D11` and provide the
 native composition control's swap-chain binding operation. The output owns
 the D3D11 device, HDR-aware flip-model swap chain, target, display tracking,
 render scheduling thread, `renderVideo()`, `Present()`, D3D11VA
-configuration, Video Processor interop, resize, and teardown:
+configuration, raw-plane libplacebo interop, resize, and teardown:
 
 ```cpp
 #include <qtav/d3d11_video_output.h>
@@ -1196,6 +1196,15 @@ HDR through the final DWM layer while Advanced Color is active; on an SDR
 display or with Windows HDR disabled, the same path tone maps into the SDR
 range. Moving the window between displays takes effect on the next frame.
 
+Opaque video surfaces may set
+`D3D11VideoOutputOptions::hdrPresentationMode` to
+`D3D11HdrPresentationMode::HDR10` together with
+`DXGI_ALPHA_MODE_IGNORE`. This selects an RGB10 swap chain and
+`DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` while Advanced Color is active,
+avoiding the DWM scRGB conversion for video-player or fullscreen presentation.
+Selecting RGB10/PQ with a blending alpha mode is rejected; the general-purpose
+FP16 scRGB default remains appropriate for transparent composition surfaces.
+
 `D3D11OutputPreference::RequireHdr` refuses to present while the current
 display is not in Advanced Color HDR mode.
 `D3D11OutputPreference::SdrOnly` creates a BGRA8 SDR swap chain. `PreferHdr`
@@ -1220,8 +1229,9 @@ The composition output caps DXGI frame latency at one, uses non-blocking
 and retries when the compositor is busy. It never waits for presentation
 capacity on the UI thread. `takeStatistics()` returns and resets render
 requests/passes, presented frames, coalesced requests, busy presents, skipped
-renders, long gaps, render/present maxima, and the renderer's color, interop,
-buffer-update, and draw-stage maxima.
+renders, Intel Dolby Vision decoder-surface GPU-copy counts, long gaps,
+render/present maxima, and the renderer's color, interop, buffer-update, and
+draw-stage maxima.
 
 ### D3D11 renderer (advanced external-context path)
 
@@ -1266,6 +1276,13 @@ for that swap-chain kind. The callback runs synchronously inside `render()`
 and is queried for every frame, so swap-chain resize, display moves, or other
 surface recreation can replace the current values before calling
 `configure()` with the new size.
+
+Submitted frames retain their decoder slice, imported texture wrappers, and
+borrowed target texture until a D3D11 completion event reports that the GPU is
+done. At most three submissions remain in flight. Call `flush()` before
+resizing, destroying, or replacing a target; it completes queued GPU work and
+releases those retained references. `D3D11VideoOutput` performs this drain
+automatically before `ResizeBuffers()`.
 
 The renderer uses `tryContextGuard()` and a non-blocking render lock while
 issuing immediate-context calls. If either is busy, `render()` returns false
@@ -1328,13 +1345,20 @@ textures report their DXGI format and color space so the final
 viewport/aspect/rotation/color pass can preserve or convert SDR, linear scRGB,
 and RGB10/PQ data correctly.
 
-The imported wrapper is retained only through submission of its Video
-Processor conversion and final draw. Decode, interop, and rendering use the
-same serialized immediate context, so a later decode submission that reuses a
-surface is ordered after the preceding GPU reads. D3D11 keeps resources
-referenced by queued commands alive; the renderer deliberately does not add a
-per-frame event query or CPU wait, which would retain decoder surfaces and
-introduce driver stalls after seek.
+The imported wrapper and copied `VideoFrame` are retained through GPU
+completion of the libplacebo draw. Decode, interop, and rendering use the same
+serialized immediate context, so a later decoder submission remains ordered
+after preceding GPU reads. Non-Intel submissions use a bounded asynchronous
+three-frame completion-query queue. Intel adapters use
+libplacebo's fast sampling policy without the additional GPU histogram
+peak-detection pass. For Dolby Vision NV12/P010 frames, the renderer copies the
+selected decoder array slice GPU-to-GPU into a pooled single-slice
+shader-resource texture before libplacebo plane sampling, without a CPU map,
+staging upload, or RGB conversion. The copy alone still reproduced the same
+`igd10um64xe.dll` access violation on the affected driver. Ordinary HDR10 then
+reproduced that driver fault through direct import at the same module offset,
+so all Intel hardware-frame submissions complete libplacebo GPU work before
+copied or directly imported resources can be recycled.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly
@@ -1400,19 +1424,15 @@ player
 ```
 
 `D3D11FrameInterop` validates the decoder texture, array slice, source format,
-device health, and exact COM device identity before entering the shared
-context guard. It caches the Video Processor enumerator/processor for the
-current NV12/P010 size and keeps a bounded pool of up to three
-shader-readable output textures and their output views. Sequential imports
-reuse a compatible free output; overlapping imported-frame lifetimes receive
-independent pooled or transient outputs, so the retained-frame contract is
-preserved without allocating a full-resolution GPU texture every frame. Each
-import retains its source and input view and submits `VideoProcessorBlt()` on
-the selected immediate/video context. The renderer passes structured frame
-color metadata to the interop. SDR input uses BGRA8 G22/P709 and retains the
-legacy BT.601/BT.709 fallback. PQ/BT.2020 input prefers RGB10/PQ P2020 and
-falls back to FP16 linear scRGB when the driver reports that conversion;
-HLG/BT.2020 prefers FP16 scRGB and can fall back to RGB10/PQ. The final
+device health, shader-resource binding, allocation dimensions, and exact COM
+device identity. Each import retains the original D3D11VA NV12/P010 texture
+array slice without creating an RGB intermediate or submitting a Video
+Processor conversion. The renderer wraps plane-specific views of that slice
+with libplacebo, uses the decoded dimensions as the visible crop when the
+decoder allocation is aligned larger, and passes structured frame color and
+Dolby Vision metadata into the same color/render pipeline. Submitted source
+slices remain retained until GPU completion, while `flush()` drains them
+before target replacement. The final
 renderer then performs display-specific tone and gamut mapping without a CPU
 map.
 
@@ -1612,10 +1632,11 @@ replacement, stop, target recreation, and retained source/import access after
 player shutdown, with an explicit software fallback result when the adapter
 has no matching decoder profile. A capability-gated D3D12-generated HEVC
 Main10 test uses PQ/BT.2020 metadata and verifies P010 D3D11VA decode,
-HDR-preserving Video Processor conversion, FP16 scRGB output above `1.0`,
-zero CPU mapping, and pixel readback. WASAPI device and strict native H.264/AAC
-example tests pass with an active render endpoint and are explicitly skipped
-when a Windows session exposes no endpoint.
+raw-plane libplacebo rendering, FP16 scRGB output near the Windows absolute
+luminance encoding for its 1000-nit sample, zero CPU mapping, and pixel
+readback. WASAPI device and strict native H.264/AAC example tests pass with an
+active render endpoint and are explicitly skipped when a Windows session
+exposes no endpoint.
 
 ## Architecture summary
 

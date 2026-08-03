@@ -829,6 +829,8 @@ struct MainWindowPrivate final {
         const auto rendered = outputStatistics.presentedFrames;
         const auto busyPresents = outputStatistics.busyPresents;
         const auto skippedRenders = outputStatistics.skippedRenders;
+        const auto decoderSurfaceCopies =
+            outputStatistics.decoderSurfaceCopies;
         const auto videoLongGaps =
             callbackState_->longVideoGaps.exchange(0);
         const auto renderLongGaps = outputStatistics.longRenderGaps;
@@ -865,6 +867,7 @@ struct MainWindowPrivate final {
             << L" fps, coalesced=" << coalesced
             << L", present-busy=" << busyPresents
             << L", render-skipped=" << skippedRenders
+            << L", decoder-copies=" << decoderSurfaceCopies
             << L", >80ms gaps(video/render)="
             << videoLongGaps << L'/' << renderLongGaps
             << L", max-gap-ms="
@@ -1065,7 +1068,14 @@ struct MainWindowPrivate final {
                         });
                 });
 
-        if (!output->open(std::move(surface))
+        qtav::D3D11VideoOutputOptions outputOptions;
+        // The player surface is opaque. Prefer native RGB10/PQ so ordinary
+        // HDR10 and Dolby Vision both avoid the extra scRGB/DWM conversion and
+        // follow the same presentation model as dedicated video renderers.
+        outputOptions.hdrPresentationMode =
+            qtav::D3D11HdrPresentationMode::HDR10;
+        outputOptions.alphaMode = DXGI_ALPHA_MODE_IGNORE;
+        if (!output->open(std::move(surface), outputOptions)
             || !output->attach(*player_)) {
             SetStatus(L"D3D11 输出初始化失败；请查看 Debug 窗口");
             AppendLog(
@@ -1079,11 +1089,12 @@ struct MainWindowPrivate final {
             L"graphics: "
             + std::wstring(
                 to_hstring(output->deviceDescription()).c_str())
-            + L", library-owned HDR-aware FP16 scRGB "
+            + L", library-owned HDR-aware RGB10/PQ "
               L"composition output");
         AppendLog(
             L"video path: library-owned render thread, "
-            L"D3D11VA/Video Processor preferred, software fallback");
+            L"D3D11VA/libplacebo raw-plane path preferred, "
+            L"software fallback");
         videoOutput_ = std::move(output);
         return true;
     }

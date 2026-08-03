@@ -8,6 +8,14 @@
 
 namespace qtav::detail {
 
+inline bool d3d11ShouldCopyDecoderSurface(
+    bool intelDevice,
+    bool hasDolbyVisionMetadata,
+    bool rawYuv) noexcept
+{
+    return intelDevice && hasDolbyVisionMetadata && rawYuv;
+}
+
 inline VideoRenderEventType d3d11FailureEvent(HRESULT result) noexcept
 {
     switch (result) {

@@ -688,6 +688,10 @@ void testHdrPresentation(
     assert(std::isfinite(pqDiffuse) && pqDiffuse > 0.0F);
     assert(std::isfinite(pqHighlight));
     assert(pqHighlight > pqDiffuse);
+    // Windows scRGB encodes absolute luminance with 1.0 == 80 nits. The
+    // synthetic right pixel is 1000 nits and must therefore land near 12.5,
+    // rather than libplacebo's native 203-nit normalized-light scale.
+    assert(pqHighlight >= 1000.0F / 80.0F * 0.95F);
     assert(pqHighlight <= 1000.0F / 80.0F * 1.05F);
     assert(
         std::abs(halfToFloat(halfPixels[0].green) - pqDiffuse)
@@ -768,6 +772,22 @@ void testHdrPresentation(
 int main(int argc, char** argv)
 {
     assert(argc == 4);
+    assert(qtav::detail::d3d11ShouldCopyDecoderSurface(
+        true,
+        true,
+        true));
+    assert(!qtav::detail::d3d11ShouldCopyDecoderSurface(
+        false,
+        true,
+        true));
+    assert(!qtav::detail::d3d11ShouldCopyDecoderSurface(
+        true,
+        false,
+        true));
+    assert(!qtav::detail::d3d11ShouldCopyDecoderSurface(
+        true,
+        true,
+        false));
     assert(qtav::detail::d3d11FailureEvent(DXGI_ERROR_DEVICE_HUNG)
         == qtav::VideoRenderEventType::SurfaceLost);
     assert(qtav::detail::d3d11FailureEvent(DXGI_ERROR_DEVICE_REMOVED)

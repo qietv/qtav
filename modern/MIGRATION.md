@@ -259,6 +259,12 @@ native composition surface must outlive that attachment. Direct
 the advanced path for externally owned graphics contexts, offscreen targets,
 or custom presentation loops.
 
+Opaque video players may additionally select
+`D3D11HdrPresentationMode::HDR10` and `DXGI_ALPHA_MODE_IGNORE` in
+`D3D11VideoOutputOptions`. This creates an RGB10/PQ composition path while
+Advanced Color is active; the default remains FP16 scRGB for general-purpose
+composition and alpha blending.
+
 `d3d11vaHardwareDecodeConfig()` creates FFmpeg's D3D11VA device on the same
 retained device access, installs callbacks for the shared recursive lock, and
 requests a bounded number of extra decoder surfaces. `D3D11VAFrame` retains a
@@ -290,13 +296,20 @@ console test passes with an active WASAPI render endpoint and audible output,
 while sessions without an endpoint report a CTest skip. The retained-resource
 contract remains documented in [D3D11VA.md](D3D11VA.md).
 
-Hardware imports are retained through libplacebo draw submission, then
-released without a per-frame completion query or `pl_gpu_finish()`. All
-decoder, interop, and renderer GPU submissions use the same serialized
-immediate context, so later decoder-surface reuse remains ordered after earlier
-reads while D3D11 retains resources referenced by queued commands. This avoids
-both decoder-surface starvation and query-induced driver stalls after repeated
-seeks; explicit GPU draining is teardown-only.
+Hardware imports, their copied core frames, and borrowed targets are retained
+until a D3D11 completion event reports that the libplacebo draw has finished.
+The renderer bounds this asynchronous queue at three submissions, and
+`D3D11VideoRenderer::flush()` explicitly drains it before target resize or
+replacement. All decoder, interop, and renderer GPU submissions use the same
+serialized immediate context. Intel adapters additionally use libplacebo's
+fast sampling policy without the optional GPU histogram peak-detection pass.
+For Dolby Vision NV12/P010 input, a pooled GPU-to-GPU copy moves the selected
+decoder slice into a single-slice shader-resource texture before libplacebo
+sampling without a CPU transfer. Copying alone still reproduced the observed
+D3D11 user-mode-driver access violation, and ordinary HDR10 reproduced the same
+fault through direct import. All Intel hardware-frame submissions therefore
+complete synchronously before resource recycling; non-Intel frames keep the
+bounded asynchronous queue.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

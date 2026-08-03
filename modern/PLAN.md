@@ -69,18 +69,20 @@ Continuation checkpoint:
   it performs no Video Processor conversion, output-texture pooling, context
   submission, or wait before libplacebo samples the raw NV12/P010 planes;
   D3D11 render attempts now use non-blocking player/render/context locks,
-  preserve the imminent queued presentation frame under pressure, and release
-  imported hardware frames immediately after ordered libplacebo draw
-  submission without per-frame GPU completion queries;
+  preserve the imminent queued presentation frame under pressure, and retain
+  imported hardware frames plus borrowed targets through a bounded
+  GPU-completion queue; the exercised Intel hardware-frame path additionally
+  completes each submission before decoder-surface reuse;
   `QtAV::OutputD3D11` now owns the Windows device, composition swap chain,
   render target, display/HDR tracking, render scheduling thread,
   D3D11VA/interop wiring, `renderVideo()`, `Present()`, resize, and teardown;
   its default FP16 scRGB path resolves the hosting window's monitor without
   relying on unsupported composition-swap-chain `GetContainingOutput()`,
   tracks Windows HDR/SDR-white/luminance changes per frame, and exposes
-  prefer-HDR, require-HDR, and SDR-only policies, while the WinUI 3 sample
-  only supplies its HWND, binds its `SwapChainPanel`, attaches the player, and
-  forwards size changes; the output caps frame latency at one, uses
+  prefer-HDR, require-HDR, and SDR-only policies. Opaque video hosts can select
+  RGB10/PQ explicitly; the WinUI 3 sample does so, supplies its HWND, binds its
+  `SwapChainPanel`, attaches the player, and forwards size changes. The output
+  caps frame latency at one, uses
   non-blocking `Present()` with bounded waitable-object backpressure on its
   private render thread, and exposes render/present plus per-stage timing
   statistics;
@@ -265,6 +267,50 @@ Current verification:
   builds pass all 13 tests registered without a host FFmpeg media-generator
   executable; the existing RGB/YUV420P/NV12 media fixtures, Advanced Color,
   installed-package consumers, and bounded Profile 5 URL test also pass;
+- a fresh Windows shared Release configure with the repository
+  `x64-windows-static-md` prefix now bootstraps vcpkg's host `pkgconf` before
+  constructing the FFmpeg imported targets, so the first configure preserves
+  the static `swresample`, `libsmb2`, and remaining transitive link closure.
+  The full build and all 36 host-FFmpeg-enabled tests pass. The native
+  HEVC Main10/P010 zero-copy test also covers aligned D3D11VA decoder textures:
+  libplacebo receives the real allocation/plane dimensions and the decoded
+  160x90 image as the visible crop, avoiding sampling the aligned padding;
+- the WinUI 3 Release sample rebuilds from that fresh shared tree with zero
+  MSBuild warnings or errors. A local generated H.264 red/blue clip reached
+  end of playback with the complete visible image and the process then exited
+  cleanly;
+- Windows FP16 output now converts libplacebo's 203-nit normalized linear
+  convention to Windows' absolute scRGB convention (`1.0 == 80 nits`) after
+  color management. The synthetic 1000-nit PQ readback lands at 12.48 scRGB,
+  but this mathematical check did not establish subjective parity with a
+  native-PQ reference player. The WinUI 3 sample therefore now selects an
+  opaque RGB10/PQ swap chain while QtAVCore retains scRGB as its default;
+- D3D11 libplacebo submissions now retain decoder slices, texture wrappers,
+  and borrowed targets through a bounded GPU-completion queue, with an
+  explicit drain before swap-chain resize. On the exercised Intel adapter,
+  Dolby Vision NV12/P010 frames are copied GPU-to-GPU from the selected decoder
+  array slice into a pooled single-slice shader-resource texture. A subsequent
+  manual run disproved the assumption that this copy alone fixed the crash:
+  at 19:39:57 the process again failed in `igd10um64xe.dll` at offset
+  `0x5e56b`. A subsequent `legend.mkv` run at 20:18:59 reproduced that exact
+  driver module and offset through ordinary HDR10 direct import, proving the
+  hazard is not Dolby-Vision-only. Every Intel hardware-frame submission now
+  uses `pl_gpu_finish()` before copied or direct decoder resources can be
+  recycled; non-Intel submissions retain the asynchronous bounded queue.
+  Intel rendering uses libplacebo's fast parameters without a histogram
+  peak-detection pass. Under the corrected Intel-wide policy, `legend.mkv`
+  reached 01:12 with 25 fps scheduled and mostly 23.3-24.4 fps rendered;
+  `wednesday.mp4` reached 02:05 with 24 fps scheduled, mostly 21-23.5 fps
+  rendered, and a scene-dependent low near 16 fps before recovery. Both used
+  active RGB10/PQ output and were closed normally. No new QtAV application
+  error was recorded after 20:20. These local observations pass the original
+  six-second failure point. The user subsequently confirmed that brightness
+  matches MPC-BE on the same display and accepted the fix for closure;
+- `legend.mkv` confirms that the brightness report is not Dolby-Vision-only:
+  its decoded metadata is BT.2020/PQ and the current sample reports active
+  RGB10/PQ output with 240-nit system SDR white and a 1405-nit display peak.
+  Those facts verify the selected transport rather than perceived brightness;
+  the user's side-by-side comparison with MPC-BE confirmed matching output;
 - the WinUI 3 sample, now using `QtAV::OutputD3D11`, sustains 24.9-25.1
   scheduled and rendered fps on the exercised 3840x2160 HEVC
   Main10/E-AC-3 HDR file; the migrated output was validated by seeking from
@@ -277,14 +323,12 @@ Current verification:
   P010/BT.2020/PQ -> FP16 scRGB -> an active Windows HDR layer, reporting
   system 240-nit SDR white and a 1405-nit display peak while sustaining
   25.0 fps;
-- after removing per-frame D3D11 completion queries, the same 3840x2160
-  Main10 HDR URL completed 12 alternating forward/backward seeks without
-  audio/video freeze; stable scheduled/rendered cadence remained 24-25 fps,
-  maximum draw time fell from the previously observed 155-194 ms to about
-  0.5 ms, and maximum total render time stayed about 3-5 ms. Process private
-  memory was 965.6 MiB before the seek run, 986.8 MiB after four seeks, and
-  984.8 MiB after eight more seeks, while working set returned from a
-  transient 886.4 MiB to 332.6 MiB, showing no per-seek linear growth;
+- the earlier unretained-submit implementation completed 12 alternating
+  forward/backward seeks on the same 3840x2160 Main10 HDR URL without
+  audio/video freeze and showed no per-seek linear memory growth. The current
+  renderer replaces that unsafe lifetime assumption with the bounded
+  completion policy above; seek regression coverage remains in the Windows
+  native tests;
 - the former macOS/iOS validation record is preserved only in
   `archived_apple/README.md`; it is not current support evidence;
 - the all-backends-disabled build passes 11/11 tests on Windows, including the
@@ -1149,9 +1193,9 @@ Completed after WASAPI and before implementing `qtav_hw_d3d11va` or
 3. [x] Define device-context locking, playback-worker access, render-thread
    access, and frame-pool lifetime using the FFmpeg 8 D3D11VA device and
    frames-context contracts.
-4. [x] Keep hardware decode, D3D11 texture interop, D3D11 Video Processor
-   operations, and final rendering as separate responsibilities and targets
-   where the existing module boundaries require them.
+4. [x] Keep hardware decode, D3D11 texture interop, libplacebo rendering, and
+   final presentation as separate responsibilities and targets where the
+   existing module boundaries require them.
 5. [x] Specify explicit software-map/copy fallback, foreign-device rejection,
    seek and flush behavior, device removal, surface recreation, and retained
    frame lifetime after player shutdown.
@@ -1184,7 +1228,7 @@ Accepted design summary:
 - WARP covers deterministic API/lifetime/error contracts while opt-in
   real-GPU tests cover native decode and zero-CPU-copy rendering.
 
-Next implementation slice:
+Historical implementation slice (completed, then superseded):
 
 1. [x] Add the common Windows D3D11 device-access target and shared recursive
    context guard.
@@ -1284,7 +1328,11 @@ Completed D3D11 renderer interop-consumption checkpoint:
 - mock WARP tests cover direct import with zero map calls, capability changes,
   enabled/disabled mapping fallback, mapped pixel output, and mapping failure.
 
-Completed D3D11 Video Processor interop checkpoint:
+Historical D3D11 Video Processor interop checkpoint (superseded):
+
+This checkpoint records the former RGB-intermediate implementation. The
+current Windows renderer instead retains raw NV12/P010 decoder slices and lets
+libplacebo own plane sampling, Dolby Vision/HDR processing, and final output.
 
 - `QtAV::InteropD3D11` validates D3D11VA NV12/P010 texture-array slices,
   exact source/target device identity, device health, format support, and
@@ -1363,8 +1411,8 @@ matrix.
   primaries conversion, and display-aware tone mapping.
 - [x] Library-owned D3D11 device, composition swap chain, render target,
   redraw-coalescing render thread, `renderVideo()`, `Present()`, resize,
-  D3D11VA/Video Processor setup, per-frame composition-monitor/Advanced Color
-  tracking, FP16 scRGB HDR presentation, and teardown, retaining the
+  D3D11VA/raw-plane libplacebo setup, per-frame composition-monitor/Advanced
+  Color tracking, FP16 scRGB HDR presentation, and teardown, retaining the
   borrowed-target renderer as the advanced external-context path.
 
 ### Audio and hardware decode

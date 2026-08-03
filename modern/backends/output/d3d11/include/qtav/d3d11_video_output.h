@@ -51,10 +51,20 @@ enum class D3D11OutputPreference {
     SdrOnly,
 };
 
+enum class D3D11HdrPresentationMode {
+    ScRGB,
+    HDR10,
+};
+
 struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputOptions {
     VideoAspectRatioMode aspectRatio = VideoAspectRatioMode::Fit;
     D3D11OutputPreference outputPreference =
         D3D11OutputPreference::PreferHdr;
+    // FP16 scRGB is the general-purpose Advanced Color path. Opaque video
+    // surfaces may select RGB10/PQ to avoid the DWM scRGB conversion and
+    // present HDR10-compatible content in the display's native transfer.
+    D3D11HdrPresentationMode hdrPresentationMode =
+        D3D11HdrPresentationMode::ScRGB;
     DXGI_ALPHA_MODE alphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     UINT bufferCount = 2;
     bool forceWarp = false;
@@ -116,6 +126,7 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
     std::int64_t maximumPresentMicroseconds = 0;
     std::uint64_t busyPresents = 0;
     std::uint64_t skippedRenders = 0;
+    std::uint64_t decoderSurfaceCopies = 0;
     std::int64_t maximumColorSetupMicroseconds = 0;
     std::int64_t maximumInteropMicroseconds = 0;
     std::int64_t maximumBufferUpdateMicroseconds = 0;

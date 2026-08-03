@@ -394,11 +394,10 @@ look like a process leak.
    flip-model frame latency at one, coalesces redraws, and uses non-blocking
    `Present()` plus bounded waitable-object backpressure when available before
    retrying.
-4. A hardware-frame import remains alive through libplacebo draw-command
-   submission, then releases its decoder-surface reference without a per-frame
-   completion query. This is valid because decoder, interop, and renderer
-   submissions share one serialized immediate context and D3D11 retains
-   resources referenced by queued commands.
+4. Except for the Intel driver workaround in AD-007, a hardware-frame import
+   remains alive through libplacebo draw-command submission and is retained by
+   the renderer's bounded GPU-completion queue. Decoder, interop, and renderer
+   submissions share one serialized immediate context.
 5. Interop retains the decoder's raw NV12/P010 slice and owns no conversion
    texture pool. Per-frame libplacebo wrappers are released after submission;
    libplacebo's renderer owns its bounded reusable shader/render caches and
@@ -473,9 +472,9 @@ Vulkan or OpenGL to its supported rendering path.
    linear FP16 scRGB, or RGB10/PQ targets, but does not implement color
    conversion itself.
 6. AD-005 remains binding: render/context acquisition is non-blocking,
-   submission uses the shared immediate context, the exact imported frame
-   stays alive through submission, and no `pl_gpu_finish()` or completion
-   query is allowed per frame. GPU drain is teardown-only.
+   submission uses the shared immediate context, and the exact imported frame
+   stays alive through submission. AD-007 defines the narrow Intel exception
+   that completes imported hardware-frame work per frame.
 
 ### Consequences
 
@@ -490,3 +489,83 @@ Vulkan or OpenGL to its supported rendering path.
 - Dolby licensing, certification, display tunnelling, enhancement-layer
   residual reconstruction, and compressed passthrough remain outside this
   decision.
+
+## AD-007: Windows uses native PQ presentation and an Intel hardware-frame synchronization workaround
+
+- Date: 2026-08-03
+- Status: Accepted
+- Scope: Windows D3D11VA/libplacebo resource completion and Advanced Color
+  presentation
+
+### Context
+
+After the Windows renderer moved to libplacebo raw-plane sampling, both Dolby
+Vision Profile 5 `wednesday.mp4` and ordinary HDR10 `legend.mkv` repeatedly
+failed in Intel's D3D11 user-mode driver. Windows Error Reporting identified
+`igd10um64xe.dll` version `32.0.101.6733`, exception `0xc0000005`, and module
+offset `0x5e56b`. Retaining decoder slices, libplacebo wrappers, borrowed
+targets, and D3D11 completion queries did not prevent the failure. Copying the
+Dolby Vision decoder array slice GPU-to-GPU into a private single-slice
+shader-resource texture also reproduced the same crash. `legend.mkv` then
+proved that the trigger was not Dolby-Vision-specific.
+
+Separately, FP16 scRGB readback produced the expected Windows absolute
+luminance and the compositor reported an active HDR layer, yet both files
+looked dim beside MPC-BE on the same display. An HDR-active diagnostic is not a
+visual brightness acceptance test, and this WinUI composition surface does not
+need alpha blending.
+
+### Decision
+
+1. `D3D11VideoOutputOptions` exposes `D3D11HdrPresentationMode`. QtAVCore keeps
+   FP16 scRGB as its general-purpose default, while an opaque video host may
+   select RGB10/PQ with `DXGI_ALPHA_MODE_IGNORE`.
+2. The WinUI 3 player is an opaque video host and selects RGB10/PQ. libplacebo
+   remains the color authority and encodes the target as BT.2020/PQ; the
+   application does not add another tone-mapping or transfer pass.
+3. On Intel adapters, every successfully submitted imported D3D11VA hardware
+   frame calls `pl_gpu_finish()` before copied or directly imported resources
+   can be recycled. The condition is Intel plus hardware import, not Dolby
+   Vision metadata.
+4. Non-Intel submissions retain the bounded asynchronous GPU-completion queue.
+   Intel software-frame rendering also remains outside the hardware-import
+   workaround.
+5. Intel rendering uses libplacebo's fast parameters without the optional GPU
+   histogram peak-detection pass. Dolby Vision decoder-surface copies remain
+   GPU-only and preserve raw NV12/P010 semantics for the RPU reshape.
+6. The Intel synchronization rule is a driver workaround, not a permanent
+   claim about D3D11 resource semantics. It must not be removed from the stable
+   path until a newer driver passes both ordinary HDR10 and Dolby Vision
+   asynchronous-import regression runs. The investigation procedure is
+   recorded in `examples/winui3_player/INTEL_DRIVER_HANDOFF.md`.
+
+### Consequences
+
+- The affected Intel hardware path trades some peak rendering throughput for
+  stability. Ordinary HDR10 sustained close to source rate in validation;
+  Dolby Vision remained more expensive and showed scene-dependent dips.
+- RGB10/PQ avoids the observed scRGB/DWM brightness mismatch for this opaque
+  surface but cannot provide premultiplied-alpha video composition.
+- `colorInfo()` remains useful evidence for format, color space, SDR white,
+  and display peak, but perceived brightness still requires comparison with a
+  trusted player on the same monitor.
+- A future Intel-driver retest must isolate the synchronization change from the
+  RGB10/PQ presentation decision. Removing `pl_gpu_finish()` cannot be used to
+  evaluate brightness, and changing output encoding cannot be used to evaluate
+  the driver crash.
+
+### Windows validation
+
+The failing adapter was Intel Iris Xe (`PCI\VEN_8086&DEV_A7A0`), driver
+`32.0.101.6733`. With Intel-wide imported-frame completion and native RGB10/PQ
+presentation:
+
+- `legend.mkv` reached 01:12 with 25 fps scheduled and mostly 23.3-24.4 fps
+  rendered;
+- `wednesday.mp4` reached 02:05 with 24 fps scheduled, mostly 21-23.5 fps
+  rendered, and a scene-dependent low near 16 fps before recovery;
+- both applications closed normally and no new QtAV Application Error event
+  was recorded after the corrected build started testing;
+- the user compared both output paths with MPC-BE on the same HDR display and
+  confirmed matching brightness;
+- the Windows Release build completed and all 36 registered CTest tests passed.

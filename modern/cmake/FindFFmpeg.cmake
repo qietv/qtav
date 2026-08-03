@@ -10,6 +10,34 @@ endif()
 
 find_package(PkgConfig QUIET)
 
+# The vcpkg FFmpeg wrapper selects its host pkgconf executable only after this
+# find module returns. On a fresh Windows static-package configure, that is too
+# late to populate the imported targets with FFmpeg's transitive dependency
+# closure. Bootstrap the one host pkgconf shipped beside the target prefix so
+# the first configure has the same link interface as subsequent configures.
+if(NOT PkgConfig_FOUND
+   AND WIN32
+   AND DEFINED VCPKG_INSTALLED_DIR
+   AND NOT VCPKG_INSTALLED_DIR STREQUAL "")
+    file(
+        GLOB _ffmpeg_vcpkg_pkgconf_candidates
+        LIST_DIRECTORIES FALSE
+        "${VCPKG_INSTALLED_DIR}/*/tools/pkgconf/pkgconf.exe"
+    )
+    list(LENGTH _ffmpeg_vcpkg_pkgconf_candidates
+        _ffmpeg_vcpkg_pkgconf_candidate_count)
+    if(_ffmpeg_vcpkg_pkgconf_candidate_count EQUAL 1)
+        list(GET _ffmpeg_vcpkg_pkgconf_candidates 0
+            _ffmpeg_vcpkg_pkgconf_executable)
+        set(
+            PKG_CONFIG_EXECUTABLE
+            "${_ffmpeg_vcpkg_pkgconf_executable}"
+            CACHE FILEPATH "pkg-config executable" FORCE
+        )
+        find_package(PkgConfig QUIET)
+    endif()
+endif()
+
 if("avcodec" IN_LIST _ffmpeg_requested_components)
     unset(FFmpeg_avcodec_VERSION_MAJOR)
 endif()
@@ -183,3 +211,6 @@ unset(_ffmpeg_component_release_library)
 unset(_ffmpeg_component_debug_library)
 unset(_ffmpeg_component_release_candidate)
 unset(_ffmpeg_component_debug_candidate)
+unset(_ffmpeg_vcpkg_pkgconf_candidates)
+unset(_ffmpeg_vcpkg_pkgconf_candidate_count)
+unset(_ffmpeg_vcpkg_pkgconf_executable)

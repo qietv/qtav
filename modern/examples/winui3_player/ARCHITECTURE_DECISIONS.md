@@ -16,6 +16,7 @@ remain with a link to their replacement.
 | [ADR-005](#adr-005-deterministic-ordered-shutdown) | Deterministic ordered shutdown | Accepted |
 | [ADR-006](#adr-006-keep-diagnostics-lightweight-and-opt-in) | Keep diagnostics lightweight and opt-in | Accepted |
 | [ADR-007](#adr-007-coalesce-progress-interaction-into-one-asynchronous-seek) | Coalesce progress interaction into one asynchronous seek | Accepted |
+| [ADR-008](#adr-008-use-opaque-rgb10pq-video-presentation) | Use opaque RGB10/PQ video presentation | Accepted |
 
 ## ADR-001: Unpackaged, self-contained WinUI 3 application
 
@@ -216,3 +217,41 @@ older completions. Normal progress resumes only from the cached
   every transient value.
 - Any future thumbnail or hover-preview feature must use a separate preview
   path; it must not turn slider movement back into repeated playback seeks.
+
+## ADR-008: Use opaque RGB10/PQ video presentation
+
+- **Status:** Accepted
+- **Date:** 2026-08-03
+
+### Context
+
+The FP16 scRGB renderer readback produced the expected absolute luminance, and
+Windows reported an active HDR composition layer. Those diagnostics did not
+establish visual parity: both ordinary HDR10 and Dolby Vision media still
+looked dim beside a trusted native-PQ player on the same display.
+
+### Decision
+
+The example's video surface is opaque, so it selects
+`D3D11HdrPresentationMode::HDR10` together with `DXGI_ALPHA_MODE_IGNORE`.
+QtAVCore retains FP16 scRGB as the general-purpose library default. Runtime
+`colorInfo()` remains diagnostic evidence for the selected swap-chain format,
+color space, display peak, and system SDR white level.
+
+### Consequences
+
+- The example submits native RGB10/PQ video instead of relying on DWM's scRGB
+  conversion for this opaque composition surface.
+- The video surface cannot use premultiplied alpha blending in this mode.
+- SDR fallback, moving between monitors, and Windows HDR-setting changes remain
+  responsibilities of the high-level D3D11 output.
+- Manual side-by-side comparison with a trusted native-PQ player is still
+  required; HDR-active metadata alone is not a brightness acceptance test.
+
+### Validation
+
+The player reported active RGB10/PQ output for ordinary HDR10 `legend.mkv` and
+Dolby Vision Profile 5 `wednesday.mp4` on the same Windows HDR display. The
+user compared the result with MPC-BE and confirmed matching brightness. The
+separate Intel imported-hardware-frame crash and synchronization workaround are
+governed by project decision AD-007 in `modern/DECISIONS.md`.

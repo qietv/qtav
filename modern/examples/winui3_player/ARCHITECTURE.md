@@ -125,10 +125,18 @@ requests are coalesced. The output uses a frame-latency cap and non-blocking
 presentation with bounded swap-chain backpressure on its own thread, so a busy
 compositor does not stall WASAPI or the WinUI dispatcher.
 
-Hardware frames normally remain on the selected D3D11 device and pass through
-D3D11 Video Processor interop without a CPU map. Unsupported media or devices
-fall back through QtAVCore's software decode/render path rather than an
-application-side decoder.
+Hardware frames normally remain on the selected D3D11 device. Their raw
+NV12/P010 planes pass through libplacebo color processing and rendering
+without a CPU map. Submitted decoder slices and swap-chain back buffers stay
+retained until GPU completion; output resize drains those submissions before
+replacing the buffers. Intel Dolby Vision NV12/P010 decoder slices are first
+copied GPU-to-GPU into a three-texture shader-resource pool without directly
+sampling the decoder surface. The copy alone did not prevent the affected
+Intel user-mode-driver access violation, and ordinary HDR10 reproduced the same
+fault through direct import. All Intel hardware-frame paths therefore complete
+libplacebo GPU work before recycling resources. Non-Intel submissions keep the
+bounded asynchronous queue. Unsupported media or devices fall back through QtAVCore's
+software decode/render path rather than an application-side decoder.
 
 ### Seek and progress
 
@@ -144,8 +152,8 @@ for valid output.
 
 ## Output color policy
 
-The example uses `D3D11VideoOutput` defaults. `PreferHdr` selects an FP16 scRGB
-composition layer when available, follows the window's current monitor, and
+The example uses `PreferHdr` but explicitly selects an opaque RGB10/PQ
+composition layer. It follows the window's current monitor and
 checks Windows Advanced Color state, SDR reference white, and display peak
 luminance per frame. HDR source is preserved on an active HDR display and tone
 mapped to SDR when Advanced Color is inactive. The Debug window reports the
@@ -167,6 +175,8 @@ resets output counters. Important interpretations are:
 - normal scheduled cadence with low rendered cadence points at render
   contention, surface state, or the graphics driver;
 - `present-busy` means non-blocking `Present()` found compositor backpressure;
+- `decoder-copies` counts Intel Dolby Vision frames isolated from their
+  decoder surfaces by the GPU-to-GPU shader-resource copy;
 - `coalesced` means multiple redraw notifications were intentionally combined;
 - `render-skipped` is retryable Player/backend contention, not necessarily a
   fatal error;

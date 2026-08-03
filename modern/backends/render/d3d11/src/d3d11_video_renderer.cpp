@@ -9,6 +9,7 @@
 #include <libplacebo/d3d11.h>
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
+#include <libplacebo/shaders/custom.h>
 
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -29,6 +30,7 @@ extern "C" {
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <deque>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -100,6 +102,20 @@ std::string hresultText(const char* operation, HRESULT result)
     stream << operation << " failed with HRESULT 0x" << std::hex
            << std::uppercase << static_cast<unsigned long>(result);
     return stream.str();
+}
+
+bool isIntelD3D11Device(ID3D11Device* device) noexcept
+{
+    if (!device) {
+        return false;
+    }
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC description {};
+    return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)))
+        && SUCCEEDED(dxgiDevice->GetAdapter(&adapter))
+        && SUCCEEDED(adapter->GetDesc(&description))
+        && description.VendorId == 0x8086U;
 }
 
 bool sameAdvancedColorInfo(
@@ -791,6 +807,18 @@ D3D11HardwareFrameInterop::importFrame(
 
 class D3D11VideoRenderer::Impl {
 public:
+    struct InFlightRender {
+        ComPtr<ID3D11Query> completion;
+        ComPtr<ID3D11Texture2D> target;
+        ComPtr<ID3D11Texture2D> decoderSurfaceCopy;
+        VideoFrame source;
+        std::shared_ptr<D3D11TextureFrame> imported;
+        std::array<pl_tex, 2> sourceTextures {};
+        pl_tex targetTexture = nullptr;
+    };
+
+    static constexpr std::size_t maximumInFlightRenders = 3;
+
     Impl(
         std::shared_ptr<D3D11DeviceAccess> deviceAccess,
         D3D11CurrentTargetCallback currentTarget)
@@ -800,7 +828,12 @@ public:
         , context_(deviceAccess_ ? deviceAccess_->immediateContext()
                                  : BorrowedD3D11DeviceContext {})
         , currentTarget_(std::move(currentTarget))
+        , intelDevice_(isIntelD3D11Device(device_.get()))
     {
+        scRgbOutputHook_.stages = PL_HOOK_OUTPUT;
+        scRgbOutputHook_.input = PL_HOOK_SIG_COLOR;
+        scRgbOutputHook_.hook = &Impl::scaleScRgbOutput;
+        scRgbOutputHook_.signature = 0x7174617653435247ULL;
     }
 
     ~Impl()
@@ -831,6 +864,45 @@ public:
         auto* self = static_cast<Impl*>(privateData);
         std::lock_guard<std::mutex> lock(self->logMutex_);
         self->lastLogError_ = message;
+    }
+
+    static pl_hook_res scaleScRgbOutput(
+        void*,
+        const pl_hook_params* params)
+    {
+        pl_hook_res result {};
+        if (!params || !params->sh) {
+            result.failed = true;
+            return result;
+        }
+
+        // libplacebo's normalized linear-light convention uses 203 nits for
+        // 1.0, while Windows scRGB defines 1.0 as 80 nits. Convert between
+        // those physical encodings after libplacebo's color management.
+        const float scale = PL_COLOR_SDR_WHITE / 80.0F;
+        const pl_shader_var variable {
+            pl_var_float("qtav_sc_rgb_scale"),
+            &scale,
+            false,
+        };
+        pl_custom_shader shader {};
+        shader.description = "Windows scRGB absolute-luminance scale";
+        shader.body = "color.rgb *= qtav_sc_rgb_scale;";
+        shader.input = PL_SHADER_SIG_COLOR;
+        shader.output = PL_SHADER_SIG_COLOR;
+        shader.variables = &variable;
+        shader.num_variables = 1;
+        if (!pl_shader_custom(params->sh, &shader)) {
+            result.failed = true;
+            return result;
+        }
+        result.output = PL_HOOK_SIG_COLOR;
+        result.sh = params->sh;
+        result.repr = params->repr;
+        result.color = params->color;
+        result.components = params->components;
+        result.rect = params->rect;
+        return result;
     }
 
     std::string takeLogError(std::string fallback)
@@ -870,11 +942,162 @@ public:
         return true;
     }
 
+    void destroyInFlightRender(InFlightRender& render) noexcept
+    {
+        for (pl_tex& texture : render.sourceTextures) {
+            if (texture && d3d11_) {
+                pl_tex_destroy(d3d11_->gpu, &texture);
+            }
+        }
+        if (render.targetTexture && d3d11_) {
+            pl_tex_destroy(d3d11_->gpu, &render.targetTexture);
+        }
+        if (render.decoderSurfaceCopy) {
+            availableDecoderSurfaceCopies_.push_back(
+                std::move(render.decoderSurfaceCopy));
+        }
+        render.imported.reset();
+        render.source = {};
+        render.target.Reset();
+    }
+
+    void destroyInFlightRenders() noexcept
+    {
+        for (InFlightRender& render : inFlightRenders_) {
+            destroyInFlightRender(render);
+        }
+        inFlightRenders_.clear();
+        availableCompletionQueries_.clear();
+        availableDecoderSurfaceCopies_.clear();
+    }
+
+    bool retireCompletedRenders(std::string& error)
+    {
+        const auto retire = [&] {
+            while (!inFlightRenders_.empty()) {
+                InFlightRender& render = inFlightRenders_.front();
+                BOOL complete = FALSE;
+                const HRESULT result = context_.get()->GetData(
+                    render.completion.Get(),
+                    &complete,
+                    sizeof(complete),
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                if (result == S_FALSE || (result == S_OK && !complete)) {
+                    break;
+                }
+                if (FAILED(result)) {
+                    error = hresultText(
+                        "Polling D3D11 render completion",
+                        result);
+                    return false;
+                }
+                ComPtr<ID3D11Query> completion =
+                    std::move(render.completion);
+                destroyInFlightRender(render);
+                inFlightRenders_.pop_front();
+                availableCompletionQueries_.push_back(
+                    std::move(completion));
+            }
+            return true;
+        };
+
+        if (!retire()) {
+            return false;
+        }
+        if (inFlightRenders_.size() >= maximumInFlightRenders) {
+            // Present normally submits the immediate-context command stream.
+            // A non-blocking Present can be rejected while the queue is full,
+            // though, so force submission before applying backpressure. This
+            // does not wait for GPU completion.
+            context_.get()->Flush();
+            return retire();
+        }
+        return true;
+    }
+
+    bool acquireCompletionQuery(
+        ComPtr<ID3D11Query>& completion,
+        std::string& error)
+    {
+        if (!availableCompletionQueries_.empty()) {
+            completion = std::move(availableCompletionQueries_.back());
+            availableCompletionQueries_.pop_back();
+            return true;
+        }
+        D3D11_QUERY_DESC description {};
+        description.Query = D3D11_QUERY_EVENT;
+        const HRESULT result = device_.get()->CreateQuery(
+            &description,
+            &completion);
+        if (FAILED(result)) {
+            error = hresultText(
+                "Creating a D3D11 render-completion query",
+                result);
+            return false;
+        }
+        return true;
+    }
+
+    bool acquireDecoderSurfaceCopy(
+        const D3D11_TEXTURE2D_DESC& sourceDescription,
+        ComPtr<ID3D11Texture2D>& texture,
+        std::string& error)
+    {
+        const auto compatible = [&](ID3D11Texture2D* candidate) {
+            if (!candidate) {
+                return false;
+            }
+            D3D11_TEXTURE2D_DESC description {};
+            candidate->GetDesc(&description);
+            return description.Width == sourceDescription.Width
+                && description.Height == sourceDescription.Height
+                && description.Format == sourceDescription.Format
+                && description.ArraySize == 1
+                && description.MipLevels == 1
+                && description.SampleDesc.Count == 1
+                && description.Usage == D3D11_USAGE_DEFAULT
+                && (description.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+        };
+        const auto existing = std::find_if(
+            availableDecoderSurfaceCopies_.begin(),
+            availableDecoderSurfaceCopies_.end(),
+            [&](const ComPtr<ID3D11Texture2D>& candidate) {
+                return compatible(candidate.Get());
+            });
+        if (existing != availableDecoderSurfaceCopies_.end()) {
+            texture = std::move(*existing);
+            availableDecoderSurfaceCopies_.erase(existing);
+            return true;
+        }
+
+        // Do not retain stale pools across a resolution or format change.
+        availableDecoderSurfaceCopies_.clear();
+        D3D11_TEXTURE2D_DESC description = sourceDescription;
+        description.ArraySize = 1;
+        description.MipLevels = 1;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        description.CPUAccessFlags = 0;
+        description.MiscFlags = 0;
+        const HRESULT result = device_.get()->CreateTexture2D(
+            &description,
+            nullptr,
+            &texture);
+        if (FAILED(result)) {
+            error = hresultText(
+                "Creating a shader-readable D3D11 decoder-surface copy",
+                result);
+            return false;
+        }
+        return true;
+    }
+
     void destroyCommon() noexcept
     {
         if (d3d11_) {
             pl_gpu_finish(d3d11_->gpu);
         }
+        destroyInFlightRenders();
         for (pl_tex& texture : uploadTextures_) {
             if (texture && d3d11_) {
                 pl_tex_destroy(d3d11_->gpu, &texture);
@@ -945,6 +1168,7 @@ public:
     bool wrapHardwareSource(
         const VideoFrame& source,
         const std::shared_ptr<D3D11TextureFrame>& imported,
+        ComPtr<ID3D11Texture2D>& decoderSurfaceCopy,
         std::array<pl_tex, 2>& textures,
         pl_frame& frame,
         pl_dovi_metadata& dovi,
@@ -964,6 +1188,8 @@ public:
             || description.MipLevels != 1
             || description.SampleDesc.Count != 1
             || imported->arraySlice() >= description.ArraySize
+            || static_cast<UINT>(source.width()) > description.Width
+            || static_cast<UINT>(source.height()) > description.Height
             || !(description.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
             error =
                 "The imported D3D11 texture is not a shader-readable default resource";
@@ -993,17 +1219,53 @@ public:
                        : DXGI_FORMAT_R8G8_UNORM,
             };
             const std::array<int, 2> widths {
-                source.width(),
-                (source.width() + 1) / 2,
+                static_cast<int>(description.Width),
+                static_cast<int>((description.Width + 1U) / 2U),
             };
             const std::array<int, 2> heights {
-                source.height(),
-                (source.height() + 1) / 2,
+                static_cast<int>(description.Height),
+                static_cast<int>((description.Height + 1U) / 2U),
             };
+            ID3D11Texture2D* sampledTexture = imported->texture();
+            UINT sampledArraySlice = imported->arraySlice();
+            if (detail::d3d11ShouldCopyDecoderSurface(
+                    intelDevice_,
+                    source.hasDolbyVisionMetadata(),
+                    rawYuv)) {
+                std::string copyError;
+                if (acquireDecoderSurfaceCopy(
+                        description,
+                        decoderSurfaceCopy,
+                        copyError)) {
+                    const UINT sourceSubresource = D3D11CalcSubresource(
+                        0,
+                        imported->arraySlice(),
+                        description.MipLevels);
+                    context_.get()->CopySubresourceRegion(
+                        decoderSurfaceCopy.Get(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        imported->texture(),
+                        sourceSubresource,
+                        nullptr);
+                    sampledTexture = decoderSurfaceCopy.Get();
+                    sampledArraySlice = 0;
+                    decoderSurfaceCopies_.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                } else {
+                    // Direct decoder-surface sampling remains the established
+                    // fallback and keeps the synchronous Intel workaround
+                    // below. A failed optional copy must not disable video.
+                    decoderSurfaceCopy.Reset();
+                }
+            }
             for (std::size_t plane = 0; plane < textures.size(); ++plane) {
                 pl_d3d11_wrap_params params {};
-                params.tex = imported->texture();
-                params.array_slice = static_cast<int>(imported->arraySlice());
+                params.tex = sampledTexture;
+                params.array_slice = static_cast<int>(sampledArraySlice);
                 params.fmt = planeFormats[plane];
                 params.w = widths[plane];
                 params.h = heights[plane];
@@ -1017,6 +1279,12 @@ public:
             frame.num_planes = 2;
             initializePlane(frame.planes[0], textures[0], 1, 0);
             initializePlane(frame.planes[1], textures[1], 2, 1);
+            frame.crop = {
+                0.0F,
+                0.0F,
+                static_cast<float>(source.width()),
+                static_cast<float>(source.height()),
+            };
             setSourceColor(source, frame);
             frame.repr.bits = tenBit
                 ? pl_bit_encoding { 16, 10, 6 }
@@ -1095,13 +1363,20 @@ public:
     D3D11AdvancedColorInfo advancedColorInfo_;
     bool allowSoftwareMappingFallback_ = false;
     bool open_ = false;
+    bool intelDevice_ = false;
 
     pl_log log_ = nullptr;
     pl_d3d11 d3d11_ = nullptr;
     pl_renderer renderer_ = nullptr;
+    pl_hook scRgbOutputHook_ {};
     std::array<pl_tex, 4> uploadTextures_ {};
+    std::deque<InFlightRender> inFlightRenders_;
+    std::vector<ComPtr<ID3D11Query>> availableCompletionQueries_;
+    std::vector<ComPtr<ID3D11Texture2D>>
+        availableDecoderSurfaceCopies_;
     std::string lastLogError_;
 
+    std::atomic<std::uint64_t> decoderSurfaceCopies_ { 0 };
     std::atomic<std::int64_t> maximumColorSetupMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumInteropMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumBufferUpdateMicroseconds_ { 0 };
@@ -1319,6 +1594,16 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         errorType = VideoRenderEventType::SurfaceLost;
         error = hresultText("The D3D11 device was removed", removedReason);
     }
+    if (error.empty()
+        && !impl_->retireCompletedRenders(error)) {
+        errorType = detail::d3d11FailureEvent(
+            impl_->device_.get()->GetDeviceRemovedReason());
+    }
+    if (error.empty()
+        && impl_->inFlightRenders_.size()
+            >= impl_->maximumInFlightRenders) {
+        return false;
+    }
 
     const auto colorSetupStarted = steadyMicroseconds();
     ComPtr<ID3D11Texture2D> targetTextureNative;
@@ -1373,10 +1658,12 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     pl_frame image {};
     std::array<pl_tex, 2> hardwareTextures {};
     std::shared_ptr<D3D11TextureFrame> imported;
+    ComPtr<ID3D11Texture2D> decoderSurfaceCopy;
     std::shared_ptr<HardwareFrameMapping> mappedFrame;
     std::unique_ptr<AVFrame, AVFrameDeleter> mappedNative;
     pl_dovi_metadata dovi {};
     bool mappedSoftware = false;
+    ComPtr<ID3D11Query> completion;
 
     const auto sourceStarted = steadyMicroseconds();
     if (error.empty() && frame.hasHardwareFrame()) {
@@ -1396,6 +1683,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 || !impl_->wrapHardwareSource(
                     frame,
                     imported,
+                    decoderSurfaceCopy,
                     hardwareTextures,
                     image,
                     dovi,
@@ -1446,6 +1734,12 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         impl_->maximumBufferUpdateMicroseconds_,
         steadyMicroseconds() - sourceStarted);
 
+    if (error.empty()
+        && !impl_->acquireCompletionQuery(completion, error)) {
+        errorType = detail::d3d11FailureEvent(
+            impl_->device_.get()->GetDeviceRemovedReason());
+    }
+
     if (error.empty()) {
         applyGeometry(image, targetFrame, config);
         const auto drawStarted = steadyMicroseconds();
@@ -1453,11 +1747,44 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         impl_->context_.get()->ClearRenderTargetView(
             target.view,
             clearColor);
+        pl_render_params renderParams = impl_->intelDevice_
+            ? pl_render_fast_params
+            : pl_render_default_params;
+        const pl_hook* outputHooks[] { &impl_->scRgbOutputHook_ };
+        if (targetFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            renderParams.hooks = outputHooks;
+            renderParams.num_hooks = 1;
+        }
         rendered = pl_render_image(
             impl_->renderer_,
             &image,
             &targetFrame,
-            &pl_render_default_params);
+            &renderParams);
+        if (rendered) {
+            impl_->context_.get()->End(completion.Get());
+            if (impl_->intelDevice_ && imported) {
+                // Intel's D3D11 UMD can access-violate when libplacebo
+                // pipelines imported D3D11VA NV12/P010 frames, even while
+                // application-owned source and target wrappers remain retained
+                // by event query. Both ordinary HDR10 and Dolby Vision reproduce
+                // the same fault on the affected driver. Copying a decoder array
+                // slice into a private shader-readable texture does not avoid it,
+                // so every Intel hardware-frame submission completes here.
+                pl_gpu_finish(impl_->d3d11_->gpu);
+            }
+            Impl::InFlightRender inFlight;
+            inFlight.completion = std::move(completion);
+            inFlight.target = std::move(targetTextureNative);
+            inFlight.decoderSurfaceCopy =
+                std::move(decoderSurfaceCopy);
+            inFlight.source = frame;
+            inFlight.imported = std::move(imported);
+            inFlight.sourceTextures = hardwareTextures;
+            hardwareTextures = {};
+            inFlight.targetTexture = targetTexture;
+            targetTexture = nullptr;
+            impl_->inFlightRenders_.push_back(std::move(inFlight));
+        }
         updateMaximum(
             impl_->maximumDrawMicroseconds_,
             steadyMicroseconds() - drawStarted);
@@ -1469,6 +1796,12 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
     if (mappedSoftware) {
         qtav_pl_unmap_avframe(impl_->d3d11_->gpu, &image);
+    }
+    if (!rendered && impl_->d3d11_) {
+        // pl_render_image may have submitted partial work before reporting an
+        // error. Complete it before releasing transient wrappers on this rare
+        // failure path.
+        pl_gpu_finish(impl_->d3d11_->gpu);
     }
     for (pl_tex& texture : hardwareTextures) {
         if (texture) {
@@ -1524,6 +1857,21 @@ void D3D11VideoRenderer::close() noexcept
     if (impl_) {
         impl_->close();
     }
+}
+
+void D3D11VideoRenderer::flush() noexcept
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+    if (!impl_->deviceAccess_ || !impl_->d3d11_) {
+        return;
+    }
+    auto contextGuard = impl_->deviceAccess_->contextGuard();
+    (void)contextGuard;
+    pl_gpu_finish(impl_->d3d11_->gpu);
+    impl_->destroyInFlightRenders();
 }
 
 BorrowedD3D11Device D3D11VideoRenderer::device() const noexcept
@@ -1623,6 +1971,8 @@ D3D11VideoRenderer::takeStatistics() noexcept
         return {};
     }
     D3D11VideoRendererStatistics result;
+    result.decoderSurfaceCopies =
+        impl_->decoderSurfaceCopies_.exchange(0);
     result.maximumColorSetupMicroseconds =
         impl_->maximumColorSetupMicroseconds_.exchange(0);
     result.maximumInteropMicroseconds =
