@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 Status legend:
 
@@ -127,8 +127,9 @@ Continuation checkpoint:
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
   Android arm64/API 28 and OHOS arm64/API 23 cross-builds on macOS plus native
   Windows x64/Visual Studio builds. Its FFmpeg 8.1.2 policy enables OpenSSL,
-  libsmb2, Vulkan, libass, libplacebo, dav1d and native VVC decode while
-  avoiding the unrelated desktop dependencies pulled by `ffmpeg[all]`; the
+  libsmb2, Vulkan, libass, libplacebo with OpenGL/OpenGL ES, dav1d and native
+  VVC decode while avoiding the unrelated desktop dependencies pulled by
+  `ffmpeg[all]`; the
   Android, OHOS, and Windows dependency packages have been built, verified,
   and uploaded by self-hosted CI; the Windows validation uses Visual Studio
   18's clang-cl 22.1.3 with lld-link and preserves FFmpeg LTO;

@@ -12,7 +12,7 @@ vcpkg_from_git(
 x_vcpkg_get_python_packages(
     PYTHON_VERSION 3
     OUT_PYTHON_VAR PYTHON3
-    PACKAGES jinja2 markupsafe
+    PACKAGES glad2==2.0.8 jinja2 markupsafe
 )
 get_filename_component(PYTHON3_DIR "${PYTHON3}" DIRECTORY)
 vcpkg_add_to_path(PREPEND "${PYTHON3_DIR}")
@@ -31,7 +31,7 @@ vcpkg_configure_meson(
         -Dvulkan=enabled
         -Dvk-proc-addr=disabled
         -Dvulkan-registry=${VULKAN_REGISTRY}
-        -Dopengl=disabled
+        -Dopengl=enabled
         -Dd3d11=disabled
         -Dshaderc=disabled
         -Dglslang=enabled

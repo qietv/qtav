@@ -23,7 +23,8 @@ triplets, toolchains, overlay ports, verification rules, or output layout.
 - Keep GPL and version3 enabled.
 - Use OpenSSL, never wolfSSL.
 - Keep libsmb2 and its FFmpeg protocol integration.
-- Keep Vulkan, libplacebo with glslang, libass, and dav1d enabled.
+- Keep Vulkan, libplacebo with glslang and OpenGL/OpenGL ES, libass, and dav1d
+  enabled.
 - Preserve FFmpeg's native VVC/H.266 decoder. Do not add VVenC or another
   external VVC encoder.
 - Keep the native decoder set available; do not add `--disable-decoders` or a
@@ -118,7 +119,7 @@ baseline requires them.
    must run on macOS; Windows validation must run on Windows.
 2. The script must finish `cmake/verify-install.cmake` successfully.
 3. Confirm FFmpeg 8/libavcodec 62, OpenSSL, libsmb2, libass, libplacebo,
-   glslang, dav1d, and Vulkan outputs are present.
+   glslang, OpenGL/OpenGL ES, dav1d, and Vulkan outputs are present.
 4. Confirm wolfSSL and VVenC are absent.
 5. Confirm installed FFmpeg CMake metadata has no vcpkg package/build-tree
    paths and the package remains consumable by the parent project.

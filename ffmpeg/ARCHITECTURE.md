@@ -63,7 +63,8 @@ FFmpeg 8.1.2
 ├── libass                   subtitle rendering
 ├── libplacebo
 │   ├── Vulkan-Headers       Vulkan API definitions
-│   └── glslang              shader compilation
+│   ├── glslang              shader compilation
+│   └── OpenGL/OpenGL ES     GL/GLES/EGL rendering backend
 └── dav1d                    AV1 software decoding
 ```
 
@@ -131,8 +132,11 @@ project-specific behavior:
   LTO working with clang-cl/lld-link.
 - libass avoids desktop system-font discovery on mobile/OHOS, so the
   application must provide subtitle fonts explicitly.
-- libplacebo receives pinned glslang discovery and normalizes Windows system
-  library flags for FFmpeg's pkg-config probes.
+- libplacebo enables its Vulkan and OpenGL backends, including OpenGL ES/EGL
+  support on Android and OHOS. Its overlay supplies the Python glad generator,
+  receives pinned glslang discovery, and normalizes Windows system library
+  flags for FFmpeg's pkg-config probes. Windows retains the libplacebo OpenGL
+  capability even though QtAVCore's preferred Windows renderer is DirectX.
 - libsmb2 supplies the missing private Winsock link metadata required by a
   static Windows consumer.
 
@@ -167,7 +171,8 @@ Every entry script runs `cmake/verify-install.cmake` after vcpkg installation.
 The verifier checks:
 
 - required FFmpeg 8/libavcodec 62 headers and metadata;
-- OpenSSL, libsmb2, libass, libplacebo/glslang, dav1d, and Vulkan;
+- OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES, dav1d, and
+  Vulkan;
 - the required FFmpeg feature records;
 - absence of wolfSSL and VVenC;
 - relocatable installed FFmpeg CMake metadata.
