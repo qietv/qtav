@@ -23,7 +23,13 @@ examples must resolve the package in this order:
 1. use the matching local target prefix when it and the sibling vcpkg status
    database already exist;
 2. otherwise download the matching artifact from the newest successful
-   completed `main` run of the FFmpeg dependencies workflow.
+   completed `main` run of the FFmpeg dependencies workflow;
+3. build the package locally with the platform entry script only when neither
+   a valid local package nor the current CI artifact can be obtained.
+
+Independently of that consumption order, a change that modifies anything under
+`ffmpeg/**` must rerun the affected platform build script locally and pass its
+installed-package verifier before the change is considered validated.
 
 The supported target prefixes and their GitHub Actions artifacts are:
 
@@ -77,10 +83,11 @@ gh run download $runId `
   --dir ffmpeg/build/x64-windows-static-md/vcpkg_installed
 ```
 
-The platform build scripts remain the source of those artifacts. Run
-`ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh` on macOS,
-or `ffmpeg/scripts/build-windows.ps1` on Windows, when intentionally rebuilding
-the dependency package rather than consuming an existing local or CI package.
+The platform build scripts remain the source of those artifacts. If both local
+lookup and artifact download fail, run `ffmpeg/scripts/build-android.sh` or
+`ffmpeg/scripts/build-ohos.sh` on macOS, or
+`ffmpeg/scripts/build-windows.ps1` on Windows. Run the corresponding script
+unconditionally when the current change modifies `ffmpeg/**`.
 
 The same artifacts can be downloaded manually from the
 [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml).

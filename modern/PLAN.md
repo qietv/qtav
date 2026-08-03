@@ -151,9 +151,11 @@ Continuation checkpoint:
   entry point was also rerun locally from a clean target install on 2026-08-03,
   completing all 25 packages and the installed-package verifier;
 - the root `README.md` and `AGENTS.md` now record the modern entry point,
-  FFmpeg 8 minimum, and local-first dependency resolution with a newest
-  successful `main` artifact fallback for Android, OHOS, and Windows; legacy
-  build guidance remains unchanged;
+  FFmpeg 8 minimum, and local-first dependency resolution followed by a newest
+  successful `main` artifact fallback, then local compilation if both fail;
+  changes under `ffmpeg/**` always require the affected local native build for
+  Android, OHOS, or Windows validation; legacy build guidance remains
+  unchanged;
 - Homebrew CMake 4.4.1 is installed at `/opt/homebrew/bin/cmake`;
 - the last local FFmpeg used for verification was Homebrew FFmpeg 8.1.2.
 

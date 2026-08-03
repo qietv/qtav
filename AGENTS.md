@@ -48,11 +48,17 @@ first:
 
 Each prefix contains the target `include/`, `lib/`, and `share/` directories;
 the associated vcpkg status database is the sibling `vcpkg/` directory under
-`vcpkg_installed/`. Project builds and examples must use a valid matching local
-prefix first. If it is missing, download the matching artifact from the latest
-successful `main` run of the
-[FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml)
-before configuring the target:
+`vcpkg_installed/`. Project builds and examples must resolve dependencies in
+this order:
+
+1. use a valid matching local prefix when present;
+2. if it is missing, download the matching artifact from the latest successful
+   `main` run of the
+   [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml);
+3. if neither the local package nor the current artifact can be obtained, run
+   the matching platform build script locally.
+
+The artifact names are:
 
 - Android artifact: `qtav-ffmpeg-arm64-android-28-static`
 - OHOS artifact: `qtav-ffmpeg-arm64-ohos-23-static`
@@ -67,10 +73,11 @@ Extract the artifact directly into the corresponding triplet's
 retain the layout above. See the root README and `ffmpeg/ARCHITECTURE.md` for
 download commands and the complete consumption contract.
 
-Run `ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh` on
-macOS, or `ffmpeg/scripts/build-windows.ps1` on Windows, only when the task is
-to create or refresh the dependency package itself, or when no valid current
-artifact is available.
+Regardless of the resolution order above, any task that modifies `ffmpeg/**`
+must run the directly affected native build script locally and pass
+`cmake/verify-install.cmake`. Use `ffmpeg/scripts/build-android.sh` or
+`ffmpeg/scripts/build-ohos.sh` on macOS and
+`ffmpeg/scripts/build-windows.ps1` on Windows.
 
 ## Non-negotiable architecture rules
 
