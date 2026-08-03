@@ -1,104 +1,192 @@
 # QtAVCore WinUI 3 player
 
-This example is an unpackaged, self-contained C++/WinRT WinUI 3 application.
-It uses the QtAVCore Windows output stack:
+This directory contains the Windows desktop player example for QtAVCore. It is
+an unpackaged, self-contained C++/WinRT WinUI 3 application, not a reusable UI
+control and not part of the legacy Qt player.
 
-- `QtAV::OutputD3D11` owns the D3D11 device, composition swap chain, render
-  target, display/HDR tracking, render scheduling thread, `renderVideo()`,
-  and `Present()` for a `SwapChainPanel`;
-- the output internally combines `QtAV::RenderD3D11`,
-  `QtAV::HWD3D11VA`, and `QtAV::InteropD3D11` for zero-CPU-map hardware
-  presentation with the library's normal software fallback;
-- `QtAV::AudioWASAPI` and `QtAV::AudioResample` for device audio;
-- `qtav::Player` for local files, FFmpeg-supported URLs, play/pause, stop,
-  seek, status, and media events.
+The example demonstrates:
 
-The example supplies its hosting HWND and
-`ISwapChainPanelNative::SetSwapChain`; the library's default `PreferHdr`
-policy creates an FP16 scRGB composition layer, tracks the window's current
-monitor and Windows HDR setting per frame, and tone maps to SDR only when
-Advanced Color is inactive. The Debug log reports whether the actual output
-layer is HDR, its color representation, system SDR white, and display peak
-luminance.
+- opening a local media file with the Windows file picker;
+- opening an FFmpeg-supported URL;
+- play, pause, stop, and asynchronous seek;
+- a progress slider that does not issue a seek for every pointer movement;
+- WASAPI audio with the device presentation clock as playback master;
+- D3D11VA hardware decode and D3D11 Video Processor presentation when the
+  media and device support them, with the library's software fallback;
+- monitor-aware SDR/HDR composition output in a WinUI `SwapChainPanel`;
+- an optional Debug window with playback, decode, render, device, and cadence
+  diagnostics.
 
-The Debug toggle opens and closes a separate log window. QtAVCore state/status
-callbacks run on the playback worker, while frame/render notifications run on
-the presentation worker. `D3D11VideoOutput` coalesces those notifications on
-its own render thread and presents outside the WinUI dispatcher. The example
-only provides an `ISwapChainPanelNative::SetSwapChain` binding callback,
-attaches the player, and forwards panel size changes. UI state and log updates
-are marshalled through `DispatcherQueue`; device audio submission remains on
-the independent audio-output worker. While playback is active, the Debug
-window also reports five-second cadence snapshots for scheduled and rendered
-video rate, coalesced redraws, compositor-busy presents, retryable skipped
-renders, gaps over 80 ms, maximum render/present time, and maximum
-color/interop/buffer-update/draw stage time. These counters make a slow
-decode/presentation cadence distinguishable from a blocking D3D11 driver
-stage.
+## Documentation
+
+- [Architecture](ARCHITECTURE.md) describes components, threads, data flow,
+  ownership, and shutdown.
+- [Architecture decisions](ARCHITECTURE_DECISIONS.md) records the choices that
+  should remain stable when the example evolves.
+- [Testing](TESTING.md) contains build checks and the manual smoke matrix.
+- [Local agent guide](AGENTS.md) contains scoped maintenance rules.
+- [QtAVCore documentation](../../README.md) describes the library API and all
+  supported backends.
+
+## Runtime stack
+
+| Responsibility | QtAVCore component |
+| --- | --- |
+| Media control, demux, decode, clocks, and queues | `qtav::Player` |
+| Device audio | `QtAV::AudioWASAPI` |
+| Audio format conversion | `QtAV::AudioResample` |
+| High-level Windows video output | `QtAV::OutputD3D11` |
+| Video rendering | `QtAV::RenderD3D11` |
+| Hardware decoding | `QtAV::HWD3D11VA` |
+| Hardware-frame interop | `QtAV::InteropD3D11` |
+| Shared Windows D3D11 device access | `QtAV::PlatformWindows` |
+
+`qtav::D3D11VideoOutput` owns the D3D11 device, composition swap chain,
+render target, render scheduling thread, `renderVideo()`, `Present()`, resize,
+display/HDR tracking, and teardown. The application supplies only its HWND and
+an `ISwapChainPanelNative::SetSwapChain` binding callback, attaches the
+`qtav::Player`, and forwards panel-size changes.
+
+Playback and device work do not run on the WinUI dispatcher. Player and output
+callbacks copy only the data needed by the UI and enqueue it through
+`DispatcherQueue`. For the complete threading contract, see
+[Architecture](ARCHITECTURE.md#thread-model).
 
 ## Requirements
 
-- Windows 10 1809 or newer;
+- Windows 10 version 1809 (build 17763) or newer;
+- an x64 development environment;
 - Visual Studio 2026 with Desktop C++ and WinUI development support;
 - Windows SDK 10.0.26100;
 - CMake 3.20 or newer;
-- a shared QtAVCore build with FFmpeg 8+ and the Windows backends enabled.
+- FFmpeg 8 or newer;
+- a shared QtAVCore build with the required Windows backends enabled.
 
-The project pins Windows App SDK `2.3.1`. NuGet restore downloads the Windows
-App SDK, C++/WinRT, and Windows SDK build packages on the first build.
+The project currently pins these NuGet packages:
+
+- Microsoft Windows App SDK `2.3.1`;
+- Microsoft C++/WinRT `3.0.260715.1`;
+- Microsoft Windows SDK Build Tools `10.0.26100.8249`.
+
+NuGet restore downloads them on the first build. The application is
+self-contained with respect to Windows App SDK, but the build still copies the
+QtAVCore and FFmpeg DLLs beside the executable.
 
 ## Build
 
-From this directory:
+From the repository root, configure a shared QtAVCore build once:
 
 ```powershell
-.\build.ps1 -Configuration Release
+cmake -S modern -B build/modern-shared `
+  -DBUILD_SHARED_LIBS=ON `
+  -DQTAV_CORE_BUILD_TESTS=ON `
+  -DQTAV_CORE_BUILD_EXAMPLES=ON
 ```
 
-By default the script uses:
-
-```text
-<repository>\build\modern-shared
-```
-
-Override that location when necessary:
+Then build the player:
 
 ```powershell
-.\build.ps1 `
+Set-Location modern/examples/winui3_player
+./build.ps1 -Configuration Release
+```
+
+By default, `build.ps1` uses `<repository>\build\modern-shared`. Override the
+location when necessary:
+
+```powershell
+./build.ps1 `
   -Configuration Release `
   -QtAVBuildDir C:\path\to\build\modern-shared
 ```
 
-The QtAVCore build directory must have been configured with
-`BUILD_SHARED_LIBS=ON`. The script builds the required QtAV targets, restores
-the WinUI NuGet packages, builds the application, and copies QtAVCore and
-FFmpeg runtime DLLs beside the executable.
+The script:
 
-Run:
+1. verifies that `QtAVBuildDir` is a shared QtAVCore CMake build;
+2. builds the core and required Windows backend targets;
+3. restores NuGet packages and builds the x64 WinUI project;
+4. copies QtAVCore and FFmpeg runtime DLLs beside the executable.
+
+Run the Release build with:
 
 ```powershell
-.\bin\x64\Release\QtAVWinUI3.exe
+./bin/x64/Release/QtAVWinUI3.exe
 ```
 
-You can also open `QtAVWinUI3.vcxproj` in Visual Studio. Set the MSBuild
-property `QtAVBuildDir` when your shared QtAVCore build is not at the default
-location.
+Use `-Configuration Debug` for the Debug configuration. `bin/`, `obj/`,
+`Debug/`, `Release/`, generated XAML files, NuGet packages, and Visual Studio
+state are intentionally ignored by this directory's `.gitignore`.
+
+### Visual Studio
+
+You can open `QtAVWinUI3.vcxproj` directly. The project only defines x64 Debug
+and Release configurations. Set the `QtAVBuildDir` MSBuild property if the
+shared QtAVCore build is not at the default location. A link-time validation
+error normally means that the matching QtAVCore configuration has not been
+built yet.
 
 ## Controls
 
-- **打开文件** selects a local media file.
-- **播放 URL** opens the URL in the adjacent text box.
-- **播放/暂停** changes playback state.
-- The slider seeks when the media is seekable. Handled pointer events from the
-  internal thumb are observed so one drag previews locally and submits exactly
-  one asynchronous seek on release. While dragging or waiting for that seek,
-  timer-based progress updates cannot move the thumb back to an obsolete
-  position. Live media keeps it disabled.
-- **Debug** toggles the separate status/event log window.
+- **打开文件** selects and immediately plays a local media file.
+- **播放 URL** or Enter in the URL box opens and plays the entered URL.
+- **播放/暂停** toggles between playing and paused states.
+- **停止** requests an asynchronous playback stop.
+- The slider seeks only when the media reports a finite, seekable duration.
+  Dragging previews the position locally and submits one seek on release;
+  keyboard or other value changes are debounced for 180 ms.
+- **Debug** opens or closes the separate diagnostics window. Closing that
+  window also clears the toggle.
 
 URL playback depends on the protocols and TLS support enabled in the linked
-FFmpeg build. Seek/output starvation is exposed as `Buffering` with a frozen
-timeline, and HTTP(S) playback uses bounded I/O timeout/reconnect defaults.
-These are file-style HTTP recovery safeguards, not yet a complete adaptive or
-live-stream packet-buffering policy; terminal failures remain visible in the
-status area and Debug window.
+FFmpeg build. HTTP(S) inputs receive bounded I/O timeout and reconnect
+defaults. These safeguards suit file-style HTTP playback; they are not a full
+adaptive-streaming or live-stream buffering policy.
+
+## Debug window
+
+The Debug window keeps the most recent 1,000 lines and reports:
+
+- state and media-status transitions;
+- media and renderer errors;
+- selected streams, dimensions, sample rate, pixel/sample formats, color
+  metadata, and whether video decode is hardware or software;
+- D3D11 device and actual SDR/HDR output information;
+- first decoded audio/video frame and first presented video frame;
+- five-second cadence snapshots for scheduled video, decoded audio, render
+  requests/passes, presented frames, coalesced redraws, busy presents,
+  retryable skipped renders, gaps over 80 ms, and maximum render-stage times.
+
+The cadence line helps distinguish decode or network starvation from a slow
+render/driver stage. It is diagnostic evidence, not a stable machine-readable
+log format.
+
+## Known limitations
+
+- This is a focused example, not a production media-browser UI.
+- There are no subtitle controls or post-load track selectors.
+- There is no adaptive bitrate policy, download cache, or detailed network
+  buffering UI.
+- Only Windows x64 Debug and Release project configurations are supplied.
+- Debug logging is in-memory and is not written to disk.
+- Closing the main window performs deterministic synchronous teardown. Active
+  FFmpeg I/O is interrupted and workers are joined, so a broken protocol or
+  graphics/audio driver can still make shutdown visibly slower than an idle
+  close. See [ADR-005](ARCHITECTURE_DECISIONS.md#adr-005-deterministic-ordered-shutdown).
+
+## Troubleshooting
+
+- **No QtAVCore import library:** configure `BUILD_SHARED_LIBS=ON`, build the
+  same Debug or Release configuration, or pass the correct `QtAVBuildDir`.
+- **A DLL is missing at launch:** rebuild through `build.ps1`; it copies all
+  DLLs from `<QtAVBuildDir>\bin\<Configuration>` to the app output directory.
+- **A URL fails but a local file works:** check the linked FFmpeg protocol/TLS
+  features and inspect the `open` or error event in the Debug window.
+- **Video is black or the surface is lost:** inspect the renderer event and
+  D3D11 device line, then reproduce after resize and monitor movement.
+- **Playback stutters or audio is noisy:** capture at least two cadence lines
+  and note media URL/type, seek history, output color mode, CPU/GPU load, and
+  whether the audio endpoint changed. Follow the evidence guide in
+  [Testing](TESTING.md#diagnosing-cadence-and-stalls).
+- **Exit is slow:** reproduce while the Debug window is closed and record
+  whether the delay occurs for local media, HTTP media, or both. Do not work
+  around it by detaching QtAVCore threads; teardown must continue to join all
+  owners safely.

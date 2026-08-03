@@ -211,9 +211,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="AGENTS.md" />
+    <None Include="ARCHITECTURE.md" />
+    <None Include="ARCHITECTURE_DECISIONS.md" />
     <Manifest Include="app.manifest" />
     <None Include="build.ps1" />
     <None Include="README.md" />
+    <None Include="TESTING.md" />
   </ItemGroup>
 
   <ItemGroup>
