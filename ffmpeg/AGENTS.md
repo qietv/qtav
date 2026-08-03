@@ -14,8 +14,9 @@ It builds FFmpeg 8.1.2 and the player dependency closure for these targets:
 macOS is a cross-compilation host only. Do not add macOS or iOS outputs. Do
 not claim a Windows change is validated until it has run on Windows.
 
-Read [`ARCHITECTURE.md`](ARCHITECTURE.md) before changing the manifest,
-triplets, toolchains, overlay ports, verification rules, or output layout.
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) and
+[`DECISIONS.md`](DECISIONS.md) before changing the manifest, triplets,
+toolchains, overlay ports, verification rules, or output layout.
 
 ## Required dependency policy
 
@@ -90,7 +91,9 @@ an alternate package location is required.
   must never resolve host headers or libraries.
 - Windows uses Visual Studio's `clang-cl` and `lld-link`, static dependency
   libraries, and the dynamic MSVC runtime (`/MD`). Keep the narrow FFmpeg LTO
-  compatibility for the `msvc:lld-link` pair.
+  compatibility for the `msvc:lld-link` pair, the MLP exception in FD-001, and
+  the libplacebo Windows x64 alignment guarantee in FD-003 until their recorded
+  retirement conditions are satisfied.
 - Never reuse one target's install tree, pkg-config path, or binary cache as a
   different target's installed prefix.
 - Fixed self-hosted runners rely on vcpkg's persistent local binary cache. Do
@@ -103,7 +106,8 @@ an alternate package location is required.
   portability fixes, and Windows clang-cl/lld-link LTO support.
 - `ports/libass/`: mobile/OHOS font-discovery policy and required portability
   fixes.
-- `ports/libplacebo/`: glslang discovery and Windows linker normalization.
+- `ports/libplacebo/`: glslang discovery, Windows D3D11/static SPIRV-Cross
+  closure, linker normalization, and allocator compatibility.
 - `ports/libsmb2/`: pkg-config metadata needed for static Windows Winsock
   linkage.
 - `triplets/`: target ABI, linkage, release-only policy, and target identity.
@@ -126,7 +130,9 @@ baseline requires them.
    paths and the package remains consumable by the parent project.
 6. Run `bash -n` on changed shell scripts and parse changed JSON files.
 7. Run `git diff --check`.
-8. Update `README.md`, `ARCHITECTURE.md`, and the parent `modern/PLAN.md` when
+8. Review `DECISIONS.md` when a compatibility patch or pinned toolchain changes;
+   update its validation evidence and retirement condition when necessary.
+9. Update `README.md`, `ARCHITECTURE.md`, and the parent `modern/PLAN.md` when
    the supported matrix, feature policy, package contract, or verified status
    changes.
 

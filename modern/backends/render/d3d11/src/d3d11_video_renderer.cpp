@@ -6,24 +6,31 @@
 
 #include <qtav/d3d11_video_renderer.h>
 
-#include <d3dcompiler.h>
+#include <libplacebo/d3d11.h>
+#include <libplacebo/log.h>
+#include <libplacebo/renderer.h>
+
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+}
+
 #include "d3d11_video_renderer_p.h"
+#include "frame_internal.h"
+#include "qtav_libplacebo_ffmpeg_bridge.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <cwchar>
 #include <iomanip>
-#include <iterator>
-#include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -56,253 +63,6 @@ void updateMaximum(
     }
 }
 
-constexpr const char* shaderSource = R"HLSL(
-struct VertexInput {
-    float2 position : POSITION;
-    float2 texcoord : TEXCOORD0;
-};
-
-struct PixelInput {
-    float4 position : SV_POSITION;
-    float2 texcoord : TEXCOORD0;
-};
-
-cbuffer ColorParameters : register(b0) {
-    float4 colorRow0;
-    float4 colorRow1;
-    float4 colorRow2;
-    uint sourceType;
-    uint sourceTransfer;
-    uint sourcePrimaries;
-    uint outputColorSpace;
-    float sdrWhiteLevelNits;
-    float displayMaximumLuminanceNits;
-    float contentMaximumLuminanceNits;
-    uint advancedColorActive;
-};
-
-Texture2D<float4> source0 : register(t0);
-Texture2D<float4> source1 : register(t1);
-Texture2D<float4> source2 : register(t2);
-SamplerState linearSampler : register(s0);
-
-PixelInput vertexMain(VertexInput input)
-{
-    PixelInput result;
-    result.position = float4(input.position, 0.0, 1.0);
-    result.texcoord = input.texcoord;
-    return result;
-}
-
-float3 pqToNits(float3 value)
-{
-    const float m1 = 2610.0 / 16384.0;
-    const float m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0;
-    const float c2 = 2413.0 / 128.0;
-    const float c3 = 2392.0 / 128.0;
-    const float3 power = pow(max(value, 0.0), 1.0 / m2);
-    const float3 numerator = max(power - c1, 0.0);
-    const float3 denominator = max(c2 - c3 * power, 0.000001);
-    return 10000.0 * pow(numerator / denominator, 1.0 / m1);
-}
-
-float3 nitsToPq(float3 value)
-{
-    const float m1 = 2610.0 / 16384.0;
-    const float m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0;
-    const float c2 = 2413.0 / 128.0;
-    const float c3 = 2392.0 / 128.0;
-    const float3 power = pow(max(value, 0.0) / 10000.0, m1);
-    return pow((c1 + c2 * power) / (1.0 + c3 * power), m2);
-}
-
-float3 hlgToNits(float3 value)
-{
-    const float a = 0.17883277;
-    const float b = 0.28466892;
-    const float c = 0.55991073;
-    const float3 low = value * value / 3.0;
-    const float3 high = (exp((value - c) / a) + b) / 12.0;
-    return 1000.0 * lerp(low, high, step(0.5, value));
-}
-
-float3 sdrToLinear(float3 value)
-{
-    const float3 low = value / 4.5;
-    const float3 high = pow((value + 0.099) / 1.099, 1.0 / 0.45);
-    return lerp(low, high, step(0.081, value));
-}
-
-float3 srgbToLinear(float3 value)
-{
-    const float3 low = value / 12.92;
-    const float3 high = pow((value + 0.055) / 1.055, 2.4);
-    return lerp(low, high, step(0.04045, value));
-}
-
-float3 linearToSrgb(float3 value)
-{
-    const float3 low = 12.92 * value;
-    const float3 high =
-        1.055 * pow(max(value, 0.0), 1.0 / 2.4) - 0.055;
-    return lerp(low, high, step(0.0031308, value));
-}
-
-float3 toBt709(float3 value, uint primaries)
-{
-    if (primaries == 1) {
-        return float3(
-            1.660491 * value.r - 0.587641 * value.g
-                - 0.072850 * value.b,
-            -0.124550 * value.r + 1.132900 * value.g
-                - 0.008349 * value.b,
-            -0.018151 * value.r - 0.100579 * value.g
-                + 1.118730 * value.b);
-    }
-    if (primaries == 2) {
-        return float3(
-            1.224745 * value.r - 0.224904 * value.g,
-            -0.042058 * value.r + 1.042081 * value.g,
-            -0.019642 * value.r - 0.078655 * value.g
-                + 1.098537 * value.b);
-    }
-    return value;
-}
-
-float3 bt709ToBt2020(float3 value)
-{
-    return float3(
-        0.627404 * value.r + 0.329283 * value.g
-            + 0.043313 * value.b,
-        0.069097 * value.r + 0.919540 * value.g
-            + 0.011362 * value.b,
-        0.016391 * value.r + 0.088013 * value.g
-            + 0.895595 * value.b);
-}
-
-float3 toneMapToPeak(float3 value, float contentPeak, float outputPeak)
-{
-    const float3 positive = max(value, 0.0);
-    const float luminance =
-        dot(positive, float3(0.2126, 0.7152, 0.0722));
-    if (contentPeak <= outputPeak || luminance <= 0.000001) {
-        return value;
-    }
-    const float relative = luminance / outputPeak;
-    const float white = max(contentPeak / outputPeak, 1.0);
-    const float mapped =
-        relative * (1.0 + relative / (white * white))
-        / (1.0 + relative);
-    return value * (mapped * outputPeak / luminance);
-}
-
-float3 sampleSource(PixelInput input)
-{
-    if (sourceType == 0) {
-        return source0.Sample(linearSampler, input.texcoord).rgb;
-    }
-    if (sourceType == 1) {
-        const float value = source0.Sample(linearSampler, input.texcoord).r;
-        return value.xxx;
-    }
-    const float y = source0.Sample(linearSampler, input.texcoord).r;
-    float u = 0.5;
-    float v = 0.5;
-    if (sourceType == 2) {
-        u = source1.Sample(linearSampler, input.texcoord).r;
-        v = source2.Sample(linearSampler, input.texcoord).r;
-    } else {
-        const float2 chroma =
-            source1.Sample(linearSampler, input.texcoord).rg;
-        u = sourceType == 4 ? chroma.y : chroma.x;
-        v = sourceType == 4 ? chroma.x : chroma.y;
-    }
-
-    const float4 sample = float4(y, u, v, 1.0);
-    return float3(
-        dot(colorRow0, sample),
-        dot(colorRow1, sample),
-        dot(colorRow2, sample));
-}
-
-float4 pixelMain(PixelInput input) : SV_TARGET
-{
-    const float3 encoded = sampleSource(input);
-    float3 linearNits;
-    if (sourceTransfer == 1) {
-        linearNits = pqToNits(encoded);
-    } else if (sourceTransfer == 2) {
-        linearNits = hlgToNits(encoded);
-    } else if (sourceTransfer == 3) {
-        linearNits = max(encoded, 0.0) * sdrWhiteLevelNits;
-    } else if (sourceTransfer == 4) {
-        linearNits = encoded * 80.0;
-    } else if (sourceTransfer == 5) {
-        linearNits =
-            srgbToLinear(max(encoded, 0.0)) * sdrWhiteLevelNits;
-    } else {
-        linearNits =
-            sdrToLinear(max(encoded, 0.0)) * sdrWhiteLevelNits;
-    }
-
-    float3 bt709Nits = toBt709(linearNits, sourcePrimaries);
-    const float outputPeak = max(displayMaximumLuminanceNits, 1.0);
-    bt709Nits = toneMapToPeak(
-        bt709Nits,
-        max(contentMaximumLuminanceNits, sdrWhiteLevelNits),
-        outputPeak);
-
-    if (outputColorSpace == 1) {
-        if (advancedColorActive == 0) {
-            return float4(
-                saturate(bt709Nits / outputPeak),
-                1.0);
-        }
-        return float4(bt709Nits / 80.0, 1.0);
-    }
-    if (outputColorSpace == 2) {
-        const float3 bt2020Nits =
-            max(bt709ToBt2020(bt709Nits), 0.0);
-        return float4(
-            saturate(nitsToPq(min(bt2020Nits, outputPeak))),
-            1.0);
-    }
-    return float4(
-        saturate(linearToSrgb(max(bt709Nits, 0.0) / outputPeak)),
-        1.0);
-}
-)HLSL";
-
-struct Vertex {
-    float x = 0.0F;
-    float y = 0.0F;
-    float u = 0.0F;
-    float v = 0.0F;
-};
-
-struct ColorParameters {
-    std::array<float, 4> row0 {};
-    std::array<float, 4> row1 {};
-    std::array<float, 4> row2 {};
-    std::uint32_t sourceType = 0;
-    std::uint32_t sourceTransfer = 0;
-    std::uint32_t sourcePrimaries = 0;
-    std::uint32_t outputColorSpace = 0;
-    float sdrWhiteLevelNits = 80.0F;
-    float displayMaximumLuminanceNits = 80.0F;
-    float contentMaximumLuminanceNits = 80.0F;
-    std::uint32_t advancedColorActive = 0;
-};
-
-static_assert(sizeof(ColorParameters) % 16 == 0);
-
-struct UploadedFrame {
-    std::array<ComPtr<ID3D11ShaderResourceView>, 3> views;
-    ColorParameters color;
-};
-
 bool isSupportedConfig(const VideoRenderConfig& config) noexcept
 {
     if (!config.surfaceSize.isValid()
@@ -334,7 +94,13 @@ bool isSupportedTargetFormat(DXGI_FORMAT format) noexcept
     }
 }
 
-std::string hresultText(const char* operation, HRESULT result);
+std::string hresultText(const char* operation, HRESULT result)
+{
+    std::ostringstream stream;
+    stream << operation << " failed with HRESULT 0x" << std::hex
+           << std::uppercase << static_cast<unsigned long>(result);
+    return stream.str();
+}
 
 bool sameAdvancedColorInfo(
     const D3D11AdvancedColorInfo& left,
@@ -376,7 +142,7 @@ float querySdrWhiteLevelNits(const wchar_t* deviceName) noexcept
 
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-    LONG status = QueryDisplayConfig(
+    const LONG status = QueryDisplayConfig(
         QDC_ONLY_ACTIVE_PATHS,
         &pathCount,
         paths.data(),
@@ -390,30 +156,21 @@ float querySdrWhiteLevelNits(const wchar_t* deviceName) noexcept
 
     for (const auto& path : paths) {
         DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
-        source.header.type =
-            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         source.header.size = sizeof(source);
-        source.header.adapterId =
-            path.sourceInfo.adapterId;
+        source.header.adapterId = path.sourceInfo.adapterId;
         source.header.id = path.sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&source.header)
-                != ERROR_SUCCESS
-            || std::wcscmp(
-                   source.viewGdiDeviceName,
-                   deviceName)
-                != 0) {
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS
+            || std::wcscmp(source.viewGdiDeviceName, deviceName) != 0) {
             continue;
         }
 
         DISPLAYCONFIG_SDR_WHITE_LEVEL white {};
-        white.header.type =
-            DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
         white.header.size = sizeof(white);
-        white.header.adapterId =
-            path.targetInfo.adapterId;
+        white.header.adapterId = path.targetInfo.adapterId;
         white.header.id = path.targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&white.header)
-                == ERROR_SUCCESS
+        if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS
             && white.SDRWhiteLevel > 0) {
             return static_cast<float>(white.SDRWhiteLevel)
                 * (80.0F / 1000.0F);
@@ -432,8 +189,7 @@ HRESULT findOutputForMonitor(
     }
 
     ComPtr<IDXGIDevice> dxgiDevice;
-    HRESULT result = device->QueryInterface(
-        IID_PPV_ARGS(&dxgiDevice));
+    HRESULT result = device->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
     if (FAILED(result)) {
         return result;
     }
@@ -471,8 +227,7 @@ HRESULT findOutputForMonitor(
             }
 
             DXGI_OUTPUT_DESC description {};
-            result = candidate->GetDesc(&description);
-            if (FAILED(result)) {
+            if (FAILED(candidate->GetDesc(&description))) {
                 continue;
             }
             if (description.Monitor == monitor) {
@@ -493,8 +248,7 @@ bool configureAdvancedColor(
     info = {};
     if (targetFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
         info.outputColorSpace = D3D11OutputColorSpace::ScRGB;
-        info.swapChainColorSpace =
-            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        info.swapChainColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
         info.bitsPerColor = 16;
         info.maximumLuminanceNits = 1000.0F;
         info.maximumFullFrameLuminanceNits = 1000.0F;
@@ -515,22 +269,18 @@ bool configureAdvancedColor(
     HRESULT result = target.swapChain->GetDevice(
         IID_PPV_ARGS(&swapChainDevice));
     if (FAILED(result) || swapChainDevice.Get() != expectedDevice) {
-        error =
-            "The current D3D11 swap chain belongs to another device";
+        error = "The current D3D11 swap chain belongs to another device";
         return false;
     }
 
     DXGI_SWAP_CHAIN_DESC1 swapDescription {};
     result = target.swapChain->GetDesc1(&swapDescription);
     if (FAILED(result)) {
-        error = hresultText(
-            "IDXGISwapChain1::GetDesc1",
-            result);
+        error = hresultText("IDXGISwapChain1::GetDesc1", result);
         return false;
     }
     if (swapDescription.Format != targetFormat
-        || (swapDescription.SwapEffect
-                != DXGI_SWAP_EFFECT_FLIP_DISCARD
+        || (swapDescription.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD
             && swapDescription.SwapEffect
                 != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)) {
         error =
@@ -539,24 +289,20 @@ bool configureAdvancedColor(
     }
 
     ComPtr<IDXGIOutput> output;
-    if (target.monitor) {
-        result = findOutputForMonitor(
-            expectedDevice,
-            target.monitor,
-            output);
-    } else {
-        result = target.swapChain->GetContainingOutput(&output);
-    }
+    result = target.monitor
+        ? findOutputForMonitor(expectedDevice, target.monitor, output)
+        : target.swapChain->GetContainingOutput(&output);
     if (FAILED(result) || !output) {
         error = target.monitor
             ? hresultText(
-                "DXGI output lookup for the current monitor",
-                result)
+                  "DXGI output lookup for the current monitor",
+                  result)
             : hresultText(
-                "IDXGISwapChain::GetContainingOutput",
-                result);
+                  "IDXGISwapChain::GetContainingOutput",
+                  result);
         return false;
     }
+
     ComPtr<IDXGIOutput6> output6;
     result = output.As(&output6);
     if (FAILED(result) || !output6) {
@@ -568,21 +314,16 @@ bool configureAdvancedColor(
     DXGI_OUTPUT_DESC1 outputDescription {};
     result = output6->GetDesc1(&outputDescription);
     if (FAILED(result)) {
-        error = hresultText(
-            "IDXGIOutput6::GetDesc1",
-            result);
+        error = hresultText("IDXGIOutput6::GetDesc1", result);
         return false;
     }
 
     info.displayDetected = true;
     info.monitor = outputDescription.Monitor;
-    info.bitsPerColor =
-        static_cast<int>(outputDescription.BitsPerColor);
+    info.bitsPerColor = static_cast<int>(outputDescription.BitsPerColor);
     info.displayColorSpace = outputDescription.ColorSpace;
-    info.minimumLuminanceNits =
-        outputDescription.MinLuminance;
-    info.maximumLuminanceNits =
-        outputDescription.MaxLuminance;
+    info.minimumLuminanceNits = outputDescription.MinLuminance;
+    info.maximumLuminanceNits = outputDescription.MaxLuminance;
     info.maximumFullFrameLuminanceNits =
         outputDescription.MaxFullFrameLuminance;
     info.advancedColorActive =
@@ -603,12 +344,9 @@ bool configureAdvancedColor(
             DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     }
     if (!info.advancedColorActive
-        || info.outputColorSpace
-            == D3D11OutputColorSpace::SDR) {
-        info.maximumLuminanceNits =
-            info.sdrWhiteLevelNits;
-        info.maximumFullFrameLuminanceNits =
-            info.sdrWhiteLevelNits;
+        || info.outputColorSpace == D3D11OutputColorSpace::SDR) {
+        info.maximumLuminanceNits = info.sdrWhiteLevelNits;
+        info.maximumFullFrameLuminanceNits = info.sdrWhiteLevelNits;
     } else {
         if (!(info.maximumLuminanceNits > 0.0F)) {
             info.maximumLuminanceNits = 1000.0F;
@@ -630,758 +368,19 @@ bool configureAdvancedColor(
             "The current flip-model swap chain cannot present the required Advanced Color space";
         return false;
     }
-    result = target.swapChain->SetColorSpace1(
-        info.swapChainColorSpace);
+    result = target.swapChain->SetColorSpace1(info.swapChainColorSpace);
     if (FAILED(result)) {
-        error = hresultText(
-            "IDXGISwapChain3::SetColorSpace1",
-            result);
+        error = hresultText("IDXGISwapChain3::SetColorSpace1", result);
         return false;
     }
     info.swapChainColorSpaceConfigured = true;
     return true;
 }
 
-std::string hresultText(const char* operation, HRESULT result)
-{
-    std::ostringstream stream;
-    stream << operation << " failed with HRESULT 0x" << std::hex
-           << std::uppercase << static_cast<unsigned long>(result);
-    return stream.str();
-}
-
-bool checkedSize(
-    int width,
-    int height,
-    int bytesPerPixel,
-    std::size_t& result) noexcept
-{
-    if (width <= 0 || height <= 0 || bytesPerPixel <= 0) {
-        return false;
-    }
-    const auto row = static_cast<std::size_t>(width)
-        * static_cast<std::size_t>(bytesPerPixel);
-    if (row > std::numeric_limits<std::size_t>::max()
-            / static_cast<std::size_t>(height)) {
-        return false;
-    }
-    result = row * static_cast<std::size_t>(height);
-    return true;
-}
-
-bool copyPlane(
-    const std::uint8_t* source,
-    int sourceStride,
-    int width,
-    int height,
-    int bytesPerPixel,
-    std::vector<std::uint8_t>& destination,
-    std::string& error)
-{
-    std::size_t size = 0;
-    if (!source || sourceStride == 0
-        || !checkedSize(width, height, bytesPerPixel, size)) {
-        error = "The D3D11 renderer received an invalid software frame plane";
-        return false;
-    }
-    const std::size_t rowBytes = static_cast<std::size_t>(width)
-        * static_cast<std::size_t>(bytesPerPixel);
-    const std::int64_t strideMagnitude = sourceStride < 0
-        ? -static_cast<std::int64_t>(sourceStride)
-        : static_cast<std::int64_t>(sourceStride);
-    if (static_cast<std::uint64_t>(strideMagnitude) < rowBytes) {
-        error = "A software frame plane has a stride smaller than its row";
-        return false;
-    }
-
-    destination.resize(size);
-    for (int y = 0; y < height; ++y) {
-        std::memcpy(
-            destination.data() + static_cast<std::size_t>(y) * rowBytes,
-            source + static_cast<std::ptrdiff_t>(y) * sourceStride,
-            rowBytes);
-    }
-    return true;
-}
-
-bool createPlaneView(
-    ID3D11Device* device,
-    const std::uint8_t* source,
-    int sourceStride,
-    int width,
-    int height,
-    int bytesPerPixel,
-    DXGI_FORMAT format,
-    ComPtr<ID3D11ShaderResourceView>& view,
-    std::string& error)
-{
-    std::vector<std::uint8_t> bytes;
-    if (!copyPlane(
-            source,
-            sourceStride,
-            width,
-            height,
-            bytesPerPixel,
-            bytes,
-            error)) {
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC descriptor {};
-    descriptor.Width = static_cast<UINT>(width);
-    descriptor.Height = static_cast<UINT>(height);
-    descriptor.MipLevels = 1;
-    descriptor.ArraySize = 1;
-    descriptor.Format = format;
-    descriptor.SampleDesc.Count = 1;
-    descriptor.Usage = D3D11_USAGE_IMMUTABLE;
-    descriptor.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    D3D11_SUBRESOURCE_DATA initial {};
-    initial.pSysMem = bytes.data();
-    initial.SysMemPitch =
-        static_cast<UINT>(width * bytesPerPixel);
-
-    ComPtr<ID3D11Texture2D> texture;
-    HRESULT result = device->CreateTexture2D(
-        &descriptor,
-        &initial,
-        &texture);
-    if (FAILED(result)) {
-        error = hresultText("ID3D11Device::CreateTexture2D", result);
-        return false;
-    }
-    result = device->CreateShaderResourceView(
-        texture.Get(),
-        nullptr,
-        &view);
-    if (FAILED(result)) {
-        error = hresultText(
-            "ID3D11Device::CreateShaderResourceView",
-            result);
-        return false;
-    }
-    return true;
-}
-
-template <typename Frame>
-bool createPackedView(
-    ID3D11Device* device,
-    const Frame& frame,
-    ComPtr<ID3D11ShaderResourceView>& view,
-    std::string& error)
-{
-    const int width = frame.width();
-    const int height = frame.height();
-    std::size_t size = 0;
-    if (!frame.data(0) || frame.lineSize(0) == 0
-        || !checkedSize(width, height, 4, size)) {
-        error = "The D3D11 renderer received an invalid packed frame";
-        return false;
-    }
-
-    int sourceBytes = 0;
-    switch (frame.format()) {
-    case PixelFormat::RGB24:
-    case PixelFormat::BGR24:
-        sourceBytes = 3;
-        break;
-    case PixelFormat::RGBA:
-    case PixelFormat::BGRA:
-    case PixelFormat::ARGB:
-        sourceBytes = 4;
-        break;
-    default:
-        error = "The D3D11 renderer does not support this packed format";
-        return false;
-    }
-    const std::int64_t strideMagnitude = frame.lineSize(0) < 0
-        ? -static_cast<std::int64_t>(frame.lineSize(0))
-        : static_cast<std::int64_t>(frame.lineSize(0));
-    if (strideMagnitude
-        < static_cast<std::int64_t>(width) * sourceBytes) {
-        error = "The packed software frame stride is too small";
-        return false;
-    }
-
-    std::vector<std::uint8_t> rgba(size);
-    for (int y = 0; y < height; ++y) {
-        const auto* source = frame.data(0)
-            + static_cast<std::ptrdiff_t>(y) * frame.lineSize(0);
-        auto* destination = rgba.data()
-            + static_cast<std::size_t>(y * width) * 4;
-        for (int x = 0; x < width; ++x) {
-            const auto* pixel = source + x * sourceBytes;
-            auto* output = destination + x * 4;
-            switch (frame.format()) {
-            case PixelFormat::RGB24:
-                output[0] = pixel[0];
-                output[1] = pixel[1];
-                output[2] = pixel[2];
-                output[3] = 255;
-                break;
-            case PixelFormat::BGR24:
-                output[0] = pixel[2];
-                output[1] = pixel[1];
-                output[2] = pixel[0];
-                output[3] = 255;
-                break;
-            case PixelFormat::RGBA:
-                std::memcpy(output, pixel, 4);
-                break;
-            case PixelFormat::BGRA:
-                output[0] = pixel[2];
-                output[1] = pixel[1];
-                output[2] = pixel[0];
-                output[3] = pixel[3];
-                break;
-            case PixelFormat::ARGB:
-                output[0] = pixel[1];
-                output[1] = pixel[2];
-                output[2] = pixel[3];
-                output[3] = pixel[0];
-                break;
-            default:
-                break;
-            }
-        }
-    }
-    return createPlaneView(
-        device,
-        rgba.data(),
-        width * 4,
-        width,
-        height,
-        4,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
-        view,
-        error);
-}
-
-void setYuvMatrix(
-    int width,
-    int height,
-    VideoColorSpace color,
-    bool p010,
-    ColorParameters& parameters)
-{
-    double kr = 0.2126;
-    double kb = 0.0722;
-    switch (color.matrix) {
-    case ColorMatrix::BT470BG:
-    case ColorMatrix::SMPTE170M:
-    case ColorMatrix::SMPTE240M:
-    case ColorMatrix::FCC:
-        kr = 0.2990;
-        kb = 0.1140;
-        break;
-    case ColorMatrix::BT2020NCL:
-    case ColorMatrix::BT2020CL:
-    case ColorMatrix::ChromaDerivedNCL:
-    case ColorMatrix::ChromaDerivedCL:
-        kr = 0.2627;
-        kb = 0.0593;
-        break;
-    case ColorMatrix::Unknown:
-        if (width <= 1024 && height <= 576) {
-            kr = 0.2990;
-            kb = 0.1140;
-        }
-        break;
-    default:
-        break;
-    }
-    const double kg = 1.0 - kr - kb;
-    const double rCr = 2.0 * (1.0 - kr);
-    const double bCb = 2.0 * (1.0 - kb);
-    const double gCb = -2.0 * kb * (1.0 - kb) / kg;
-    const double gCr = -2.0 * kr * (1.0 - kr) / kg;
-
-    const bool fullRange = color.range == ColorRange::Full;
-    double yOffset = 0.0;
-    double yScale = 1.0;
-    double cOffset = 0.5;
-    double cScale = 1.0;
-    if (!fullRange) {
-        if (p010) {
-            constexpr double normalizedCodeScale = 65535.0 / 65472.0;
-            yOffset = 64.0 / 1023.0 / normalizedCodeScale;
-            yScale = (1023.0 / 876.0) * normalizedCodeScale;
-            cOffset = 512.0 / 1023.0 / normalizedCodeScale;
-            cScale = (1023.0 / 896.0) * normalizedCodeScale;
-        } else {
-            yOffset = 16.0 / 255.0;
-            yScale = 255.0 / 219.0;
-            cOffset = 128.0 / 255.0;
-            cScale = 255.0 / 224.0;
-        }
-    } else if (p010) {
-        constexpr double normalizedCodeScale = 65535.0 / 65472.0;
-        yScale = normalizedCodeScale;
-        cOffset = 512.0 / 1023.0 / normalizedCodeScale;
-        cScale = normalizedCodeScale;
-    }
-
-    const auto row = [&](double cb, double cr) {
-        return std::array<float, 4> {
-            static_cast<float>(yScale),
-            static_cast<float>(cb * cScale),
-            static_cast<float>(cr * cScale),
-            static_cast<float>(
-                -yScale * yOffset - (cb + cr) * cScale * cOffset),
-        };
-    };
-    parameters.row0 = row(0.0, rCr);
-    parameters.row1 = row(gCb, gCr);
-    parameters.row2 = row(bCb, 0.0);
-}
-
-std::uint32_t shaderTransfer(ColorTransfer transfer) noexcept
-{
-    switch (transfer) {
-    case ColorTransfer::PQ:
-        return 1;
-    case ColorTransfer::HLG:
-        return 2;
-    case ColorTransfer::Linear:
-        return 3;
-    case ColorTransfer::SRGB:
-        return 5;
-    default:
-        return 0;
-    }
-}
-
-std::uint32_t shaderPrimaries(ColorPrimaries primaries) noexcept
-{
-    switch (primaries) {
-    case ColorPrimaries::BT2020:
-        return 1;
-    case ColorPrimaries::SMPTE432:
-        return 2;
-    default:
-        return 0;
-    }
-}
-
-float contentMaximumLuminance(const VideoFrame& frame) noexcept
-{
-    const ContentLightMetadata content =
-        frame.contentLightMetadata();
-    if (content.maximumContentLightLevel > 0) {
-        return static_cast<float>(
-            content.maximumContentLightLevel);
-    }
-    const MasteringDisplayMetadata mastering =
-        frame.masteringDisplayMetadata();
-    if (mastering.hasLuminance
-        && mastering.maximumLuminance > 0.0) {
-        return static_cast<float>(
-            mastering.maximumLuminance);
-    }
-    return frame.colorSpaceInfo().isHdr() ? 1000.0F : 80.0F;
-}
-
-void setPresentationParameters(
-    const VideoFrame& frame,
-    const D3D11TextureFrame* imported,
-    const D3D11AdvancedColorInfo& output,
-    ColorParameters& parameters) noexcept
-{
-    const VideoColorSpace source = frame.colorSpaceInfo();
-    parameters.sourceTransfer =
-        shaderTransfer(source.transfer);
-    parameters.sourcePrimaries =
-        shaderPrimaries(source.primaries);
-    parameters.contentMaximumLuminanceNits =
-        contentMaximumLuminance(frame);
-
-    if (imported) {
-        switch (imported->colorSpace()) {
-        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
-            parameters.sourceTransfer = 1;
-            parameters.sourcePrimaries = 1;
-            break;
-        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
-            parameters.sourceTransfer = 4;
-            parameters.sourcePrimaries = 0;
-            break;
-        default:
-            parameters.sourceTransfer = 5;
-            parameters.sourcePrimaries = 0;
-            parameters.contentMaximumLuminanceNits =
-                output.sdrWhiteLevelNits;
-            break;
-        }
-    }
-
-    parameters.outputColorSpace =
-        static_cast<std::uint32_t>(output.outputColorSpace);
-    parameters.sdrWhiteLevelNits =
-        output.sdrWhiteLevelNits > 0.0F
-        ? output.sdrWhiteLevelNits
-        : 80.0F;
-    parameters.displayMaximumLuminanceNits =
-        output.maximumLuminanceNits > 0.0F
-        ? output.maximumLuminanceNits
-        : parameters.sdrWhiteLevelNits;
-    parameters.contentMaximumLuminanceNits = std::max(
-        parameters.contentMaximumLuminanceNits,
-        parameters.sdrWhiteLevelNits);
-    parameters.advancedColorActive =
-        (output.advancedColorActive || !output.displayDetected)
-        ? 1U
-        : 0U;
-}
-
-template <typename Frame>
-bool uploadSoftwareFrame(
-    ID3D11Device* device,
-    const Frame& frame,
-    VideoColorSpace color,
-    UploadedFrame& uploaded,
-    std::string& error)
-{
-    const int width = frame.width();
-    const int height = frame.height();
-    const int chromaWidth = (width + 1) / 2;
-    const int chromaHeight = (height + 1) / 2;
-    switch (frame.format()) {
-    case PixelFormat::RGB24:
-    case PixelFormat::BGR24:
-    case PixelFormat::RGBA:
-    case PixelFormat::BGRA:
-    case PixelFormat::ARGB:
-        uploaded.color.sourceType = 0;
-        return createPackedView(device, frame, uploaded.views[0], error);
-    case PixelFormat::Gray8:
-        uploaded.color.sourceType = 1;
-        return createPlaneView(
-            device,
-            frame.data(0),
-            frame.lineSize(0),
-            width,
-            height,
-            1,
-            DXGI_FORMAT_R8_UNORM,
-            uploaded.views[0],
-            error);
-    case PixelFormat::YUV420P:
-    case PixelFormat::YUV422P:
-    case PixelFormat::YUV444P: {
-        uploaded.color.sourceType = 2;
-        const int planeWidth = frame.format() == PixelFormat::YUV444P
-            ? width
-            : chromaWidth;
-        const int planeHeight = frame.format() == PixelFormat::YUV420P
-            ? chromaHeight
-            : height;
-        if (!createPlaneView(
-                device,
-                frame.data(0),
-                frame.lineSize(0),
-                width,
-                height,
-                1,
-                DXGI_FORMAT_R8_UNORM,
-                uploaded.views[0],
-                error)
-            || !createPlaneView(
-                device,
-                frame.data(1),
-                frame.lineSize(1),
-                planeWidth,
-                planeHeight,
-                1,
-                DXGI_FORMAT_R8_UNORM,
-                uploaded.views[1],
-                error)
-            || !createPlaneView(
-                device,
-                frame.data(2),
-                frame.lineSize(2),
-                planeWidth,
-                planeHeight,
-                1,
-                DXGI_FORMAT_R8_UNORM,
-                uploaded.views[2],
-                error)) {
-            return false;
-        }
-        setYuvMatrix(width, height, color, false, uploaded.color);
-        return true;
-    }
-    case PixelFormat::NV12:
-    case PixelFormat::NV21:
-        uploaded.color.sourceType =
-            frame.format() == PixelFormat::NV12 ? 3 : 4;
-        if (!createPlaneView(
-                device,
-                frame.data(0),
-                frame.lineSize(0),
-                width,
-                height,
-                1,
-                DXGI_FORMAT_R8_UNORM,
-                uploaded.views[0],
-                error)
-            || !createPlaneView(
-                device,
-                frame.data(1),
-                frame.lineSize(1),
-                chromaWidth,
-                chromaHeight,
-                2,
-                DXGI_FORMAT_R8G8_UNORM,
-                uploaded.views[1],
-                error)) {
-            return false;
-        }
-        setYuvMatrix(width, height, color, false, uploaded.color);
-        return true;
-    case PixelFormat::P010:
-        uploaded.color.sourceType = 3;
-        if (!createPlaneView(
-                device,
-                frame.data(0),
-                frame.lineSize(0),
-                width,
-                height,
-                2,
-                DXGI_FORMAT_R16_UNORM,
-                uploaded.views[0],
-                error)
-            || !createPlaneView(
-                device,
-                frame.data(1),
-                frame.lineSize(1),
-                chromaWidth,
-                chromaHeight,
-                4,
-                DXGI_FORMAT_R16G16_UNORM,
-                uploaded.views[1],
-                error)) {
-            return false;
-        }
-        setYuvMatrix(width, height, color, true, uploaded.color);
-        return true;
-    default:
-        error = "The D3D11 renderer does not support this software pixel format";
-        return false;
-    }
-}
-
-bool uploadFrame(
-    ID3D11Device* device,
-    const VideoFrame& frame,
-    UploadedFrame& uploaded,
-    std::string& error)
-{
-    if (!frame || frame.hasHardwareFrame()) {
-        error =
-            "The D3D11 software renderer requires a valid software video frame";
-        return false;
-    }
-    return uploadSoftwareFrame(
-        device,
-        frame,
-        frame.colorSpaceInfo(),
-        uploaded,
-        error);
-}
-
-bool uploadMappedFrame(
-    ID3D11Device* device,
-    const HardwareFrameMapping& frame,
-    int expectedWidth,
-    int expectedHeight,
-    VideoColorSpace color,
-    UploadedFrame& uploaded,
-    std::string& error)
-{
-    if (frame.width() != expectedWidth
-        || frame.height() != expectedHeight) {
-        error =
-            "The mapped D3D11 hardware frame dimensions do not match its source";
-        return false;
-    }
-    return uploadSoftwareFrame(
-        device,
-        frame,
-        color,
-        uploaded,
-        error);
-}
-
-bool importTextureFrame(
-    ID3D11Device* device,
-    const VideoFrame& source,
-    const D3D11TextureFrame& imported,
-    UploadedFrame& uploaded,
-    std::string& error)
-{
-    if (imported.width() != source.width()
-        || imported.height() != source.height()
-        || !imported.texture()
-        || !imported.shaderResourceView()) {
-        error =
-            "The imported D3D11 texture frame has invalid dimensions, format, or resources";
-        return false;
-    }
-
-    ComPtr<ID3D11Device> textureDevice;
-    imported.texture()->GetDevice(&textureDevice);
-    ComPtr<ID3D11Resource> viewResource;
-    imported.shaderResourceView()->GetResource(&viewResource);
-    if (textureDevice.Get() != device
-        || viewResource.Get() != imported.texture()) {
-        error =
-            "The imported D3D11 texture frame belongs to another device or resource";
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC textureDescription {};
-    imported.texture()->GetDesc(&textureDescription);
-    D3D11_SHADER_RESOURCE_VIEW_DESC viewDescription {};
-    imported.shaderResourceView()->GetDesc(&viewDescription);
-    const DXGI_FORMAT expectedFormat = imported.dxgiFormat();
-    const bool validFormat =
-        (expectedFormat == DXGI_FORMAT_B8G8R8A8_UNORM
-            && imported.format() == PixelFormat::BGRA)
-        || ((expectedFormat == DXGI_FORMAT_R8G8B8A8_UNORM
-                || expectedFormat
-                    == DXGI_FORMAT_R10G10B10A2_UNORM
-                || expectedFormat
-                    == DXGI_FORMAT_R16G16B16A16_FLOAT)
-            && imported.format() == PixelFormat::RGBA);
-    if (textureDescription.Width != static_cast<UINT>(source.width())
-        || textureDescription.Height != static_cast<UINT>(source.height())
-        || textureDescription.ArraySize != 1
-        || textureDescription.SampleDesc.Count != 1
-        || !validFormat
-        || textureDescription.Format != expectedFormat
-        || viewDescription.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D
-        || (viewDescription.Format != DXGI_FORMAT_UNKNOWN
-            && viewDescription.Format != expectedFormat)) {
-        error =
-            "The imported D3D11 texture or shader view description is unsupported";
-        return false;
-    }
-
-    uploaded.views[0] = imported.shaderResourceView();
-    uploaded.color.sourceType = 0;
-    return true;
-}
-
-std::array<float, 2> rotatedCoordinate(
-    VideoRotation rotation,
-    float u,
-    float v) noexcept
-{
-    switch (rotation) {
-    case VideoRotation::Rotate90:
-        return { v, 1.0F - u };
-    case VideoRotation::Rotate180:
-        return { 1.0F - u, 1.0F - v };
-    case VideoRotation::Rotate270:
-        return { 1.0F - v, u };
-    default:
-        return { u, v };
-    }
-}
-
-void makeGeometry(
-    const VideoFrame& frame,
-    const VideoRenderConfig& config,
-    std::array<Vertex, 4>& vertices,
-    D3D11_VIEWPORT& viewport)
-{
-    VideoViewport bounds = config.viewport;
-    if (!bounds.isValid()) {
-        bounds = {
-            0,
-            0,
-            config.surfaceSize.width,
-            config.surfaceSize.height,
-        };
-    }
-
-    const bool quarterTurn =
-        config.rotation == VideoRotation::Rotate90
-        || config.rotation == VideoRotation::Rotate270;
-    const float displayWidth = static_cast<float>(
-        quarterTurn ? frame.height() : frame.width());
-    const float displayHeight = static_cast<float>(
-        quarterTurn ? frame.width() : frame.height());
-    const float sourceAspect = displayWidth / displayHeight;
-    const float targetAspect = static_cast<float>(bounds.width)
-        / static_cast<float>(bounds.height);
-
-    float drawX = static_cast<float>(bounds.x);
-    float drawY = static_cast<float>(bounds.y);
-    float drawWidth = static_cast<float>(bounds.width);
-    float drawHeight = static_cast<float>(bounds.height);
-    float u0 = 0.0F;
-    float u1 = 1.0F;
-    float v0 = 0.0F;
-    float v1 = 1.0F;
-
-    if (config.aspectRatio == VideoAspectRatioMode::Fit) {
-        if (targetAspect > sourceAspect) {
-            drawWidth = drawHeight * sourceAspect;
-            drawX += (static_cast<float>(bounds.width) - drawWidth) * 0.5F;
-        } else {
-            drawHeight = drawWidth / sourceAspect;
-            drawY += (static_cast<float>(bounds.height) - drawHeight) * 0.5F;
-        }
-    } else if (config.aspectRatio == VideoAspectRatioMode::Fill) {
-        if (targetAspect > sourceAspect) {
-            const float visible = sourceAspect / targetAspect;
-            v0 = (1.0F - visible) * 0.5F;
-            v1 = 1.0F - v0;
-        } else {
-            const float visible = targetAspect / sourceAspect;
-            u0 = (1.0F - visible) * 0.5F;
-            u1 = 1.0F - u0;
-        }
-    }
-
-    viewport.TopLeftX = drawX;
-    viewport.TopLeftY = drawY;
-    viewport.Width = drawWidth;
-    viewport.Height = drawHeight;
-    viewport.MinDepth = 0.0F;
-    viewport.MaxDepth = 1.0F;
-
-    const std::array<std::array<float, 2>, 4> displayed {
-        std::array<float, 2> { u0, v0 },
-        std::array<float, 2> { u1, v0 },
-        std::array<float, 2> { u0, v1 },
-        std::array<float, 2> { u1, v1 },
-    };
-    const std::array<std::array<float, 2>, 4> positions {
-        std::array<float, 2> { -1.0F, 1.0F },
-        std::array<float, 2> { 1.0F, 1.0F },
-        std::array<float, 2> { -1.0F, -1.0F },
-        std::array<float, 2> { 1.0F, -1.0F },
-    };
-    for (std::size_t index = 0; index < vertices.size(); ++index) {
-        const auto uv = rotatedCoordinate(
-            config.rotation,
-            displayed[index][0],
-            displayed[index][1]);
-        vertices[index] = {
-            positions[index][0],
-            positions[index][1],
-            uv[0],
-            uv[1],
-        };
-    }
-}
-
 bool targetDescription(
     ID3D11Device* expectedDevice,
     ID3D11RenderTargetView* view,
+    ComPtr<ID3D11Texture2D>& texture,
     D3D11_TEXTURE2D_DESC& description,
     DXGI_FORMAT& viewFormat,
     std::string& error)
@@ -1392,10 +391,7 @@ bool targetDescription(
     }
     ComPtr<ID3D11Resource> resource;
     view->GetResource(&resource);
-    ComPtr<ID3D11Texture2D> texture;
-    if (!resource
-        || FAILED(resource.As(&texture))
-        || !texture) {
+    if (!resource || FAILED(resource.As(&texture)) || !texture) {
         error = "The current D3D11 render target is not a 2D texture";
         return false;
     }
@@ -1407,8 +403,7 @@ bool targetDescription(
     }
     D3D11_RENDER_TARGET_VIEW_DESC viewDescription {};
     view->GetDesc(&viewDescription);
-    if (viewDescription.ViewDimension
-        != D3D11_RTV_DIMENSION_TEXTURE2D) {
+    if (viewDescription.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D) {
         error = "The current D3D11 render target is not a 2D texture view";
         return false;
     }
@@ -1417,6 +412,333 @@ bool targetDescription(
         ? description.Format
         : viewDescription.Format;
     return true;
+}
+
+VideoViewport effectiveViewport(const VideoRenderConfig& config) noexcept
+{
+    return config.viewport.isValid()
+        ? config.viewport
+        : VideoViewport {
+              0,
+              0,
+              config.surfaceSize.width,
+              config.surfaceSize.height,
+          };
+}
+
+pl_rotation rotation(VideoRotation value) noexcept
+{
+    switch (value) {
+    case VideoRotation::Rotate90:
+        return PL_ROTATION_90;
+    case VideoRotation::Rotate180:
+        return PL_ROTATION_180;
+    case VideoRotation::Rotate270:
+        return PL_ROTATION_270;
+    default:
+        return PL_ROTATION_0;
+    }
+}
+
+pl_color_levels levels(ColorRange value) noexcept
+{
+    switch (value) {
+    case ColorRange::Limited:
+        return PL_COLOR_LEVELS_LIMITED;
+    case ColorRange::Full:
+        return PL_COLOR_LEVELS_FULL;
+    default:
+        return PL_COLOR_LEVELS_UNKNOWN;
+    }
+}
+
+pl_color_system system(ColorMatrix value) noexcept
+{
+    switch (value) {
+    case ColorMatrix::RGB:
+        return PL_COLOR_SYSTEM_RGB;
+    case ColorMatrix::BT709:
+        return PL_COLOR_SYSTEM_BT_709;
+    case ColorMatrix::SMPTE240M:
+        return PL_COLOR_SYSTEM_SMPTE_240M;
+    case ColorMatrix::BT2020NCL:
+        return PL_COLOR_SYSTEM_BT_2020_NC;
+    case ColorMatrix::BT2020CL:
+        return PL_COLOR_SYSTEM_BT_2020_C;
+    case ColorMatrix::ICtCp:
+        return PL_COLOR_SYSTEM_BT_2100_PQ;
+    case ColorMatrix::YCgCo:
+        return PL_COLOR_SYSTEM_YCGCO;
+    default:
+        return PL_COLOR_SYSTEM_BT_601;
+    }
+}
+
+pl_color_primaries primaries(ColorPrimaries value) noexcept
+{
+    switch (value) {
+    case ColorPrimaries::BT470M:
+        return PL_COLOR_PRIM_BT_470M;
+    case ColorPrimaries::BT470BG:
+        return PL_COLOR_PRIM_BT_601_625;
+    case ColorPrimaries::SMPTE170M:
+    case ColorPrimaries::SMPTE240M:
+        return PL_COLOR_PRIM_BT_601_525;
+    case ColorPrimaries::BT2020:
+        return PL_COLOR_PRIM_BT_2020;
+    case ColorPrimaries::SMPTE431:
+        return PL_COLOR_PRIM_DCI_P3;
+    case ColorPrimaries::SMPTE432:
+        return PL_COLOR_PRIM_DISPLAY_P3;
+    case ColorPrimaries::EBU3213:
+        return PL_COLOR_PRIM_EBU_3213;
+    case ColorPrimaries::BT709:
+    default:
+        return PL_COLOR_PRIM_BT_709;
+    }
+}
+
+pl_color_transfer transfer(ColorTransfer value) noexcept
+{
+    switch (value) {
+    case ColorTransfer::Gamma22:
+        return PL_COLOR_TRC_GAMMA22;
+    case ColorTransfer::Gamma28:
+        return PL_COLOR_TRC_GAMMA28;
+    case ColorTransfer::Linear:
+        return PL_COLOR_TRC_LINEAR;
+    case ColorTransfer::SRGB:
+        return PL_COLOR_TRC_SRGB;
+    case ColorTransfer::PQ:
+        return PL_COLOR_TRC_PQ;
+    case ColorTransfer::HLG:
+        return PL_COLOR_TRC_HLG;
+    case ColorTransfer::SMPTE428:
+        return PL_COLOR_TRC_ST428;
+    default:
+        return PL_COLOR_TRC_BT_1886;
+    }
+}
+
+pl_chroma_location chromaLocation(ChromaLocation value) noexcept
+{
+    switch (value) {
+    case ChromaLocation::Left:
+        return PL_CHROMA_LEFT;
+    case ChromaLocation::Center:
+        return PL_CHROMA_CENTER;
+    case ChromaLocation::TopLeft:
+        return PL_CHROMA_TOP_LEFT;
+    case ChromaLocation::Top:
+        return PL_CHROMA_TOP_CENTER;
+    case ChromaLocation::BottomLeft:
+        return PL_CHROMA_BOTTOM_LEFT;
+    case ChromaLocation::Bottom:
+        return PL_CHROMA_BOTTOM_CENTER;
+    default:
+        return PL_CHROMA_UNKNOWN;
+    }
+}
+
+void setHdrMetadata(
+    const VideoFrame& frame,
+    pl_hdr_metadata& destination) noexcept
+{
+    const MasteringDisplayMetadata mastering =
+        frame.masteringDisplayMetadata();
+    if (mastering.hasPrimaries) {
+        destination.prim.red = {
+            static_cast<float>(mastering.primaries[0].x),
+            static_cast<float>(mastering.primaries[0].y),
+        };
+        destination.prim.green = {
+            static_cast<float>(mastering.primaries[1].x),
+            static_cast<float>(mastering.primaries[1].y),
+        };
+        destination.prim.blue = {
+            static_cast<float>(mastering.primaries[2].x),
+            static_cast<float>(mastering.primaries[2].y),
+        };
+        destination.prim.white = {
+            static_cast<float>(mastering.whitePoint.x),
+            static_cast<float>(mastering.whitePoint.y),
+        };
+    }
+    if (mastering.hasLuminance) {
+        destination.min_luma = static_cast<float>(
+            std::max(mastering.minimumLuminance, 0.000001));
+        destination.max_luma =
+            static_cast<float>(mastering.maximumLuminance);
+    }
+    const ContentLightMetadata light = frame.contentLightMetadata();
+    destination.max_cll =
+        static_cast<float>(light.maximumContentLightLevel);
+    destination.max_fall =
+        static_cast<float>(light.maximumFrameAverageLightLevel);
+}
+
+void setSourceColor(const VideoFrame& source, pl_frame& frame) noexcept
+{
+    const VideoColorSpace color = source.colorSpaceInfo();
+    frame.repr.sys = system(color.matrix);
+    frame.repr.levels = levels(color.range);
+    frame.repr.alpha = PL_ALPHA_NONE;
+    frame.color.primaries = primaries(color.primaries);
+    frame.color.transfer = transfer(color.transfer);
+    setHdrMetadata(source, frame.color.hdr);
+    pl_frame_set_chroma_location(&frame, chromaLocation(color.chromaLocation));
+}
+
+void setTargetColor(
+    DXGI_FORMAT format,
+    const D3D11AdvancedColorInfo& info,
+    pl_frame& target) noexcept
+{
+    target.repr.sys = PL_COLOR_SYSTEM_RGB;
+    target.repr.levels = PL_COLOR_LEVELS_FULL;
+    target.repr.alpha = PL_ALPHA_NONE;
+
+    switch (info.outputColorSpace) {
+    case D3D11OutputColorSpace::ScRGB:
+        target.color.primaries = PL_COLOR_PRIM_BT_709;
+        target.color.transfer = PL_COLOR_TRC_LINEAR;
+        break;
+    case D3D11OutputColorSpace::HDR10:
+        target.color = pl_color_space_hdr10;
+        break;
+    case D3D11OutputColorSpace::SDR:
+    default:
+        target.color = pl_color_space_srgb;
+        break;
+    }
+
+    target.color.hdr.min_luma =
+        std::max(info.minimumLuminanceNits, 0.0F);
+    target.color.hdr.max_luma =
+        std::max(info.maximumLuminanceNits, 1.0F);
+    target.color.hdr.max_cll = target.color.hdr.max_luma;
+    target.color.hdr.max_fall = std::max(
+        info.maximumFullFrameLuminanceNits,
+        1.0F);
+
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        target.repr.bits = { 16, 16, 0 };
+    } else if (format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        target.repr.bits = { 10, 10, 0 };
+    } else {
+        target.repr.bits = { 8, 8, 0 };
+    }
+}
+
+void applyGeometry(
+    pl_frame& image,
+    pl_frame& target,
+    const VideoRenderConfig& config) noexcept
+{
+    image.rotation = rotation(config.rotation);
+    const VideoViewport viewport = effectiveViewport(config);
+    target.crop = {
+        static_cast<float>(viewport.x),
+        static_cast<float>(viewport.y),
+        static_cast<float>(viewport.x + viewport.width),
+        static_cast<float>(viewport.y + viewport.height),
+    };
+    if (config.aspectRatio == VideoAspectRatioMode::Stretch) {
+        return;
+    }
+    if (config.aspectRatio == VideoAspectRatioMode::Fit) {
+        const float sourceAspect = pl_aspect_rotate(
+            pl_rect2df_aspect(&image.crop),
+            image.rotation);
+        pl_rect2df_aspect_set(&target.crop, sourceAspect, 0.0F);
+        return;
+    }
+    const float targetAspect = pl_rect2df_aspect(&target.crop);
+    const float sourceAspect = pl_aspect_rotate(
+        targetAspect,
+        image.rotation);
+    pl_rect2df_aspect_set(&image.crop, sourceAspect, 0.0F);
+}
+
+void initializePlane(
+    pl_plane& plane,
+    pl_tex texture,
+    int components,
+    int firstComponent) noexcept
+{
+    plane.texture = texture;
+    plane.components = components;
+    std::fill(std::begin(plane.component_mapping),
+              std::end(plane.component_mapping),
+              PL_CHANNEL_NONE);
+    for (int index = 0; index < components; ++index) {
+        plane.component_mapping[index] = firstComponent + index;
+    }
+}
+
+AVPixelFormat avPixelFormat(PixelFormat format) noexcept
+{
+    switch (format) {
+    case PixelFormat::YUV420P:
+        return AV_PIX_FMT_YUV420P;
+    case PixelFormat::YUV422P:
+        return AV_PIX_FMT_YUV422P;
+    case PixelFormat::YUV444P:
+        return AV_PIX_FMT_YUV444P;
+    case PixelFormat::NV12:
+        return AV_PIX_FMT_NV12;
+    case PixelFormat::NV21:
+        return AV_PIX_FMT_NV21;
+    case PixelFormat::P010:
+        return AV_PIX_FMT_P010LE;
+    case PixelFormat::RGB24:
+        return AV_PIX_FMT_RGB24;
+    case PixelFormat::BGR24:
+        return AV_PIX_FMT_BGR24;
+    case PixelFormat::RGBA:
+        return AV_PIX_FMT_RGBA;
+    case PixelFormat::BGRA:
+        return AV_PIX_FMT_BGRA;
+    case PixelFormat::ARGB:
+        return AV_PIX_FMT_ARGB;
+    case PixelFormat::Gray8:
+        return AV_PIX_FMT_GRAY8;
+    default:
+        return AV_PIX_FMT_NONE;
+    }
+}
+
+struct AVFrameDeleter {
+    void operator()(AVFrame* frame) const noexcept
+    {
+        av_frame_free(&frame);
+    }
+};
+
+std::unique_ptr<AVFrame, AVFrameDeleter> mappedAvFrame(
+    const HardwareFrameMapping& mapping) noexcept
+{
+    const AVPixelFormat format = avPixelFormat(mapping.format());
+    if (format == AV_PIX_FMT_NONE || mapping.width() <= 0
+        || mapping.height() <= 0 || mapping.planeCount() <= 0
+        || mapping.planeCount() > AV_NUM_DATA_POINTERS) {
+        return {};
+    }
+    std::unique_ptr<AVFrame, AVFrameDeleter> frame(av_frame_alloc());
+    if (!frame) {
+        return {};
+    }
+    frame->format = format;
+    frame->width = mapping.width();
+    frame->height = mapping.height();
+    for (int plane = 0; plane < mapping.planeCount(); ++plane) {
+        frame->data[plane] = const_cast<std::uint8_t*>(mapping.data(plane));
+        frame->linesize[plane] = mapping.lineSize(plane);
+        if (!frame->data[plane] || frame->linesize[plane] == 0) {
+            return {};
+        }
+    }
+    return frame;
 }
 
 } // namespace
@@ -1434,22 +756,31 @@ bool D3D11RenderTarget::isValid() const noexcept
 
 D3D11TextureFrame::~D3D11TextureFrame() = default;
 
+UINT D3D11TextureFrame::arraySlice() const noexcept
+{
+    return 0;
+}
+
 DXGI_FORMAT D3D11TextureFrame::dxgiFormat() const noexcept
 {
     return format() == PixelFormat::BGRA
         ? DXGI_FORMAT_B8G8R8A8_UNORM
         : format() == PixelFormat::RGBA
         ? DXGI_FORMAT_R8G8B8A8_UNORM
+        : format() == PixelFormat::NV12
+        ? DXGI_FORMAT_NV12
+        : format() == PixelFormat::P010
+        ? DXGI_FORMAT_P010
         : DXGI_FORMAT_UNKNOWN;
 }
 
-DXGI_COLOR_SPACE_TYPE
-D3D11TextureFrame::colorSpace() const noexcept
+DXGI_COLOR_SPACE_TYPE D3D11TextureFrame::colorSpace() const noexcept
 {
     return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 }
 
 D3D11HardwareFrameInterop::~D3D11HardwareFrameInterop() = default;
+
 std::shared_ptr<D3D11TextureFrame>
 D3D11HardwareFrameInterop::importFrame(
     const HardwareFrame& frame,
@@ -1464,16 +795,17 @@ public:
         std::shared_ptr<D3D11DeviceAccess> deviceAccess,
         D3D11CurrentTargetCallback currentTarget)
         : deviceAccess_(std::move(deviceAccess))
-        , device_(
-              deviceAccess_
-                  ? deviceAccess_->device()
-                  : BorrowedD3D11Device {})
-        , context_(
-              deviceAccess_
-                  ? deviceAccess_->immediateContext()
-                  : BorrowedD3D11DeviceContext {})
+        , device_(deviceAccess_ ? deviceAccess_->device()
+                                : BorrowedD3D11Device {})
+        , context_(deviceAccess_ ? deviceAccess_->immediateContext()
+                                 : BorrowedD3D11DeviceContext {})
         , currentTarget_(std::move(currentTarget))
     {
+    }
+
+    ~Impl()
+    {
+        close();
     }
 
     void notify(VideoRenderEventType type, std::string detail)
@@ -1488,200 +820,271 @@ public:
         }
     }
 
-    bool makePipeline(std::string& error)
+    static void logCallback(
+        void* privateData,
+        pl_log_level level,
+        const char* message)
     {
-        if (vertexShader_ && pixelShader_) {
-            return true;
+        if (!privateData || !message || level > PL_LOG_ERR) {
+            return;
         }
-        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
-#if defined(_DEBUG)
-        flags |= D3DCOMPILE_DEBUG;
-#endif
-        ComPtr<ID3DBlob> vertexCode;
-        ComPtr<ID3DBlob> pixelCode;
-        ComPtr<ID3DBlob> messages;
-        HRESULT result = D3DCompile(
-            shaderSource,
-            std::strlen(shaderSource),
-            "qtav_d3d11_renderer",
-            nullptr,
-            nullptr,
-            "vertexMain",
-            "vs_5_0",
-            flags,
-            0,
-            &vertexCode,
-            &messages);
-        if (FAILED(result)) {
-            error = "D3D11 vertex shader compilation failed";
-            if (messages && messages->GetBufferPointer()) {
-                error += ": ";
-                error.append(
-                    static_cast<const char*>(messages->GetBufferPointer()),
-                    messages->GetBufferSize());
-            }
-            return false;
-        }
-        messages.Reset();
-        result = D3DCompile(
-            shaderSource,
-            std::strlen(shaderSource),
-            "qtav_d3d11_renderer",
-            nullptr,
-            nullptr,
-            "pixelMain",
-            "ps_5_0",
-            flags,
-            0,
-            &pixelCode,
-            &messages);
-        if (FAILED(result)) {
-            error = "D3D11 pixel shader compilation failed";
-            if (messages && messages->GetBufferPointer()) {
-                error += ": ";
-                error.append(
-                    static_cast<const char*>(messages->GetBufferPointer()),
-                    messages->GetBufferSize());
-            }
-            return false;
-        }
+        auto* self = static_cast<Impl*>(privateData);
+        std::lock_guard<std::mutex> lock(self->logMutex_);
+        self->lastLogError_ = message;
+    }
 
-        result = device_.get()->CreateVertexShader(
-            vertexCode->GetBufferPointer(),
-            vertexCode->GetBufferSize(),
-            nullptr,
-            &vertexShader_);
-        if (FAILED(result)) {
-            error = hresultText(
-                "ID3D11Device::CreateVertexShader",
-                result);
-            return false;
+    std::string takeLogError(std::string fallback)
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        if (!lastLogError_.empty()) {
+            fallback += ": " + lastLogError_;
+            lastLogError_.clear();
         }
-        result = device_.get()->CreatePixelShader(
-            pixelCode->GetBufferPointer(),
-            pixelCode->GetBufferSize(),
-            nullptr,
-            &pixelShader_);
-        if (FAILED(result)) {
-            error = hresultText(
-                "ID3D11Device::CreatePixelShader",
-                result);
-            return false;
-        }
+        return fallback;
+    }
 
-        const D3D11_INPUT_ELEMENT_DESC elements[] {
-            {
-                "POSITION",
-                0,
-                DXGI_FORMAT_R32G32_FLOAT,
-                0,
-                0,
-                D3D11_INPUT_PER_VERTEX_DATA,
-                0,
-            },
-            {
-                "TEXCOORD",
-                0,
-                DXGI_FORMAT_R32G32_FLOAT,
-                0,
-                8,
-                D3D11_INPUT_PER_VERTEX_DATA,
-                0,
-            },
-        };
-        result = device_.get()->CreateInputLayout(
-            elements,
-            static_cast<UINT>(std::size(elements)),
-            vertexCode->GetBufferPointer(),
-            vertexCode->GetBufferSize(),
-            &inputLayout_);
-        if (FAILED(result)) {
-            error = hresultText(
-                "ID3D11Device::CreateInputLayout",
-                result);
+    bool createCommon(std::string& error)
+    {
+        pl_log_params logParams {};
+        logParams.log_cb = &Impl::logCallback;
+        logParams.log_priv = this;
+        logParams.log_level = PL_LOG_ERR;
+        log_ = pl_log_create(PL_API_VER, &logParams);
+
+        pl_d3d11_params d3d11Params {};
+        d3d11Params.device = device_.get();
+        d3d11_ = pl_d3d11_create(log_, &d3d11Params);
+        if (!d3d11_) {
+            error = takeLogError(
+                "libplacebo could not import the borrowed D3D11 device");
+            destroyCommon();
             return false;
         }
-
-        D3D11_BUFFER_DESC vertexDescriptor {};
-        vertexDescriptor.ByteWidth =
-            static_cast<UINT>(sizeof(Vertex) * 4);
-        vertexDescriptor.Usage = D3D11_USAGE_DYNAMIC;
-        vertexDescriptor.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        vertexDescriptor.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        result = device_.get()->CreateBuffer(
-            &vertexDescriptor,
-            nullptr,
-            &vertexBuffer_);
-        if (FAILED(result)) {
-            error = hresultText(
-                "ID3D11Device::CreateBuffer(vertex)",
-                result);
-            return false;
-        }
-
-        D3D11_BUFFER_DESC colorDescriptor {};
-        colorDescriptor.ByteWidth =
-            static_cast<UINT>(sizeof(ColorParameters));
-        colorDescriptor.Usage = D3D11_USAGE_DYNAMIC;
-        colorDescriptor.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        colorDescriptor.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        result = device_.get()->CreateBuffer(
-            &colorDescriptor,
-            nullptr,
-            &colorBuffer_);
-        if (FAILED(result)) {
-            error = hresultText(
-                "ID3D11Device::CreateBuffer(color)",
-                result);
-            return false;
-        }
-
-        D3D11_SAMPLER_DESC samplerDescriptor {};
-        samplerDescriptor.Filter =
-            D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-        samplerDescriptor.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        samplerDescriptor.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        samplerDescriptor.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        samplerDescriptor.MaxLOD = D3D11_FLOAT32_MAX;
-        result = device_.get()->CreateSamplerState(
-            &samplerDescriptor,
-            &sampler_);
-        if (FAILED(result)) {
-            error = hresultText(
-                "ID3D11Device::CreateSamplerState",
-                result);
-            return false;
-        }
-
-        D3D11_RASTERIZER_DESC rasterizerDescriptor {};
-        rasterizerDescriptor.FillMode = D3D11_FILL_SOLID;
-        rasterizerDescriptor.CullMode = D3D11_CULL_NONE;
-        rasterizerDescriptor.DepthClipEnable = TRUE;
-        result = device_.get()->CreateRasterizerState(
-            &rasterizerDescriptor,
-            &rasterizer_);
-        if (FAILED(result)) {
-            error = hresultText(
-                "ID3D11Device::CreateRasterizerState",
-                result);
+        renderer_ = pl_renderer_create(log_, d3d11_->gpu);
+        if (!renderer_) {
+            error = takeLogError(
+                "libplacebo could not create its D3D11 renderer");
+            destroyCommon();
             return false;
         }
         return true;
     }
 
-    void releasePipeline() noexcept
+    void destroyCommon() noexcept
     {
-        rasterizer_.Reset();
-        sampler_.Reset();
-        colorBuffer_.Reset();
-        vertexBuffer_.Reset();
-        inputLayout_.Reset();
-        pixelShader_.Reset();
-        vertexShader_.Reset();
+        if (d3d11_) {
+            pl_gpu_finish(d3d11_->gpu);
+        }
+        for (pl_tex& texture : uploadTextures_) {
+            if (texture && d3d11_) {
+                pl_tex_destroy(d3d11_->gpu, &texture);
+            }
+        }
+        if (renderer_) {
+            pl_renderer_destroy(&renderer_);
+        }
+        if (d3d11_) {
+            pl_d3d11_destroy(&d3d11_);
+        }
+        if (log_) {
+            pl_log_destroy(&log_);
+        }
+    }
+
+    void close() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex_);
+            open_ = false;
+            config_ = {};
+        }
+        std::lock_guard<std::mutex> renderLock(renderMutex_);
+        if (!deviceAccess_) {
+            destroyCommon();
+            return;
+        }
+        auto contextGuard = deviceAccess_->contextGuard();
+        (void)contextGuard;
+        destroyCommon();
+    }
+
+    bool wrapTarget(
+        ID3D11Texture2D* native,
+        DXGI_FORMAT format,
+        int width,
+        int height,
+        const D3D11AdvancedColorInfo& color,
+        pl_tex& texture,
+        pl_frame& frame,
+        std::string& error)
+    {
+        pl_d3d11_wrap_params params {};
+        params.tex = native;
+        params.array_slice = 0;
+        params.fmt = format;
+        params.w = width;
+        params.h = height;
+        texture = pl_d3d11_wrap(d3d11_->gpu, &params);
+        if (!texture || !texture->params.renderable) {
+            error = takeLogError(
+                "libplacebo cannot wrap the D3D11 render target");
+            return false;
+        }
+        frame.num_planes = 1;
+        initializePlane(frame.planes[0], texture, 4, 0);
+        frame.crop = {
+            0.0F,
+            0.0F,
+            static_cast<float>(width),
+            static_cast<float>(height),
+        };
+        setTargetColor(format, color, frame);
+        return true;
+    }
+
+    bool wrapHardwareSource(
+        const VideoFrame& source,
+        const std::shared_ptr<D3D11TextureFrame>& imported,
+        std::array<pl_tex, 2>& textures,
+        pl_frame& frame,
+        pl_dovi_metadata& dovi,
+        std::string& error)
+    {
+        if (!imported || !imported->texture()
+            || imported->width() != source.width()
+            || imported->height() != source.height()) {
+            error =
+                "The imported D3D11 texture does not match the decoded frame";
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC description {};
+        imported->texture()->GetDesc(&description);
+        if (description.Usage != D3D11_USAGE_DEFAULT
+            || description.MipLevels != 1
+            || description.SampleDesc.Count != 1
+            || imported->arraySlice() >= description.ArraySize
+            || !(description.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+            error =
+                "The imported D3D11 texture is not a shader-readable default resource";
+            return false;
+        }
+
+        const PixelFormat format = imported->format();
+        const bool rawYuv = format == PixelFormat::NV12
+            || format == PixelFormat::P010;
+        if (source.hasDolbyVisionMetadata() && !rawYuv) {
+            error =
+                "Dolby Vision requires raw NV12/P010 D3D11 plane sampling";
+            return false;
+        }
+
+        if (rawYuv) {
+            const bool tenBit = format == PixelFormat::P010;
+            if (description.Format
+                != (tenBit ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12)) {
+                error =
+                    "The imported D3D11 decoder texture format is inconsistent";
+                return false;
+            }
+            const std::array<DXGI_FORMAT, 2> planeFormats {
+                tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
+                tenBit ? DXGI_FORMAT_R16G16_UNORM
+                       : DXGI_FORMAT_R8G8_UNORM,
+            };
+            const std::array<int, 2> widths {
+                source.width(),
+                (source.width() + 1) / 2,
+            };
+            const std::array<int, 2> heights {
+                source.height(),
+                (source.height() + 1) / 2,
+            };
+            for (std::size_t plane = 0; plane < textures.size(); ++plane) {
+                pl_d3d11_wrap_params params {};
+                params.tex = imported->texture();
+                params.array_slice = static_cast<int>(imported->arraySlice());
+                params.fmt = planeFormats[plane];
+                params.w = widths[plane];
+                params.h = heights[plane];
+                textures[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
+                if (!textures[plane] || !textures[plane]->params.sampleable) {
+                    error = takeLogError(
+                        "libplacebo cannot wrap a D3D11 decoder plane");
+                    return false;
+                }
+            }
+            frame.num_planes = 2;
+            initializePlane(frame.planes[0], textures[0], 1, 0);
+            initializePlane(frame.planes[1], textures[1], 2, 1);
+            setSourceColor(source, frame);
+            frame.repr.bits = tenBit
+                ? pl_bit_encoding { 16, 10, 6 }
+                : pl_bit_encoding { 8, 8, 0 };
+
+            const AVFrame* native =
+                detail::FrameFactory::nativeVideoFrame(source);
+            if (source.hasDolbyVisionMetadata()
+                && (!native
+                    || !qtav_pl_map_dovi(&frame, &dovi, native))) {
+                error =
+                    "FFmpeg Dolby Vision metadata changed during D3D11 mapping";
+                return false;
+            }
+        } else {
+            pl_d3d11_wrap_params params {};
+            params.tex = imported->texture();
+            params.array_slice = static_cast<int>(imported->arraySlice());
+            params.fmt = imported->dxgiFormat();
+            params.w = source.width();
+            params.h = source.height();
+            textures[0] = pl_d3d11_wrap(d3d11_->gpu, &params);
+            if (!textures[0] || !textures[0]->params.sampleable) {
+                error = takeLogError(
+                    "libplacebo cannot wrap the imported D3D11 texture");
+                return false;
+            }
+            frame.num_planes = 1;
+            initializePlane(
+                frame.planes[0],
+                textures[0],
+                std::min(textures[0]->params.format->num_components, 4),
+                0);
+            if (imported->format() == PixelFormat::BGRA) {
+                frame.planes[0].component_mapping[0] = 2;
+                frame.planes[0].component_mapping[1] = 1;
+                frame.planes[0].component_mapping[2] = 0;
+                frame.planes[0].component_mapping[3] = 3;
+            }
+            frame.repr.sys = PL_COLOR_SYSTEM_RGB;
+            frame.repr.levels = PL_COLOR_LEVELS_FULL;
+            frame.repr.alpha = PL_ALPHA_NONE;
+            switch (imported->colorSpace()) {
+            case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+                frame.color.primaries = PL_COLOR_PRIM_BT_709;
+                frame.color.transfer = PL_COLOR_TRC_LINEAR;
+                break;
+            case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+                frame.color = pl_color_space_hdr10;
+                break;
+            default:
+                frame.color = pl_color_space_srgb;
+                break;
+            }
+        }
+
+        frame.crop = {
+            0.0F,
+            0.0F,
+            static_cast<float>(source.width()),
+            static_cast<float>(source.height()),
+        };
+        return true;
     }
 
     mutable std::mutex stateMutex_;
     std::mutex renderMutex_;
+    std::mutex logMutex_;
     std::shared_ptr<D3D11DeviceAccess> deviceAccess_;
     BorrowedD3D11Device device_;
     BorrowedD3D11DeviceContext context_;
@@ -1693,13 +1096,12 @@ public:
     bool allowSoftwareMappingFallback_ = false;
     bool open_ = false;
 
-    ComPtr<ID3D11VertexShader> vertexShader_;
-    ComPtr<ID3D11PixelShader> pixelShader_;
-    ComPtr<ID3D11InputLayout> inputLayout_;
-    ComPtr<ID3D11Buffer> vertexBuffer_;
-    ComPtr<ID3D11Buffer> colorBuffer_;
-    ComPtr<ID3D11SamplerState> sampler_;
-    ComPtr<ID3D11RasterizerState> rasterizer_;
+    pl_log log_ = nullptr;
+    pl_d3d11 d3d11_ = nullptr;
+    pl_renderer renderer_ = nullptr;
+    std::array<pl_tex, 4> uploadTextures_ {};
+    std::string lastLogError_;
+
     std::atomic<std::int64_t> maximumColorSetupMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumInteropMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumBufferUpdateMicroseconds_ { 0 };
@@ -1753,7 +1155,7 @@ VideoRenderCapabilities D3D11VideoRenderer::capabilities() const
         std::lock_guard<std::mutex> lock(impl_->stateMutex_);
         hardwareInterop = impl_->hardwareInterop_;
     }
-    if (hardwareInterop
+    if (hardwareInterop && impl_
         && hardwareInterop->deviceAccess() == impl_->deviceAccess_) {
         result.hardwareDevices =
             hardwareInterop->capabilities().sourceDevices;
@@ -1794,12 +1196,10 @@ bool D3D11VideoRenderer::open(const VideoRenderConfig& config)
     {
         std::lock_guard<std::mutex> lock(impl_->stateMutex_);
         if (error.empty() && !impl_->currentTarget_) {
-            error =
-                "The D3D11 renderer requires a current-target callback";
-        } else if (
-            error.empty() && impl_->hardwareInterop_
-            && impl_->hardwareInterop_->deviceAccess()
-                != impl_->deviceAccess_) {
+            error = "The D3D11 renderer requires a current-target callback";
+        } else if (error.empty() && impl_->hardwareInterop_
+                   && impl_->hardwareInterop_->deviceAccess()
+                       != impl_->deviceAccess_) {
             error =
                 "The D3D11 hardware interop belongs to another device access";
         }
@@ -1810,10 +1210,11 @@ bool D3D11VideoRenderer::open(const VideoRenderConfig& config)
     }
 
     {
-        std::lock_guard<std::mutex> lock(impl_->renderMutex_);
-        if (!impl_->makePipeline(error)) {
-            impl_->releasePipeline();
-        }
+        std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+        auto contextGuard = impl_->deviceAccess_->contextGuard();
+        (void)contextGuard;
+        impl_->destroyCommon();
+        impl_->createCommon(error);
     }
     if (!error.empty()) {
         impl_->notify(
@@ -1855,7 +1256,7 @@ bool D3D11VideoRenderer::configure(const VideoRenderConfig& config)
 
 bool D3D11VideoRenderer::render(const VideoFrame& frame)
 {
-    if (!impl_) {
+    if (!impl_ || !frame) {
         return false;
     }
 
@@ -1864,10 +1265,13 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop;
     bool allowSoftwareMappingFallback = false;
     {
-        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
-        if (!impl_->open_) {
-            currentTarget = {};
-        } else {
+        std::unique_lock<std::mutex> lock(
+            impl_->stateMutex_,
+            std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return false;
+        }
+        if (impl_->open_) {
             config = impl_->config_;
             currentTarget = impl_->currentTarget_;
             hardwareInterop = impl_->hardwareInterop_;
@@ -1890,12 +1294,6 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         return false;
     }
 
-    std::string error;
-    std::string fallbackDetail;
-    VideoRenderEventType errorType = VideoRenderEventType::Error;
-    bool rendered = false;
-    D3D11AdvancedColorInfo advancedColorInfo;
-    bool advancedColorInfoResolved = false;
     std::unique_lock<std::mutex> renderLock(
         impl_->renderMutex_,
         std::try_to_lock);
@@ -1906,297 +1304,213 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     if (!contextGuard) {
         return false;
     }
-    {
-        const HRESULT removedReason =
-            impl_->device_.get()->GetDeviceRemovedReason();
-        if (detail::d3d11FailureEvent(removedReason)
-            == VideoRenderEventType::SurfaceLost) {
-            errorType = VideoRenderEventType::SurfaceLost;
-            error = hresultText(
-                "The D3D11 device was removed",
-                removedReason);
-        }
 
-        const auto colorSetupStarted = steadyMicroseconds();
-        D3D11_TEXTURE2D_DESC targetDescriptor {};
-        DXGI_FORMAT targetFormat = DXGI_FORMAT_UNKNOWN;
-        if (error.empty()
-            && (!targetDescription(
-                    impl_->device_.get(),
-                    target.view,
-                    targetDescriptor,
-                    targetFormat,
-                    error)
-                || targetDescriptor.Width
-                    != static_cast<UINT>(config.surfaceSize.width)
-                || targetDescriptor.Height
-                    != static_cast<UINT>(config.surfaceSize.height)
-                || targetDescriptor.SampleDesc.Count != 1
-                || !isSupportedTargetFormat(targetFormat))) {
-            if (error.empty()) {
-                error =
-                    "The current D3D11 target size, sample count, or pixel format is unsupported";
-            }
-        }
-        if (error.empty()) {
-            advancedColorInfoResolved = configureAdvancedColor(
+    std::string error;
+    std::string fallbackDetail;
+    VideoRenderEventType errorType = VideoRenderEventType::Error;
+    bool rendered = false;
+    D3D11AdvancedColorInfo advancedColorInfo;
+    bool advancedColorInfoResolved = false;
+
+    const HRESULT removedReason =
+        impl_->device_.get()->GetDeviceRemovedReason();
+    if (detail::d3d11FailureEvent(removedReason)
+        == VideoRenderEventType::SurfaceLost) {
+        errorType = VideoRenderEventType::SurfaceLost;
+        error = hresultText("The D3D11 device was removed", removedReason);
+    }
+
+    const auto colorSetupStarted = steadyMicroseconds();
+    ComPtr<ID3D11Texture2D> targetTextureNative;
+    D3D11_TEXTURE2D_DESC targetDescriptor {};
+    DXGI_FORMAT targetFormat = DXGI_FORMAT_UNKNOWN;
+    if (error.empty()
+        && (!targetDescription(
                 impl_->device_.get(),
-                target,
+                target.view,
+                targetTextureNative,
+                targetDescriptor,
                 targetFormat,
-                advancedColorInfo,
-                error);
+                error)
+            || targetDescriptor.Width
+                != static_cast<UINT>(config.surfaceSize.width)
+            || targetDescriptor.Height
+                != static_cast<UINT>(config.surfaceSize.height)
+            || targetDescriptor.SampleDesc.Count != 1
+            || !isSupportedTargetFormat(targetFormat))) {
+        if (error.empty()) {
+            error =
+                "The current D3D11 target size, sample count, or pixel format is unsupported";
         }
-        updateMaximum(
-            impl_->maximumColorSetupMicroseconds_,
-            steadyMicroseconds() - colorSetupStarted);
+    }
+    if (error.empty()) {
+        advancedColorInfoResolved = configureAdvancedColor(
+            impl_->device_.get(),
+            target,
+            targetFormat,
+            advancedColorInfo,
+            error);
+    }
+    updateMaximum(
+        impl_->maximumColorSetupMicroseconds_,
+        steadyMicroseconds() - colorSetupStarted);
 
-        UploadedFrame uploaded;
-        std::shared_ptr<D3D11TextureFrame> textureFrame;
-        std::shared_ptr<HardwareFrameMapping> mappedFrame;
-        if (error.empty() && frame.hasHardwareFrame()) {
-            const HardwareFrame hardwareFrame = frame.hardwareFrame();
-            const bool compatibleInterop =
-                hardwareInterop
-                && hardwareInterop->deviceAccess()
-                    == impl_->deviceAccess_
-                && hardwareInterop->supports(hardwareFrame);
-            if (compatibleInterop) {
-                const auto interopStarted =
-                    steadyMicroseconds();
-                // Keep the imported object until the Video Processor and draw
-                // commands below are submitted. Decoder, interop, and renderer
-                // submissions share this serialized immediate context, so
-                // later decoder reuse is ordered after those GPU reads. D3D11
-                // retains resources referenced by queued commands; a per-frame
-                // completion query would only throttle submission and keep
-                // scarce decoder surfaces unavailable longer.
-                textureFrame = hardwareInterop->importFrame(
-                    hardwareFrame,
-                    frame.colorSpaceInfo());
-                if (textureFrame) {
-                    if (!importTextureFrame(
-                            impl_->device_.get(),
-                            frame,
-                            *textureFrame,
-                            uploaded,
-                            error)) {
-                        textureFrame.reset();
-                    }
-                } else if (error.empty()) {
+    pl_tex targetTexture = nullptr;
+    pl_frame targetFrame {};
+    if (error.empty()
+        && !impl_->wrapTarget(
+            targetTextureNative.Get(),
+            targetFormat,
+            config.surfaceSize.width,
+            config.surfaceSize.height,
+            advancedColorInfo,
+            targetTexture,
+            targetFrame,
+            error)) {
+        // Error populated by wrapTarget().
+    }
+
+    pl_frame image {};
+    std::array<pl_tex, 2> hardwareTextures {};
+    std::shared_ptr<D3D11TextureFrame> imported;
+    std::shared_ptr<HardwareFrameMapping> mappedFrame;
+    std::unique_ptr<AVFrame, AVFrameDeleter> mappedNative;
+    pl_dovi_metadata dovi {};
+    bool mappedSoftware = false;
+
+    const auto sourceStarted = steadyMicroseconds();
+    if (error.empty() && frame.hasHardwareFrame()) {
+        const HardwareFrame hardwareFrame = frame.hardwareFrame();
+        const bool compatibleInterop = hardwareInterop
+            && hardwareInterop->deviceAccess() == impl_->deviceAccess_
+            && hardwareInterop->supports(hardwareFrame);
+        if (compatibleInterop) {
+            const auto interopStarted = steadyMicroseconds();
+            imported = hardwareInterop->importFrame(
+                hardwareFrame,
+                frame.colorSpaceInfo());
+            updateMaximum(
+                impl_->maximumInteropMicroseconds_,
+                steadyMicroseconds() - interopStarted);
+            if (!imported
+                || !impl_->wrapHardwareSource(
+                    frame,
+                    imported,
+                    hardwareTextures,
+                    image,
+                    dovi,
+                    error)) {
+                if (error.empty()) {
                     error = "D3D11 hardware-frame import failed";
                 }
-                updateMaximum(
-                    impl_->maximumInteropMicroseconds_,
-                    steadyMicroseconds() - interopStarted);
+            }
+        } else {
+            error =
+                "The D3D11 renderer has no compatible interop for this hardware frame";
+        }
+
+        if (!error.empty() && allowSoftwareMappingFallback) {
+            fallbackDetail = error
+                + "; using explicit software-mapping fallback";
+            error.clear();
+            if (!hardwareFrame.isMappable(HardwareMapMode::Read)
+                || !(mappedFrame =
+                    hardwareFrame.map(HardwareMapMode::Read))
+                || !(mappedNative = mappedAvFrame(*mappedFrame))
+                || !qtav_pl_map_avframe(
+                    impl_->d3d11_->gpu,
+                    &image,
+                    impl_->uploadTextures_.data(),
+                    mappedNative.get())) {
+                error = impl_->takeLogError(
+                    "The D3D11 hardware frame could not be mapped for software fallback");
             } else {
-                error =
-                    "The D3D11 renderer has no compatible interop for this hardware frame";
-            }
-
-            if (!error.empty() && allowSoftwareMappingFallback) {
-                fallbackDetail = error
-                    + "; using explicit software-mapping fallback";
-                error.clear();
-                if (!hardwareFrame.isMappable(HardwareMapMode::Read)
-                    || !(mappedFrame =
-                        hardwareFrame.map(HardwareMapMode::Read))) {
-                    error =
-                        "The D3D11 hardware frame could not be mapped for software fallback";
-                } else if (!uploadMappedFrame(
-                               impl_->device_.get(),
-                               *mappedFrame,
-                               frame.width(),
-                               frame.height(),
-                               frame.colorSpaceInfo(),
-                               uploaded,
-                               error)) {
-                    mappedFrame.reset();
-                }
-            }
-        } else if (
-            error.empty()
-            && !uploadFrame(
-                impl_->device_.get(),
-                frame,
-                uploaded,
-                error)) {
-            // The common error classification below handles this failure.
-        }
-        if (error.empty()) {
-            setPresentationParameters(
-                frame,
-                textureFrame.get(),
-                advancedColorInfo,
-                uploaded.color);
-        }
-        if (!error.empty()) {
-            const HRESULT uploadReason =
-                impl_->device_.get()->GetDeviceRemovedReason();
-            errorType = detail::d3d11FailureEvent(uploadReason);
-        }
-
-        std::array<Vertex, 4> vertices;
-        D3D11_VIEWPORT viewport {};
-        const auto bufferUpdateStarted = steadyMicroseconds();
-        if (error.empty()) {
-            makeGeometry(frame, config, vertices, viewport);
-
-            D3D11_MAPPED_SUBRESOURCE mapped {};
-            HRESULT result = impl_->context_.get()->Map(
-                impl_->vertexBuffer_.Get(),
-                0,
-                D3D11_MAP_WRITE_DISCARD,
-                0,
-                &mapped);
-            if (SUCCEEDED(result)) {
-                std::memcpy(
-                    mapped.pData,
-                    vertices.data(),
-                    sizeof(vertices));
-                impl_->context_.get()->Unmap(
-                    impl_->vertexBuffer_.Get(),
-                    0);
-            } else {
-                error = hresultText(
-                    "ID3D11DeviceContext::Map(vertex)",
-                    result);
-                errorType = detail::d3d11FailureEvent(result);
+                mappedSoftware = true;
             }
         }
-        if (error.empty()) {
-            D3D11_MAPPED_SUBRESOURCE mapped {};
-            const HRESULT result = impl_->context_.get()->Map(
-                impl_->colorBuffer_.Get(),
-                0,
-                D3D11_MAP_WRITE_DISCARD,
-                0,
-                &mapped);
-            if (SUCCEEDED(result)) {
-                std::memcpy(
-                    mapped.pData,
-                    &uploaded.color,
-                    sizeof(uploaded.color));
-                impl_->context_.get()->Unmap(
-                    impl_->colorBuffer_.Get(),
-                    0);
-            } else {
-                error = hresultText(
-                    "ID3D11DeviceContext::Map(color)",
-                    result);
-                errorType = detail::d3d11FailureEvent(result);
-            }
+    } else if (error.empty()) {
+        const AVFrame* native = detail::FrameFactory::nativeVideoFrame(frame);
+        if (!native
+            || !qtav_pl_map_avframe(
+                impl_->d3d11_->gpu,
+                &image,
+                impl_->uploadTextures_.data(),
+                native)) {
+            error = impl_->takeLogError(
+                "libplacebo could not map the decoded software frame for D3D11");
+        } else {
+            mappedSoftware = true;
         }
-        if (error.empty()) {
-            updateMaximum(
-                impl_->maximumBufferUpdateMicroseconds_,
-                steadyMicroseconds() - bufferUpdateStarted);
-        }
+    }
+    updateMaximum(
+        impl_->maximumBufferUpdateMicroseconds_,
+        steadyMicroseconds() - sourceStarted);
 
-        if (error.empty()) {
-            const auto drawStarted = steadyMicroseconds();
-            constexpr float clearColor[] { 0.0F, 0.0F, 0.0F, 1.0F };
-            impl_->context_.get()->ClearRenderTargetView(
-                target.view,
-                clearColor);
-            impl_->context_.get()->OMSetRenderTargets(
-                1,
-                &target.view,
-                nullptr);
-            constexpr float blendFactor[] {
-                0.0F,
-                0.0F,
-                0.0F,
-                0.0F,
-            };
-            impl_->context_.get()->OMSetBlendState(
-                nullptr,
-                blendFactor,
-                0xffffffffU);
-            impl_->context_.get()->RSSetViewports(1, &viewport);
-            impl_->context_.get()->RSSetState(
-                impl_->rasterizer_.Get());
-
-            const UINT stride = sizeof(Vertex);
-            const UINT offset = 0;
-            ID3D11Buffer* vertexBuffer = impl_->vertexBuffer_.Get();
-            impl_->context_.get()->IASetInputLayout(
-                impl_->inputLayout_.Get());
-            impl_->context_.get()->IASetVertexBuffers(
-                0,
-                1,
-                &vertexBuffer,
-                &stride,
-                &offset);
-            impl_->context_.get()->IASetPrimitiveTopology(
-                D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-            impl_->context_.get()->VSSetShader(
-                impl_->vertexShader_.Get(),
-                nullptr,
-                0);
-            impl_->context_.get()->HSSetShader(nullptr, nullptr, 0);
-            impl_->context_.get()->DSSetShader(nullptr, nullptr, 0);
-            impl_->context_.get()->GSSetShader(nullptr, nullptr, 0);
-            impl_->context_.get()->PSSetShader(
-                impl_->pixelShader_.Get(),
-                nullptr,
-                0);
-
-            ID3D11ShaderResourceView* views[] {
-                uploaded.views[0].Get(),
-                uploaded.views[1].Get(),
-                uploaded.views[2].Get(),
-            };
-            ID3D11SamplerState* sampler = impl_->sampler_.Get();
-            ID3D11Buffer* colorBuffer = impl_->colorBuffer_.Get();
-            impl_->context_.get()->PSSetShaderResources(0, 3, views);
-            impl_->context_.get()->PSSetSamplers(0, 1, &sampler);
-            impl_->context_.get()->PSSetConstantBuffers(
-                0,
-                1,
-                &colorBuffer);
-            impl_->context_.get()->Draw(4, 0);
-
-            ID3D11ShaderResourceView* emptyViews[] {
-                nullptr,
-                nullptr,
-                nullptr,
-            };
-            impl_->context_.get()->PSSetShaderResources(
-                0,
-                3,
-                emptyViews);
-            impl_->context_.get()->OMSetRenderTargets(
-                0,
-                nullptr,
-                nullptr);
-            updateMaximum(
-                impl_->maximumDrawMicroseconds_,
-                steadyMicroseconds() - drawStarted);
-            rendered = true;
-
-            const HRESULT drawReason =
-                impl_->device_.get()->GetDeviceRemovedReason();
-            if (detail::d3d11FailureEvent(drawReason)
-                == VideoRenderEventType::SurfaceLost) {
-                rendered = false;
-                errorType = VideoRenderEventType::SurfaceLost;
-                error = hresultText(
-                    "The D3D11 device was removed during rendering",
-                    drawReason);
-            }
+    if (error.empty()) {
+        applyGeometry(image, targetFrame, config);
+        const auto drawStarted = steadyMicroseconds();
+        constexpr float clearColor[] { 0.0F, 0.0F, 0.0F, 1.0F };
+        impl_->context_.get()->ClearRenderTargetView(
+            target.view,
+            clearColor);
+        rendered = pl_render_image(
+            impl_->renderer_,
+            &image,
+            &targetFrame,
+            &pl_render_default_params);
+        updateMaximum(
+            impl_->maximumDrawMicroseconds_,
+            steadyMicroseconds() - drawStarted);
+        if (!rendered) {
+            error = impl_->takeLogError(
+                "libplacebo could not render the D3D11 video frame");
         }
     }
 
+    if (mappedSoftware) {
+        qtav_pl_unmap_avframe(impl_->d3d11_->gpu, &image);
+    }
+    for (pl_tex& texture : hardwareTextures) {
+        if (texture) {
+            pl_tex_destroy(impl_->d3d11_->gpu, &texture);
+        }
+    }
+    if (targetTexture) {
+        pl_tex_destroy(impl_->d3d11_->gpu, &targetTexture);
+    }
+
+    const HRESULT drawReason =
+        impl_->device_.get()->GetDeviceRemovedReason();
+    if (detail::d3d11FailureEvent(drawReason)
+        == VideoRenderEventType::SurfaceLost) {
+        rendered = false;
+        errorType = VideoRenderEventType::SurfaceLost;
+        error = hresultText(
+            "The D3D11 device was removed during rendering",
+            drawReason);
+    } else if (impl_->d3d11_
+               && pl_gpu_is_failed(impl_->d3d11_->gpu)) {
+        rendered = false;
+        errorType = VideoRenderEventType::SurfaceLost;
+        error = "libplacebo reported a failed D3D11 device";
+    }
+
     if (advancedColorInfoResolved) {
-        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
-        if (!sameAdvancedColorInfo(
+        std::unique_lock<std::mutex> lock(
+            impl_->stateMutex_,
+            std::try_to_lock);
+        if (lock.owns_lock()
+            && !sameAdvancedColorInfo(
                 impl_->advancedColorInfo_,
                 advancedColorInfo)) {
             impl_->advancedColorInfo_ = advancedColorInfo;
         }
     }
     if (!rendered) {
-        impl_->notify(errorType, std::move(error));
+        impl_->notify(
+            errorType,
+            error.empty() ? "libplacebo D3D11 rendering failed"
+                          : std::move(error));
     } else if (!fallbackDetail.empty()) {
         impl_->notify(
             VideoRenderEventType::Error,
@@ -2207,15 +1521,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
 void D3D11VideoRenderer::close() noexcept
 {
-    if (!impl_) {
-        return;
+    if (impl_) {
+        impl_->close();
     }
-    {
-        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
-        impl_->open_ = false;
-    }
-    std::lock_guard<std::mutex> lock(impl_->renderMutex_);
-    impl_->releasePipeline();
 }
 
 BorrowedD3D11Device D3D11VideoRenderer::device() const noexcept

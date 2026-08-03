@@ -5,6 +5,10 @@ Qt-free player under `../modern/`. It follows the vcpkg overlay model used by
 [`qietv/qie-vcpkg-overlay`](https://github.com/qietv/qie-vcpkg-overlay), but
 uses an explicit player feature set instead of `ffmpeg[all]`.
 
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the package structure and
+[`DECISIONS.md`](DECISIONS.md) for the rationale and retirement criteria of
+local compatibility patches.
+
 Supported build hosts and targets:
 
 | Host | Target | Triplet |
@@ -48,8 +52,11 @@ end-to-end playback claim.
 The overlay also builds libplacebo with `-Dopengl=enabled`. Its build virtual
 environment supplies glad 2 to generate the merged OpenGL, OpenGL ES, and EGL
 loader. Android and OHOS therefore install libplacebo with
-`PL_HAVE_OPENGL 1`; Windows retains the same capability even though QtAVCore
-uses DirectX there.
+`PL_HAVE_OPENGL 1`. Windows additionally enables libplacebo's D3D11 backend
+and installs the complete static SPIRV-Cross C/glsl/hlsl/msl/cpp/reflect
+closure. QtAVCore uses only that D3D11 backend on Windows; the installed
+OpenGL capability is not a QtAVCore Windows rendering path. See
+[FD-002](DECISIONS.md) for the static-link contract.
 
 The mobile/OHOS libass overlay disables automatic system-font discovery and
 does not pull fontconfig. Applications must supply an explicit default font or
@@ -123,7 +130,10 @@ and install root before starting the manifest installation.
 libplacebo does not support the MSVC `cl.exe` C compiler. The Windows triplet
 therefore uses Visual Studio's `clang-cl` compiler with the Windows SDK and
 MSVC ABI. It produces release static libraries using the dynamic MSVC runtime
-(`/MD`).
+(`/MD`). FFmpeg keeps LTO and external NASM enabled with one narrow MLP
+inline-assembly exception, and libplacebo preserves 16-byte allocation
+alignment across its Windows x64 public/private boundary. These are intentional
+compatibility contracts; see [FD-001 and FD-003](DECISIONS.md).
 
 ## Outputs and parent-project consumption
 
@@ -154,7 +164,8 @@ scripts accept `QTAV_FFMPEG_INSTALL_ROOT` on macOS and `-InstallRoot` on
 Windows when a different artifact directory is needed.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the subproject's layering,
-dependency graph, target model, and parent-project integration contract.
+dependency graph, target model, and parent-project integration contract, and
+[`DECISIONS.md`](DECISIONS.md) for compatibility-patch rationale.
 Maintenance rules for agents and contributors are in [`AGENTS.md`](AGENTS.md).
 
 ## CI

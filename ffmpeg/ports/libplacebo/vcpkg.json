@@ -8,6 +8,10 @@
   "dependencies": [
     "fast-float",
     "glslang",
+    {
+      "name": "spirv-cross",
+      "platform": "windows"
+    },
     "vulkan-headers",
     {
       "name": "vcpkg-get-python-packages",

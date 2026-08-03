@@ -1,3 +1,7 @@
+if(WIN32)
+    return()
+endif()
+
 find_path(QTAV_GLES3_INCLUDE_DIR GLES3/gl3.h)
 find_library(QTAV_GLES3_LIBRARY_PATH NAMES GLESv3)
 find_library(QTAV_OPENGL_EGL_LIBRARY_PATH NAMES EGL)

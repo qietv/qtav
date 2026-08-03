@@ -232,8 +232,12 @@ serialization. `tryContextGuard()` is the non-blocking alternative used by the
 real-time renderer; context or renderer contention declines that render
 attempt instead of waiting on the native/UI render thread. The renderer
 uploads software RGB, YUV, NV12/NV21, P010, and gray frames; handles
-range/matrix, PQ/HLG, primaries, and tone mapping in its pixel shader; and
-supports SDR 8-bit, FP16 scRGB, and RGB10/PQ targets.
+range/matrix, PQ/HLG, primaries, Dolby Vision reshaping, tone mapping, gamut
+mapping, scaling, and output encoding through libplacebo's D3D11 backend; and
+supports SDR 8-bit, FP16 scRGB, and RGB10/PQ targets. The former handwritten
+Windows HLSL color pipeline has been removed. Windows builds expose D3D11 as
+their only QtAVCore GPU renderer and do not build the Vulkan or OpenGL render
+targets.
 Supplying the swap chain enables per-frame `IDXGIOutput6` discovery,
 `SetColorSpace1()`, Windows SDR-white lookup, and automatic display/HDR-setting
 changes. Resize, custom viewports, aspect handling, right-angle rotation, and
@@ -243,8 +247,8 @@ platform/backend headers and never enter a core public header.
 Applications that do not need to share a D3D11 device should prefer
 `D3D11VideoOutput`. Its `attach()` call takes exclusive ownership of the
 player's default render slot and render callback until `detach()`, configures
-D3D11VA against the output-owned device, and installs the D3D11 Video
-Processor interop path. With a hosting HWND, its default `PreferHdr` policy
+D3D11VA against the output-owned device, and installs the D3D11 raw-plane
+interop path. With a hosting HWND, its default `PreferHdr` policy
 creates an FP16 scRGB composition layer, resolves the current monitor through
 `IDXGIOutput6`, configures the swap-chain color space, and preserves PQ/HLG
 output while Windows HDR is active. `RequireHdr` reports unavailable HDR
@@ -265,14 +269,15 @@ outside installed core headers. Explicit CPU mapping, software fallback, seek,
 media replacement, stop, and retained lifetime after player shutdown are
 implemented. `QtAV::RenderD3D11` now exposes decoder-independent
 `D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces for
-the adapter layer; imported texture and shader-view pointers remain valid
-while the texture-frame object lives. `QtAV::InteropD3D11` implements the
-adapter with same-device validation and a D3D11 Video Processor pass from the
-decoder NV12/P010 array slice to a shader-readable SDR BGRA8, FP16 scRGB, or
-RGB10/PQ intermediate. The imported texture now reports its DXGI format and
-color space. PQ/BT.2020 hardware frames therefore stay HDR through the
-zero-CPU-map path instead of being unconditionally converted to SDR. The
-renderer consumes that result, reports D3D11 hardware-frame capability, and
+the adapter layer; imported raw texture pointers and array-slice identity
+remain valid while the texture-frame object lives. `QtAV::InteropD3D11`
+implements same-device validation and retains the decoder NV12/P010 slice
+without a Video Processor RGB pass. The renderer wraps plane-specific D3D11
+views with libplacebo, attaches the exact FFmpeg Dolby Vision RPU before color
+conversion, and renders directly to the selected SDR, FP16 scRGB, or RGB10/PQ
+target. PQ/BT.2020 and Profile 5 hardware frames therefore preserve their raw
+semantic input through the zero-CPU-map path. The renderer reports D3D11
+hardware-frame capability and
 offers an explicit, disabled-by-default software mapping fallback through
 `setAllowSoftwareMappingFallback()`. The interop and renderer use the same
 recursive context guard; foreign devices are rejected before context access.
@@ -285,12 +290,13 @@ console test passes with an active WASAPI render endpoint and audible output,
 while sessions without an endpoint report a CTest skip. The retained-resource
 contract remains documented in [D3D11VA.md](D3D11VA.md).
 
-Hardware imports are retained through Video Processor and draw submission,
-then released without a per-frame completion query. All decoder, interop, and
-renderer GPU submissions use the same serialized immediate context, so later
-decoder-surface reuse remains ordered after earlier reads while D3D11 retains
-resources referenced by queued commands. This avoids both decoder-surface
-starvation and query-induced driver stalls after repeated seeks.
+Hardware imports are retained through libplacebo draw submission, then
+released without a per-frame completion query or `pl_gpu_finish()`. All
+decoder, interop, and renderer GPU submissions use the same serialized
+immediate context, so later decoder-surface reuse remains ordered after earlier
+reads while D3D11 retains resources referenced by queued commands. This avoids
+both decoder-surface starvation and query-induced driver stalls after repeated
+seeks; explicit GPU draining is teardown-only.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -307,7 +313,8 @@ or pace playback. Decoded planar audio therefore normally uses
 - buffering policy for live/network streams;
 - audio time-stretch without pitch change;
 - compressed Dolby passthrough, Atmos object rendering, Dolby Vision
-  enhancement-layer residual reconstruction, licensing, and certification.
+  enhancement-layer residual reconstruction, display tunnelling, licensing,
+  and certification.
 
 The Android harness is currently an integration checkpoint rather than a
 legacy QtAV API replacement. It proves the NDK, packaging, signing,

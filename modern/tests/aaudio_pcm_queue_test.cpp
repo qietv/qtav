@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+#if defined(NDEBUG)
+#  undef NDEBUG
+#endif
+
 #include "../backends/audio/aaudio/src/aaudio_pcm_queue.h"
 
 #include <algorithm>

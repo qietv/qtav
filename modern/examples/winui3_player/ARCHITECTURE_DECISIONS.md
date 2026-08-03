@@ -15,6 +15,7 @@ remain with a link to their replacement.
 | [ADR-004](#adr-004-use-wasapi-as-the-playback-clock-master) | Use WASAPI as the playback clock master | Accepted |
 | [ADR-005](#adr-005-deterministic-ordered-shutdown) | Deterministic ordered shutdown | Accepted |
 | [ADR-006](#adr-006-keep-diagnostics-lightweight-and-opt-in) | Keep diagnostics lightweight and opt-in | Accepted |
+| [ADR-007](#adr-007-coalesce-progress-interaction-into-one-asynchronous-seek) | Coalesce progress interaction into one asynchronous seek | Accepted |
 
 ## ADR-001: Unpackaged, self-contained WinUI 3 application
 
@@ -181,3 +182,37 @@ window. Treat the text format as diagnostic, not as a public API.
 - Diagnostics are easy to copy visually but are not persisted automatically.
 - Stable telemetry or automated performance analysis should use a separate
   structured interface rather than parsing this log text.
+
+## ADR-007: Coalesce progress interaction into one asynchronous seek
+
+- **Status:** Accepted
+- **Date:** 2026-08-03
+
+### Context
+
+A progress slider can emit many value changes during one drag. Treating each
+change as a media command creates overlapping asynchronous seeks, repeatedly
+flushes decoder and output generations, and lets an obsolete completion update
+the current UI. It also makes a UI preview look like authoritative playback
+time while the new audio/video generation is still buffering.
+
+### Decision
+
+For pointer input, slider movement updates only the local time preview and one
+absolute seek is submitted when the interaction ends. Non-pointer value
+changes are coalesced by a 180 ms debounce. While a seek is pending, the
+progress timer does not overwrite the selected target. Every submitted seek
+has a serial number, and media replacement, stop, or a newer seek invalidates
+older completions. Normal progress resumes only from the cached
+`Player::position()` after the current completion is observed.
+
+### Consequences
+
+- One drag causes one decoder/output-generation transition instead of a burst
+  of intermediate transitions.
+- The displayed target remains stable while Player reports `Buffering` and
+  waits for real post-seek output.
+- Keyboard and accessibility changes remain usable without issuing a seek for
+  every transient value.
+- Any future thumbnail or hover-preview feature must use a separate preview
+  path; it must not turn slider movement back into repeated playback seeks.

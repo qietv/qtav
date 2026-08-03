@@ -8,7 +8,7 @@ if(PkgConfig_FOUND)
         "libplacebo>=7.351.0"
     )
 endif()
-find_package(FFmpeg REQUIRED COMPONENTS avutil)
+find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil)
 
 if(NOT TARGET PkgConfig::QTAV_LIBPLACEBO)
     return()
@@ -27,6 +27,7 @@ target_include_directories(qtav_render_libplacebo_common
 target_link_libraries(qtav_render_libplacebo_common
     PUBLIC
         PkgConfig::QTAV_LIBPLACEBO
+        FFmpeg::avcodec
         FFmpeg::avutil
 )
 set_target_properties(qtav_render_libplacebo_common PROPERTIES

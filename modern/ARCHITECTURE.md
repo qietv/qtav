@@ -108,7 +108,8 @@ and presentation ownership stays in a platform adapter or high-level output:
   image; `QtAV::RenderVulkanAndroid` owns the Android surface and swapchain;
 - `QtAV::RenderOpenGL` borrows the current OpenGL ES context/framebuffer;
   `QtAV::RenderOpenGLAndroid` owns EGL display/context/window-surface/swap;
-- `QtAV::RenderD3D11` borrows Windows D3D11 resources;
+- `QtAV::RenderD3D11` borrows Windows D3D11 resources and uses libplacebo's
+  D3D11 backend; Windows does not build the Vulkan or OpenGL render targets;
   `QtAV::OutputD3D11` is the high-level composition owner for ordinary Windows
   presentation.
 
@@ -121,19 +122,19 @@ is never retried through another API.
 
 ## libplacebo color pipeline
 
-libplacebo is the shader and color-pipeline authority for the Vulkan and
-OpenGL ES renderers. QtAVCore no longer maintains handwritten mobile shaders
+libplacebo is the shader and color-pipeline authority for the D3D11, Vulkan,
+and OpenGL ES renderers. QtAVCore no longer maintains handwritten shaders
 for YCbCr-to-RGB matrices, transfer functions, primaries conversion, Dolby
 Vision reshaping, tone mapping, gamut mapping, scaling, or SDR/HDR output
 encoding.
 
 The shared target `QtAV::RenderLibplaceboCommon` bridges an internal FFmpeg
-frame to libplacebo's FFmpeg mapping API. Both GPU renderers then supply:
+frame to libplacebo's FFmpeg mapping API. The GPU renderers then supply:
 
 - the source frame and its structured range, matrix, transfer, primaries,
   chroma-location, HDR10, and Dolby Vision metadata;
 - crop and display geometry;
-- an SDR, BT.2020/PQ, BT.2020/HLG, or extended-linear output contract;
+- an SDR, BT.2020/PQ, BT.2020/HLG, scRGB, or extended-linear output contract;
 - a borrowed target texture/framebuffer and synchronization hooks.
 
 libplacebo generates the backend shaders and performs the complete semantic
@@ -142,7 +143,7 @@ representation conversion that preserves raw source components. It must not
 apply a color matrix, inverse/forward transfer, gamut conversion, Dolby
 Vision reshape, tone mapping, or output encoding.
 
-This boundary currently allows two normalization passes:
+This boundary currently allows two mobile normalization passes:
 
 - Vulkan external-format hardware images may be normalized to an explicit raw
   Y/Cb/Cr representation when libplacebo cannot wrap the opaque external
@@ -154,11 +155,18 @@ This boundary currently allows two normalization passes:
 These passes are GPU-to-GPU representation work, not decoded-source copies and
 not alternative color pipelines.
 
+Windows needs no normalization shader. D3D11VA textures are created with
+`D3D11_BIND_SHADER_RESOURCE`; the interop retains the exact NV12/P010 array
+slice, and libplacebo wraps its luma and chroma plane views directly. A D3D11
+Video Processor RGB conversion is deliberately absent because it would erase
+the raw Profile 5 representation before Dolby Vision reshaping.
+
 ## Dolby Vision and HDR behavior
 
 FFmpeg parses Dolby Vision RPU data into frame side data. libdovi is not
-required or enabled. QtAVCore correlates MediaCodec output with the parsed RPU
-by presentation timestamp and retains it on the hardware-backed `VideoFrame`.
+required or enabled. Android correlates MediaCodec output with the parsed RPU
+by presentation timestamp; Windows retains FFmpeg's RPU on the decoded
+D3D11VA-backed `VideoFrame`.
 
 Profile 5 has no conventional HDR10-compatible base layer. Its raw base-layer
 components must reach libplacebo before ordinary color conversion:
@@ -183,6 +191,23 @@ private AImageReader / AHardwareBuffer
 An Android import that cannot prove the raw-component contract is rejected for
 Dolby Vision. Implicit `SurfaceTexture`/external-OES conversion is not treated
 as a valid Profile 5 source.
+
+The Windows path applies the same ordering through D3D11 only:
+
+```text
+FFmpeg HEVC/D3D11VA + parsed RPU
+       -> retained shader-readable P010 texture-array slice
+       -> libplacebo D3D11 luma/chroma plane views
+       -> Dolby Vision reshape
+       -> libplacebo color/tone/gamut pipeline
+       -> BGRA8 sRGB, FP16 scRGB, or RGB10/PQ D3D11 target
+       -> DXGI composition/presentation
+```
+
+The native D3D11 layer selects resources, swap-chain color spaces, display
+capabilities, and presentation timing. It does not parse Dolby metadata or
+implement YCbCr conversion, transfer functions, tone mapping, gamut mapping,
+or output encoding in a separate shader.
 
 The user-facing HDR policy selects the application renderer's output target:
 
@@ -252,9 +277,10 @@ No platform audio header reaches the core API.
 ## Build and package boundaries
 
 Supported-target FFmpeg and transitive dependencies come only from the
-repository `../ffmpeg/` vcpkg subproject. Vulkan and OpenGL ES rendering both
-require the packaged libplacebo build; Android requires libplacebo's OpenGL
-support (`pl_has_opengl=1`) for `QtAV::RenderOpenGL`.
+repository `../ffmpeg/` vcpkg subproject. D3D11, Vulkan, and OpenGL ES
+rendering require the packaged libplacebo build. Windows additionally requires
+`pl_has_d3d11=1` and SPIRV-Cross for libplacebo's SPIR-V-to-HLSL compilation;
+Android requires `pl_has_opengl=1` for `QtAV::RenderOpenGL`.
 
 Public targets expose only their required installed dependencies. Build-tree,
 NDK, SDK, and producer-machine paths must not leak into exported CMake targets.
@@ -284,8 +310,8 @@ Before accepting a backend change, verify that:
 4. native-buffer release occurs only after GPU completion;
 5. a zero-copy claim keeps decoded-source map/transfer/staging/upload counters
    at zero;
-6. libplacebo remains the sole semantic color/shader authority for Vulkan and
-   OpenGL ES;
+6. libplacebo remains the sole semantic color/shader authority for D3D11,
+   Vulkan, and OpenGL ES;
 7. direct-Surface and application-rendered modes are reported distinctly;
 8. unsupported capabilities fail or fall back explicitly rather than silently
    changing color interpretation or copying decoded pixels.

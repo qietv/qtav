@@ -1,0 +1,33 @@
+diff --git a/src/pl_alloc.c b/src/pl_alloc.c
+--- a/src/pl_alloc.c
++++ b/src/pl_alloc.c
+@@ -25,7 +25,11 @@ struct header {
+     struct ext *ext;
+ 
+     // Pointer to actual data, for alignment purposes
++#if defined(_WIN64)
++    _Alignas(16) max_align_t data[];
++#else
+     max_align_t data[];
++#endif
+ };
+ 
+ // Lazily allocated, to save space for leaf allocations and allocations which
+diff --git a/src/pl_alloc.h b/src/pl_alloc.h
+--- a/src/pl_alloc.h
++++ b/src/pl_alloc.h
+@@ -83,7 +83,13 @@ char *pl_strndup0(void *parent, const char *str, size_t size);
+ // `priv` at the address of `pub` + sizeof(pub), rounded up to the maximum
+ // alignment requirements.
+ 
+-#define PL_ALIGN_MEM(size) PL_ALIGN2(size, alignof(max_align_t))
++#if defined(_WIN64)
++#define PL_ALLOC_ALIGNMENT 16
++#else
++#define PL_ALLOC_ALIGNMENT alignof(max_align_t)
++#endif
++
++#define PL_ALIGN_MEM(size) PL_ALIGN2(size, PL_ALLOC_ALIGNMENT)
+ 
+ #define PL_PRIV(pub) \
+     (void *) ((uintptr_t) (pub) + PL_ALIGN_MEM(sizeof(*(pub))))

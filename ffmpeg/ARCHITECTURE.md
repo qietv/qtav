@@ -45,6 +45,7 @@ developer builds.
 | `vcpkg-configuration.json` | Pinned builtin registry and overlay routing |
 | `vcpkg/` | Unmodified pinned upstream vcpkg submodule |
 | `ports/` | Project-specific port overlays and source patches |
+| `DECISIONS.md` | Rationale, validation, and retirement criteria for compatibility patches |
 | `triplets/` | Target architecture, ABI, linkage, platform, and build type |
 | `triplets/toolchains/` | OHOS SDK and Windows clang-cl toolchain adaptation |
 | `scripts/` | Stable local/CI entry points and vcpkg orchestration |
@@ -65,6 +66,8 @@ FFmpeg 8.1.2
 │   ├── Vulkan-Headers       Vulkan API definitions
 │   ├── glslang              shader compilation
 │   ├── OpenGL/OpenGL ES     GL/GLES/EGL rendering backend
+│   ├── D3D11                Windows rendering backend
+│   ├── SPIRV-Cross          Windows static shader translation closure
 │   └── DOVI reshaping       built-in Dolby Vision shader processing
 └── dav1d                    AV1 software decoding
 ```
@@ -121,7 +124,11 @@ libplacebo cannot use the MSVC `cl.exe` C compiler. The chainloaded toolchain
 therefore discovers `clang-cl` inside Visual Studio even when a self-hosted
 runner service account does not have it on `PATH`. FFmpeg emits LLVM LTO
 objects through clang-cl and links them directly with lld-link; a narrow patch
-allows exactly this otherwise compatible driver-type pair.
+allows exactly this otherwise compatible driver-type pair. LTO and external
+NASM remain enabled, with one narrow MLP inline-assembly exception. The
+libplacebo allocator must preserve 16-byte alignment across its Windows x64
+public/private object boundary. The evidence, rejected alternatives, and patch
+retirement criteria are recorded in [FD-001 and FD-003](DECISIONS.md).
 
 ## Overlay design
 
@@ -130,16 +137,20 @@ project-specific behavior:
 
 - FFmpeg imports the libsmb2 protocol integration, preserves the player
   feature policy, fixes pinned Windows/target portability issues, and keeps
-  LTO working with clang-cl/lld-link.
+  LTO working with clang-cl/lld-link apart from the single incompatible MLP
+  inline-assembly label optimization described above.
 - libass avoids desktop system-font discovery on mobile/OHOS, so the
   application must provide subtitle fonts explicitly.
 - libplacebo enables its Vulkan and OpenGL backends, including OpenGL ES/EGL
   support on Android and OHOS, plus its built-in Dolby Vision reshaping
-  component. Its overlay supplies the Python glad generator, receives pinned
-  glslang discovery, and normalizes Windows system library flags for FFmpeg's
-  pkg-config probes. The optional external `libdovi` raw-RPU parser is not
-  part of the dependency closure. Windows retains the libplacebo OpenGL
-  capability even though QtAVCore's preferred Windows renderer is DirectX.
+  component. Windows additionally enables its D3D11 backend and carries the
+  complete static SPIRV-Cross translation closure. Its overlay supplies the
+  Python glad generator, receives pinned glslang discovery, and normalizes
+  Windows system library flags for FFmpeg's pkg-config probes. The optional
+  external `libdovi` raw-RPU parser is not part of the dependency closure.
+  QtAVCore exposes only libplacebo's D3D11 path on Windows, not its installed
+  OpenGL or Vulkan capabilities. The static shader-translation closure is
+  governed by [FD-002](DECISIONS.md).
 - the Android FFmpeg overlay enables FFmpeg's built-in RPU decoder for the
   HEVC MediaCodec wrapper and PTS-correlates parsed Dolby Vision metadata with
   hardware output frames before QtAVCore receives them.
@@ -178,7 +189,7 @@ The verifier checks:
 
 - required FFmpeg 8/libavcodec 62 headers and metadata;
 - OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES/Dolby Vision
-  reshaping, dav1d, and Vulkan;
+  reshaping, dav1d, and Vulkan, plus libplacebo D3D11/SPIRV-Cross on Windows;
 - the required FFmpeg feature records;
 - absence of wolfSSL and VVenC;
 - relocatable installed FFmpeg CMake metadata.

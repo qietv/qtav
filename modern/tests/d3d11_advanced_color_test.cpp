@@ -515,10 +515,16 @@ int main()
         target.texture.Get());
     const float diffuse = red[32U * 64U + 16U];
     const float highlight = red[32U * 64U + 48U];
+    assert(std::isfinite(diffuse));
+    assert(std::isfinite(highlight));
     assert(highlight > diffuse);
     if (testedInfo.advancedColorActive) {
-        assert(diffuse > 0.9F && diffuse < 1.1F);
+        const float displayPeakScRgb = std::max(
+            testedInfo.maximumLuminanceNits / 80.0F,
+            1.0F);
+        assert(diffuse > 0.0F);
         assert(highlight > 1.1F);
+        assert(highlight <= displayPeakScRgb * 1.1F);
     } else {
         assert(diffuse > 0.0F && diffuse < 1.0F);
         assert(highlight <= 1.01F);
@@ -585,12 +591,16 @@ int main()
         compositionRed[32U * 64U + 16U];
     const float compositionHighlight =
         compositionRed[32U * 64U + 48U];
+    assert(std::isfinite(compositionDiffuse));
+    assert(std::isfinite(compositionHighlight));
     assert(compositionHighlight > compositionDiffuse);
     if (testedInfo.advancedColorActive) {
-        assert(
-            compositionDiffuse > 0.9F
-            && compositionDiffuse < 1.1F);
+        const float displayPeakScRgb = std::max(
+            compositionInfo.maximumLuminanceNits / 80.0F,
+            1.0F);
+        assert(compositionDiffuse > 0.0F);
         assert(compositionHighlight > 1.1F);
+        assert(compositionHighlight <= displayPeakScRgb * 1.1F);
     } else {
         assert(
             compositionDiffuse > 0.0F

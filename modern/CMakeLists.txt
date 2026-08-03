@@ -29,7 +29,10 @@ option(QTAV_CORE_INSTALL "Generate install rules" ON)
 
 set(QTAV_MINIMUM_FFMPEG_AVCODEC_MAJOR 62)
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+# The repository module understands the packaged static FFmpeg dependency
+# closure. Put it ahead of any dependency-provided FindFFMPEG.cmake whose
+# imported targets may contain only the primary Windows archives.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(QtAVBackend)
 
@@ -64,7 +67,9 @@ if(QTAV_CORE_INSTALL)
     if(TARGET qtav_render_vulkan)
         set(QTAV_CORE_PACKAGE_NEEDS_VULKAN TRUE)
     endif()
-    if(TARGET qtav_render_vulkan OR TARGET qtav_render_opengl)
+    if(TARGET qtav_render_vulkan
+       OR TARGET qtav_render_opengl
+       OR TARGET qtav_render_d3d11)
         set(QTAV_CORE_PACKAGE_NEEDS_LIBPLACEBO TRUE)
     endif()
 

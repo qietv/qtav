@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -144,51 +146,6 @@ bool supportsHevcMain10(ID3D11Device* device)
         && p010Supported;
 }
 
-bool supportsVideoProcessorFormat(
-    ID3D11Device* device,
-    DXGI_FORMAT inputFormat,
-    int width,
-    int height)
-{
-    ComPtr<ID3D11VideoDevice> videoDevice;
-    if (!device
-        || FAILED(device->QueryInterface(
-            IID_PPV_ARGS(&videoDevice)))) {
-        return false;
-    }
-
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content {};
-    content.InputFrameFormat =
-        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-    content.InputFrameRate = { 1, 1 };
-    content.InputWidth = static_cast<UINT>(width);
-    content.InputHeight = static_cast<UINT>(height);
-    content.OutputFrameRate = { 1, 1 };
-    content.OutputWidth = static_cast<UINT>(width);
-    content.OutputHeight = static_cast<UINT>(height);
-    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
-
-    ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
-    if (FAILED(videoDevice->CreateVideoProcessorEnumerator(
-            &content,
-            &enumerator))) {
-        return false;
-    }
-
-    UINT inputSupport = 0;
-    UINT outputSupport = 0;
-    return SUCCEEDED(enumerator->CheckVideoProcessorFormat(
-               inputFormat,
-               &inputSupport))
-        && (inputSupport
-            & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)
-        && SUCCEEDED(enumerator->CheckVideoProcessorFormat(
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            &outputSupport))
-        && (outputSupport
-            & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT);
-}
-
 ComPtr<ID3D11Texture2D> makeDecoderTexture(
     ID3D11Device* device,
     DXGI_FORMAT format,
@@ -202,6 +159,7 @@ ComPtr<ID3D11Texture2D> makeDecoderTexture(
     description.Format = format;
     description.SampleDesc.Count = 1;
     description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
     ComPtr<ID3D11Texture2D> texture;
     device->CreateTexture2D(
@@ -357,12 +315,6 @@ void testWarpContracts()
     assert(lockPending.get());
 
     const auto capabilities = interop.capabilities();
-    if (capabilities.sourceDevices.empty()) {
-        std::cout
-            << "WARP texture/slice/lifetime/locking contracts passed; "
-               "Video Processor conversion unavailable and skipped\n";
-        return;
-    }
     assert(capabilities.sourceDevices.size() == 1);
     assert(
         capabilities.sourceDevices.front()
@@ -419,73 +371,31 @@ void testWarpContracts()
             [&] { return interop.importFrame(frame); });
         assert(
             pending.wait_for(std::chrono::milliseconds(50))
-            == std::future_status::timeout);
+            == std::future_status::ready);
     }
     auto imported = pending.get();
     assert(mapCalls == 0);
-
-    if (!imported) {
-        std::cout
-            << "WARP exposes D3D11 video interfaces but not the "
-               "NV12-to-BGRA8 Video Processor conversion; "
-               "conversion output checks skipped\n";
-        return;
-    }
-
+    assert(imported);
     assert(imported->width() == 64);
     assert(imported->height() == 32);
-    assert(imported->format() == qtav::PixelFormat::BGRA);
-    assert(
-        imported->dxgiFormat()
-        == DXGI_FORMAT_B8G8R8A8_UNORM);
+    assert(imported->format() == qtav::PixelFormat::NV12);
+    assert(imported->dxgiFormat() == DXGI_FORMAT_NV12);
+    assert(imported->arraySlice() == 1);
     assert(
         imported->colorSpace()
-        == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-    assert(imported->texture());
-    assert(imported->shaderResourceView());
+        == DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+    assert(imported->texture() == texture.Get());
+    assert(!imported->shaderResourceView());
     ComPtr<ID3D11Device> importedDevice;
     imported->texture()->GetDevice(&importedDevice);
     assert(importedDevice.Get() == warp.device.Get());
-    ComPtr<ID3D11Resource> viewResource;
-    imported->shaderResourceView()->GetResource(&viewResource);
-    assert(viewResource.Get() == imported->texture());
-
-    ID3D11Texture2D* pooledTexture = imported->texture();
-    imported.reset();
-    for (int index = 0; index < 64; ++index) {
-        imported = interop.importFrame(frame);
-        assert(imported);
-        assert(imported->texture() == pooledTexture);
-        imported.reset();
-    }
-
-    auto retainedPooledImport = interop.importFrame(frame);
-    auto overlappingImport = interop.importFrame(frame);
-    assert(retainedPooledImport);
-    assert(overlappingImport);
-    assert(
-        retainedPooledImport->texture()
-        != overlappingImport->texture());
-    imported = std::move(retainedPooledImport);
-    overlappingImport.reset();
-
-    std::vector<std::shared_ptr<qtav::D3D11TextureFrame>>
-        retainedImports;
-    for (int index = 0; index < 4; ++index) {
-        auto retained = interop.importFrame(frame);
-        assert(retained);
-        for (const auto& previous : retainedImports) {
-            assert(retained->texture() != previous->texture());
-        }
-        retainedImports.push_back(std::move(retained));
-    }
-    retainedImports.clear();
 
     frame = {};
     texture.Reset();
     assert(imported->texture());
-    assert(imported->shaderResourceView());
+    assert(!imported->shaderResourceView());
     interop.flush();
+    assert(imported->texture());
 }
 
 RenderTarget makeTarget(
@@ -641,7 +551,9 @@ float halfToFloat(std::uint16_t value)
 void testNativeZeroCopy(
     const char* media,
     qtav::PixelFormat expectedFormat,
-    bool exerciseLifecycle)
+    bool exerciseLifecycle,
+    bool requireDolbyVision = false,
+    int stopAfterRenderedFrames = 0)
 {
     const auto resources = makeDevice(D3D_DRIVER_TYPE_HARDWARE);
     if (!resources.device || !resources.context) {
@@ -676,29 +588,11 @@ void testNativeZeroCopy(
     assert(target.texture && target.view);
     auto interop =
         std::make_shared<qtav::D3D11FrameInterop>(access);
-    if (interop->capabilities().sourceDevices.empty()) {
-        std::cout
-            << "D3D11 Video Processor unavailable; "
-               "native zero-copy test skipped\n";
-        return;
-    }
+    assert(!interop->capabilities().sourceDevices.empty());
     const DXGI_FORMAT nativeFormat =
         expectedFormat == qtav::PixelFormat::P010
         ? DXGI_FORMAT_P010
         : DXGI_FORMAT_NV12;
-    if (!supportsVideoProcessorFormat(
-            resources.device.Get(),
-            nativeFormat,
-            width,
-            height)) {
-        std::cout
-            << (expectedFormat == qtav::PixelFormat::P010
-                    ? "P010"
-                    : "NV12")
-            << " Video Processor conversion unavailable; "
-               "native zero-copy test skipped\n";
-        return;
-    }
     auto contractTexture = makeDecoderTexture(
         resources.device.Get(),
         nativeFormat);
@@ -741,7 +635,9 @@ void testNativeZeroCopy(
     std::atomic<bool> renderError { false };
     std::atomic<int> hardwareFrames { 0 };
     std::atomic<int> colorAwareImports { 0 };
+    std::atomic<int> dolbyVisionFrames { 0 };
     std::atomic<int> renderRequests { 0 };
+    std::atomic<bool> stopRequested { false };
     std::mutex mutex;
     std::condition_variable changed;
     int stage = 0;
@@ -800,6 +696,9 @@ void testNativeZeroCopy(
                 if (!frame.hasHardwareFrame()) {
                     return;
                 }
+                if (frame.hasDolbyVisionMetadata()) {
+                    ++dolbyVisionFrames;
+                }
                 const auto native =
                     qtav::d3d11vaFrame(frame.hardwareFrame());
                 if (!native
@@ -807,10 +706,21 @@ void testNativeZeroCopy(
                     || native.softwareFormat() != expectedFormat) {
                     std::abort();
                 }
-                if (hardwareFrames.fetch_add(1) == 0) {
+                D3D11_TEXTURE2D_DESC decoderDescription {};
+                native.texture()->GetDesc(&decoderDescription);
+                if (!(decoderDescription.BindFlags
+                      & D3D11_BIND_SHADER_RESOURCE)) {
+                    std::abort();
+                }
+                const bool retainThisFrame = requireDolbyVision
+                    ? frame.hasDolbyVisionMetadata() && !retainedFrame
+                    : hardwareFrames.load() == 0;
+                hardwareFrames.fetch_add(1);
+                if (retainThisFrame) {
                     const qtav::VideoColorSpace color =
                         frame.colorSpaceInfo();
-                    if (expectedFormat == qtav::PixelFormat::P010) {
+                    if (expectedFormat == qtav::PixelFormat::P010
+                        && !requireDolbyVision) {
                         assert(
                             color.range
                             == qtav::ColorRange::Limited);
@@ -838,7 +748,13 @@ void testNativeZeroCopy(
                 if (player.renderVideo() < 0.0) {
                     return;
                 }
-                ++renderRequests;
+                const int rendered = ++renderRequests;
+                if (stopAfterRenderedFrames > 0
+                    && rendered >= stopAfterRenderedFrames
+                    && !stopRequested.exchange(true)) {
+                    player.setState(qtav::State::Stopped);
+                    return;
+                }
                 if (!exerciseLifecycle) {
                     return;
                 }
@@ -918,7 +834,7 @@ void testNativeZeroCopy(
             }
             if (!player.waitFor(
                     qtav::State::Stopped,
-                    15'000)) {
+                    stopAfterRenderedFrames > 0 ? 60'000 : 15'000)) {
                 std::abort();
             }
         }
@@ -946,39 +862,19 @@ void testNativeZeroCopy(
     assert(colorAwareImports.load() == 1);
     assert(renderRequests.load() > 0);
     assert(!renderError.load());
+    if (requireDolbyVision) {
+        assert(dolbyVisionFrames.load() > 0);
+    }
     assert(retainedFrame);
     assert(retainedImport);
     assert(retainedImport->texture());
-    assert(retainedImport->shaderResourceView());
-    if (expectedFormat == qtav::PixelFormat::P010) {
-        assert(retainedImport->format() == qtav::PixelFormat::RGBA);
-        assert(
-            retainedImport->dxgiFormat()
-                == DXGI_FORMAT_R10G10B10A2_UNORM
-            || retainedImport->dxgiFormat()
-                == DXGI_FORMAT_R16G16B16A16_FLOAT);
-        assert(
-            (retainedImport->dxgiFormat()
-                    == DXGI_FORMAT_R10G10B10A2_UNORM
-                && retainedImport->colorSpace()
-                    == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
-            || (retainedImport->dxgiFormat()
-                    == DXGI_FORMAT_R16G16B16A16_FLOAT
-                && retainedImport->colorSpace()
-                    == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709));
-    } else {
-        assert(retainedImport->format() == qtav::PixelFormat::BGRA);
-        assert(
-            retainedImport->dxgiFormat()
-            == DXGI_FORMAT_B8G8R8A8_UNORM);
-        assert(
-            retainedImport->colorSpace()
-            == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-    }
+    assert(!retainedImport->shaderResourceView());
+    assert(retainedImport->format() == expectedFormat);
+    assert(retainedImport->dxgiFormat() == nativeFormat);
 
     interop->flush();
     assert(retainedImport->texture());
-    assert(retainedImport->shaderResourceView());
+    assert(!retainedImport->shaderResourceView());
 
     target = makeTarget(
         resources.device.Get(),
@@ -1031,9 +927,14 @@ void testNativeZeroCopy(
                 }
             }
         }
-        assert(leftRed > leftBlue * 2.0);
-        assert(rightBlue > rightRed * 2.0);
-        assert(maximumComponent > 1.0F);
+        if (requireDolbyVision) {
+            assert(std::isfinite(maximumComponent));
+            assert(maximumComponent > 0.0F);
+        } else {
+            assert(leftRed > leftBlue * 2.0);
+            assert(rightBlue > rightRed * 2.0);
+            assert(maximumComponent > 1.0F);
+        }
         const auto output = renderer->advancedColorInfo();
         assert(
             output.outputColorSpace
@@ -1069,7 +970,13 @@ void testNativeZeroCopy(
                 ? "HEVC Main10/P010"
                 : "H.264/NV12")
         << " zero-CPU-map frames rendered: "
-        << hardwareFrames.load() << '\n';
+        << hardwareFrames.load();
+    if (requireDolbyVision) {
+        std::cout
+            << ", Dolby Vision metadata frames: "
+            << dolbyVisionFrames.load();
+    }
+    std::cout << '\n';
 }
 
 } // namespace
@@ -1081,10 +988,21 @@ int main(int argc, char** argv)
     }
     testWarpContracts();
     if (argc >= 2) {
-        testNativeZeroCopy(
-            argv[1],
-            qtav::PixelFormat::NV12,
-            true);
+        const std::string_view first = argv[1];
+        if (first.rfind("https://", 0) == 0
+            || first.rfind("http://", 0) == 0) {
+            testNativeZeroCopy(
+                argv[1],
+                qtav::PixelFormat::P010,
+                false,
+                true,
+                48);
+        } else {
+            testNativeZeroCopy(
+                argv[1],
+                qtav::PixelFormat::NV12,
+                true);
+        }
     }
     if (argc == 3) {
         if (std::filesystem::exists(argv[2])) {

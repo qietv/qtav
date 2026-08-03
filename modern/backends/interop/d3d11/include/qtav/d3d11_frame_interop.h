@@ -12,9 +12,10 @@
 
 namespace qtav {
 
-// Imports same-device D3D11VA NV12/P010 decoder slices through the D3D11
-// Video Processor into shader-readable SDR BGRA8 textures. No decoded pixels
-// are mapped through CPU memory.
+// Retains same-device, shader-readable D3D11VA NV12/P010 decoder slices for
+// direct plane sampling by libplacebo's D3D11 backend. No Video Processor RGB
+// conversion or decoded-pixel CPU mapping occurs before Dolby Vision/HDR
+// processing.
 class QTAV_INTEROP_D3D11_EXPORT D3D11FrameInterop final
     : public D3D11HardwareFrameInterop {
 public:

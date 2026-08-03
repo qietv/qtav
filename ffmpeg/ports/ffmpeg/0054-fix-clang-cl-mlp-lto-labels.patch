@@ -1,0 +1,23 @@
+diff --git a/libavcodec/x86/mlpdsp_init.c b/libavcodec/x86/mlpdsp_init.c
+--- a/libavcodec/x86/mlpdsp_init.c
++++ b/libavcodec/x86/mlpdsp_init.c
+@@ -47,6 +47,9 @@ REMATRIX_CHANNEL_FUNC(sse4)
+ REMATRIX_CHANNEL_FUNC(avx2_bmi2)
+ 
+-#if HAVE_7REGS && HAVE_INLINE_ASM && HAVE_INLINE_ASM_NONLOCAL_LABELS
++// clang-cl LTO does not publish non-local labels defined only inside GNU
++// inline assembly to lld-link's symbol resolver. Keep the C implementation
++// for this one filter while retaining FFmpeg's external NASM SIMD paths.
++#if HAVE_7REGS && HAVE_INLINE_ASM && HAVE_INLINE_ASM_NONLOCAL_LABELS && !(defined(__clang__) && defined(_MSC_VER))
+ 
+ extern char ff_mlp_firorder_8;
+ extern char ff_mlp_firorder_7;
+@@ -196,7 +199,7 @@ static void mlp_filter_channel_x86(int32_t *state, const int32_t *coeff,
+ av_cold void ff_mlpdsp_init_x86(MLPDSPContext *c)
+ {
+     int cpu_flags = av_get_cpu_flags();
+-#if HAVE_7REGS && HAVE_INLINE_ASM && HAVE_INLINE_ASM_NONLOCAL_LABELS
++#if HAVE_7REGS && HAVE_INLINE_ASM && HAVE_INLINE_ASM_NONLOCAL_LABELS && !(defined(__clang__) && defined(_MSC_VER))
+     if (INLINE_MMX(cpu_flags))
+         c->mlp_filter_channel = mlp_filter_channel_x86;
+ #endif

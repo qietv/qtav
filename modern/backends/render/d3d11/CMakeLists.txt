@@ -2,6 +2,12 @@ if(NOT WIN32)
     return()
 endif()
 
+find_package(FFmpeg REQUIRED COMPONENTS avutil)
+
+if(NOT TARGET qtav_render_libplacebo_common)
+    return()
+endif()
+
 add_library(qtav_render_d3d11
     src/d3d11_video_renderer.cpp
 )
@@ -16,13 +22,17 @@ target_include_directories(qtav_render_d3d11
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/core/src"
 )
 target_link_libraries(qtav_render_d3d11
     PUBLIC
         QtAV::Core
         QtAV::PlatformWindows
     PRIVATE
-        d3dcompiler
+        QtAV::RenderLibplaceboCommon
+        FFmpeg::avutil
+        d3d11
         dxgi
         user32
 )

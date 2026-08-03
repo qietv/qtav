@@ -7,6 +7,8 @@ vcpkg_from_git(
     PATCHES
         0001-add-glslang-libdir-option.patch
         0002-fix-windows-shlwapi-linkage.patch
+        0003-use-static-spirv-cross.patch
+        0004-align-windows-clang-allocations.patch
 )
 
 x_vcpkg_get_python_packages(
@@ -22,6 +24,11 @@ if(NOT EXISTS "${VULKAN_REGISTRY}")
     message(FATAL_ERROR "Vulkan registry not found: ${VULKAN_REGISTRY}")
 endif()
 
+set(LIBPLACEBO_D3D11 disabled)
+if(VCPKG_TARGET_IS_WINDOWS)
+    set(LIBPLACEBO_D3D11 enabled)
+endif()
+
 vcpkg_configure_meson(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
@@ -32,7 +39,7 @@ vcpkg_configure_meson(
         -Dvk-proc-addr=disabled
         -Dvulkan-registry=${VULKAN_REGISTRY}
         -Dopengl=enabled
-        -Dd3d11=disabled
+        -Dd3d11=${LIBPLACEBO_D3D11}
         -Dshaderc=disabled
         -Dglslang=enabled
         -Dlcms=disabled
@@ -72,9 +79,27 @@ foreach(GLSLANG_LIBRARY IN ITEMS
     )
 endforeach()
 if(VCPKG_TARGET_IS_WINDOWS)
-    string(REGEX REPLACE
-        "(^|[ \t])shlwapi\\.lib"
-        "\\1-lshlwapi"
+    foreach(WINDOWS_LIBRARY IN ITEMS shlwapi version)
+        string(REGEX REPLACE
+            "(^|[ \t])${WINDOWS_LIBRARY}\\.lib"
+            "\\1-l${WINDOWS_LIBRARY}"
+            LIBPLACEBO_PC_CONTENT
+            "${LIBPLACEBO_PC_CONTENT}"
+        )
+    endforeach()
+    # The upstream SPIRV-Cross C pkg-config module exposes only its C wrapper
+    # archive even though the static wrapper calls the backend and core C++
+    # archives. Publish the complete ordered closure required by libplacebo's
+    # D3D11 SPIR-V-to-HLSL compiler.
+    string(REPLACE
+        "Requires: spirv-cross-c >= 0.29.0"
+        "Requires:"
+        LIBPLACEBO_PC_CONTENT
+        "${LIBPLACEBO_PC_CONTENT}"
+    )
+    string(REPLACE
+        " -lversion\n"
+        " -lversion -lspirv-cross-c -lspirv-cross-glsl -lspirv-cross-hlsl -lspirv-cross-msl -lspirv-cross-cpp -lspirv-cross-reflect -lspirv-cross-util -lspirv-cross-core\n"
         LIBPLACEBO_PC_CONTENT
         "${LIBPLACEBO_PC_CONTENT}"
     )

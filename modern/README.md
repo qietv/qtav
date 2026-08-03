@@ -42,7 +42,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional libswscale CPU renderer for application-owned image buffers;
 - optional Windows D3D11 renderer for a retained application-selected device
   and immediate context plus borrowed current render-target/swap-chain views,
-  including Windows Advanced Color SDR, FP16 scRGB, and RGB10 HDR10 output;
+  using libplacebo for FFmpeg color metadata, Dolby Vision RPU reshaping, HDR
+  tone/gamut mapping, scaling, and Windows Advanced Color SDR, FP16 scRGB, or
+  RGB10 HDR10 output;
 - optional high-level Windows D3D11 composition output that owns the device,
   HDR-aware FP16 scRGB or SDR swap chain, render target, display tracking,
   redraw-coalescing thread, D3D11VA/interop wiring, `renderVideo()`,
@@ -53,8 +55,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional Android AAudio device sink with callback-safe bounded buffering,
   device timing, latency reporting, and disconnect recovery;
 - optional D3D11VA hardware decoding on an application-selected retained
-  D3D11 device, with reference-counted decoder texture-array slices and
-  explicit software fallback;
+  D3D11 device, with reference-counted shader-readable NV12/P010 decoder
+  texture-array slices and explicit software fallback;
 - optional Android MediaCodec H.264/HEVC hardware decoding into an
   application-supplied, versioned `ANativeWindow`, with explicit present,
   monotonic-time present, drop, stale-generation rejection, and software
@@ -148,16 +150,20 @@ Current backend integration boundary:
 - `QtAV::RenderD3D11` uploads software YUV420/422/444, NV12/NV21, P010,
   RGB/BGR/RGBA/BGRA/ARGB, or Gray8 frames and renders through an
   application-selected D3D11 device and immediate context plus the current
-  application-owned render-target view;
+  application-owned render-target view. libplacebo's D3D11 backend is the sole
+  Windows authority for color conversion, Dolby Vision, HDR tone mapping,
+  gamut mapping, scaling, and output encoding; QtAVCore does not build its
+  Vulkan or OpenGL render targets on Windows;
 - `QtAV::PlatformWindows` retains an application-selected D3D11 device and
   its verified immediate context behind a shared recursive context guard;
 - `QtAV::HWD3D11VA` creates FFmpeg's hardware device on that selected D3D11
-  device, shares the same context lock, and exposes retained NV12/P010 decoder
-  texture-array slices through a Windows-only strong frame view;
+  device, shares the same context lock, requests shader-readable decode
+  resources, and exposes retained NV12/P010 decoder texture-array slices
+  through a Windows-only strong frame view;
 - `QtAV::InteropD3D11` consumes same-device D3D11VA NV12/P010 texture-array
-  slices through the D3D11 Video Processor and returns shader-readable SDR
-  BGRA8, FP16 scRGB, or RGB10/PQ textures without mapping decoded pixels
-  through CPU memory;
+  slices as raw luma/chroma planes for libplacebo without a D3D11 Video
+  Processor RGB conversion and without mapping, transferring, staging, or
+  uploading decoded pixels through CPU memory;
 - `QtAV::OutputD3D11` combines the Windows device, renderer, decoder, and
   interop targets into a composition-surface output for ordinary applications;
   the application supplies a swap-chain binding callback, surface size, and
@@ -247,9 +253,10 @@ Requirements:
 - CMake 3.20 or newer;
 - a C++17 compiler;
 - FFmpeg 8.0 or newer development libraries;
-- libplacebo 7.351.0 or newer when the Vulkan renderer is enabled;
-- `pkg-config` is required for the Vulkan/libplacebo renderer and recommended
-  for resolving static FFmpeg dependency closures.
+- libplacebo 7.351.0 or newer for the Vulkan/OpenGL ES renderers or the Windows
+  D3D11 renderer;
+- `pkg-config` is required for a libplacebo renderer and recommended for
+  resolving static FFmpeg dependency closures.
 
 ```sh
 cmake -S modern -B build/modern -DQTAV_CORE_BUILD_TESTS=ON

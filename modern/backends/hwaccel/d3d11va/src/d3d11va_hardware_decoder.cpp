@@ -94,6 +94,10 @@ HardwareDecodeDevice createDecodeDevice(
     native->lock = &lockD3D11Device;
     native->unlock = &unlockD3D11Device;
     native->lock_ctx = lifetime;
+    // libplacebo's D3D11 backend samples the decoder's NV12/P010 planes
+    // directly. FFmpeg combines this device-wide flag with
+    // D3D11_BIND_DECODER when it creates each codec frames context.
+    native->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
 
     if (av_hwdevice_ctx_init(reference) < 0) {
         av_buffer_unref(&reference);

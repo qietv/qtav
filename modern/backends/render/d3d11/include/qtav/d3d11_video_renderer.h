@@ -74,9 +74,11 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11RenderTarget {
 
 using D3D11CurrentTargetCallback = std::function<D3D11RenderTarget()>;
 
-// A backend-specific, reference-counted view of a shader-readable D3D11
-// texture imported from a hardware video frame. The returned native objects
-// are borrowed and remain valid while this object is alive.
+// A backend-specific, reference-counted view of a D3D11 texture imported from
+// a hardware video frame. NV12/P010 decoder surfaces are exposed in their raw
+// form so libplacebo can sample their planes before Dolby Vision reshaping and
+// color conversion. The returned native objects are borrowed and remain valid
+// while this object is alive.
 class QTAV_RENDER_D3D11_EXPORT D3D11TextureFrame {
 public:
     virtual ~D3D11TextureFrame();
@@ -87,8 +89,10 @@ public:
     virtual ID3D11Texture2D* texture() const noexcept = 0;
     virtual ID3D11ShaderResourceView*
     shaderResourceView() const noexcept = 0;
+    // Array slice used when texture() is a decoder texture array.
+    virtual UINT arraySlice() const noexcept;
     // Existing implementations default to an SDR BGRA/RGBA interpretation.
-    // HDR-aware interop implementations override these values.
+    // Raw decoder interop overrides these with NV12/P010 and source identity.
     virtual DXGI_FORMAT dxgiFormat() const noexcept;
     virtual DXGI_COLOR_SPACE_TYPE colorSpace() const noexcept;
 };

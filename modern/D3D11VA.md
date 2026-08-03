@@ -1,361 +1,243 @@
-# D3D11VA device, frame, and interop design
+# D3D11VA, raw-plane interop, and libplacebo design
 
-Status: implemented and verified on Windows; both `QtAV::HWD3D11VA` and
-`QtAV::InteropD3D11` support the documented SDR and HDR-preserving output
-paths. Native active-HDR presentation is verified on a PHL 27B1U7903.
-
-This document records the ownership, threading, fallback, and test contracts
-implemented by `QtAV::HWD3D11VA` and `QtAV::InteropD3D11`. It is deliberately
-limited to FFmpeg 8's modern `AV_PIX_FMT_D3D11` path. The legacy
+Status: implemented on Windows for FFmpeg 8 `AV_PIX_FMT_D3D11`. The legacy
 `AV_PIX_FMT_D3D11VA_VLD` API is out of scope.
+
+This document defines the ownership, color, threading, fallback, and validation
+contracts shared by `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`,
+`QtAV::RenderD3D11`, and `QtAV::OutputD3D11`.
 
 ## Invariants
 
-- The preferred path decodes and renders on one application-selected D3D11
-  device.
-- Core public headers continue to expose neither Windows SDK nor FFmpeg types.
-- D3D11 types appear only in Windows platform/backend headers.
-- A copied QtAVCore frame keeps its decoder surface, array slice, frame pool,
-  hardware device context, synchronization state, and native device alive.
-- The playback worker may submit decode or transfer work while the application
-  calls `renderVideo()` on its render thread, but calls on the shared immediate
-  and video contexts are serialized.
-- "Zero-copy interop" means that no decoded pixels are mapped through CPU
-  memory and no cross-device staging copy is made. A same-device D3D11 Video
-  Processor pass is allowed.
-
-The last distinction is necessary for the initial implementation. FFmpeg's
-D3D11VA decoder uses one fixed-size `D3D11_BIND_DECODER` texture array, while
-Direct3D 11 does not allow a shader-resource view to be created from a decoder
-texture array. The decoder texture and slice will therefore be consumed
-directly as a Video Processor input and converted to a same-device,
-shader-readable intermediate texture. The existing renderer remains
-responsible for the final viewport, aspect-ratio, rotation, and target pass.
+- Decode, interop, and rendering use one application-selected D3D11 device and
+  its immediate context.
+- Windows builds use only the QtAVCore D3D11 GPU renderer. The Vulkan and
+  OpenGL renderer targets are not built on Windows.
+- Core public headers expose neither Windows SDK nor FFmpeg types.
+- A copied frame retains its FFmpeg frame, decoder array slice, frames context,
+  hardware device, COM resources, and synchronization lifetime.
+- Zero-copy means no decoded-source CPU map, transfer, staging copy, upload, or
+  cross-device copy. libplacebo samples the decoder's native NV12/P010 planes.
+- libplacebo is the sole semantic color authority. QtAVCore has no Windows
+  shader or Video Processor path for YCbCr conversion, Dolby Vision reshaping,
+  PQ/HLG conversion, tone mapping, gamut mapping, or output encoding.
+- A Dolby Vision RPU belongs to one exact `VideoFrame`; it is never reused by
+  timestamp approximation or applied after ordinary YCbCr conversion.
+- Real-time render/context contention is retryable and non-blocking. There is
+  no per-frame completion query, `Flush()`, or `pl_gpu_finish()`.
 
 ## Target and dependency boundaries
 
-The implementation will use these responsibilities:
-
 ```text
 qtav_core
-  generic hardware-device token, FFmpeg decoder selection, AVFrame lifetime
+  decoder selection, FFmpeg AVFrame lifetime, structured color/RPU metadata
 
 qtav_platform_windows
-  retained D3D11 device/immediate-context access and shared recursive lock
+  retained D3D11 device/immediate context and shared recursive lock
 
 qtav_hw_d3d11va
   FFmpeg D3D11VA device creation on the selected device
-  D3D11VA configuration helper
-  retained decoder-texture-and-array-slice accessor
+  shader-readable decoder-surface request
+  retained texture-array slice accessor
 
 qtav_interop_d3d11
-  foreign-device validation
-  D3D11 Video Processor import/conversion
-  shader-readable same-device texture view
+  same-device/raw-resource validation
+  exact decoder-frame retention
+  no GPU conversion work
 
 qtav_render_d3d11
-  software upload
-  interop interface consumption
-  final shader, geometry, viewport, rotation, and current render target
+  libplacebo D3D11 device import
+  software AVFrame mapping and hardware luma/chroma plane wrapping
+  Dolby Vision/color/tone/gamut/scaling/output pipeline
+  viewport, rotation, current target, and Advanced Color discovery
+
+qtav_output_d3d11
+  owned device, swap chain, target, render scheduling, and presentation
 ```
 
-`qtav_hw_d3d11va` must not depend on the renderer.
-`qtav_render_d3d11` must not depend on a decoder implementation.
-`qtav_interop_d3d11` is the optional adapter between the two. Video Processor
-code initially remains an internal responsibility of the interop target; it
-can become a separate target later if another backend needs the same service.
+The decoder never depends on the renderer. The renderer consumes a
+decoder-independent `D3D11HardwareFrameInterop` contract. The optional interop
+target adapts the retained D3D11VA frame without merging decode, render, or
+presentation responsibilities.
 
-The common Windows target is required to avoid either a renderer-to-decoder
-dependency or independent locks around the same immediate context.
+The repository FFmpeg package supplies libplacebo 7.351.0 with
+`PL_HAVE_D3D11=1`, built-in Dolby Vision mapping, glslang, and the complete
+static SPIRV-Cross closure. QtAVCore consumes that package with clang-cl/lld-link
+on Windows; a system or independently downloaded FFmpeg is not a fallback.
 
-## Selected device and core bridge
+## Selected device and decoder resources
 
-The Windows platform target will add a reference-counted
-`D3D11DeviceAccess` value. Its factory receives a borrowed
-`ID3D11Device` and `ID3D11DeviceContext`, verifies that the context is the
-device's immediate context, retains both COM interfaces, and creates the
-shared recursive lock.
+`D3D11DeviceAccess` verifies that a borrowed context is the selected device's
+immediate context, retains both COM interfaces, and owns the recursive lock
+shared with FFmpeg.
 
-The existing renderer constructor that accepts independent borrowed device and
-context values remains the software-only convenience path. The hardware path
-uses a new renderer overload taking the same `std::shared_ptr<D3D11DeviceAccess>`
-that is passed to the D3D11VA configuration helper. Applications which issue
-their own immediate-context calls concurrently can acquire the same public
-RAII context guard; otherwise they retain their existing responsibility to
-avoid racing QtAVCore.
+`d3d11vaHardwareDecodeConfig()` allocates an FFmpeg D3D11VA device context,
+installs the retained device/context and lock callbacks, requests
+`D3D11_BIND_SHADER_RESOURCE`, initializes the context, and returns an opaque
+core `HardwareDecodeDevice`. FFmpeg combines that bind flag with its decoder
+requirements when allocating the fixed NV12/P010 texture array.
 
-Core will add a concrete, PIMPL-backed `HardwareDecodeDevice` token to
-`HardwareDecodeConfig`. The public token reports only
-`HardwareDeviceType` and generic native identity. An uninstalled private bridge
-between core and in-tree hardware backends carries a referenced FFmpeg
-`AVHWDeviceContext`; no FFmpeg declaration enters an installed header.
+The bounded `extraHardwareFrames` setting is copied to
+`AVCodecContext::extra_hw_frames`. Retaining more decoder frames than the
+configured allowance applies backpressure; it does not grow an alternate pool
+or copy the decoded pixels.
 
-`d3d11vaHardwareDecodeConfig(deviceAccess, options)` will:
+For a D3D11 hardware frame, the generic `NativeHandle` contains:
 
-1. allocate an FFmpeg 8 D3D11VA device context;
-2. install retained references to the selected D3D11 device and its immediate
-   context;
-3. install lock/unlock callbacks backed by the shared recursive lock;
-4. initialize the FFmpeg device context and wrap it in the generic core token;
-5. set the requested hardware type and software-fallback policy.
-
-`Player` takes an `av_buffer_ref()` of that supplied device context before
-`avcodec_open2()`. If no device token is supplied, the existing
-FFmpeg-created-device behavior remains available for supported generic
-hardware selection. A supplied token whose type differs from
-`HardwareDecodeConfig::deviceType` is rejected before decoder open.
-
-The D3D11VA options include a bounded `extraHardwareFrames` value. It is copied
-to `AVCodecContext::extra_hw_frames` before opening the codec so FFmpeg can size
-its required fixed decoder array for the current codec, reference pictures,
-frame threading, QtAVCore's current render frame, and a small number of
-application-retained frames. The default will be four extra frames. Retaining
-more frames than the configured allowance deliberately applies decoder
-backpressure rather than silently copying frames or growing an incompatible
-pool.
-
-## Retained native-frame access
-
-Core's generic `NativeHandle` gains a subresource/index field. For
-`HardwareDeviceType::D3D11`, a texture handle contains:
-
-- `value`: the decoded `ID3D11Texture2D*` from `AVFrame::data[0]`;
+- `value`: `ID3D11Texture2D*` from `AVFrame::data[0]`;
 - `subresource`: the array slice encoded by `AVFrame::data[1]`.
 
-The core value remains toolkit-independent. The D3D11VA backend exposes a
-strong Windows-only value, tentatively named `D3D11VAFrame`, with:
+`D3D11VAFrame` is valid only when the texture, slice, device identity, decoded
+size, and NV12/P010 software format are consistent. The borrowed native
+pointers remain valid while a copy of the strong frame view or source
+`HardwareFrame` is alive.
 
-- a retained `HardwareFrame`;
-- a borrowed `ID3D11Texture2D*`;
-- the `UINT` array slice;
-- the source `ID3D11Device*` identity;
-- decoded size and software format.
+Seek, decoder flush, replacement, and stop release player-owned references but
+do not invalidate application copies. An old decoder pool survives until its
+last retained frame is released.
 
-`d3d11vaFrame(const HardwareFrame&)` returns an invalid value unless the frame
-is D3D11 hardware, the texture is present, the slice is within the texture
-array, the texture's device matches the retained source-device identity, and
-the software format is supported. The native pointers remain valid while a
-copy of `D3D11VAFrame` or its source `HardwareFrame` is alive. Native code that
-needs a longer independent lifetime must call `AddRef`.
+## Raw-plane interop and Dolby ordering
 
-The retained `HardwareFrame` continues to own a cloned FFmpeg `AVFrame`. Its
-buffer reference owns the texture slice and `AVHWFramesContext`; the frames
-context owns the hardware-device reference; the device reference owns the COM
-interfaces and lock state. Consequently:
+`D3D11FrameInterop` validates:
 
-- seek and `avcodec_flush_buffers()` invalidate queued/current player frames,
-  but not copies already held by the application;
-- media replacement and stop release player references without invalidating
-  retained application frames;
-- old pools survive codec reconfiguration until their last frame is released;
-- a retained frame can still be mapped or inspected after `Player` is
-  destroyed, unless the native device itself has been removed.
+1. D3D11 hardware-frame and same-device identity;
+2. `D3D11_USAGE_DEFAULT`, one mip level, and one sample;
+3. NV12 or P010 DXGI format and a valid array slice;
+4. `D3D11_BIND_SHADER_RESOURCE`.
 
-## Context locking
+It returns a retained wrapper around the original decoder texture and slice.
+It creates no Video Processor, RGB intermediate, shader resource view, pool,
+or GPU command. Its color-space accessor is diagnostic only; semantic metadata
+comes from the source `VideoFrame`.
 
-FFmpeg 8 requires D3D11VA device lock callbacks to use a recursive lock. The
-callbacks protect its immediate-context, video-context, and internal staging
-texture operations, but they do not protect application or renderer calls.
-QtAVCore therefore installs callbacks that use the same recursive mutex as
-`D3D11DeviceAccess`.
+The renderer wraps plane-specific views through `pl_d3d11_wrap()`:
 
-The lock is acquired for:
+```text
+NV12: R8 luma + R8G8 chroma
+P010: R16 luma + R16G16 chroma, bit encoding {16, 10, 6}
+```
 
-- FFmpeg decode submission through its installed callbacks;
-- `av_hwframe_transfer_data()` through those same callbacks;
-- interop Video Processor input/output view creation and blits;
-- renderer immediate-context map, state, draw, copy, and flush operations.
+It then applies the source range, matrix, primaries, transfer, chroma location,
+mastering display, and content-light metadata. If the frame has
+`AV_FRAME_DATA_DOVI_METADATA`, the renderer maps that exact RPU to libplacebo
+while the raw plane representation is still active. Only then may
+`pl_render_image()` perform the Dolby reshape and ordinary color pipeline.
 
-The renderer uses the non-blocking form of the shared guard and declines a
-retryable render attempt when another thread owns the context. Decode and
-interop retain the blocking guard because their submissions must complete as
-one serialized operation.
+This ordering is mandatory for Profile 5, whose base layer is not a
+conventional HDR10-compatible image. An import that reports an RGB
+intermediate or cannot expose raw shader-readable planes is rejected for Dolby
+Vision.
 
-Device resource-creation methods are free-threaded, but implementations may
-hold the guard across related creation and submission to keep failure and
-device-removal handling atomic. Backend event callbacks are invoked only after
-the guard is released.
+Software frames use libplacebo's FFmpeg mapping bridge with Dolby mapping
+enabled. An explicit hardware-to-software mapping fallback exists but remains
+disabled by default and is reported when used.
 
-QtAVCore does not enable or disable `ID3D11Multithread` protection behind the
-application's back. The shared guard is the synchronization contract for
-QtAVCore components. An application that accesses the same immediate context
-from additional threads must use that guard or provide equivalent external
-serialization.
+## Output color and presentation
 
-## Interop and final rendering
+The current D3D11 target selects the libplacebo destination contract:
 
-`qtav_render_d3d11` defines decoder-independent
-`D3D11HardwareFrameInterop` and retained `D3D11TextureFrame` interfaces. The
-renderer advertises D3D11
-hardware-frame support only while a compatible interop object is installed.
+- BGRA8: full-range sRGB/BT.709 SDR;
+- FP16: full-range linear BT.709 scRGB;
+- RGB10: full-range BT.2020/PQ HDR10.
 
-`qtav_interop_d3d11` implements the interface as follows:
+When a swap chain is supplied, `IDXGIOutput6`, the current monitor, Windows SDR
+reference white, display luminance, `CheckColorSpaceSupport()`, and
+`SetColorSpace1()` refine the target metadata. These native calls choose and
+describe the destination; they do not implement tone mapping.
 
-1. validate the D3D11VA retained frame and compare source and target COM device
-   identity;
-2. validate NV12 or P010 software format, coded size, array slice, device
-   health, and Video Processor format support;
-3. cache the enumerator and processor for the current size/format, then create
-   retained input/output views and a same-device shader-readable RGB
-   intermediate for the import;
-4. configure source/destination rectangles and color space from structured
-   frame metadata;
-5. submit `VideoProcessorBlt()` under the shared context guard;
-6. return a retained texture frame which reports its DXGI format/color space
-   and keeps the source frame and all imported resources alive through the
-   renderer submission.
+libplacebo owns YCbCr conversion, Dolby Vision, transfer functions, gamut
+mapping, tone mapping, scaling, and final encoding. Native D3D11 code owns only
+device/resource validation, target clearing, swap-chain configuration, and
+presentation.
 
-The renderer releases that imported wrapper after the Video Processor and draw
-commands are submitted. All decode, interop, and render commands use the same
-serialized immediate context, so later decoder-surface reuse is ordered after
-the earlier GPU reads, and D3D11 retains COM resources referenced by queued
-commands. No per-frame event query or CPU wait is needed. Avoiding that extra
-completion fence prevents driver throttling and decoder-surface starvation
-after repeated seeks.
+## Threading, lifetime, and performance
 
-SDR input uses a BGRA8 G22/P709 intermediate. PQ/BT.2020 input prefers an
-RGB10/PQ P2020 intermediate and falls back to FP16 linear scRGB when the driver
-reports that conversion. HLG/BT.2020 prefers FP16 scRGB and can fall back to
-RGB10/PQ. The renderer then applies geometry plus display-specific transfer,
-gamut, and tone mapping to the current application-owned SDR, scRGB, or HDR10
-render target. Target/swap-chain recreation changes only the current-target
-callback and renderer configuration; it does not rebuild the decoder device
-or pool.
+FFmpeg decode callbacks and QtAVCore D3D11 rendering share the recursive
+`D3D11DeviceAccess` lock. `D3D11VideoRenderer::render()` uses a try-lock for
+both renderer state and immediate-context ownership; contention declines the
+render so the output can retry instead of blocking its render/UI thread.
 
-Direct shader views over the decoder array are not an initial path. A future
-implementation may add a proven vendor/runtime path, but it must be capability
-checked and cannot replace the portable Video Processor contract.
+The imported frame and libplacebo plane wrappers remain alive until
+`pl_render_image()` has submitted its commands. They are then released without
+waiting for GPU completion. Because decode and render submissions use the same
+serialized immediate context, later decoder-surface reuse is ordered after the
+earlier reads and D3D11 retains queued resource references.
+
+Per-frame `pl_gpu_finish()`, D3D11 event queries, and synchronous flushes are
+forbidden. `pl_gpu_finish()` is used only during renderer teardown before its
+reusable libplacebo resources are destroyed. The high-level output separately
+uses a frame-latency-one flip-model swap chain, redraw coalescing, non-blocking
+`Present()`, and bounded compositor backpressure as specified by AD-005.
 
 ## Fallback and failure policy
 
-There are two distinct fallback decisions:
+- `HardwareDecodeConfig::allowSoftwareFallback` controls fallback when D3D11VA
+  device/codec initialization fails.
+- `D3D11VideoRenderer::setAllowSoftwareMappingFallback()` controls the
+  separate, disabled-by-default readback fallback when an individual hardware
+  import is incompatible.
+- A foreign device, invalid slice, non-shader-readable resource, wrong format,
+  or removed device is rejected before semantic rendering.
+- No implicit resource sharing, cross-device copy, Video Processor conversion,
+  or alternate native shader is attempted.
+- Device removal is terminal for that device generation. The application must
+  create and bind a new device access, renderer, interop, and decode config.
 
-- `HardwareDecodeConfig::allowSoftwareFallback` controls reopening/continuing
-  with FFmpeg software decoding when D3D11VA device creation, codec capability,
-  pixel-format negotiation, or decoder initialization fails.
-- `D3D11VideoRenderer` has a separate, disabled-by-default
-  `allowSoftwareMappingFallback` option. When import is unsupported or the
-  source belongs to another healthy device, the renderer may call
-  `HardwareFrame::map(Read)` and feed the result to its existing software
-  upload path.
-
-No implicit cross-device GPU resource sharing or copy is attempted. A foreign
-device is rejected before any context operation. CPU mapping is the only
-initial cross-device fallback and is observable through a renderer error/detail
-event; when disabled or unsuccessful, `render()` fails.
-
-The state rules are:
-
-- seek/loop flush: clear the player's current frame and interop caches which
-  are tied to frame parameters; retained external frames remain valid;
-- media replacement/stop: close the codec and release active pools after
-  retained frames drain naturally;
-- surface recreation: reacquire the current target on every render and retain
-  the decoder/intermediate resources;
-- decoder format/size change: create a new FFmpeg pool and rebuild interop
-  Video Processor resources without mutating retained old-frame state;
-- device removal: classify the decoder/interop/renderer failure consistently,
-  stop submitting work, and report a terminal backend error. Automatic
-  recreation is not attempted because both the decoder pool and render target
-  belong to the removed device. The application creates a new
-  `D3D11DeviceAccess`, renderer, interop, and decode config and rebinds them.
-
-Software mapping may fail for a format for which FFmpeg does not support
-`av_hwframe_transfer_data()` (notably an opaque 4:2:0 surface). That failure is
-reported; it is never treated as a valid empty frame.
+Dolby Vision support here means FFmpeg-parsed Profile 5 metadata can drive
+libplacebo rendering to an SDR/scRGB/HDR10 target. It does not claim Dolby
+certification, enhancement-layer residual reconstruction, compressed
+passthrough, display tunnelling, or licensed logo behavior.
 
 ## Validation matrix
 
-Deterministic Windows/WARP tests do not claim hardware-video support. They
-cover contracts that WARP can exercise reliably:
+Deterministic WARP tests cover:
 
-- device/immediate-context identity validation and retained COM lifetime;
-- shared recursive locking from playback-worker and render-thread simulations;
-- D3D11 texture-array/slice extraction using a synthetic hardware-frame data
-  object;
-- invalid slice, wrong format, missing texture, and foreign-device rejection;
-- interop capability reporting and renderer behavior with a mock imported
-  texture frame;
-- enabled/disabled software-map fallback and map failure;
-- seek/media-replacement/stop/shutdown lifetime using mock hardware frames;
-- surface recreation plus factored device-removal/error classification;
-- no Windows or FFmpeg declarations in core installed headers.
+- device/context identity and recursive/try-lock behavior;
+- retained texture-array slice lifetime;
+- NV12/P010 raw-import validation and foreign-device rejection;
+- proof that import does not wait on or submit to the immediate context;
+- software-frame color/geometry rendering through libplacebo D3D11;
+- synthetic PQ, HLG, HDR-to-SDR, HDR10, scRGB, and Dolby Vision RPU rendering;
+- retryable context contention, explicit software mapping fallback, target
+  recreation, and device-removal classification.
 
-Real-GPU integration tests use generated media and skip with an explicit
-reason when the adapter or codec profile is unavailable. They cover:
+Hardware-adapter integration covers:
 
-- H.264 D3D11VA decode on the application-selected device;
-- NV12 texture-array and slice access, bounded pool use, and CPU mapping;
-- same-device D3D11VA-to-Video-Processor-to-render-target presentation with no
-  call to the CPU mapping path;
-- pixel readback within tolerance, seek, pause/resume, media replacement,
-  stop, and retained-frame use after player shutdown;
-- P010/HEVC when a checked adapter profile supports it;
-- foreign-device rejection and the explicit CPU fallback path.
+- H.264/NV12 and HEVC Main10/P010 D3D11VA decode on the selected device;
+- shader-resource bind flags on real decoder arrays;
+- exact raw slice retention with zero decoded-source CPU mapping;
+- libplacebo rendering to BGRA8 and FP16 targets with pixel readback;
+- pause/resume, seek, media replacement, explicit stop, target recreation, and
+  retained frame/import lifetime after player shutdown;
+- the supplied Dolby Vision Profile 5 media through FFmpeg RPU parsing,
+  D3D11VA raw-plane import, and bounded D3D11/libplacebo presentation.
 
-Static and shared builds, install/export consumption of
-`QtAV::PlatformWindows`, `QtAV::HWD3D11VA`, `QtAV::RenderD3D11`, and
-`QtAV::InteropD3D11`, the all-backends-disabled build, `git diff --check`, and
-the Qt-dependency scan remain release gates.
+The network-media check is intentionally bounded; it does not download the
+8.6-GB file. From a Release build directory, run:
 
-## Implementation order
+```powershell
+./bin/Release/qtav_interop_d3d11_test.exe `
+  "https://2dland.cn/test/Wednesday.S01E01.2022.NF.WEB-DL.2160p.HEVC.DV.DDP-Xiaomi.mp4"
+```
 
-1. [x] Add the common Windows device-access target and the opaque
-   supplied-device bridge in core.
-2. [x] Add `qtav_hw_d3d11va`, decoder configuration, retained texture/slice
-   access, mapping, and lifecycle tests.
-3. [x] Add decoder-independent D3D11 renderer interop interfaces.
-4. [x] Add renderer capability reporting, texture-frame consumption, and
-   explicit software-map fallback with mock WARP tests.
-5. [x] Add the Video Processor implementation in `qtav_interop_d3d11`.
-6. [x] Add WARP contract tests, native zero-copy tests, console-example
-   wiring, install/export validation, and final public documentation.
-7. [x] Preserve PQ/HLG HDR through RGB10/PQ or FP16 scRGB intermediates and
-   validate Main10/P010 output above scRGB `1.0` without CPU mapping.
+The test stops after at least 48 rendered hardware frames and requires Dolby
+Vision metadata on the rendered sequence. The final 2026-08-03 validation
+rendered 49 D3D11VA/P010 frames, all 49 with FFmpeg-parsed Dolby Vision
+metadata, with zero decoded-source CPU mapping.
 
-Completed Video Processor checkpoint:
-
-- `QtAV::InteropD3D11` is an optional Windows target that depends on the
-  decoder and renderer contracts without merging their responsibilities;
-- `D3D11FrameInterop` rejects invalid slices, unsupported NV12/P010 resources,
-  removed or foreign devices before context work, then serializes Video
-  Processor operations through the shared recursive guard;
-- the interop caches the enumerator/processor for the active size and format,
-  creates retained per-import views and an SDR BGRA8, FP16 scRGB, or
-  RGB10/PQ shader resource, and keeps the decoder frame alive through final
-  renderer submission;
-- the renderer supplies structured color metadata through a backward-
-  compatible color-aware import overload; Direct3D 11.1 color spaces cover
-  range, BT.601/709/2020, PQ, HLG, and chroma siting when the driver reports
-  the conversion, with a legacy SDR BT.601/709 fallback;
-- WARP verifies texture/slice extraction, retained lifetime, recursive locking,
-  and safe unavailable behavior on systems without software Video Processor
-  support;
-- hardware-adapter tests prove generated H.264/NV12 and PQ/BT.2020 HEVC
-  Main10/P010 D3D11VA frames reach the render target with correct pixel
-  readback and no CPU mapping; Main10 additionally reaches FP16 scRGB above
-  `1.0`, and its media generation/decode remain capability-gated;
-- the H.264 zero-copy test covers pause/resume, seek, media replacement,
-  explicit stop, target recreation, and retained source/import use after
-  `Player` shutdown;
-- the headless console example wires the selected device, D3D11VA decoder,
-  Video Processor interop, offscreen D3D11 renderer, and WASAPI audio path; its
-  strict H.264/AAC CTest has passed with an active WASAPI render endpoint and
-  audible output, while unavailable endpoints still return skip code 77
-  instead of reporting a false device pass.
+Static/shared builds, install/export consumers, the all-backends-disabled
+build, `git diff --check`, and the Qt-dependency scan remain release gates.
 
 ## Source and license boundary
 
-Implementation is based only on QtAVCore's existing code, FFmpeg 8 public APIs,
-and Microsoft public D3D11/DXGI APIs. Aleksoid1978/VideoRenderer is an isolated
-GPL-3.0 behavioral reference only. Its C++, shaders, lookup tables, data, and
-vendor-specific extensions must not be copied, vendored, or linked.
+Implementation uses QtAVCore code, FFmpeg 8 public APIs, libplacebo public APIs,
+and Microsoft D3D11/DXGI APIs. No third-party player shader, lookup table, or
+Dolby implementation is copied.
 
-Primary API references:
+Primary references:
 
 - [FFmpeg 8 hardware-frame parameter contract](https://ffmpeg.org/doxygen/8.0/group__lavc__decoding.html)
 - [FFmpeg 8 D3D11VA hardware-context implementation](https://ffmpeg.org/doxygen/8.0/hwcontext__d3d11va_8c_source.html)
-- [Microsoft D3D11 device/context threading](https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-devices-intro)
-- [Microsoft D3D11 bind-flag rules](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_bind_flag)
-- [Microsoft Video Processor input-view contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11videodevice-createvideoprocessorinputview)
+- [libplacebo D3D11 API](https://code.videolan.org/videolan/libplacebo/-/blob/v7.351.0/src/include/libplacebo/d3d11.h)
+- [Microsoft D3D11 bind flags](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_bind_flag)
 - [Microsoft DXGI NV12/P010 view formats](https://learn.microsoft.com/en-us/windows/win32/api/dxgiformat/ne-dxgiformat-dxgi_format)

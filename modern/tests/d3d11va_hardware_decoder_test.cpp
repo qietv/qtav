@@ -440,6 +440,12 @@ void testPlayerLifecycle(
                         || native.height() != frame.height()) {
                         std::abort();
                     }
+                    D3D11_TEXTURE2D_DESC description {};
+                    native.texture()->GetDesc(&description);
+                    if (!(description.BindFlags
+                          & D3D11_BIND_SHADER_RESOURCE)) {
+                        std::abort();
+                    }
 
                     if (hardwareFrames.fetch_add(1) == 0) {
                         const auto mapping = hardware.map();

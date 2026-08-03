@@ -22,6 +22,7 @@ vcpkg_from_github(
         0051-libsmb2-integration.patch
         0052-allow-clang-cl-lld-link-lto.patch
         0053-mediacodec-dovi-metadata.patch
+        0054-fix-clang-cl-mlp-lto-labels.patch
 )
 
 file(COPY

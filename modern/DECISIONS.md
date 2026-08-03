@@ -320,3 +320,173 @@ through OpenGL ES ZeroCopy with the requested files:
 The Android player APK cross-build, v3 signing, installation, raw-YCbCr/Dolby
 Vision rendering, native HDR surface, and native-fence return all remained
 active during these runs.
+
+## AD-004: Playback time advances only after output resumes
+
+- Date: 2026-08-03
+- Status: Accepted
+- Scope: Player clock, seek, startup, audio underrun, and application progress
+
+### Context
+
+Resetting a monotonic wall clock to a seek target can make `position()` advance
+before the replacement audio/video generation reaches an output. Repeated
+forward and backward seeks then appear as a moving timeline with frozen sound
+and picture. A clock-capable audio sink also has no valid post-seek device
+position until flushed output is submitted and presented.
+
+### Decision
+
+1. An accepted playing seek invalidates obsolete packet, decode, presentation,
+   and audio generations, anchors `position()` at the requested target, and
+   reports `Buffering` until the new generation produces usable output.
+2. With a clock-capable audio sink, playback time resumes only after a valid
+   post-flush device-clock sample. Callback-only playback resumes after the
+   first new-generation output is actually delivered.
+3. A/V startup and playing seeks use bounded video preroll before device audio
+   is released. This prevents the audio clock from running ahead while the
+   first video frames are still being decoded.
+4. `Player::position()` reads a generation-checked cached clock snapshot. It
+   never calls the audio device or waits behind a sink write, and any
+   extrapolation is bounded by the media time already submitted to the sink.
+5. Audio underrun re-enters `Buffering` and freezes fallback time until output
+   re-anchors. Applications observe Player state, status, and position; they do
+   not advance an independent playback clock.
+
+### Consequences
+
+- The requested seek position can remain visibly unchanged for a short period
+  while replacement output is prepared; that is intentional buffering, not a
+  stalled UI clock.
+- UI timers may sample and display `position()`, but cannot infer progress by
+  adding wall time.
+- Audio sinks that expose a presentation clock must invalidate it on flush and
+  publish a new-generation sample after accepting output.
+- Tests for seek and underrun must assert both clock behavior and real output
+  resumption, not only asynchronous seek completion.
+
+## AD-005: D3D11 presentation is bounded, retryable, and submission-ordered
+
+- Date: 2026-08-03
+- Status: Accepted
+- Scope: Player video presentation and Windows D3D11 output, rendering, and
+  hardware-frame interop
+
+### Context
+
+Repeated seeks exposed stalls when a render attempt waited behind Player or
+D3D11 locks, synchronous swap-chain backpressure, or a per-frame GPU completion
+query. The completion query extended the lifetime of scarce D3D11VA decoder
+surfaces and serialized CPU submission behind driver completion. Recreating
+interop output textures without bounded reuse also made transient GPU memory
+look like a process leak.
+
+### Decision
+
+1. `Player::renderVideo()` and the D3D11 renderer use non-blocking acquisition
+   for real-time state, render, and immediate-context ownership. Contention is
+   a retryable declined render, not permission to block the native render or UI
+   thread.
+2. When the bounded presentation queue is full, it preserves its contiguous
+   near-term frames and rejects a farther-future incoming frame. A decode burst
+   after seek must not replace the frame that is about to be displayed.
+3. `D3D11VideoOutput` owns presentation on its private render thread, caps
+   flip-model frame latency at one, coalesces redraws, and uses non-blocking
+   `Present()` plus bounded waitable-object backpressure when available before
+   retrying.
+4. A hardware-frame import remains alive through libplacebo draw-command
+   submission, then releases its decoder-surface reference without a per-frame
+   completion query. This is valid because decoder, interop, and renderer
+   submissions share one serialized immediate context and D3D11 retains
+   resources referenced by queued commands.
+5. Interop retains the decoder's raw NV12/P010 slice and owns no conversion
+   texture pool. Per-frame libplacebo wrappers are released after submission;
+   libplacebo's renderer owns its bounded reusable shader/render caches and
+   teardown performs the only explicit GPU drain.
+6. Retryable skipped renders, compositor-busy presents, and maximum render
+   stage durations are counted without per-frame logging.
+
+### Consequences
+
+- Audio, UI dispatch, and control operations remain responsive when the GPU or
+  compositor is temporarily busy.
+- A negative `renderVideo()` result, skipped render, or busy present schedules a
+  later attempt and is not by itself a fatal rendering error.
+- Driver working set may rise transiently across seek and queued GPU work, but
+  retained application resources are bounded and must not grow linearly per
+  frame or per seek.
+- A future design that submits decoder reuse and rendering on different
+  immediate contexts, devices, or unordered queues must add an explicit GPU
+  synchronization contract before using the same early-release rule.
+
+### Windows validation
+
+The exercised 3840x2160 HEVC Main10 HDR URL completed twelve alternating
+forward/backward seeks at 24-25 scheduled and rendered frames per second.
+Maximum draw time fell from 155-194 ms to about 0.5 ms and total render time
+remained about 3-5 ms. Process private memory measured 965.6 MiB before the
+seek run, 986.8 MiB after four seeks, and 984.8 MiB after eight more seeks;
+working set returned from a transient 886.4 MiB to 332.6 MiB. This is evidence
+of bounded reuse rather than per-seek linear growth, while deterministic
+Windows static and shared builds pass all 34 tests.
+
+## AD-006: Windows D3D11 uses libplacebo as its color authority
+
+- Date: 2026-08-03
+- Status: Accepted
+- Scope: Windows D3D11 software rendering, D3D11VA interop, Dolby Vision, and
+  HDR/SDR presentation
+
+### Context
+
+The former Windows renderer implemented YCbCr conversion, PQ/HLG transfer,
+primaries conversion, and tone mapping in a handwritten HLSL pixel shader.
+Its hardware path first converted D3D11VA NV12/P010 decoder slices to RGB with
+the D3D11 Video Processor. That split color semantics across two native paths
+and made Dolby Vision Profile 5 incorrect: Profile 5 raw base-layer components
+must be reshaped with the FFmpeg-parsed RPU before ordinary YCbCr conversion.
+
+Android already establishes libplacebo as the sole semantic color authority
+and preserves exact-frame lifetime, raw-component ordering, and non-blocking
+graphics scheduling. Windows needs the same semantic contract without adding
+Vulkan or OpenGL to its supported rendering path.
+
+### Decision
+
+1. Windows GPU rendering uses only `QtAV::RenderD3D11`. The Windows build does
+   not produce QtAVCore Vulkan or OpenGL renderer targets, including when those
+   APIs happen to be installed on the development machine.
+2. libplacebo's D3D11 backend owns YCbCr conversion, Dolby Vision RPU
+   reshaping, PQ/HLG handling, tone mapping, gamut mapping, scaling, and final
+   SDR/scRGB/HDR10 encoding. QtAVCore has no alternative Windows shader for
+   those semantic operations.
+3. D3D11VA decoder textures are created shader-readable. `InteropD3D11`
+   validates and retains the same-device raw NV12/P010 texture-array slice; it
+   performs no Video Processor RGB conversion and no decoded-pixel CPU map,
+   transfer, staging copy, or upload.
+4. The renderer wraps the retained luma and chroma planes directly with
+   libplacebo and maps the `AV_FRAME_DATA_DOVI_METADATA` belonging to that exact
+   `VideoFrame` before `pl_render_image()`. Profile 5 is rejected if a hardware
+   import cannot preserve that raw-plane contract.
+5. Software FFmpeg frames use libplacebo's FFmpeg mapping bridge with Dolby
+   mapping enabled. DXGI output/display discovery still selects SDR BGRA8,
+   linear FP16 scRGB, or RGB10/PQ targets, but does not implement color
+   conversion itself.
+6. AD-005 remains binding: render/context acquisition is non-blocking,
+   submission uses the shared immediate context, the exact imported frame
+   stays alive through submission, and no `pl_gpu_finish()` or completion
+   query is allowed per frame. GPU drain is teardown-only.
+
+### Consequences
+
+- Windows and Android now share the same semantic color authority while using
+  different libplacebo GPU backends.
+- A Dolby Vision Profile 5 frame can be tone-mapped to an SDR target or mapped
+  to an active HDR target without first being misinterpreted as conventional
+  YCbCr.
+- Native D3D11 code remains responsible for device, resource, swap-chain,
+  display-capability, clear, and presentation operations; those operations do
+  not constitute an alternative color pipeline.
+- Dolby licensing, certification, display tunnelling, enhancement-layer
+  residual reconstruction, and compressed passthrough remain outside this
+  decision.

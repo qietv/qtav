@@ -44,9 +44,10 @@ Continuation checkpoint:
   Vulkan/OpenGL ES/AAudio/MediaCodec production paths;
 - the D3D11VA device/frame/interop design and supplied-device core bridge are
   complete; the native `qtav_hw_d3d11va` decoder backend and
-  `qtav_interop_d3d11` Video Processor path are complete, including
-  same-device validation, SDR BGRA8 plus HDR RGB10/FP16 conversion, native
-  H.264/NV12 and PQ/BT.2020 HEVC Main10/P010 zero-CPU-map rendering,
+  raw `qtav_interop_d3d11` texture/slice path are complete, including
+  same-device validation, shader-readable NV12/P010 decoder surfaces, native
+  H.264/NV12 and PQ/BT.2020 HEVC Main10/P010 zero-CPU-map rendering through
+  libplacebo's D3D11 backend to SDR BGRA8, HDR RGB10, or FP16 scRGB targets,
   Windows Advanced Color swap-chain/display tracking, lifecycle coverage,
   example wiring, installed target export, and strict native H.264/AAC
   playback through an active WASAPI render endpoint; the implementation,
@@ -64,14 +65,13 @@ Continuation checkpoint:
   freeze the fallback clock until recovery, and
   HTTP(S) inputs use bounded read-timeout/reconnect defaults instead of
   immediately converting a recoverable disconnect into `Invalid`;
-  the D3D11 Video Processor interop now reuses a bounded three-output texture
-  pool instead of allocating a full-resolution output texture per frame and
-  retires replaced pools without invalidating externally retained imports;
+  D3D11 interop now retains only the decoder texture and exact array slice;
+  it performs no Video Processor conversion, output-texture pooling, context
+  submission, or wait before libplacebo samples the raw NV12/P010 planes;
   D3D11 render attempts now use non-blocking player/render/context locks,
   preserve the imminent queued presentation frame under pressure, and release
-  imported hardware frames immediately after ordered Video Processor/draw
-  submission instead of retaining decoder surfaces behind per-frame GPU event
-  queries;
+  imported hardware frames immediately after ordered libplacebo draw
+  submission without per-frame GPU completion queries;
   `QtAV::OutputD3D11` now owns the Windows device, composition swap chain,
   render target, display/HDR tracking, render scheduling thread,
   D3D11VA/interop wiring, `renderVideo()`, `Present()`, resize, and teardown;
@@ -137,6 +137,12 @@ Continuation checkpoint:
   FFmpeg-parsed Dolby Vision RPU metadata; backend-owned shaders are limited
   to unavoidable representation normalization, including crop-aware raw
   Y/Cb/Cr normalization before libplacebo on Android hardware frames;
+- Windows now follows the same color-authority boundary through libplacebo's
+  D3D11 backend. FFmpeg-parsed Dolby Vision metadata, Dolby Vision reshaping,
+  transfer handling, gamut conversion, HDR tone mapping, and target encoding
+  are owned by libplacebo; QtAVCore has no alternate native Windows shader for
+  those operations. Windows exposes only the QtAVCore D3D11 renderer and does
+  not build its OpenGL or Vulkan renderer targets;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
@@ -252,9 +258,13 @@ Current verification:
   the changed generic backend/hardware-device tests compile with the Android
   toolchain, and a native macOS target is rejected by the new support gate
   with the archive location in its diagnostic;
-- the current static and shared Windows builds pass 34/34 CTest tests,
-  including the high-level D3D11 composition-output lifecycle test, Advanced
-  Color test, WASAPI device test, and strict native H.264/AAC playback;
+- before the libplacebo D3D11 migration, the static and shared Windows builds
+  passed 34/34 CTest tests, including the high-level D3D11 composition-output
+  lifecycle test, Advanced Color test, WASAPI device test, and strict native
+  H.264/AAC playback. After the migration, both static and shared Release
+  builds pass all 13 tests registered without a host FFmpeg media-generator
+  executable; the existing RGB/YUV420P/NV12 media fixtures, Advanced Color,
+  installed-package consumers, and bounded Profile 5 URL test also pass;
 - the WinUI 3 sample, now using `QtAV::OutputD3D11`, sustains 24.9-25.1
   scheduled and rendered fps on the exercised 3840x2160 HEVC
   Main10/E-AC-3 HDR file; the migrated output was validated by seeking from
@@ -291,12 +301,12 @@ Current verification:
 - on Windows with Visual Studio 2026 and vcpkg FFmpeg 8.1.2, static/shared
   Release tests cover the supplied hardware-device bridge, deterministic WARP
   texture/slice/lifetime/locking contracts, D3D11 software/imported/mapped
-  rendering, native H.264/NV12 and HEVC Main10/P010 D3D11VA-to-Video-Processor
-  presentation with verified pixels and no CPU mapping, plus pause/resume,
+  rendering through libplacebo, native H.264/NV12 and HEVC Main10/P010 raw
+  D3D11VA plane presentation with verified pixels and no CPU mapping, plus pause/resume,
   seek, media replacement, stop, surface recreation, and retained-frame use
   after player shutdown;
-- Windows Advanced Color coverage now includes deterministic PQ/HLG EOTF,
-  BT.2020 conversion, SDR tone mapping, FP16 scRGB and RGB10/PQ numeric
+- Windows Advanced Color coverage now includes libplacebo-governed PQ/HLG,
+  BT.2020 conversion, SDR tone mapping, FP16 scRGB and RGB10/PQ semantic
   readback, native HWND and composition flip-model swap chains,
   `IDXGIOutput6`, `SetColorSpace1`, composition-monitor lookup, SDR-white
   lookup, and same-adapter display switching while Windows HDR is disabled
@@ -304,6 +314,10 @@ Current verification:
   PHL 27B1U7903 reported a 10-bit G2084/P2020 output, system-derived 240-nit
   SDR white, 1405.11-nit peak luminance, and 1000-nit PQ output above scRGB
   `1.0`;
+- the supplied 8.6-GB Dolby Vision Profile 5 URL is covered by a bounded
+  network integration run: 49 HEVC Main10/P010 D3D11VA frames rendered through
+  libplacebo, all 49 carrying FFmpeg-parsed Dolby Vision metadata, with zero
+  decoded-source CPU mapping;
 - the strict generated H.264/AAC native example test proves simultaneous
   D3D11VA decode, D3D11 rendering, audio decode, and audible WASAPI output
   through the active render endpoint;
@@ -713,6 +727,9 @@ is now deferred:
    source map/transfer/staging/upload, and clean shutdown.
 
 ## Next task
+
+The user-prioritized Windows D3D11/libplacebo migration above was completed
+without advancing or replacing this queued plan state.
 
 The Android example playback-stutter task is complete:
 

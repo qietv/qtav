@@ -1,3 +1,7 @@
+if(WIN32)
+    return()
+endif()
+
 if(ANDROID)
     find_library(QTAV_VULKAN_LIBRARY_PATH vulkan)
     if(QTAV_VULKAN_LIBRARY_PATH)

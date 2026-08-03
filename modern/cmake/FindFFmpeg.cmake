@@ -136,13 +136,11 @@ foreach(_component IN LISTS _ffmpeg_requested_components)
                 )
             endif()
 
-            # Static FFmpeg packages carry their third-party dependency
-            # closure in pkg-config metadata.  Keep the primary archive as
-            # the imported location, then propagate that closure so mobile
-            # consumers also link dependencies such as OpenSSL, dav1d, and
-            # libsmb2 from the same target prefix.
-            if(FFmpeg_${_component}_LIBRARY MATCHES "\\.a$"
-               AND TARGET PkgConfig::PC_FFMPEG_${_component})
+            # Repository FFmpeg packages carry their third-party dependency
+            # closure in pkg-config metadata. Keep the primary archive as the
+            # imported location, then propagate that closure for both Unix
+            # .a archives and Windows static .lib archives.
+            if(TARGET PkgConfig::PC_FFMPEG_${_component})
                 target_link_libraries(
                     FFmpeg::${_component}
                     INTERFACE
