@@ -147,7 +147,9 @@ Continuation checkpoint:
   desktop dependencies pulled by `ffmpeg[all]`; the
   Android, OHOS, and Windows dependency packages have been built, verified,
   and uploaded by self-hosted CI; the Windows validation uses Visual Studio
-  18's clang-cl 22.1.3 with lld-link and preserves FFmpeg LTO;
+  18's clang-cl 22.1.3 with lld-link and preserves FFmpeg LTO; the Windows
+  entry point was also rerun locally from a clean target install on 2026-08-03,
+  completing all 25 packages and the installed-package verifier;
 - the root `README.md` and `AGENTS.md` now record the modern entry point and
   FFmpeg 8 minimum; legacy build guidance remains unchanged;
 - Homebrew CMake 4.4.1 is installed at `/opt/homebrew/bin/cmake`;

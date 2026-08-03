@@ -115,6 +115,11 @@ git submodule update --init ffmpeg/vcpkg
 ./ffmpeg/scripts/build-windows.ps1
 ```
 
+The script stops before bootstrapping vcpkg unless it is running on 64-bit
+Windows in a 64-bit PowerShell process and can locate CMake, Visual Studio's
+`clang-cl`, and `lld-link`. It prints the resolved compiler, linker, triplet,
+and install root before starting the manifest installation.
+
 libplacebo does not support the MSVC `cl.exe` C compiler. The Windows triplet
 therefore uses Visual Studio's `clang-cl` compiler with the Windows SDK and
 MSVC ABI. It produces release static libraries using the dynamic MSVC runtime
