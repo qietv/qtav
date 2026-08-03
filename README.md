@@ -17,19 +17,25 @@ legacy root QtAV implementation, not QtAVCore.
 
 QtAVCore builds must use FFmpeg and its dependency closure produced by this
 repository's [`ffmpeg/`](ffmpeg/ARCHITECTURE.md) vcpkg subproject, rather than
-a system/Homebrew or unrelated prebuilt target FFmpeg. The local mobile target
-prefixes and their GitHub Actions artifacts are:
+a system/Homebrew or unrelated prebuilt target FFmpeg. Project builds and
+examples must resolve the package in this order:
+
+1. use the matching local target prefix when it and the sibling vcpkg status
+   database already exist;
+2. otherwise download the matching artifact from the newest successful
+   completed `main` run of the FFmpeg dependencies workflow.
+
+The supported target prefixes and their GitHub Actions artifacts are:
 
 | Target | Local target prefix | Artifact |
 | --- | --- | --- |
 | Android arm64/API 28 | `ffmpeg/build/arm64-android-28-static/vcpkg_installed/arm64-android-28-static` | `qtav-ffmpeg-arm64-android-28-static` |
 | OHOS arm64/API 23 | `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static` | `qtav-ffmpeg-arm64-ohos-23-static` |
+| Windows x64 | `ffmpeg/build/x64-windows-static-md/vcpkg_installed/x64-windows-static-md` | `qtav-ffmpeg-x64-windows-static-md` |
 
-If a local package is absent, build it on macOS with
-`ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh`. To download
-both packages from the latest successful completed `main` run instead, query
-Actions at download time as shown below. Do not hardcode a run ID, commit SHA,
-or artifact URL:
+When a local prefix is absent, query Actions at download time as shown below.
+Do not hardcode a run ID, commit SHA, artifact URL, or reuse an older successful
+run when a newer one is available. On macOS, download Android and OHOS with:
 
 ```sh
 run_id="$(gh run list \
@@ -51,6 +57,30 @@ gh run download "$run_id" \
   --name qtav-ffmpeg-arm64-ohos-23-static \
   --dir ffmpeg/build/arm64-ohos-23-static/vcpkg_installed
 ```
+
+On Windows, run the equivalent PowerShell commands from the repository root:
+
+```powershell
+$runId = gh run list `
+  --repo qietv/qtav `
+  --workflow ffmpeg-dependencies.yml `
+  --branch main `
+  --status success `
+  --limit 1 `
+  --json databaseId `
+  --jq '.[0].databaseId'
+if (-not $runId) { throw 'No successful FFmpeg dependency workflow run found.' }
+
+gh run download $runId `
+  --repo qietv/qtav `
+  --name qtav-ffmpeg-x64-windows-static-md `
+  --dir ffmpeg/build/x64-windows-static-md/vcpkg_installed
+```
+
+The platform build scripts remain the source of those artifacts. Run
+`ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh` on macOS,
+or `ffmpeg/scripts/build-windows.ps1` on Windows, when intentionally rebuilding
+the dependency package rather than consuming an existing local or CI package.
 
 The same artifacts can be downloaded manually from the
 [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml).

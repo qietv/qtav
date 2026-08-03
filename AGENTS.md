@@ -36,22 +36,27 @@ dependencies from this repository's `ffmpeg/` vcpkg subproject. Do not use a
 system/Homebrew FFmpeg or an independently downloaded target FFmpeg as a
 fallback. A host `ffmpeg` executable may be used only to generate test media.
 
-When locating an existing mobile package, check these target prefixes first:
+When locating an existing dependency package, check these target prefixes
+first:
 
 - Android arm64/API 28:
   `ffmpeg/build/arm64-android-28-static/vcpkg_installed/arm64-android-28-static`
 - OHOS arm64/API 23:
   `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static`
+- Windows x64:
+  `ffmpeg/build/x64-windows-static-md/vcpkg_installed/x64-windows-static-md`
 
 Each prefix contains the target `include/`, `lib/`, and `share/` directories;
 the associated vcpkg status database is the sibling `vcpkg/` directory under
-`vcpkg_installed/`. If a local prefix is missing, either run
-`ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh` on macOS,
-or download the matching artifact from the latest successful `main` run of
-the [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml):
+`vcpkg_installed/`. Project builds and examples must use a valid matching local
+prefix first. If it is missing, download the matching artifact from the latest
+successful `main` run of the
+[FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml)
+before configuring the target:
 
 - Android artifact: `qtav-ffmpeg-arm64-android-28-static`
 - OHOS artifact: `qtav-ffmpeg-arm64-ohos-23-static`
+- Windows artifact: `qtav-ffmpeg-x64-windows-static-md`
 
 Resolve the workflow run at download time and select the newest successful
 completed `main` run. Never pin or reuse a run ID, commit SHA, artifact URL, or
@@ -61,6 +66,11 @@ Extract the artifact directly into the corresponding triplet's
 `vcpkg_installed/` directory so the target prefix and sibling status database
 retain the layout above. See the root README and `ffmpeg/ARCHITECTURE.md` for
 download commands and the complete consumption contract.
+
+Run `ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh` on
+macOS, or `ffmpeg/scripts/build-windows.ps1` on Windows, only when the task is
+to create or refresh the dependency package itself, or when no valid current
+artifact is available.
 
 ## Non-negotiable architecture rules
 
