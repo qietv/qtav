@@ -9,6 +9,11 @@ application-owned rendering callback, inspired by the public shape of
 It is not source- or binary-compatible with `mdk-sdk`, and no `mdk-sdk` source
 code is used.
 
+The current system structure is documented in
+[`ARCHITECTURE.md`](ARCHITECTURE.md). Durable architecture choices and their
+consequences are recorded in [`DECISIONS.md`](DECISIONS.md), while milestone
+status and the active next task live in [`PLAN.md`](PLAN.md).
+
 ## Supported targets
 
 QtAVCore is maintained for Windows, Android, and OHOS targets only. The former
@@ -58,15 +63,18 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   a private GPU-sampled `AImageReader`, retained `AHardwareBuffer` external
   memory, native YCbCr sampling, and acquire/release fence bridging;
 - optional Android MediaCodec-to-OpenGL ES zero-CPU-copy texture interop
-  through a detached `SurfaceTexture`, timestamp-correlated
-  `updateTexImage()`, and `GL_TEXTURE_EXTERNAL_OES` sampling;
+  through a private GPU-sampled `AImageReader`, retained `AHardwareBuffer`,
+  EGLImage import, raw Y/Cb/Cr sampling, and acquire/release fence bridging;
 - optional platform-neutral Vulkan software-frame renderer using borrowed
-  application-selected device/queue and current-image resources, with SDR,
-  HDR10/PQ, HDR10/HLG, and extended-linear output contracts;
+  application-selected device/queue and current-image resources, with
+  libplacebo color conversion, tone mapping, Dolby Vision RPU reshaping, and
+  SDR, HDR10/PQ, HDR10/HLG, or extended-linear output contracts;
 - optional Android Vulkan surface adapter that retains the current
   `ANativeWindow` generation, selects a supported SDR/native-HDR swapchain,
   publishes its output color space, and owns surface/swapchain synchronization;
-- optional platform-neutral OpenGL ES 3.x software-frame renderer plus an
+- optional platform-neutral OpenGL ES 3.x renderer using libplacebo for
+  software and hardware-frame color conversion, Dolby Vision RPU reshaping,
+  tone mapping, gamut mapping, and output encoding, plus an
   Android EGL adapter that owns its display, context, window surface, and
   surface generation, selects native 10-bit BT.2020/PQ or BT.2020/HLG when
   available, and preserves an explicit RGBA8/sRGB SDR fallback;
@@ -84,8 +92,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
   decoding, Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback,
   AAudio output, MediaCodec H.264/HEVC direct-surface validation, and
-  H.264/HEVC private-AImageReader Vulkan plus SurfaceTexture external-OES
-  texture paths;
+  H.264/HEVC private-AImageReader Vulkan plus AHardwareBuffer/EGLImage OpenGL
+  ES texture paths;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -129,11 +137,12 @@ Current backend integration boundary:
   application-owned Vulkan device, and returns a release sync fd after GPU
   submission without a decoded-pixel map, software transfer, staging copy, or
   renderer upload;
-- `QtAV::InteropMediaCodecOpenGL` owns a detached Android `SurfaceTexture`,
-  supplies its producer window to `QtAV::HWMediaCodec`, releases each output
-  once, correlates the single current image by timestamp and surface
-  generation, and samples its transform through `GL_TEXTURE_EXTERNAL_OES`
-  without a decoded-pixel map, transfer, staging copy, or renderer upload;
+- `QtAV::InteropMediaCodecOpenGL` owns a private GPU-sampled Android
+  `AImageReader`, supplies its producer window to `QtAV::HWMediaCodec`,
+  correlates codec and image timestamps, imports retained `AHardwareBuffer`
+  images as EGLImages, and returns a release sync fd after GL submission and
+  platform presentation
+  without a decoded-pixel map, software transfer, staging copy, or upload;
 - `QtAV::RenderCPU` converts and scales decoded software frames into packed
   RGB/BGR/RGBA/BGRA/ARGB or Gray8 buffers;
 - `QtAV::RenderD3D11` uploads software YUV420/422/444, NV12/NV21, P010,
@@ -154,11 +163,12 @@ Current backend integration boundary:
   the application supplies a swap-chain binding callback, surface size, and
   normally its hosting HWND, then the output owns display/HDR tracking,
   render scheduling, and presentation;
-- `QtAV::RenderVulkan` packs supported software planes into a Vulkan storage
-  buffer and draws through an application-supplied current image, applying
-  structured color metadata and the common viewport/aspect/rotation contract;
-  the target's `VkColorSpaceKHR` selects deterministic HDR-to-SDR output or
-  native HDR10/PQ, HDR10/HLG, or extended-linear encoding;
+- `QtAV::RenderVulkan` maps supported FFmpeg software frames into libplacebo
+  textures and renders into an application-supplied current image. libplacebo
+  owns color conversion, scaling, tone mapping, Dolby Vision reshaping, and
+  final SDR/HDR encoding while QtAVCore supplies the common
+  viewport/aspect/rotation contract. The target's `VkColorSpaceKHR` selects
+  SDR, native HDR10/PQ, HDR10/HLG, or extended-linear output;
 - `QtAV::RenderVulkanAndroid` owns Android surface, swapchain, image-view, and
   acquire/present resources for a retained active `ANativeWindow`, prefers
   native HDR format/color-space pairs when available, and submits HDR10 static
@@ -166,9 +176,12 @@ Current backend integration boundary:
   owns the Vulkan instance, device, queue, and NativeActivity;
 - `QtAV::RenderOpenGL` uploads the same software YUV420/422/444, NV12/NV21,
   P010, RGB/BGR/RGBA/BGRA/ARGB, and Gray8 families into OpenGL ES textures,
-  applies the structured color path plus the common viewport/aspect/rotation
-  contract, and writes explicit SDR sRGB, HDR10/PQ, or HDR10/HLG encoding into
-  a caller-supplied current framebuffer;
+  maps their structured metadata through the shared FFmpeg/libplacebo bridge,
+  applies the common viewport/aspect/rotation contract, and asks libplacebo's
+  OpenGL backend to generate the shaders for explicit SDR sRGB, HDR10/PQ, or
+  HDR10/HLG output into a caller-supplied current framebuffer; an optional
+  `OpenGLPresentCallback` submits that framebuffer before a hardware source
+  image receives its producer release fence;
 - `QtAV::RenderOpenGLAndroid` retains the current `ANativeWindow` generation
   and owns its EGL display, OpenGL ES 3.x context, window surface, and swap,
   prefers an exact RGB10_A2 BT.2020/PQ surface, considers BT.2020/HLG, and
@@ -208,15 +221,16 @@ specified in [`MOBILE.md`](MOBILE.md).
 The Android Vulkan and OpenGL ES zero-CPU-copy paths are separate backends.
 Vulkan consumes private GPU-sampled
 `AImageReader` images by importing retained `AHardwareBuffer` allocations,
-native YCbCr/external formats, and acquire/release fences. OpenGL ES consumes
-a detached MediaCodec `SurfaceTexture` through
-`GL_TEXTURE_EXTERNAL_OES`, with explicit timestamp/generation correlation,
-single-current-image lifetime, surface recreation, and seek/flush coverage.
-P010/HDR external-OES sampling is enabled automatically only when the current
-GL context exposes the required external-YUV extensions and Android reports a
-BT.2020/PQ or BT.2020/HLG dataspace matching the exact latched image; private
-`AImageReader` plus `AHardwareBuffer`/`EGLImage` remains a future optional
-alternative. On OHOS, the confirmed GLES path uses
+native YCbCr/external formats, and acquire/release fences. OpenGL ES also owns
+a private GPU-sampled `AImageReader`, imports each retained
+`AHardwareBuffer` as an EGLImage, waits its acquire fence, and returns a
+release fence after submission. `GL_EXT_YUV_target` exposes raw Y, Cb, and Cr;
+a crop-aware GPU normalization pass stores those components in RGBA16F without
+performing color conversion, after which libplacebo applies FFmpeg's Dolby
+Vision metadata and the complete output color pipeline. Imports that cannot
+prove this raw contract are rejected for Dolby Vision rather than sampled
+through an implicitly converted SurfaceTexture. On OHOS, the confirmed GLES
+path uses
 `OH_NativeImage` plus an external-OES texture. OHOS Vulkan additionally needs
 a retained `OH_AVBuffer`/`OH_NativeBuffer` bridge because the current FFmpeg 8
 OHCodec buffer branch performs `OH_AVBuffer_GetAddr()` plus
@@ -233,7 +247,9 @@ Requirements:
 - CMake 3.20 or newer;
 - a C++17 compiler;
 - FFmpeg 8.0 or newer development libraries;
-- `pkg-config` is recommended but not required.
+- libplacebo 7.351.0 or newer when the Vulkan renderer is enabled;
+- `pkg-config` is required for the Vulkan/libplacebo renderer and recommended
+  for resolving static FFmpeg dependency closures.
 
 ```sh
 cmake -S modern -B build/modern -DQTAV_CORE_BUILD_TESTS=ON
@@ -260,8 +276,9 @@ clear error. Current switches are:
 `QTAV_RENDER_MOBILE=AUTO` builds the dependency-free mobile renderer selector,
 `QTAV_RENDER_OPENGL=AUTO` builds the OpenGL ES renderer when GLES 3 headers
 and libraries are available and adds the Android EGL adapter on Android,
-`QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader and
-`glslc` are available (the Android harness requires it explicitly),
+`QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader,
+libplacebo 7.351.0 or newer, and (on Android) `glslc` are available. The
+Android harness requires this backend explicitly,
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
@@ -279,9 +296,9 @@ MediaCodec hardware context are available.
 `QTAV_INTEROP_MEDIACODEC_VULKAN=AUTO` builds the private-AImageReader Vulkan
 interop on Android API 26 or newer when the MediaCodec and Vulkan targets are
 both available.
-`QTAV_INTEROP_MEDIACODEC_OPENGL=AUTO` builds the SurfaceTexture external-OES
-interop on Android API 28 or newer when the MediaCodec and OpenGL ES targets
-are both available.
+`QTAV_INTEROP_MEDIACODEC_OPENGL=AUTO` builds the private-AImageReader
+AHardwareBuffer/EGLImage interop on Android API 28 or newer when the
+MediaCodec and OpenGL ES targets are both available.
 Backend implementations not otherwise described remain disabled under
 `AUTO`, and explicitly requesting one with `ON` is an error.
 
@@ -312,10 +329,10 @@ H.264/AAC playback passed and produced audible output.
 ### Android arm64 foundation harness
 
 The initial Android production-path harness is under
-`examples/android/`. It uses SDK CMake/Ninja and NDK r28c to cross-build a
-checksum-pinned minimal FFmpeg 8.1.2 configuration and QtAVCore for
-`arm64-v8a`, then uses AAPT2, zipalign, and apksigner to package a
-NativeActivity without Qt or a Gradle dependency:
+`examples/android/`. It uses SDK CMake/Ninja and NDK r29 to consume the
+repository-local arm64/API 28 FFmpeg 8.1.2 vcpkg dependency package and
+cross-build QtAVCore for `arm64-v8a`, then uses AAPT2, zipalign, and apksigner
+to package a NativeActivity without Qt or a Gradle dependency:
 
 ```sh
 modern/examples/android/build-android.sh
@@ -370,18 +387,17 @@ runs through the private `AImageReader` target for both H.264 and HEVC:
 the device imports external-format `AHardwareBuffer` images, samples them
 through Vulkan YCbCr conversion, returns release sync fds, and requires all
 decoded-source CPU-map, software-transfer, staging-copy, and renderer-upload
-counters to stay zero. Separate H.264 and HEVC phases then use detached
-`SurfaceTexture` producers, correlate MediaCodec output timestamps, sample
-the current images as `GL_TEXTURE_EXTERNAL_OES`, cover seek/flush plus EGL
-window suspension/recreation, and keep the same decoded-source counters at
-zero. A connected fallback phase keeps the same H.264 media session, injects
-a fatal Vulkan renderer error after 30 successful native-buffer
-presentations, creates the compatible SurfaceTexture/OpenGL ES candidate, and
-rebinds MediaCodec from AImageReader generation 5 to SurfaceTexture generation
-6 through the explicit policy callback. The recorded run continued with 32
-Vulkan-generation and 180 OpenGL ES-generation decoded frames, 30 Vulkan
-imports/release fences, 179 external-OES images, and zero decoded-source
-map/transfer/staging/upload calls. The
+counters to stay zero. Separate H.264 and HEVC phases then use private
+`AImageReader` producers, correlate MediaCodec output timestamps, import
+AHardwareBuffer-backed EGLImages as raw YCbCr, cover seek/flush plus EGL window
+suspension/recreation, return release fences, and keep the same decoded-source
+counters at zero. A connected fallback phase keeps the same H.264 media
+session, injects a fatal Vulkan renderer error after 30 successful
+native-buffer presentations, creates the compatible AImageReader/OpenGL ES
+candidate, and rebinds MediaCodec to its new producer through the explicit
+policy callback. The recorded run continued with 32 Vulkan-generation and 180
+OpenGL ES-generation decoded frames, matching raw imports and release fences,
+and zero decoded-source map/transfer/staging/upload calls. The
 accepted shared Android/OHOS responsibility and lifecycle design is documented
 in [`MOBILE.md`](MOBILE.md).
 
@@ -409,17 +425,20 @@ controls remain touchable on a portrait phone.
 
 The option matrix exercises software decode through Vulkan or OpenGL ES,
 MediaCodec direct-Surface output, MediaCodec/AImageReader Vulkan ZeroCopy, and
-MediaCodec/SurfaceTexture OpenGL ES ZeroCopy. Changing an option rebuilds the
-affected native pipeline at the current position. Remote URLs go directly to
-QtAVCore/FFmpeg networking; the example cross-builds OpenSSL, explicitly
+MediaCodec/AImageReader/AHardwareBuffer/EGLImage OpenGL ES ZeroCopy. Changing
+an option rebuilds the affected native pipeline at the current position.
+Remote URLs go directly to
+QtAVCore/FFmpeg networking; the example uses OpenSSL from the same repository
+vcpkg dependency package and explicitly
 verifies HTTPS peers and host names against an app-private PEM bundle assembled
 from Android's public system trust store, and does not download through Java
 or the Android networking stack. This is remote-file playback, not adaptive
 streaming.
 
-Hardware decode with direct-Surface presentation is the example's smooth
-playback default; ZeroCopy is an explicit interop/application-processing
-option. The core paces MediaCodec packets by DTS before decode, independently
+Hardware decode with Vulkan ZeroCopy is the example default so application
+color processing, including Dolby Vision, reaches libplacebo. Disabling
+ZeroCopy explicitly selects direct-Surface presentation. The core paces
+MediaCodec packets by DTS before decode, independently
 of audio decode and device submission, and retains only a small bounded window
 of decoded Surface outputs for the presentation worker. This avoids both
 demux starvation and exhaustion of the codec output pool. The dedicated
@@ -429,8 +448,7 @@ private AImageReader ownership transfer, preventing producer bursts from
 silently coalescing images without waiting for the render deadline. Its
 diagnostics separate core queue/late drops, application render drops,
 frames-in-flight, AHardwareBuffer cache reuse, and interop queue/acquire/import
-progress. SurfaceTexture drops only an ambiguous zero-PTS first output;
-AImageReader accepts zero as a valid timestamp.
+progress. Both private AImageReader paths accept zero as a valid timestamp.
 
 Build and sign the arm64 debug APK without installing it:
 
@@ -690,6 +708,18 @@ driver-reported format or external format and suggested YCbCr conversion. The
 renderer also applies the `AImage` crop rectangle, so codec-aligned native
 allocations may be larger than the visible decoded frame.
 
+libplacebo's public Vulkan wrapping API requires a defined `VkFormat`, while
+Android private MediaCodec buffers on tested devices expose only an external
+format. For that case the interop performs one GPU-only sampling pass into an
+FP16 Vulkan texture, applying only an immutable sampler and the visible crop.
+Ordinary frames use the driver's suggested YCbCr conversion. Dolby Vision
+frames instead use an identity conversion that preserves raw Y/Cb/Cr in
+component order, so libplacebo receives the base-layer signals required by
+the FFmpeg RPU metadata. No transfer, gamut mapping, tone mapping, HDR output
+encoding, or RPU processing is implemented in that small normalization pass;
+libplacebo performs those operations from the FP16 texture onward. This does
+not map, transfer, stage, or upload decoded pixels through the CPU.
+
 When an acquire sync fd is present it is imported into a temporary Vulkan
 semaphore. Submission waits on that semaphore and transfers ownership from
 the foreign queue family; completion signals an exportable semaphore whose
@@ -741,40 +771,49 @@ player
     .setState(qtav::State::Playing);
 ```
 
-The interop constructs `android.graphics.SurfaceTexture` in detached mode and
-retains its producer `ANativeWindow`. On the renderer thread it attaches the
-consumer to the current OpenGL ES context, releases each MediaCodec output
-exactly once, calls `ASurfaceTexture_updateTexImage()`, and accepts only the
-timestamp-correlated surface generation. The renderer samples the returned
-external texture with its SurfaceTexture transform. The Android interop
-right-composes the conventional OpenGL vertical-origin conversion so the
-matrix consumes QtAV's top-left source coordinates while retaining producer
-crop, scale, and rotation. The renderer submits the draw and calls `glFlush()`
-before a later update advances the single current image.
-A configured `width` and `height` only set the SurfaceTexture's default buffer
-size; omitted values use `1x1`, and MediaCodec video output overrides that
-default with the decoded size.
-A short native retry worker only emits redraw requests; it never calls GL or
-SurfaceTexture APIs.
+The interop creates a private GPU-sampled `AImageReader` and retains its
+producer `ANativeWindow`. MediaCodec output timestamps are correlated with
+acquired PRIVATE images. On the renderer thread each retained AHardwareBuffer
+is imported with `eglGetNativeClientBufferANDROID` and
+`eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID)`, then bound to
+`GL_TEXTURE_EXTERNAL_OES`. Native-fence EGL sync waits the image acquire fd;
+applications that accept MediaCodec frames through
+`setVideoFrameScheduler()` can call the non-blocking `queueFrame()` after
+reserving bounded render capacity. Image acquisition then completes
+asynchronously and raises `RedrawRequested` for the retained exact frame. The
+reader keeps acquisition slack outside the correlation window so a coalesced
+listener callback cannot strand an already-queued producer image at
+`MAX_IMAGES_ACQUIRED`.
+
+After libplacebo submission, `OpenGLVideoRenderer` invokes its optional
+`OpenGLPresentCallback` with the context current and only then asks the interop
+to export a release sync fd and return the image with
+`AImage_deleteAsync()`. Android's adapter uses this hook for
+`eglSwapBuffers()`, ensuring the fence covers default-framebuffer presentation
+instead of remaining deferred until a later swap.
+
+The external sampler uses `GL_EXT_YUV_target`, so R/G/B contain normalized
+Y/Cb/Cr rather than an Android-selected RGB conversion. A small crop-aware GPU
+pass writes those raw components into an RGBA16F texture. It performs no color
+matrix, transfer, gamut, tone mapping, or output encoding; libplacebo performs
+all of those operations after applying any FFmpeg `AVDOVIMetadata`. A
+configured `width` and `height` only set the AImageReader's initial size;
+MediaCodec output supplies each acquired image's actual dimensions and crop.
 
 Call `flush()` before seek, loop, decoder/media replacement, explicit stop, or
 an interop-policy switch. Close the renderer while its context can still be
-made current so the SurfaceTexture detaches cleanly. Same-context Android
-window loss/recreation does not replace the decoder surface or map the native
-frame.
+made current so pending EGLImage and GL resources are released safely.
+Same-context Android window loss/recreation does not replace the decoder
+surface or map the native frame.
 
-The default contract accepts SDR 8-bit external-OES sampling and probes
-P010/HDR support on first use. Automatic acceptance requires Android 13+
-`SurfaceTexture.getDataSpace()`, `GL_OES_EGL_image_external_essl3`,
-`GL_EXT_YUV_target`, and a dataspace compatible with the frame's BT.2020/PQ
-or BT.2020/HLG metadata. An unsupported result remains rejected so the
-application can select direct-Surface or software fallback without mapping the
-hardware frame. `hdrExternalOesSamplingEnabled` is an explicit trust override;
-set `autoDetectHdrExternalOesSampling` false as well to force-disable this
-path. `statistics()` reports the probe status and last dataspace in addition
-to codec decisions, latches, GL texture attach/detach/update counts, redraws,
-pending depth, timestamps, and the zero CPU-map/transfer/staging/upload
-counters.
+The raw hardware contract requires `GL_OES_EGL_image_external_essl3`,
+`GL_EXT_YUV_target`, AHardwareBuffer EGLImage import, and Android native-fence
+sync. An unsupported result remains rejected so the application can select
+direct-Surface or software fallback without mapping the hardware frame. The
+old SurfaceTexture HDR trust switches remain source-compatible fields but are
+ignored. `statistics()` reports raw imports, AHardwareBuffer format,
+acquire/release fences, fallback synchronization, redraws, pending depth,
+timestamps, and the zero CPU-map/transfer/staging/upload counters.
 
 Multiple `VideoRenderAPI` instances can be associated with one player by using
 an application-owned opaque key:
@@ -819,6 +858,13 @@ delivery; returning `false` keeps the presentation-worker path. Use
 `playbackStatistics()` to distinguish decoded/delivered frames, bounded queue
 overflow drops, late drops, the video-queue high-water mark, and presentation
 queue starvation count/maximum duration.
+
+`OpenGLPresentCallback` runs synchronously inside
+`OpenGLVideoRenderer::render()` on the graphics-owner thread, after libplacebo
+submits the framebuffer and before
+`OpenGLHardwareFrameInterop::releaseFrame()`. It must perform only the
+platform's bounded presentation operation and must not transfer ownership of
+the current context to another thread.
 
 An accepted seek while playing changes the media status to `Buffering` and
 holds `position()` at the requested position until output really resumes. A
@@ -866,17 +912,33 @@ memory with rendering.
 ### Vulkan renderer and Android surface adapter
 
 Link `QtAV::RenderVulkan` and construct the engine with an
-application-selected physical device, logical device, graphics queue, and
-queue-family index. The application supplies the current image/view, extent,
-format, `VkColorSpaceKHR`, wait/signal semaphores, final layout, and surface
-generation through `VulkanCurrentTargetCallback`. These Vulkan objects remain
-borrowed and must survive the submission fence. Supported targets are
+application-selected Vulkan instance, physical device, logical device,
+graphics queue, and queue-family index. Vulkan 1.2 timeline semaphores and
+host query reset must be enabled when the borrowed logical device is created
+and declared in `BorrowedVulkanDevice`. The application supplies the current
+image/view, extent, format, `VkColorSpaceKHR`, wait/signal semaphores, final
+layout, and surface generation through `VulkanCurrentTargetCallback`. These
+Vulkan objects remain borrowed and must survive the submission fence.
+Supported targets are
 RGBA8/BGRA8 with sRGB/BT.709 nonlinear output, 10-bit packed RGB with
 HDR10/PQ or HDR10/HLG output, and RGBA16F with extended-sRGB-linear or
 BT.2020-linear output. PQ/HLG sources preserve BT.2020 and native HDR
 luminance on HDR targets; SDR targets retain the documented BT.709/sRGB tone
 mapping. Linear HDR targets use `1.0` as the renderer's 100-nit reference
 white and preserve brighter values above `1.0`.
+
+Software frames are mapped with libplacebo's FFmpeg bridge. When FFmpeg has
+parsed a Dolby Vision RPU into `AV_FRAME_DATA_DOVI_METADATA`, libplacebo maps
+the metadata, applies base-layer reshaping, and tone maps to the selected
+target. The repository FFmpeg overlay makes the HEVC MediaCodec wrapper run
+FFmpeg's own RPU parser before submitting each access unit, correlates the
+result with the reordered hardware output timestamp, and attaches the same
+frame side data used by the software decoder. MediaCodec frames then enter the
+same libplacebo DOVI path after zero-copy external-image normalization. This
+does not require libdovi: the optional raw-RPU parser remains disabled. RPUs
+that require a residual enhancement layer are rejected by this
+base-layer-only path; compressed passthrough, Dolby certification, and
+licensing are outside QtAVCore's scope.
 
 The renderer can also accept an optional `VulkanHardwareFrameInterop`.
 `prepareFrame()` starts or polls asynchronous producer release before a
@@ -897,7 +959,15 @@ auto renderer =
     std::make_shared<qtav::AndroidVulkanVideoRenderer>(
         qtav::BorrowedAndroidVulkanContext {
             instance,
-            { physicalDevice, device, queue, queueFamilyIndex },
+            {
+                instance,
+                physicalDevice,
+                device,
+                queue,
+                queueFamilyIndex,
+                true, // timelineSemaphoreEnabled
+                true, // hostQueryResetEnabled
+            },
             hdrMetadataExtensionWasEnabled,
         },
         qtav::VulkanOutputPreference::PreferHdr);
@@ -979,16 +1049,17 @@ generation, and `OpenGLOutputColorSpace`; framebuffer zero is the default
 framebuffer. The context must be current for `open()`, `render()`, and
 `close()`. The engine accepts
 YUV420/422/444, NV12/NV21, little-endian P010, RGB/BGR,
-RGBA/BGRA/ARGB, and Gray8 software frames. It applies structured
-range/matrix/transfer/primaries metadata, Fit/Fill/Stretch, custom viewports,
-and all right-angle rotations. For `SdrSrgb`, it queries the bound framebuffer
-attachment's color encoding: an sRGB attachment receives linear BT.709 and
-performs the fixed-function sRGB conversion exactly once, while a linear or
-UNORM attachment receives explicitly sRGB-encoded shader output. This keeps
-Android's sRGB EGL window and application-owned linear FBOs visually
-consistent, including PQ/HLG tone mapping to SDR. BT.2020 `HDR10PQ` and
-`HDR10HLG` targets preserve HDR luminance and convert primaries/transfer
-explicitly. Hardware-frame interop remains separate work.
+RGBA/BGRA/ARGB, and Gray8 software frames. It maps their FFmpeg storage and
+structured range/matrix/transfer/primaries metadata into libplacebo, which
+owns color conversion, scaling, Dolby Vision reshaping, tone mapping, gamut
+mapping, and final output encoding. The renderer supplies Fit/Fill/Stretch,
+custom viewports, and right-angle rotations through libplacebo frame geometry.
+For `SdrSrgb`, it queries the bound framebuffer attachment's color encoding so
+fixed-function sRGB conversion occurs exactly once. BT.2020 `HDR10PQ` and
+`HDR10HLG` targets preserve HDR through libplacebo's corresponding output
+color contract. Android hardware interop supplies an RGBA16F raw-YCbCr
+normalization texture to this same pipeline; it does not run a competing color
+shader.
 
 ### Mobile renderer selector
 
@@ -1027,7 +1098,7 @@ selector->setHardwareFrameFallbackCallback(
             return qtav::MobileHardwareFrameFallbackDecision {
                 qtav::MobileHardwareFrameFallbackRoute::
                     OpenGLESInterop,
-                "MediaCodec rebound to the SurfaceTexture producer",
+                "MediaCodec rebound to the OpenGL AImageReader producer",
             };
         }
         return qtav::MobileHardwareFrameFallbackDecision {
@@ -1342,7 +1413,9 @@ map.
 matrix, and chroma location. `masteringDisplayMetadata()` and
 `contentLightMetadata()` return copied HDR10 static metadata, so their values
 remain valid with any copied frame after decoder progress or player shutdown.
-The existing `colorSpace()` string remains available for diagnostics.
+`hasDolbyVisionMetadata()` reports whether FFmpeg attached parsed RPU metadata
+without exposing FFmpeg structures. The existing `colorSpace()` string remains
+available for diagnostics.
 
 ## Backend contracts
 
@@ -1503,6 +1576,17 @@ Vulkan, samples aligned native allocations using their visible crop, and
 returns one release sync fd per import. The device result requires bounded
 pending images and zero decoded-source CPU map, software transfer, staging
 copy, and renderer upload counters.
+The same path decodes the checksum-pinned FFmpeg FATE profile 8.4 sample with
+MediaCodec: all 100 decoded frames retain FFmpeg-parsed RPU metadata, 97 are
+rendered through libplacebo from raw external-format Y/Cb/Cr, and all 97
+imports return release fences with zero CPU map/transfer/staging/upload.
+Independent OpenGL ES phases import 99 H.264 and 180 HEVC
+AHardwareBuffer/EGLImages through the raw-YCbCr path, return a release fence
+for every imported image, survive seek plus EGL surface recreation, and retain
+the same zero-copy counters. A forced Vulkan failure rebinds MediaCodec to a
+new OpenGL AImageReader and presents another 180 raw frames without retrying
+the retired Vulkan image. Manual Profile 5 validation is recorded in
+[`DECISIONS.md`](DECISIONS.md).
 Windows D3D11 tests use the WARP device for deterministic offscreen rendering
 and cover RGB, YUV420P, NV12, and synthetic P010 PQ/HLG input; SDR tone
 mapping; FP16 scRGB and RGB10/PQ numeric output; viewport, aspect ratio,
@@ -1526,7 +1610,10 @@ zero CPU mapping, and pixel readback. WASAPI device and strict native H.264/AAC
 example tests pass with an active render endpoint and are explicitly skipped
 when a Windows session exposes no endpoint.
 
-## Architecture
+## Architecture summary
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the complete ownership, threading,
+libplacebo color-pipeline, Android zero-copy, HDR, and packaging boundaries.
 
 ```text
 Player facade

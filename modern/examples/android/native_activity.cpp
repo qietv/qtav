@@ -46,6 +46,8 @@ constexpr const char* MediaCodecH264AssetName =
     "qtav-mediacodec-h264.mp4";
 constexpr const char* MediaCodecHevcAssetName =
     "qtav-mediacodec-hevc.mp4";
+constexpr const char* MediaCodecDoviAssetName =
+    "qtav-mediacodec-dovi.mov";
 
 bool hasExtension(
     const std::vector<VkExtensionProperties>& extensions,
@@ -195,7 +197,7 @@ struct VulkanContext {
         application.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         application.pEngineName = "QtAVCore";
         application.engineVersion = VK_MAKE_VERSION(2, 0, 0);
-        application.apiVersion = VK_API_VERSION_1_1;
+        application.apiVersion = VK_API_VERSION_1_2;
         VkInstanceCreateInfo instanceInfo {
             VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         };
@@ -341,17 +343,27 @@ struct VulkanContext {
         androidHardwareBufferExternalMemoryEnabled = true;
         externalSemaphoreFdEnabled = true;
         foreignQueueFamilyEnabled = true;
-        VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeatures {
+        VkPhysicalDeviceSamplerYcbcrConversionFeatures supportedYcbcrFeatures {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
         };
+        VkPhysicalDeviceVulkan12Features supportedVulkan12Features {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        };
+        supportedVulkan12Features.pNext = &supportedYcbcrFeatures;
         VkPhysicalDeviceFeatures2 deviceFeatures {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         };
-        deviceFeatures.pNext = &ycbcrFeatures;
+        deviceFeatures.pNext = &supportedVulkan12Features;
         vkGetPhysicalDeviceFeatures2(
             physicalDevice,
             &deviceFeatures);
-        if (ycbcrFeatures.samplerYcbcrConversion != VK_TRUE) {
+        if (supportedVulkan12Features.timelineSemaphore != VK_TRUE
+            || supportedVulkan12Features.hostQueryReset != VK_TRUE) {
+            error =
+                "libplacebo requires Vulkan timelineSemaphore and hostQueryReset";
+            return false;
+        }
+        if (supportedYcbcrFeatures.samplerYcbcrConversion != VK_TRUE) {
             error =
                 "The Android Vulkan device does not support sampler YCbCr conversion";
             return false;
@@ -366,12 +378,22 @@ struct VulkanContext {
         VkDeviceCreateInfo deviceInfo {
             VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         };
+        VkPhysicalDeviceSamplerYcbcrConversionFeatures enabledYcbcrFeatures {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+        };
+        enabledYcbcrFeatures.samplerYcbcrConversion = VK_TRUE;
+        VkPhysicalDeviceVulkan12Features enabledVulkan12Features {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        };
+        enabledVulkan12Features.pNext = &enabledYcbcrFeatures;
+        enabledVulkan12Features.timelineSemaphore = VK_TRUE;
+        enabledVulkan12Features.hostQueryReset = VK_TRUE;
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
         deviceInfo.enabledExtensionCount =
             static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
-        deviceInfo.pNext = &ycbcrFeatures;
+        deviceInfo.pNext = &enabledVulkan12Features;
         result = vkCreateDevice(
             physicalDevice,
             &deviceInfo,
@@ -411,10 +433,13 @@ struct VulkanContext {
         return {
             instance,
             {
+                instance,
                 physicalDevice,
                 device,
                 queue,
                 queueFamilyIndex,
+                true,
+                true,
             },
             hdrMetadataEnabled,
         };
@@ -525,6 +550,7 @@ enum class TestPhase {
     WaitingForMediaCodecVulkan,
     MediaCodecVulkanH264,
     MediaCodecVulkanHevc,
+    MediaCodecVulkanDovi,
     MediaCodecFallbackH264,
     MediaCodecOpenGLH264,
     MediaCodecOpenGLHevc,
@@ -606,7 +632,7 @@ struct TestState {
             + " gles_hdr="
             + (openGlHdrOutputPassed.load() ? "pass" : "fail")
             + " offscreen=" + (offscreenPassed.load() ? "pass" : "fail")
-            + " hdr=pq,hlg native_hdr="
+            + " hdr=pq,hlg,dovi native_hdr="
             + (nativeHdrOutputPassed.load() ? "pass" : "fail")
             + " hdr_source="
             + (nativeHdrFramePresented.load() ? "pass" : "fail")
@@ -622,11 +648,16 @@ struct TestState {
             + " mediacodec_surface_recreations="
             + std::to_string(
                 mediaCodecSurfaceRecreations.load())
-            + " mediacodec_vulkan=h264,hevc"
+            + " mediacodec_vulkan=h264,hevc,dovi"
             + " mediacodec_vulkan_frames="
             + std::to_string(
                 mediaCodecVulkanH264Frames.load()
-                + mediaCodecVulkanHevcFrames.load())
+                + mediaCodecVulkanHevcFrames.load()
+                + mediaCodecVulkanDoviFrames.load())
+            + " mediacodec_vulkan_dovi_frames="
+            + std::to_string(mediaCodecVulkanDoviFrames.load())
+            + " dovi_metadata_frames="
+            + std::to_string(mediaCodecVulkanDoviMetadataFrames.load())
             + " mediacodec_vulkan_rendered="
             + std::to_string(
                 mediaCodecVulkanRendered.load())
@@ -655,10 +686,10 @@ struct TestState {
             + " mediacodec_opengl_rendered="
             + std::to_string(
                 mediaCodecOpenGLRendered.load())
-            + " external_oes_images="
+            + " ahardwarebuffer_eglimages="
             + std::to_string(
                 mediaCodecOpenGLImages.load())
-            + " external_oes_redraws="
+            + " ahardwarebuffer_redraws="
             + std::to_string(
                 mediaCodecOpenGLRedraws.load())
             + " mediacodec_opengl_surface_recreations="
@@ -679,8 +710,11 @@ struct TestState {
             copyTestAsset(activity, MediaCodecH264AssetName);
         mediaCodecHevcPath =
             copyTestAsset(activity, MediaCodecHevcAssetName);
+        mediaCodecDoviPath =
+            copyTestAsset(activity, MediaCodecDoviAssetName);
         if (mediaPath.empty() || mediaCodecH264Path.empty()
-            || mediaCodecHevcPath.empty()) {
+            || mediaCodecHevcPath.empty()
+            || mediaCodecDoviPath.empty()) {
             fail("could not copy packaged media assets");
             return;
         }
@@ -806,6 +840,14 @@ struct TestState {
             if (!validateMediaCodecVulkanPhase("hevc")) {
                 return;
             }
+            startMediaCodecVulkanPhase(
+                TestPhase::MediaCodecVulkanDovi);
+            return;
+        }
+        if (currentPhase == TestPhase::MediaCodecVulkanDovi) {
+            if (!validateMediaCodecVulkanPhase("dovi")) {
+                return;
+            }
             startMediaCodecFallbackPhase();
             return;
         }
@@ -835,12 +877,17 @@ struct TestState {
 
     void handleVideoFrame(const qtav::VideoFrame& frame)
     {
-        if (!frame || frame.width() != 160 || frame.height() != 90) {
+        const TestPhase currentPhase = phase.load();
+        const bool doviPhase =
+            currentPhase == TestPhase::MediaCodecVulkanDovi;
+        if (!frame
+            || (doviPhase
+                    ? frame.width() != 1920 || frame.height() != 1080
+                    : frame.width() != 160 || frame.height() != 90)) {
             fail("unexpected video frame");
             return;
         }
 
-        const TestPhase currentPhase = phase.load();
         if (currentPhase == TestPhase::Software) {
             observeAAudio();
             if (!offscreenChecked.exchange(true)) {
@@ -863,7 +910,7 @@ struct TestState {
                 openGlOffscreenPassed = true;
                 player.setState(qtav::State::Paused);
                 logInfo(
-                    "QTAV_ANDROID_TEST: OFFSCREEN_PASS hdr=pq,hlg");
+                    "QTAV_ANDROID_TEST: OFFSCREEN_PASS hdr=pq,hlg,dovi");
                 logInfo(
                     "QTAV_ANDROID_TEST: GLES_OFFSCREEN_PASS "
                     "formats=yuv,nv12,p010,rgb "
@@ -877,6 +924,7 @@ struct TestState {
             && currentPhase != TestPhase::MediaCodecHevc
             && currentPhase != TestPhase::MediaCodecVulkanH264
             && currentPhase != TestPhase::MediaCodecVulkanHevc
+            && currentPhase != TestPhase::MediaCodecVulkanDovi
             && currentPhase != TestPhase::MediaCodecFallbackH264
             && currentPhase != TestPhase::MediaCodecOpenGLH264
             && currentPhase != TestPhase::MediaCodecOpenGLHevc) {
@@ -884,26 +932,36 @@ struct TestState {
         }
 
         if (currentPhase == TestPhase::MediaCodecVulkanH264
-            || currentPhase == TestPhase::MediaCodecVulkanHevc) {
-            std::atomic<int>& phaseFrames =
-                currentPhase
-                    == TestPhase::MediaCodecVulkanH264
-                ? mediaCodecVulkanH264Frames
-                : mediaCodecVulkanHevcFrames;
+            || currentPhase == TestPhase::MediaCodecVulkanHevc
+            || currentPhase == TestPhase::MediaCodecVulkanDovi) {
+            std::atomic<int>* phaseFrames =
+                currentPhase == TestPhase::MediaCodecVulkanH264
+                ? &mediaCodecVulkanH264Frames
+                : currentPhase == TestPhase::MediaCodecVulkanHevc
+                ? &mediaCodecVulkanHevcFrames
+                : &mediaCodecVulkanDoviFrames;
             const int frameNumber =
-                phaseFrames.fetch_add(
+                phaseFrames->fetch_add(
                     1,
                     std::memory_order_acq_rel)
                 + 1;
+            if (currentPhase == TestPhase::MediaCodecVulkanDovi
+                && frame.hasDolbyVisionMetadata()) {
+                ++mediaCodecVulkanDoviMetadataFrames;
+            }
             if (frameNumber == 1) {
                 logInfo(
                     std::string(
                         "QTAV_ANDROID_TEST: "
                         "MEDIACODEC_VULKAN_FIRST_OUTPUT codec=")
-                    + (currentPhase
-                               == TestPhase::MediaCodecVulkanH264
-                           ? "h264"
-                           : "hevc"));
+                    + (currentPhase == TestPhase::MediaCodecVulkanH264
+                            ? "h264"
+                            : currentPhase
+                                    == TestPhase::MediaCodecVulkanHevc
+                            ? "hevc"
+                            : "dovi")
+                    + " dovi_metadata="
+                    + (frame.hasDolbyVisionMetadata() ? "present" : "absent"));
             }
             return;
         }
@@ -1269,7 +1327,16 @@ struct TestState {
                 + rendererError);
             return;
         }
-        mediaCodecVulkanRenderer->setEventCallback({});
+        mediaCodecVulkanErrorLogged = false;
+        mediaCodecVulkanRenderer->setEventCallback(
+            [this](const qtav::VideoRenderEvent& event) {
+                if (event.type != qtav::VideoRenderEventType::RedrawRequested
+                    && !mediaCodecVulkanErrorLogged.exchange(true)) {
+                    logError(
+                        "QTAV_ANDROID_TEST: MEDIACODEC_VULKAN_RENDER_ERROR "
+                        + event.detail);
+                }
+            });
 
         qtav::MediaCodecHardwareDecodeOptions options;
         options.allowSoftwareFallback = false;
@@ -1291,8 +1358,15 @@ struct TestState {
         phase = targetPhase;
         const bool h264 =
             targetPhase == TestPhase::MediaCodecVulkanH264;
-        const std::string& path =
-            h264 ? mediaCodecH264Path : mediaCodecHevcPath;
+        const bool dovi =
+            targetPhase == TestPhase::MediaCodecVulkanDovi;
+        const char* codec = h264 ? "h264" : dovi ? "dovi" : "hevc";
+        const std::string& path = h264
+            ? mediaCodecH264Path
+            : dovi ? mediaCodecDoviPath : mediaCodecHevcPath;
+        player.setPlaybackRate(dovi ? 0.25F : 1.0F);
+        mediaCodecVulkanRenderedAtPhaseStart =
+            mediaCodecVulkanRendered.load();
         player
             .setVideoRenderAPI(mediaCodecVulkanRenderer)
             .setRenderCallback([this](void*) {
@@ -1306,7 +1380,7 @@ struct TestState {
             std::string(
                 "QTAV_ANDROID_TEST: "
                 "MEDIACODEC_VULKAN_PHASE_READY codec=")
-            + (h264 ? "h264" : "hevc")
+            + codec
             + " generation="
             + std::to_string(surface.generation())
             + " max_images=5 zero_cpu_copy=required");
@@ -1326,11 +1400,15 @@ struct TestState {
         }
         const qtav::MediaCodecVulkanInteropStatistics statistics =
             mediaCodecVulkanInterop->statistics();
-        const int decoded =
-            std::strcmp(codec, "h264") == 0
+        const bool dovi = std::strcmp(codec, "dovi") == 0;
+        const int decoded = std::strcmp(codec, "h264") == 0
             ? mediaCodecVulkanH264Frames.load()
-            : mediaCodecVulkanHevcFrames.load();
+            : dovi ? mediaCodecVulkanDoviFrames.load()
+                   : mediaCodecVulkanHevcFrames.load();
+        const int rendered = mediaCodecVulkanRendered.load()
+            - mediaCodecVulkanRenderedAtPhaseStart.load();
         if (decoded < 60
+            || rendered < 60
             || statistics.imagesImported < 60
             || statistics.releaseFencesReturned
                 != statistics.imagesImported
@@ -1341,17 +1419,20 @@ struct TestState {
             || statistics.stagingCopies != 0
             || statistics.rendererUploads != 0
             || statistics.lastHardwareBufferFormat == 0
+            || (statistics.lastExternalFormat != 0
+                && statistics.unconvertedYcbcrImports == 0)
             || (statistics.lastVulkanFormat
                     == VK_FORMAT_UNDEFINED
-                && statistics.lastExternalFormat == 0)) {
+                && statistics.lastExternalFormat == 0)
+            || (dovi
+                && mediaCodecVulkanDoviMetadataFrames.load() < 60)) {
             fail(
                 std::string(
                     "MediaCodec Vulkan zero-CPU-copy validation failed for ")
                 + codec
                 + " decoded=" + std::to_string(decoded)
                 + " rendered="
-                + std::to_string(
-                    mediaCodecVulkanRendered.load())
+                + std::to_string(rendered)
                 + " queued="
                 + std::to_string(
                     statistics.codecOutputsQueued)
@@ -1372,6 +1453,9 @@ struct TestState {
                 + " max_pending="
                 + std::to_string(
                     statistics.maximumPendingImages)
+                + " raw_ycbcr_imports="
+                + std::to_string(
+                    statistics.unconvertedYcbcrImports)
                 + " interop_error="
                 + mediaCodecVulkanInterop->lastError());
             return false;
@@ -1390,6 +1474,12 @@ struct TestState {
                 "MEDIACODEC_VULKAN_PASS codec=")
             + codec
             + " decoded=" + std::to_string(decoded)
+            + " rendered=" + std::to_string(rendered)
+            + " dovi_metadata="
+            + std::to_string(
+                dovi
+                    ? mediaCodecVulkanDoviMetadataFrames.load()
+                    : 0)
             + " queued="
             + std::to_string(
                 statistics.codecOutputsQueued)
@@ -1413,6 +1503,9 @@ struct TestState {
             + " external_format="
             + std::to_string(
                 statistics.lastExternalFormat)
+            + " raw_ycbcr_imports="
+            + std::to_string(
+                statistics.unconvertedYcbcrImports)
             + " max_pending="
             + std::to_string(
                 statistics.maximumPendingImages)
@@ -1504,6 +1597,7 @@ struct TestState {
 
     void startMediaCodecFallbackPhase()
     {
+        player.setPlaybackRate(1.0F);
         player
             .setVideoRenderAPI({})
             .setRenderCallback({})
@@ -1601,7 +1695,7 @@ struct TestState {
                                 qtav::
                                     MobileHardwareFrameFallbackRoute::
                                         NoVideo,
-                                "compatible SurfaceTexture interop "
+                                "compatible AImageReader/EGLImage interop "
                                 "was unavailable",
                             };
                     }
@@ -1627,7 +1721,7 @@ struct TestState {
                                     MobileHardwareFrameFallbackRoute::
                                         NoVideo,
                                 "could not bind MediaCodec to the "
-                                "replacement SurfaceTexture",
+                                "replacement AImageReader",
                             };
                     }
                     player.setHardwareDecodeConfig(config);
@@ -1646,8 +1740,8 @@ struct TestState {
                             qtav::
                                 MobileHardwareFrameFallbackRoute::
                                     OpenGLESInterop,
-                            "MediaCodec rebound to the detached "
-                            "SurfaceTexture producer",
+                            "MediaCodec rebound to the private "
+                            "AImageReader/AHardwareBuffer producer",
                         };
                 });
         mediaCodecFallbackSelector->setEventCallback(
@@ -1766,6 +1860,12 @@ struct TestState {
             || vulkanStatistics.releaseFenceFallbacks != 0
             || openGLStatistics.imagesLatched < 60
             || openGLStatistics.maximumPendingFrames > 4
+            || openGLStatistics.rawYcbcrImports < 60
+            || openGLStatistics.textureAttachments
+                != openGLStatistics.textureDetaches
+            || openGLStatistics.releaseFencesReturned
+                    + openGLStatistics.releaseFenceFallbacks
+                != openGLStatistics.textureAttachments
             || vulkanStatistics.cpuMapCalls != 0
             || vulkanStatistics.softwareTransferCalls != 0
             || vulkanStatistics.stagingCopies != 0
@@ -1816,8 +1916,10 @@ struct TestState {
             + " release_fences="
             + std::to_string(
                 vulkanStatistics.releaseFencesReturned)
-            + " external_oes_images="
-            + std::to_string(openGLStatistics.imagesLatched)
+            + " eglimage_raw_ycbcr="
+            + std::to_string(openGLStatistics.rawYcbcrImports)
+            + " gl_release_fences="
+            + std::to_string(openGLStatistics.releaseFencesReturned)
             + " cpu_map=0 transfer=0 staging=0 upload=0");
         return true;
     }
@@ -1934,7 +2036,7 @@ struct TestState {
             || decodeConfig.surfaceGeneration
                 != surface.generation()) {
             fail(
-                "could not bind MediaCodec to the SurfaceTexture producer");
+                "could not bind MediaCodec to the AImageReader producer");
             return;
         }
 
@@ -1959,8 +2061,8 @@ struct TestState {
             + (h264 ? "h264" : "hevc")
             + " generation="
             + std::to_string(surface.generation())
-            + " producer=surfacetexture"
-            + " texture=external_oes"
+            + " producer=aimagereader"
+            + " texture=ahardwarebuffer_eglimage_raw_ycbcr"
             + " max_pending=4 zero_cpu_copy=required");
         player.setState(qtav::State::Playing);
     }
@@ -1984,10 +2086,16 @@ struct TestState {
             : mediaCodecOpenGLHevcFrames.load();
         if (decoded < 60
             || statistics.imagesLatched < 60
-            || statistics.textureAttachments != 1
-            || statistics.textureDetaches != 1
+            || statistics.textureAttachments < 60
+            || statistics.textureDetaches
+                != statistics.textureAttachments
             || statistics.textureUpdates
-                < statistics.imagesLatched
+                != statistics.textureAttachments
+            || statistics.rawYcbcrImports
+                != statistics.textureAttachments
+            || statistics.releaseFencesReturned
+                    + statistics.releaseFenceFallbacks
+                != statistics.textureAttachments
             || statistics.redrawSignals == 0
             || statistics.maximumPendingFrames > 4
             || statistics.lastTimestampNanoseconds <= 0
@@ -2072,8 +2180,18 @@ struct TestState {
                 statistics.maximumPendingFrames)
             + " timestamp_ns="
             + std::to_string(
-                statistics.lastTimestampNanoseconds)
-            + " texture=external_oes"
+                    statistics.lastTimestampNanoseconds)
+            + " acquire_fences="
+            + std::to_string(statistics.acquireFencesWaited)
+            + " release_fences="
+            + std::to_string(statistics.releaseFencesReturned)
+            + " release_fallbacks="
+            + std::to_string(statistics.releaseFenceFallbacks)
+            + " raw_ycbcr="
+            + std::to_string(statistics.rawYcbcrImports)
+            + " ahb_format="
+            + std::to_string(statistics.lastHardwareBufferFormat)
+            + " texture=ahardwarebuffer_eglimage_raw_ycbcr"
             + " cpu_map=0 transfer=0 staging=0 upload=0");
         return true;
     }
@@ -2171,7 +2289,9 @@ struct TestState {
             if (currentPhase
                     == TestPhase::MediaCodecVulkanH264
                 || currentPhase
-                    == TestPhase::MediaCodecVulkanHevc) {
+                    == TestPhase::MediaCodecVulkanHevc
+                || currentPhase
+                    == TestPhase::MediaCodecVulkanDovi) {
                 if (!mediaCodecVulkanRenderer
                     || !mediaCodecVulkanRenderer->setWindow(
                         window)) {
@@ -2347,7 +2467,9 @@ struct TestState {
         } else if (
             currentPhase == TestPhase::MediaCodecVulkanH264
             || currentPhase
-                == TestPhase::MediaCodecVulkanHevc) {
+                == TestPhase::MediaCodecVulkanHevc
+            || currentPhase
+                == TestPhase::MediaCodecVulkanDovi) {
             if (mediaCodecVulkanRenderer) {
                 mediaCodecVulkanRenderer->setWindow(nullptr);
             }
@@ -2393,7 +2515,9 @@ struct TestState {
         } else if (
             currentPhase == TestPhase::MediaCodecVulkanH264
             || currentPhase
-                == TestPhase::MediaCodecVulkanHevc) {
+                == TestPhase::MediaCodecVulkanHevc
+            || currentPhase
+                == TestPhase::MediaCodecVulkanDovi) {
             logInfo(
                 "QTAV_ANDROID_TEST: "
                 "MEDIACODEC_VULKAN_SURFACE_REMOVED");
@@ -2714,6 +2838,7 @@ struct TestState {
     std::string mediaPath;
     std::string mediaCodecH264Path;
     std::string mediaCodecHevcPath;
+    std::string mediaCodecDoviPath;
     std::shared_ptr<qtav::AAudioAudioSink> aaudioSink;
     std::shared_ptr<qtav::SwresampleAudioConverter>
         audioConverter;
@@ -2734,7 +2859,11 @@ struct TestState {
         mediaCodecVulkanRenderer;
     std::atomic<int> mediaCodecVulkanH264Frames { 0 };
     std::atomic<int> mediaCodecVulkanHevcFrames { 0 };
+    std::atomic<int> mediaCodecVulkanDoviFrames { 0 };
+    std::atomic<int> mediaCodecVulkanDoviMetadataFrames { 0 };
     std::atomic<int> mediaCodecVulkanRendered { 0 };
+    std::atomic<int> mediaCodecVulkanRenderedAtPhaseStart { 0 };
+    std::atomic<bool> mediaCodecVulkanErrorLogged { false };
     std::atomic<int> mediaCodecVulkanImports { 0 };
     std::atomic<int> mediaCodecVulkanAcquireFences { 0 };
     std::atomic<int> mediaCodecVulkanReleaseFences { 0 };

@@ -23,10 +23,15 @@ enum class VulkanOutputPreference {
 };
 
 struct QTAV_RENDER_VULKAN_EXPORT BorrowedVulkanDevice {
+    VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queueFamilyIndex = 0;
+    // libplacebo 7 requires these Vulkan 1.2 features to have been enabled
+    // when the borrowed logical device was created.
+    bool timelineSemaphoreEnabled = false;
+    bool hostQueryResetEnabled = false;
 
     bool isValid() const noexcept;
 };
@@ -37,8 +42,8 @@ struct QTAV_RENDER_VULKAN_EXPORT VulkanRenderTarget {
     VkImage image = VK_NULL_HANDLE;
     VkImageView imageView = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
-    // Defines the encoding written by the fragment shader, not just display
-    // metadata. The format/color-space pair must be supported by the renderer.
+    // Defines the encoding written by libplacebo, not just display metadata.
+    // The format/color-space pair must be supported by the renderer.
     VkColorSpaceKHR colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkExtent2D extent {};
     VkImageLayout finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -98,6 +103,13 @@ public:
     virtual VkImage image() const noexcept = 0;
     virtual VkImageView imageView() const noexcept = 0;
     virtual VkSampler sampler() const noexcept = 0;
+    // Optional view/sampler pair which exposes undecoded Y, Cb, and Cr in
+    // RGB component order. Android external formats use this for Dolby
+    // Vision RPU reshaping before libplacebo performs any color conversion.
+    virtual VkImageView unconvertedImageView() const noexcept;
+    virtual VkSampler unconvertedSampler() const noexcept;
+    virtual VkFormat format() const noexcept;
+    virtual VkImageUsageFlags usage() const noexcept;
     virtual VkSemaphore acquireSemaphore() const noexcept = 0;
     virtual VkSemaphore releaseSemaphore() const noexcept = 0;
     virtual VkImageLayout initialLayout() const noexcept;
@@ -107,6 +119,10 @@ public:
     // The decoded image can occupy a cropped region of a larger native
     // allocation. Coordinates are normalized against that allocation.
     virtual VulkanNormalizedSourceRect normalizedSourceRect() const noexcept;
+
+    // Queue the imported producer fence on the borrowed graphics queue. The
+    // next libplacebo submission is then ordered after decoder completion.
+    virtual bool waitForProducer(std::string& detail) noexcept;
 
     // Called immediately after a successful queue submission. Android
     // implementations export the signalled release semaphore as a sync fd and

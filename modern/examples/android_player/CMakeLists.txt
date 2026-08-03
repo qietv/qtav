@@ -7,16 +7,6 @@ if(NOT ANDROID)
         "The QtAVCore Android player requires the Android NDK toolchain")
 endif()
 
-foreach(openssl_library IN ITEMS
-        QTAV_ANDROID_OPENSSL_SSL_LIBRARY
-        QTAV_ANDROID_OPENSSL_CRYPTO_LIBRARY)
-    if(NOT IS_ABSOLUTE "${${openssl_library}}"
-            OR NOT EXISTS "${${openssl_library}}")
-        message(FATAL_ERROR
-            "${openssl_library} must name the cross-built Android archive")
-    endif()
-endforeach()
-
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/../../cmake")
 find_package(FFmpeg REQUIRED COMPONENTS avformat avcodec avutil)
 
@@ -90,7 +80,5 @@ target_link_libraries(
         log
         mediandk
         vulkan
-        "${QTAV_ANDROID_OPENSSL_SSL_LIBRARY}"
-        "${QTAV_ANDROID_OPENSSL_CRYPTO_LIBRARY}"
         dl
 )

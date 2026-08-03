@@ -28,6 +28,10 @@ struct QTAV_CORE_EXPORT FrameFactory {
         HardwareFrame frame,
         std::int64_t timestampMs = 0,
         std::int64_t durationMs = 0);
+    // Internal backend bridge. The returned reference is owned by frame and
+    // remains valid only while a copy of frame remains alive.
+    static const AVFrame* nativeVideoFrame(
+        const VideoFrame& frame) noexcept;
 };
 
 } // namespace qtav::detail

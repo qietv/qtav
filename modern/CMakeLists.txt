@@ -4,7 +4,7 @@ project(
     QtAVCore
     VERSION 2.0.0
     DESCRIPTION "A modern, Qt-free media playback core based on FFmpeg"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 if(NOT WIN32
@@ -54,6 +54,7 @@ if(QTAV_CORE_INSTALL)
 
     set(QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS avformat avcodec avutil)
     set(QTAV_CORE_PACKAGE_NEEDS_VULKAN FALSE)
+    set(QTAV_CORE_PACKAGE_NEEDS_LIBPLACEBO FALSE)
     if(TARGET qtav_render_cpu)
         list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS swscale)
     endif()
@@ -62,6 +63,9 @@ if(QTAV_CORE_INSTALL)
     endif()
     if(TARGET qtav_render_vulkan)
         set(QTAV_CORE_PACKAGE_NEEDS_VULKAN TRUE)
+    endif()
+    if(TARGET qtav_render_vulkan OR TARGET qtav_render_opengl)
+        set(QTAV_CORE_PACKAGE_NEEDS_LIBPLACEBO TRUE)
     endif()
 
     install(

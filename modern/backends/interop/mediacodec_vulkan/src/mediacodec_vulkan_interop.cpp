@@ -110,6 +110,7 @@ struct AtomicStatistics {
     std::atomic<std::uint64_t> hardwareBufferImportCacheHits { 0 };
     std::atomic<std::uint64_t> hardwareBufferImportsRemoved { 0 };
     std::atomic<std::uint64_t> maximumCachedHardwareBufferImports { 0 };
+    std::atomic<std::uint64_t> unconvertedYcbcrImports { 0 };
     std::atomic<std::uint32_t> lastHardwareBufferFormat { 0 };
     std::atomic<int> lastVulkanFormat {
         static_cast<int>(VK_FORMAT_UNDEFINED)
@@ -373,6 +374,7 @@ bool supportedChromaOffset(
 std::shared_ptr<ConversionResources> conversionResources(
     const std::shared_ptr<SharedState>& state,
     const VkAndroidHardwareBufferFormatPropertiesANDROID& properties,
+    bool preserveYcbcr,
     std::string& error)
 {
     if ((properties.formatFeatures
@@ -402,9 +404,39 @@ std::shared_ptr<ConversionResources> conversionResources(
     ConversionKey key;
     key.format = properties.format;
     key.externalFormat = properties.externalFormat;
-    key.model = properties.suggestedYcbcrModel;
-    key.range = properties.suggestedYcbcrRange;
-    key.components = properties.samplerYcbcrConversionComponents;
+    key.model = preserveYcbcr
+        ? VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY
+        : properties.suggestedYcbcrModel;
+    key.range = preserveYcbcr
+        ? VK_SAMPLER_YCBCR_RANGE_ITU_FULL
+        : properties.suggestedYcbcrRange;
+    if (preserveYcbcr) {
+        const auto explicitSwizzle = [](
+            VkComponentSwizzle swizzle,
+            VkComponentSwizzle identity) {
+            return swizzle == VK_COMPONENT_SWIZZLE_IDENTITY
+                ? identity
+                : swizzle;
+        };
+        // A Vulkan YCbCr model consumes (Cr, Y, Cb) as (R, G, B).
+        // Reorder the Android suggested pre-conversion swizzle so the
+        // identity model exposes (Y, Cb, Cr) to libplacebo.
+        key.components.r = explicitSwizzle(
+            properties.samplerYcbcrConversionComponents.g,
+            VK_COMPONENT_SWIZZLE_G);
+        key.components.g = explicitSwizzle(
+            properties.samplerYcbcrConversionComponents.b,
+            VK_COMPONENT_SWIZZLE_B);
+        key.components.b = explicitSwizzle(
+            properties.samplerYcbcrConversionComponents.r,
+            VK_COMPONENT_SWIZZLE_R);
+        key.components.a = explicitSwizzle(
+            properties.samplerYcbcrConversionComponents.a,
+            VK_COMPONENT_SWIZZLE_A);
+    } else {
+        key.components =
+            properties.samplerYcbcrConversionComponents;
+    }
     key.xOffset = properties.suggestedXChromaOffset;
     key.yOffset = properties.suggestedYChromaOffset;
     key.filter =
@@ -446,10 +478,9 @@ std::shared_ptr<ConversionResources> conversionResources(
         ? &externalFormat
         : nullptr;
     conversionInfo.format = properties.format;
-    conversionInfo.ycbcrModel = properties.suggestedYcbcrModel;
-    conversionInfo.ycbcrRange = properties.suggestedYcbcrRange;
-    conversionInfo.components =
-        properties.samplerYcbcrConversionComponents;
+    conversionInfo.ycbcrModel = key.model;
+    conversionInfo.ycbcrRange = key.range;
+    conversionInfo.components = key.components;
     conversionInfo.xChromaOffset =
         properties.suggestedXChromaOffset;
     conversionInfo.yChromaOffset =
@@ -517,6 +548,9 @@ struct HardwareBufferResources {
 
     ~HardwareBufferResources()
     {
+        if (unconvertedImageView) {
+            vkDestroyImageView(device, unconvertedImageView, nullptr);
+        }
         if (imageView) {
             vkDestroyImageView(device, imageView, nullptr);
         }
@@ -556,10 +590,17 @@ struct HardwareBufferResources {
         conversion = conversionResources(
             state,
             formatProperties,
+            false,
             error);
         if (!conversion) {
             return false;
         }
+        std::string unconvertedError;
+        unconvertedConversion = conversionResources(
+            state,
+            formatProperties,
+            true,
+            unconvertedError);
 
         VkExternalFormatANDROID externalFormatInfo {
             VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID,
@@ -668,8 +709,12 @@ struct HardwareBufferResources {
         viewInfo.image = image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = formatProperties.format;
-        viewInfo.components =
-            formatProperties.samplerYcbcrConversionComponents;
+        viewInfo.components = {
+            VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY,
+        };
         viewInfo.subresourceRange.aspectMask =
             VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.levelCount = 1;
@@ -685,6 +730,27 @@ struct HardwareBufferResources {
                 result);
             return false;
         }
+        if (unconvertedConversion) {
+            VkSamplerYcbcrConversionInfo unconvertedViewConversion {
+                VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+            };
+            unconvertedViewConversion.conversion =
+                unconvertedConversion->conversion;
+            viewInfo.pNext = &unconvertedViewConversion;
+            result = vkCreateImageView(
+                state->device.device,
+                &viewInfo,
+                nullptr,
+                &unconvertedImageView);
+            if (result != VK_SUCCESS) {
+                unconvertedImageView = VK_NULL_HANDLE;
+                unconvertedConversion.reset();
+            } else {
+                state->statistics.unconvertedYcbcrImports.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
+        }
 
         hardwareBufferFormat = description.format;
         vulkanFormat = formatProperties.format;
@@ -697,7 +763,9 @@ struct HardwareBufferResources {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView imageView = VK_NULL_HANDLE;
+    VkImageView unconvertedImageView = VK_NULL_HANDLE;
     std::shared_ptr<ConversionResources> conversion;
+    std::shared_ptr<ConversionResources> unconvertedConversion;
     std::atomic<bool> returnedToProducer { false };
     std::uint32_t hardwareBufferFormat = 0;
     VkFormat vulkanFormat = VK_FORMAT_UNDEFINED;
@@ -780,7 +848,13 @@ public:
             // Import may have succeeded before a later render-target or
             // pipeline failure. Consume the producer fence on the Vulkan
             // queue before returning the image in this exceptional path.
-            if (imageObject_ && acquireSemaphore_) {
+            if (imageObject_ && acquireSemaphore_
+                && producerWaitQueued_.load(std::memory_order_acquire)) {
+                if (vkQueueWaitIdle(state_->device.queue) == VK_SUCCESS) {
+                    AImage_delete(imageObject_);
+                    imageObject_ = nullptr;
+                }
+            } else if (imageObject_ && acquireSemaphore_) {
                 VkPipelineStageFlags stage =
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
                 VkSubmitInfo submit {
@@ -855,6 +929,32 @@ public:
             : VK_NULL_HANDLE;
     }
 
+    VkImageView unconvertedImageView() const noexcept override
+    {
+        return resources_
+            ? resources_->unconvertedImageView
+            : VK_NULL_HANDLE;
+    }
+
+    VkSampler unconvertedSampler() const noexcept override
+    {
+        return resources_ && resources_->unconvertedConversion
+            ? resources_->unconvertedConversion->sampler
+            : VK_NULL_HANDLE;
+    }
+
+    VkFormat format() const noexcept override
+    {
+        return resources_
+            ? resources_->vulkanFormat
+            : VK_FORMAT_UNDEFINED;
+    }
+
+    VkImageUsageFlags usage() const noexcept override
+    {
+        return VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+
     VkSemaphore acquireSemaphore() const noexcept override
     {
         return acquireSemaphore_;
@@ -876,6 +976,35 @@ public:
         return normalizedSourceRect_;
     }
 
+    bool waitForProducer(std::string& detail) noexcept override
+    {
+        if (!acquireSemaphore_
+            || producerWaitQueued_.load(std::memory_order_acquire)) {
+            return true;
+        }
+        const VkPipelineStageFlags stage =
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo submit {
+            VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        };
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &acquireSemaphore_;
+        submit.pWaitDstStageMask = &stage;
+        const VkResult result = vkQueueSubmit(
+            state_->device.queue,
+            1,
+            &submit,
+            VK_NULL_HANDLE);
+        if (result != VK_SUCCESS) {
+            detail = resultError(
+                "vkQueueSubmit(AImage acquire fence)",
+                result);
+            return false;
+        }
+        producerWaitQueued_.store(true, std::memory_order_release);
+        return true;
+    }
+
     void releaseToProducer() noexcept override
     {
         if (!imageObject_ || releaseAttempted_.exchange(true)) {
@@ -888,6 +1017,28 @@ public:
         resources_->returnedToProducer.store(
             true,
             std::memory_order_release);
+        // libplacebo has already queued sampling and foreign-queue ownership
+        // release. Append an empty signal submission on the same graphics
+        // queue so the exported sync fd covers all preceding work.
+        VkSubmitInfo submit {
+            VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        };
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &releaseSemaphore_;
+        if (vkQueueSubmit(
+                state_->device.queue,
+                1,
+                &submit,
+                VK_NULL_HANDLE)
+            != VK_SUCCESS) {
+            state_->statistics.releaseFenceFallbacks.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            vkQueueWaitIdle(state_->device.queue);
+            AImage_delete(imageObject_);
+            imageObject_ = nullptr;
+            return;
+        }
         VkSemaphoreGetFdInfoKHR descriptorInfo {
             VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
         };
@@ -910,6 +1061,9 @@ public:
             state_->statistics.releaseFenceFallbacks.fetch_add(
                 1,
                 std::memory_order_relaxed);
+            vkQueueWaitIdle(state_->device.queue);
+            AImage_delete(imageObject_);
+            imageObject_ = nullptr;
         }
     }
 
@@ -1093,6 +1247,7 @@ private:
     VkSemaphore acquireSemaphore_ = VK_NULL_HANDLE;
     VkSemaphore releaseSemaphore_ = VK_NULL_HANDLE;
     std::shared_ptr<HardwareBufferResources> resources_;
+    std::atomic<bool> producerWaitQueued_ { false };
     std::atomic<bool> releaseAttempted_ { false };
 };
 
@@ -1645,7 +1800,15 @@ MediaCodecVulkanInterop::prepareFrame(
         detail = "The MediaCodec Vulkan interop object is empty";
         return VulkanHardwareImportStatus::Error;
     }
-    return impl_->prepareFrame(frame, detail);
+    auto status = impl_->prepareFrame(frame, detail);
+    if (status == VulkanHardwareImportStatus::Pending) {
+        // Keep the association with this exact decoded output. Retrying only
+        // from the later redraw callback can observe a newer Player frame and
+        // continually outrun the timestamp-correlated PRIVATE AImage.
+        impl_->waitForFrameImage(frame, std::chrono::milliseconds(100));
+        status = impl_->prepareFrame(frame, detail);
+    }
+    return status;
 }
 
 VulkanHardwareImportResult
@@ -1713,6 +1876,9 @@ MediaCodecVulkanInterop::statistics() const noexcept
             std::memory_order_relaxed);
     result.maximumCachedHardwareBufferImports =
         source.maximumCachedHardwareBufferImports.load(
+            std::memory_order_relaxed);
+    result.unconvertedYcbcrImports =
+        source.unconvertedYcbcrImports.load(
             std::memory_order_relaxed);
     result.lastHardwareBufferFormat =
         source.lastHardwareBufferFormat.load(

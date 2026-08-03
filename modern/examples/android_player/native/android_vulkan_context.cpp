@@ -205,7 +205,7 @@ bool AndroidVulkanContext::create(
     applicationInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     applicationInfo.pEngineName = "QtAVCore";
     applicationInfo.engineVersion = VK_MAKE_VERSION(2, 0, 0);
-    applicationInfo.apiVersion = VK_API_VERSION_1_1;
+    applicationInfo.apiVersion = VK_API_VERSION_1_2;
 
     VkInstanceCreateInfo instanceInfo {
         VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -346,9 +346,27 @@ bool AndroidVulkanContext::create(
     std::vector<const char*> enabledDeviceExtensions {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
-    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrFeatures {
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures supportedYcbcrFeatures {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
     };
+    VkPhysicalDeviceVulkan12Features supportedVulkan12Features {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    };
+    supportedVulkan12Features.pNext = requireMediaCodecInterop
+        ? &supportedYcbcrFeatures
+        : nullptr;
+    VkPhysicalDeviceFeatures2 supportedFeatures {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    };
+    supportedFeatures.pNext = &supportedVulkan12Features;
+    vkGetPhysicalDeviceFeatures2(physicalDevice_, &supportedFeatures);
+    if (supportedVulkan12Features.timelineSemaphore != VK_TRUE
+        || supportedVulkan12Features.hostQueryReset != VK_TRUE) {
+        error =
+            "libplacebo requires Vulkan timelineSemaphore and hostQueryReset";
+        reset();
+        return false;
+    }
     if (requireMediaCodecInterop) {
         constexpr std::array<const char*, 3> requiredInteropExtensions {
             VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
@@ -365,12 +383,7 @@ bool AndroidVulkanContext::create(
             enabledDeviceExtensions.push_back(extension);
         }
 
-        VkPhysicalDeviceFeatures2 features {
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        };
-        features.pNext = &ycbcrFeatures;
-        vkGetPhysicalDeviceFeatures2(physicalDevice_, &features);
-        if (ycbcrFeatures.samplerYcbcrConversion != VK_TRUE) {
+        if (supportedYcbcrFeatures.samplerYcbcrConversion != VK_TRUE) {
             error =
                 "MediaCodec Vulkan ZeroCopy requires sampler YCbCr conversion";
             reset();
@@ -400,12 +413,25 @@ bool AndroidVulkanContext::create(
     VkDeviceCreateInfo deviceInfo {
         VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
     };
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures enabledYcbcrFeatures {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+    };
+    enabledYcbcrFeatures.samplerYcbcrConversion =
+        requireMediaCodecInterop ? VK_TRUE : VK_FALSE;
+    VkPhysicalDeviceVulkan12Features enabledVulkan12Features {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    };
+    enabledVulkan12Features.pNext = requireMediaCodecInterop
+        ? &enabledYcbcrFeatures
+        : nullptr;
+    enabledVulkan12Features.timelineSemaphore = VK_TRUE;
+    enabledVulkan12Features.hostQueryReset = VK_TRUE;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.enabledExtensionCount =
         static_cast<std::uint32_t>(enabledDeviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = enabledDeviceExtensions.data();
-    deviceInfo.pNext = requireMediaCodecInterop ? &ycbcrFeatures : nullptr;
+    deviceInfo.pNext = &enabledVulkan12Features;
     result = vkCreateDevice(
         physicalDevice_,
         &deviceInfo,
@@ -431,10 +457,13 @@ AndroidVulkanContext::borrowed() const noexcept
     return {
         instance_,
         {
+            instance_,
             physicalDevice_,
             device_,
             queue_,
             queueFamilyIndex_,
+            true,
+            true,
         },
         hdrMetadataEnabled_,
     };

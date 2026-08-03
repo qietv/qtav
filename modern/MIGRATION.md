@@ -1,5 +1,10 @@
 # QtAV to QtAVCore migration
 
+The current component and ownership model is documented in
+[`ARCHITECTURE.md`](ARCHITECTURE.md); implementation order lives in
+[`PLAN.md`](PLAN.md), and durable decisions live in
+[`DECISIONS.md`](DECISIONS.md).
+
 QtAVCore is an incremental replacement, not a compatibility wrapper. Legacy
 QtAV remains buildable while callers move to the new API one integration at a
 time.
@@ -86,14 +91,17 @@ already own a graphics context or require multiple/custom render targets:
   retained `AHardwareBuffer` external-format import, and acquire/release
   synchronization without mapping or re-uploading decoded pixels;
 - optional Android MediaCodec/OpenGL ES texture interop through
-  `QtAV::InteropMediaCodecOpenGL`, using a detached `SurfaceTexture`,
-  timestamp-correlated `GL_TEXTURE_EXTERNAL_OES` sampling, and no decoded
-  source mapping or upload;
+  `QtAV::InteropMediaCodecOpenGL`, using a private GPU-sampled `AImageReader`,
+  AHardwareBuffer/EGLImage import, raw `GL_EXT_YUV_target` component sampling,
+  native-fence synchronization, and no decoded-source mapping or upload;
 - optional platform-neutral `QtAV::RenderVulkan` software-frame rendering and
   Android `QtAV::RenderVulkanAndroid` surface/swapchain adaptation using
   application-owned Vulkan context objects and NativeActivity lifecycle;
-- optional platform-neutral `QtAV::RenderOpenGL` OpenGL ES 3.x software-frame
-  rendering with explicit SDR/PQ/HLG target encoding and Android
+  libplacebo now owns Vulkan color conversion, scaling, tone mapping, output
+  encoding, and FFmpeg-parsed Dolby Vision RPU reshaping;
+- optional platform-neutral `QtAV::RenderOpenGL` OpenGL ES 3.x rendering with
+  libplacebo color conversion, scaling, tone mapping, output encoding, and
+  FFmpeg-parsed Dolby Vision RPU reshaping, plus Android
   `QtAV::RenderOpenGLAndroid` EGL/window adaptation for native RGB10_A2 HDR or
   explicit RGBA8/sRGB fallback;
 - optional platform-neutral `QtAV::RenderMobile` policy that keeps one
@@ -149,10 +157,18 @@ and returns a Vulkan release sync fd through asynchronous image deletion.
 Its configured width and height are optional default reader dimensions;
 MediaCodec supplies the actual decoded buffer size, so applications do not
 need to pre-probe media dimensions before creating the interop. The OpenGL ES
-SurfaceTexture interop follows the same default-size behavior.
+AImageReader interop follows the same default-size behavior.
 `MediaCodecVulkanInterop::queueFrame()` releases an output and performs a
 bounded wait for its matching AImage ownership transfer, allowing applications
 to reserve a render slot and schedule Vulkan presentation independently.
+`MediaCodecOpenGLInterop::queueFrame()` instead releases non-blockingly after
+the application reserves bounded capacity; its AImageReader listener wakes the
+graphics thread when the exact timestamp-correlated image arrives. OpenGL
+window adapters should set `OpenGLVideoRenderer::setPresentCallback()` so the
+platform submit (Android `eglSwapBuffers()`) runs before the interop exports
+the image's release fence. This replaces adapters that presented only after
+`render()` returned, which could leave default-framebuffer work outside the
+release fence and eventually exhaust AImageReader acquisitions.
 Vulkan image, memory, view, and YCbCr-conversion objects are reused by retained
 `AHardwareBuffer` identity until AImageReader reports that allocation removed;
 the interop statistics now distinguish per-frame imports from persistent
@@ -172,6 +188,11 @@ transfer, matrix, and chroma location. HDR10 mastering-display and content
 light side data are copied into toolkit-independent value types. Active
 renderers use that metadata for range, matrix, transfer, primaries, and HDR
 output decisions without exposing FFmpeg types.
+`VideoFrame::hasDolbyVisionMetadata()` similarly reports parsed RPU frame
+metadata without exposing its FFmpeg representation. The repository FFmpeg
+MediaCodec overlay parses HEVC RPU NAL units with FFmpeg's built-in parser and
+matches them to hardware output presentation timestamps before creating each
+`VideoFrame`.
 `AudioSink` can use an injected `AudioFrameConverter` when decoded and device
 PCM formats differ. Applications link `QtAV::AudioResample` and pass a
 `SwresampleAudioConverter` through `Player::setAudioFrameConverter()`.
@@ -285,7 +306,8 @@ or pace playback. Decoded planar audio therefore normally uses
 - active track switching after load;
 - buffering policy for live/network streams;
 - audio time-stretch without pitch change;
-- compressed Dolby passthrough, Atmos object rendering, and Dolby Vision.
+- compressed Dolby passthrough, Atmos object rendering, Dolby Vision
+  enhancement-layer residual reconstruction, licensing, and certification.
 
 The Android harness is currently an integration checkpoint rather than a
 legacy QtAV API replacement. It proves the NDK, packaging, signing,
@@ -301,8 +323,8 @@ independent.
 Android MediaCodec direct-surface H.264/HEVC output is now stable, including
 explicit present/drop, seek/flush, media replacement, stop, stale-surface
 rejection, background/foreground surface recreation, and shutdown on the
-recorded device. The separate Android Vulkan native-buffer and SurfaceTexture
-external-OES adapters are now implemented and device-validated; both OHOS
+recorded device. The separate Android Vulkan and OpenGL ES native-buffer
+adapters are now implemented and device-validated; both OHOS
 native-buffer adapters remain planned. Their
 zero-CPU-copy contract forbids decoded-pixel mapping, software transfer, CPU
 staging, and re-upload; it requires retained native-buffer lifetime, explicit
@@ -310,38 +332,40 @@ producer/release synchronization, and capability-gated format support. A
 Vulkan-to-OpenGL ES switch attempts compatible GLES native import for
 subsequent frames, then follows the caller's explicit direct-surface,
 software-decode, or no-video policy instead of silently copying a hardware
-frame. Android Vulkan now uses private GPU-sampled
-`AImageReader`/`AHardwareBuffer` import; Android GLES now uses a detached
-`SurfaceTexture` with timestamp/generation correlation and
-`GL_TEXTURE_EXTERNAL_OES`. Its SDR 8-bit path is enabled, while P010/HDR
-sampling is accepted automatically only after native GL-extension checks and
-Android 13+ reports a dataspace matching the exact latched HDR image. The
-explicit trust override remains available for independently validated paths.
-The SurfaceTexture matrix is normalized from conventional OpenGL coordinates
-to QtAV's top-left source convention without discarding producer crop, scale,
-or rotation, keeping its picture orientation consistent with Vulkan.
+frame. Android Vulkan uses private GPU-sampled `AImageReader`/AHardwareBuffer
+import. Android GLES now uses its own private AImageReader, imports retained
+AHardwareBuffers as EGLImages, and samples raw Y/Cb/Cr through
+`GL_EXT_YUV_target`. A crop-aware RGBA16F normalization pass performs no color
+conversion; libplacebo then applies Dolby Vision reshaping and the complete
+SDR/PQ/HLG pipeline. Imports without the raw-component contract are rejected
+for Dolby Vision rather than relying on implicit SurfaceTexture conversion.
 Both Android presentation adapters also treat a republished identical
 `ANativeWindow` with changed buffer geometry as a resize and refresh their
 swapchain/EGL target without reopening the decoder.
 The Vulkan-to-GLES policy is now connected: after the selector prepares the
 OpenGL ES candidate, its synchronous hardware-frame callback rebinds
-subsequent MediaCodec output to the SurfaceTexture producer or selects the
+subsequent MediaCodec output to the OpenGL AImageReader producer or selects the
 caller's direct-surface, software-decode, or no-video route. The current and
 late frames from the retired Vulkan surface are discarded without mapping.
 The connected Adreno 830 run injected fatal Vulkan failure after 30 successful
-imports and continued the same H.264 media session with 179 external-OES
-images; both interop paths reported zero decoded-source
-map/transfer/staging/upload calls. OHOS GLES uses
+imports and continued the same H.264 media session with 180 raw EGLImage
+imports and matching release fences; both interop paths reported zero
+decoded-source map/transfer/staging/upload calls. OHOS GLES uses
 `OH_NativeImage` with an external-OES texture. OHOS Vulkan remains conditional
 on adding a retained
 `OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer
 branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
 zero-CPU-copy source as-is.
-The Vulkan engine now has offscreen goldens, a bounded three-frame resource
-ring, Android background/foreground surface recreation coverage, and numeric
-P010/BT.2020 PQ/HLG checks for mastering-display, MaxCLL, default luminance,
-SDR tone mapping, native 10-bit HDR10/PQ plus HDR10/HLG encoding, HLG-to-PQ
-conversion, and FP16 extended-linear output above reference white. The Android
+The Vulkan renderer now imports the application device through libplacebo.
+`BorrowedVulkanDevice` therefore also requires its `VkInstance` and explicit
+confirmation that Vulkan 1.2 `timelineSemaphore` and `hostQueryReset` were
+enabled at logical-device creation. Existing aggregate initializers must add
+those three fields. The engine has offscreen goldens, including synthetic
+FFmpeg Dolby Vision metadata, a bounded three-frame resource ring, Android
+background/foreground surface recreation coverage, and numeric P010/BT.2020
+PQ/HLG checks for mastering-display, MaxCLL, default luminance, SDR tone
+mapping, native 10-bit HDR10/PQ plus HDR10/HLG encoding, HLG-to-PQ conversion,
+and FP16 extended-linear output above reference white. The Android
 adapter now exposes output preference and selected-surface queries, enables
 HDR format/color-space selection when the application created its instance
 with `VK_EXT_swapchain_colorspace`, and submits static metadata when the
@@ -360,11 +384,14 @@ pause/resume plus background/foreground lifecycle. MediaCodec direct-surface
 presentation now passes H.264 and HEVC connected-device coverage with explicit
 present/drop decisions, seek, media replacement, stop, surface-generation
 replacement, stale-token rejection, and clean shutdown. Android
-MediaCodec/Vulkan interop now passes H.264 and HEVC private-AImageReader
-import with native YCbCr/external-format sampling, one returned release fence
-per import, bounded pending images, and zero decoded-source
-map/transfer/staging/upload counters. OHOS texture interop remains separate
-backend work under the responsibility and lifecycle boundaries in
+MediaCodec/Vulkan interop now passes H.264, HEVC, and a real profile 8.4 Dolby
+Vision stream through private-AImageReader import with native
+YCbCr/external-format sampling, one returned release fence per imported DOVI
+frame, bounded pending images, and zero decoded-source
+map/transfer/staging/upload counters. The DOVI phase retains parsed RPU
+metadata on all 100 output frames and renders 97 through libplacebo. OHOS
+texture interop remains separate backend work under the responsibility and
+lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and
@@ -376,8 +403,13 @@ when its device format requires it.
 The core is codec-agnostic and uses the decoder registered by FFmpeg. AC-3,
 E-AC-3, and TrueHD software decoding have been exercised through the audio
 frame callback. This is PCM decode support only; IEC 61937/HDMI passthrough,
-Atmos object rendering, Dolby Vision processing, licensing, and certification
-are separate backend/product work.
+and Atmos object rendering remain separate backend/product work. On the
+Vulkan video path, FFmpeg-parsed `AV_FRAME_DATA_DOVI_METADATA` is passed to
+libplacebo for base-layer Dolby Vision reshaping and target-aware tone mapping;
+the HEVC MediaCodec wrapper obtains that metadata through the same in-tree
+FFmpeg RPU parser. libdovi is not required or enabled. Enhancement-layer
+residual reconstruction, licensing, and certification remain outside this
+implementation.
 
 ## Threading rules
 
@@ -418,6 +450,9 @@ are separate backend/product work.
   thread that owns the native graphics context; it returns a negative value
   when no frame is ready or a retryable player/backend lock is busy, so native
   render loops should retry instead of blocking the UI/render thread;
+- `OpenGLPresentCallback` runs on that same graphics-owner thread after
+  framebuffer submission and before hardware-source release; it is intended
+  for the adapter's bounded window-present call, not general application work;
 - D3D11 renderer, decoder, interop, and application calls sharing one
   immediate context must serialize through the same
   `D3D11DeviceAccess::contextGuard()` or equivalent external locking; the
@@ -457,17 +492,21 @@ are separate backend/product work.
 
 ## Recommended next implementation order
 
-1. Use the CPU swscale renderer and image-buffer target as the reference
+1. Keep the resolved Android OpenGL ZeroCopy long-form/reopen regression in
+   the connected-device gate while preserving the zero-copy and libplacebo
+   color paths.
+2. Keep the CPU swscale renderer and image-buffer target as the reference
    software path.
-2. Use the interleaved PCM libswresample backend when a sink negotiates a
-   different format.
-3. Use the completed Windows D3D11VA device/frame and zero-CPU-copy interop
+3. Keep the interleaved PCM libswresample backend as the reference when a sink
+   negotiates a different format.
+4. Use the completed Windows D3D11VA device/frame and zero-CPU-copy interop
    contracts as the native desktop reference.
-4. Use the completed Android renderer, audio, MediaCodec, and interop paths as
+5. Use the completed Android renderer, audio, MediaCodec, and interop paths as
    the mobile reference.
-5. Implement the OHOS production path using the shared mobile contracts.
-6. Add subtitle and multi-track switching.
-7. Add live-stream buffering and recovery policies.
+6. Resume the OHOS production path using the shared mobile contracts only when
+   its deferred milestone is explicitly reactivated.
+7. Add subtitle and multi-track switching.
+8. Add live-stream buffering and recovery policies.
 
 Each backend should remain optional so the core library never acquires a GUI
 toolkit dependency.

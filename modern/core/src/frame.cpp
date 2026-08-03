@@ -678,6 +678,14 @@ ContentLightMetadata VideoFrame::contentLightMetadata() const noexcept
     return result;
 }
 
+bool VideoFrame::hasDolbyVisionMetadata() const noexcept
+{
+    return isValid()
+        && av_frame_get_side_data(
+            storage_->frame,
+            AV_FRAME_DATA_DOVI_METADATA);
+}
+
 bool VideoFrame::hasHardwareFrame() const noexcept
 {
     return storage_ && storage_->hardwareFrame.isValid();
@@ -844,6 +852,12 @@ VideoFrame detail::FrameFactory::hardware(
         timestampMs,
         durationMs);
     return storage->frame ? VideoFrame(std::move(storage)) : VideoFrame {};
+}
+
+const AVFrame* detail::FrameFactory::nativeVideoFrame(
+    const VideoFrame& frame) noexcept
+{
+    return frame.storage_ ? frame.storage_->frame : nullptr;
 }
 
 } // namespace qtav

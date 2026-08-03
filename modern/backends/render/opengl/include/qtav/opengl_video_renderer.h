@@ -56,6 +56,13 @@ QTAV_RENDER_OPENGL_EXPORT bool openGLColorSpaceIsHdr(
 
 using OpenGLCurrentTargetCallback =
     std::function<OpenGLRenderTarget()>;
+// Optional platform presentation hook. It runs with the caller's OpenGL ES
+// context current after rendering has been submitted, but before a hardware
+// source image is returned to its producer. Window-system adapters use this
+// ordering so the interop release fence covers presentation work as well as
+// sampling work.
+using OpenGLPresentCallback =
+    std::function<bool(std::string& detail)>;
 
 enum class OpenGLHardwareImportStatus {
     Ready,
@@ -66,9 +73,10 @@ enum class OpenGLHardwareImportStatus {
 };
 
 // A current-context view of a native image sampled through
-// GL_TEXTURE_EXTERNAL_OES. The producer retains the single current image
-// until its next update; renderers must submit and flush the draw before
-// asking the interop to advance it.
+// GL_TEXTURE_EXTERNAL_OES. rawYcbcr requires GL_EXT_YUV_target and means that
+// sampling yields normalized Y, Cb, and Cr in R, G, and B respectively. The
+// renderer copies those raw components, with crop applied, to an internal
+// floating-point texture before libplacebo performs any color processing.
 struct QTAV_RENDER_OPENGL_EXPORT OpenGLExternalTextureFrame {
     std::uint32_t texture = 0;
     // Column-major matrix mapping the renderer's top-left normalized source
@@ -79,12 +87,14 @@ struct QTAV_RENDER_OPENGL_EXPORT OpenGLExternalTextureFrame {
         0.0F, 0.0F, 1.0F, 0.0F,
         0.0F, 0.0F, 0.0F, 1.0F,
     };
+    bool rawYcbcr = false;
+    int bitDepth = 0;
     std::int64_t timestampNanoseconds = 0;
     std::uint32_t generation = 0;
 
     explicit operator bool() const noexcept
     {
-        return texture != 0 && timestampNanoseconds > 0
+        return texture != 0 && timestampNanoseconds >= 0
             && generation != 0;
     }
 };
@@ -116,6 +126,13 @@ public:
     virtual bool supports(const HardwareFrame& frame) const noexcept = 0;
     virtual OpenGLHardwareImportResult prepareFrame(
         const VideoFrame& frame) = 0;
+    // Called after all sampling commands and the optional platform-present
+    // callback for the imported image have been submitted. Android
+    // implementations use this point to return an AImageReader buffer with a
+    // GPU release fence that also covers window presentation.
+    virtual bool releaseFrame(
+        const OpenGLExternalTextureFrame& frame,
+        std::string& detail) noexcept;
     virtual void releaseCurrentContextResources() noexcept = 0;
     virtual void setFrameAvailableCallback(
         FrameAvailableCallback callback) = 0;
@@ -144,6 +161,7 @@ public:
 
     void setCurrentTargetCallback(
         OpenGLCurrentTargetCallback callback);
+    void setPresentCallback(OpenGLPresentCallback callback);
     OpenGLHardwareImportStatus prepareHardwareFrame(
         const VideoFrame& frame,
         std::string* detail = nullptr);

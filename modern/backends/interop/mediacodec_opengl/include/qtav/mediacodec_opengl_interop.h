@@ -19,25 +19,25 @@ namespace qtav {
 
 struct QTAV_INTEROP_MEDIACODEC_OPENGL_EXPORT
 MediaCodecOpenGLInteropConfig {
+    // Retained for source compatibility; the AImageReader path is native and
+    // does not require Java or SurfaceTexture.
     JavaVM* javaVM = nullptr;
-    // Optional default SurfaceTexture buffer dimensions. MediaCodec video
-    // output overrides them; non-positive values use a 1x1 default.
+    // Optional default AImageReader dimensions. MediaCodec overrides them;
+    // non-positive values use a 1x1 default.
     int width = 0;
     int height = 0;
-    // Bounds MediaCodec outputs released but not yet matched to the
-    // SurfaceTexture's single current image. Values are clamped to [2, 16].
+    // Bounds timestamp-correlated PRIVATE images. Values are clamped to
+    // [4, 16]; the reader reserves two additional acquisition slots for the
+    // renderer and callback-drain ownership overlap.
     int maximumPendingFrames = 4;
-    // A native retry worker only schedules redraws. SurfaceTexture and GL
-    // calls remain on the renderer thread with its context current.
+    // Retained for source compatibility. AImageReader callbacks schedule
+    // redraws directly.
     int redrawRetryMilliseconds = 2;
-    // Explicitly trusts P010/HDR external-OES sampling without the runtime
-    // dataspace probe below. Keep false unless the complete device path was
-    // independently validated.
+    // Deprecated and ignored compatibility switches. HDR and Dolby Vision now
+    // require the raw GL_EXT_YUV_target import contract and never rely on
+    // implicit SurfaceTexture color conversion or dataspace inference.
     bool hdrExternalOesSamplingEnabled = false;
-    // When no explicit trust override is supplied, provisionally accepts an
-    // HDR frame only when the current GL context exposes the external-YUV
-    // extensions and Android 13+ reports matching BT.2020/PQ or BT.2020/HLG
-    // dataspace for the exact image latched from SurfaceTexture.
+    // Deprecated and ignored; retained only for source compatibility.
     bool autoDetectHdrExternalOesSampling = true;
 };
 
@@ -67,15 +67,18 @@ MediaCodecOpenGLInteropStatistics {
     MediaCodecOpenGLHdrSamplingStatus hdrSamplingStatus =
         MediaCodecOpenGLHdrSamplingStatus::Disabled;
     std::int32_t lastDataSpace = 0;
+    std::uint64_t acquireFencesWaited = 0;
+    std::uint64_t releaseFencesReturned = 0;
+    std::uint64_t releaseFenceFallbacks = 0;
+    std::uint64_t rawYcbcrImports = 0;
+    std::uint32_t lastHardwareBufferFormat = 0;
 };
 
-// Owns a detached android.graphics.SurfaceTexture and exposes its producer
-// ANativeWindow to FFmpeg's MediaCodec wrapper. With the renderer's OpenGL ES
-// context current, decoded outputs are released to the producer, latched by
-// timestamp through ASurfaceTexture_updateTexImage(), and sampled directly as
-// GL_TEXTURE_EXTERNAL_OES. The current image remains retained by
-// SurfaceTexture until the next update; decoded pixels are never CPU-mapped
-// or uploaded.
+// Owns a private AImageReader and exposes its producer ANativeWindow to
+// FFmpeg's MediaCodec wrapper. Timestamp-correlated PRIVATE AImages are
+// imported as AHardwareBuffer-backed EGLImages and exposed as raw Y/Cb/Cr
+// GL_TEXTURE_EXTERNAL_OES textures. The renderer returns each AImage with an
+// EGL native-fence sync fd. Decoded pixels are never CPU-mapped or uploaded.
 class QTAV_INTEROP_MEDIACODEC_OPENGL_EXPORT
 MediaCodecOpenGLInterop final : public OpenGLHardwareFrameInterop {
 public:
@@ -98,15 +101,27 @@ public:
 
     HardwareInteropCapabilities capabilities() const override;
     bool supports(const HardwareFrame& frame) const noexcept override;
+    // Non-blockingly registers the frame/timestamp association and releases
+    // its MediaCodec output into the private AImageReader. Image acquisition
+    // completes asynchronously and schedules a redraw through the frame-
+    // available callback. This performs no EGL or OpenGL work, so an
+    // application may call it from the video scheduler, retain the exact
+    // VideoFrame, and render later on the graphics thread at the supplied
+    // playback deadline.
+    bool queueFrame(const VideoFrame& frame, std::string& detail);
     OpenGLHardwareImportResult prepareFrame(
         const VideoFrame& frame) override;
+    bool releaseFrame(
+        const OpenGLExternalTextureFrame& frame,
+        std::string& detail) noexcept override;
     void releaseCurrentContextResources() noexcept override;
     void setFrameAvailableCallback(
         FrameAvailableCallback callback) override;
 
-    // Reject pending timestamp associations before seek, loop, decoder
-    // replacement, explicit stop, or renderer fallback. The SurfaceTexture
-    // generation remains valid until this object is replaced.
+    // Reject pending timestamp associations and acquired images before seek,
+    // loop, decoder replacement, explicit stop, or renderer fallback. The
+    // AImageReader producer generation remains valid until this object is
+    // replaced.
     void flush() noexcept;
     MediaCodecOpenGLInteropStatistics statistics() const noexcept;
 

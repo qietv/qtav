@@ -1,6 +1,23 @@
 find_path(QTAV_GLES3_INCLUDE_DIR GLES3/gl3.h)
 find_library(QTAV_GLES3_LIBRARY_PATH NAMES GLESv3)
-if(NOT QTAV_GLES3_INCLUDE_DIR OR NOT QTAV_GLES3_LIBRARY_PATH)
+find_library(QTAV_OPENGL_EGL_LIBRARY_PATH NAMES EGL)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(
+        QTAV_LIBPLACEBO
+        QUIET
+        IMPORTED_TARGET
+        GLOBAL
+        "libplacebo>=7.351.0"
+    )
+endif()
+find_package(FFmpeg REQUIRED COMPONENTS avutil)
+
+if(NOT QTAV_GLES3_INCLUDE_DIR
+   OR NOT QTAV_GLES3_LIBRARY_PATH
+   OR NOT QTAV_OPENGL_EGL_LIBRARY_PATH
+   OR NOT TARGET PkgConfig::QTAV_LIBPLACEBO
+   OR NOT TARGET qtav_render_libplacebo_common)
     return()
 endif()
 set(QTAV_GLES3_LIBRARY GLESv3)
@@ -19,11 +36,18 @@ target_include_directories(qtav_render_opengl
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
-    PRIVATE "${QTAV_GLES3_INCLUDE_DIR}"
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/core/src"
+        "${QTAV_GLES3_INCLUDE_DIR}"
 )
 target_link_libraries(qtav_render_opengl
     PUBLIC QtAV::Core
-    PRIVATE "${QTAV_GLES3_LIBRARY}"
+    PRIVATE
+        "${QTAV_GLES3_LIBRARY}"
+        "${QTAV_OPENGL_EGL_LIBRARY_PATH}"
+        PkgConfig::QTAV_LIBPLACEBO
+        FFmpeg::avutil
+        QtAV::RenderLibplaceboCommon
 )
 
 if(NOT BUILD_SHARED_LIBS)
@@ -45,7 +69,11 @@ if(MSVC)
 else()
     target_compile_options(
         qtav_render_opengl
-        PRIVATE -Wall -Wextra -Wpedantic)
+        PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wno-missing-field-initializers)
 endif()
 
 if(ANDROID)

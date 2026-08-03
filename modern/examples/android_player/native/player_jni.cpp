@@ -39,7 +39,7 @@ namespace {
 
 constexpr const char* LogTag = "QtAVCorePlayer";
 // The Player callback is already paced against the playback clock. While an
-// asynchronous AImageReader/SurfaceTexture import is pending, retain a bounded
+// asynchronous AImageReader import is pending, retain a bounded
 // set of exact outputs already released to the producer plus only the newest
 // not-yet-released candidate. A deep second FIFO can exhaust MediaCodec output
 // slots and then present obsolete frames in a burst after the path recovers.
@@ -243,7 +243,7 @@ void applyRemoteTlsOptions(qtav::Player& player)
 struct PlayerOptions {
     bool vulkan = true;
     bool hdr = true;
-    bool zeroCopy = false;
+    bool zeroCopy = true;
     bool hardwareDecode = true;
 
     bool operator==(const PlayerOptions& other) const noexcept
@@ -361,8 +361,6 @@ public:
         savedPosition_ = 0;
         userWantsPlaying_.store(true);
         videoSizePacked_.store(0);
-        openGLDirectFallbackPending_.store(false);
-        openGLDirectFallbackActive_ = false;
 
         if (mediaPath_.empty()) {
             setStatus("The selected media has no readable path or descriptor");
@@ -398,8 +396,6 @@ public:
         if (directSurfaceActive && directSurfaceRemainsActive) {
             return;
         }
-        openGLDirectFallbackPending_.store(false);
-        openGLDirectFallbackActive_ = false;
         if (!mediaPath_.empty() && window_) {
             rebuildPlayer(savedPosition_, userWantsPlaying_.load());
         }
@@ -503,27 +499,6 @@ public:
         return videoSizePacked_.load();
     }
 
-    bool applyPendingVideoFallback()
-    {
-        if (!openGLDirectFallbackPending_.exchange(false)) {
-            return false;
-        }
-        const std::uint64_t requestedGeneration =
-            openGLDirectFallbackGeneration_.load();
-        std::lock_guard<std::mutex> lock(commandMutex_);
-        if (playerGeneration_.load() != requestedGeneration
-            || options_.vulkan || !options_.zeroCopy
-            || !options_.hardwareDecode) {
-            return false;
-        }
-        const std::int64_t resumePosition = resumePositionLocked();
-        options_.zeroCopy = false;
-        openGLDirectFallbackActive_ = true;
-        savedPosition_ = resumePosition;
-        rebuildPlayer(savedPosition_, userWantsPlaying_.load());
-        return true;
-    }
-
     int requestedFrameRateMilliHertz() const noexcept
     {
         return requestedFrameRateMilliHertz_.load();
@@ -568,6 +543,12 @@ public:
         if (decoded > 0 || presented > 0) {
             result += " · callbacks/presented " + std::to_string(decoded)
                 + "/" + std::to_string(presented);
+        }
+        const std::uint64_t dolbyVisionFrames =
+            dolbyVisionFrames_.load();
+        if (dolbyVisionFrames > 0) {
+            result += " · Dolby Vision RPU frames "
+                + std::to_string(dolbyVisionFrames);
         }
         if (presented > 0) {
             int frameRateMilliHertz = 0;
@@ -647,6 +628,12 @@ public:
                 + std::to_string(
                     maximumCachedHardwareBufferImports_.load());
         }
+        const std::uint64_t rawYcbcrImports =
+            unconvertedYcbcrImports_.load();
+        if (rawYcbcrImports > 0) {
+            result += " · raw YCbCr imports "
+                + std::to_string(rawYcbcrImports);
+        }
         const std::uint64_t codecOutputs =
             interopCodecOutputsQueued_.load();
         const std::uint64_t imagesAcquired =
@@ -669,11 +656,11 @@ public:
                 openGLHdrSamplingStatus_.load());
         if (openGLHdrStatus
             == qtav::MediaCodecOpenGLHdrSamplingStatus::Supported) {
-            result += " · OES HDR verified ds "
-                + std::to_string(openGLLastDataSpace_.load());
+            result += " · raw AHB/EGLImage YCbCr active fmt "
+                + std::to_string(openGLHardwareBufferFormat_.load());
         } else if (openGLHdrStatus
                    == qtav::MediaCodecOpenGLHdrSamplingStatus::Unsupported) {
-            result += " · OES HDR unsupported";
+            result += " · raw AHB/EGLImage YCbCr unsupported";
         }
         const int frameRate = requestedFrameRateMilliHertz_.load();
         if (frameRate > 0) {
@@ -710,6 +697,22 @@ private:
     static constexpr std::int64_t InvalidTimestamp =
         std::numeric_limits<std::int64_t>::min();
 
+    void observeDolbyVisionFrame(const qtav::VideoFrame& frame)
+    {
+        if (!frame.hasDolbyVisionMetadata()) {
+            return;
+        }
+        const std::uint64_t count =
+            dolbyVisionFrames_.fetch_add(1) + 1;
+        if (count == 1) {
+            logMessage(
+                ANDROID_LOG_INFO,
+                directEnabled_.load()
+                    ? "First Dolby Vision RPU metadata frame received; MediaCodec direct Surface bypasses libplacebo"
+                    : "First Dolby Vision RPU metadata frame received; libplacebo reshaping is active");
+        }
+    }
+
     void observeVideoSize(int width, int height) noexcept
     {
         if (width <= 0 || height <= 0) {
@@ -730,27 +733,6 @@ private:
         }
         std::lock_guard<std::mutex> lock(outputMutex_);
         directOutputColorSpace_ = describeVideoColorSpace(color);
-    }
-
-    void requestOpenGLDirectFallback(
-        std::uint64_t generation,
-        const std::string& message)
-    {
-        if (playerGeneration_.load() != generation) {
-            return;
-        }
-        openGLDirectFallbackGeneration_.store(generation);
-        if (openGLDirectFallbackPending_.exchange(true)) {
-            return;
-        }
-        renderEnabled_.store(false);
-        setStatus(
-            message
-            + "; switching to the MediaCodec direct Surface path");
-        logMessage(
-            ANDROID_LOG_WARN,
-            message
-                + "; switching to the MediaCodec direct Surface path");
     }
 
     void setFrameRateWindow(ANativeWindow* window)
@@ -1036,6 +1018,7 @@ private:
                         return;
                     }
                     decodedVideoFrames_.fetch_add(1);
+                    observeDolbyVisionFrame(frame);
                     observeVideoSize(frame.width(), frame.height());
                     latestVideoTimestamp_.store(frame.timestamp());
                     observeVideoCallback(frame.timestamp(), generation);
@@ -1058,10 +1041,6 @@ private:
                     if (directEnabled_.load()) {
                         recordDirectOutputColorSpace(frame);
                         presentDirectSurfaceFrame(frame, generation);
-                    } else if (discardZeroTimestampOpenGLFrame(
-                                   frame,
-                                   generation)) {
-                        return;
                     } else {
                         enqueueRenderFrame(frame, generation);
                     }
@@ -1153,6 +1132,7 @@ private:
         std::string mode = options_.hardwareDecode
             ? "MediaCodec → AImageReader → Vulkan ZeroCopy"
             : "software decode → Vulkan";
+        mode += " · libplacebo";
         mode += vulkanRenderer_->hdrOutputActive()
             ? " · HDR output"
             : " · SDR output";
@@ -1185,12 +1165,6 @@ private:
                 }
                 const std::string message =
                     "OpenGL ES renderer: " + event.detail;
-                if (event.detail.find(
-                        "P010/HDR SurfaceTexture sampling")
-                    != std::string::npos) {
-                    requestOpenGLDirectFallback(generation, message);
-                    return;
-                }
                 if (setPipelineErrorOnce(message)) {
                     logMessage(ANDROID_LOG_ERROR, message);
                 }
@@ -1232,11 +1206,9 @@ private:
         }
         renderer_ = openGLRenderer_;
         std::string mode = options_.hardwareDecode
-            ? "MediaCodec → SurfaceTexture → OpenGL ES ZeroCopy"
+            ? "MediaCodec → AImageReader/AHardwareBuffer → EGLImage raw YCbCr → OpenGL ES ZeroCopy"
             : "software decode → OpenGL ES";
-        if (useHardwareZeroCopy) {
-            mode += " · HDR OES auto-detect";
-        }
+        mode += " · libplacebo";
         mode += openGLRenderer_->hdrOutputActive()
             ? " · HDR output"
             : " · SDR output";
@@ -1270,10 +1242,7 @@ private:
                 decodeOptions);
             directEnabled_.store(true);
             setActiveMode(
-                openGLDirectFallbackActive_
-                    ? "MediaCodec direct Surface · OpenGL ES HDR ZeroCopy "
-                      "unavailable; codec dataspace passthrough"
-                    : "MediaCodec direct Surface · codec dataspace passthrough");
+                "MediaCodec direct Surface · codec dataspace passthrough");
         } else {
             const bool hardwareZeroCopy =
                 options_.hardwareDecode && options_.zeroCopy;
@@ -1291,26 +1260,41 @@ private:
             }
             player->setVideoRenderAPI(renderer_);
             renderEnabled_.store(true);
-            if (hardwareZeroCopy && vulkanInterop_) {
+            if (hardwareZeroCopy
+                && (vulkanInterop_ || openGLInterop_)) {
+                const auto scheduledVulkanInterop = vulkanInterop_;
+                const auto scheduledOpenGLInterop = openGLInterop_;
                 player->setVideoFrameScheduler(
-                    [this, generation = playerGeneration_.load()](
+                    [this,
+                     generation = playerGeneration_.load(),
+                     scheduledVulkanInterop,
+                     scheduledOpenGLInterop](
                         const qtav::VideoFrame& frame,
                         int,
                         std::int64_t monotonicNanoseconds) {
                         if (playerGeneration_.load() != generation
                             || !renderEnabled_.load()
-                            || !vulkanInterop_) {
+                            || (!scheduledVulkanInterop
+                                && !scheduledOpenGLInterop)) {
                             return false;
                         }
                         if (!reserveScheduledRenderFrame(generation)) {
                             return false;
                         }
                         std::string detail;
-                        if (!vulkanInterop_->queueFrame(frame, detail)) {
+                        const bool queued = scheduledVulkanInterop
+                            ? scheduledVulkanInterop->queueFrame(
+                                  frame,
+                                  detail)
+                            : scheduledOpenGLInterop->queueFrame(
+                                  frame,
+                                  detail);
+                        if (!queued) {
                             cancelScheduledRenderFrame();
                             return false;
                         }
                         decodedVideoFrames_.fetch_add(1);
+                        observeDolbyVisionFrame(frame);
                         observeVideoSize(frame.width(), frame.height());
                         latestVideoTimestamp_.store(frame.timestamp());
                         observeVideoCallback(
@@ -1323,10 +1307,11 @@ private:
                         return true;
                     });
             }
-            // onVideoFrame() queues the exact reference-counted frame below.
-            // A second redraw request for the same callback would retry every
-            // asynchronous MediaCodec output before AImageReader has produced
-            // its image.
+            // Scheduled hardware frames already retain the exact frame in the
+            // bounded render queue. AImageReader completion wakes the render
+            // thread through the interop callback; no core redraw callback is
+            // needed for the same frame. Software/fallback frames continue to
+            // enter through onVideoFrame().
             player->setRenderCallback({});
         }
         player->setHardwareDecodeConfig(std::move(hardwareConfig));
@@ -1345,7 +1330,6 @@ private:
             pipelineError_.clear();
         }
         unsupportedSoftwareFrame_.store(false);
-        zeroTimestampOpenGLDropLogged_.store(false);
         {
             std::lock_guard<std::mutex> lock(outputMutex_);
             directOutputColorSpace_.clear();
@@ -1373,6 +1357,7 @@ private:
             generation);
         duration_.store(0);
         decodedVideoFrames_.store(0);
+        dolbyVisionFrames_.store(0);
         latestVideoTimestamp_.store(InvalidTimestamp);
         renderAttempts_.store(0);
         renderedVideoFrames_.store(0);
@@ -1384,6 +1369,7 @@ private:
         hardwareBufferImports_.store(0);
         hardwareBufferImportCacheHits_.store(0);
         maximumCachedHardwareBufferImports_.store(0);
+        unconvertedYcbcrImports_.store(0);
         interopCodecOutputsQueued_.store(0);
         interopImagesAcquired_.store(0);
         interopImagesImported_.store(0);
@@ -1391,7 +1377,7 @@ private:
         interopMaximumPendingImages_.store(0);
         openGLHdrSamplingStatus_.store(static_cast<int>(
             qtav::MediaCodecOpenGLHdrSamplingStatus::Disabled));
-        openGLLastDataSpace_.store(0);
+        openGLHardwareBufferFormat_.store(0);
         openGLHdrSupportLogged_.store(false);
         resetPresentationTiming(generation);
         setStatus(
@@ -1461,42 +1447,6 @@ private:
         }
     }
 
-    bool discardZeroTimestampOpenGLFrame(
-        const qtav::VideoFrame& frame,
-        std::uint64_t generation)
-    {
-        if (frame.timestamp() != 0) {
-            return false;
-        }
-        std::shared_ptr<qtav::MediaCodecOpenGLInterop> interop;
-        {
-            std::lock_guard<std::mutex> lock(renderScheduleMutex_);
-            if (renderGeneration_ != generation) {
-                return false;
-            }
-            interop = scheduledOpenGLInterop_;
-        }
-        if (!interop) {
-            return false;
-        }
-        // SurfaceTexture reports zero both for a legitimate zero-PTS image
-        // and before any image has been latched, so those states cannot be
-        // correlated safely. Drop that single codec output and begin with
-        // the first positive timestamp instead of retrying it indefinitely.
-        qtav::MediaCodecFrame output =
-            qtav::mediaCodecFrame(frame, interop->surface());
-        if (!output || !output.isPending() || !output.drop()) {
-            return false;
-        }
-        if (!zeroTimestampOpenGLDropLogged_.exchange(true)) {
-            logMessage(
-                ANDROID_LOG_INFO,
-                "Dropped the zero-PTS SurfaceTexture frame because "
-                "timestamp 0 cannot be distinguished from no latched image");
-        }
-        return true;
-    }
-
     void releasePlayerAndPipeline()
     {
         playerGeneration_.fetch_add(1);
@@ -1554,6 +1504,7 @@ private:
         pendingRenderFrames_.clear();
         scheduledRenderDeadlines_.clear();
         scheduledRenderReservations_ = 0;
+        scheduledRenderFramesInFlight_ = 0;
         renderFrameQueued_ = false;
         renderRedrawRequested_ = false;
     }
@@ -1566,6 +1517,7 @@ private:
             pendingRenderFrames_.clear();
             scheduledRenderDeadlines_.clear();
             scheduledRenderReservations_ = 0;
+            scheduledRenderFramesInFlight_ = 0;
             renderFrameQueued_ = false;
             renderRedrawRequested_ = false;
         }
@@ -1583,6 +1535,7 @@ private:
         pendingRenderFrames_.clear();
         scheduledRenderDeadlines_.clear();
         scheduledRenderReservations_ = 0;
+        scheduledRenderFramesInFlight_ = 0;
         renderFrameQueued_ = false;
         renderRedrawRequested_ = false;
         renderScheduleChanged_.notify_all();
@@ -1606,6 +1559,7 @@ private:
                     || renderFrames_.size()
                             + pendingRenderFrames_.size()
                             + scheduledRenderReservations_
+                            + scheduledRenderFramesInFlight_
                         < MaximumQueuedRenderFrames;
             });
             if (renderThreadStopping_
@@ -1633,6 +1587,7 @@ private:
                 || renderFrames_.size()
                         + pendingRenderFrames_.size()
                         + scheduledRenderReservations_
+                        + scheduledRenderFramesInFlight_
                     < MaximumQueuedRenderFrames;
         });
         if (renderThreadStopping_
@@ -1825,6 +1780,8 @@ private:
                         statistics.hardwareBufferImportCacheHits);
                     maximumCachedHardwareBufferImports_.store(
                         statistics.maximumCachedHardwareBufferImports);
+                    unconvertedYcbcrImports_.store(
+                        statistics.unconvertedYcbcrImports);
                     interopCodecOutputsQueued_.store(
                         statistics.codecOutputsQueued);
                     interopImagesAcquired_.store(
@@ -1843,22 +1800,25 @@ private:
                     interopImagesAcquired_.store(
                         statistics.imagesLatched);
                     interopImagesImported_.store(
-                        statistics.imagesLatched);
+                        statistics.textureAttachments);
+                    unconvertedYcbcrImports_.store(
+                        statistics.rawYcbcrImports);
                     interopStaleImagesDropped_.store(
                         statistics.staleFramesDropped);
                     interopMaximumPendingImages_.store(
                         statistics.maximumPendingFrames);
                     openGLHdrSamplingStatus_.store(
                         static_cast<int>(statistics.hdrSamplingStatus));
-                    openGLLastDataSpace_.store(statistics.lastDataSpace);
+                    openGLHardwareBufferFormat_.store(
+                        statistics.lastHardwareBufferFormat);
                     if (statistics.hdrSamplingStatus
                             == qtav::MediaCodecOpenGLHdrSamplingStatus::Supported
                         && !openGLHdrSupportLogged_.exchange(true)) {
                         logMessage(
                             ANDROID_LOG_INFO,
-                            "OpenGL HDR external-OES auto-detection accepted "
-                            "SurfaceTexture dataspace "
-                                + std::to_string(statistics.lastDataSpace));
+                            "OpenGL raw AHardwareBuffer/EGLImage YCbCr path active; format "
+                                + std::to_string(
+                                    statistics.lastHardwareBufferFormat));
                     }
                 }
                 const std::uint64_t renderedCount =
@@ -1928,17 +1888,26 @@ private:
                         frame = std::move(
                             pendingRenderFrames_.front());
                         pendingRenderFrames_.pop_front();
+                        ++scheduledRenderFramesInFlight_;
                     }
-                    if (attemptFrame(frame)
-                        == AttemptResult::Pending) {
+                    const AttemptResult result = attemptFrame(frame);
+                    {
                         std::lock_guard<std::mutex> lock(
                             renderScheduleMutex_);
+                        if (scheduledRenderFramesInFlight_ > 0) {
+                            --scheduledRenderFramesInFlight_;
+                        }
                         if (renderGeneration_ == generation
-                            && scheduledRenderer_ == renderer) {
+                            && scheduledRenderer_ == renderer
+                            && result == AttemptResult::Pending) {
                             pendingRenderFrames_.push_back(
                                 std::move(frame));
+                        } else if (frame) {
+                            scheduledRenderDeadlines_.erase(
+                                frame.timestamp());
                         }
                     }
+                    renderScheduleChanged_.notify_all();
                 }
             }
 
@@ -1955,23 +1924,33 @@ private:
                             < MaximumPendingRenderFrames) {
                         frame = std::move(renderFrames_.front());
                         renderFrames_.pop_front();
+                        ++scheduledRenderFramesInFlight_;
                         removedQueuedFrame = true;
                     }
                 }
+                const AttemptResult result = frame
+                    ? attemptFrame(frame)
+                    : AttemptResult::Discarded;
                 if (removedQueuedFrame) {
-                    renderScheduleChanged_.notify_all();
-                }
-                if (frame && attemptFrame(frame)
-                        == AttemptResult::Pending) {
                     std::lock_guard<std::mutex> lock(
                         renderScheduleMutex_);
+                    if (scheduledRenderFramesInFlight_ > 0) {
+                        --scheduledRenderFramesInFlight_;
+                    }
                     if (renderGeneration_ == generation
                         && scheduledRenderer_ == renderer
+                        && result == AttemptResult::Pending
                         && pendingRenderFrames_.size()
                             < MaximumPendingRenderFrames) {
                         pendingRenderFrames_.push_back(
                             std::move(frame));
+                    } else if (frame) {
+                        scheduledRenderDeadlines_.erase(
+                            frame.timestamp());
                     }
+                }
+                if (removedQueuedFrame) {
+                    renderScheduleChanged_.notify_all();
                 }
             }
         }
@@ -1991,6 +1970,7 @@ private:
             pendingRenderFrames_.clear();
             scheduledRenderDeadlines_.clear();
             scheduledRenderReservations_ = 0;
+            scheduledRenderFramesInFlight_ = 0;
         }
         renderScheduleChanged_.notify_all();
         if (renderThread_.joinable()) {
@@ -2109,6 +2089,7 @@ private:
     std::unordered_map<std::int64_t, std::int64_t>
         scheduledRenderDeadlines_;
     std::size_t scheduledRenderReservations_ = 0;
+    std::size_t scheduledRenderFramesInFlight_ = 0;
     std::uint64_t renderGeneration_ = 0;
     bool renderFrameQueued_ = false;
     bool renderRedrawRequested_ = false;
@@ -2123,9 +2104,8 @@ private:
     std::atomic<std::int64_t> duration_ { 0 };
     std::atomic<std::uint64_t> videoSizePacked_ { 0 };
     std::atomic<std::uint64_t> playerGeneration_ { 0 };
-    std::atomic<bool> openGLDirectFallbackPending_ { false };
-    std::atomic<std::uint64_t> openGLDirectFallbackGeneration_ { 0 };
     std::atomic<std::uint64_t> decodedVideoFrames_ { 0 };
+    std::atomic<std::uint64_t> dolbyVisionFrames_ { 0 };
     std::atomic<std::int64_t> latestVideoTimestamp_ {
         InvalidTimestamp
     };
@@ -2140,6 +2120,7 @@ private:
     std::atomic<std::uint64_t> hardwareBufferImportCacheHits_ { 0 };
     std::atomic<std::uint64_t>
         maximumCachedHardwareBufferImports_ { 0 };
+    std::atomic<std::uint64_t> unconvertedYcbcrImports_ { 0 };
     std::atomic<std::uint64_t> interopCodecOutputsQueued_ { 0 };
     std::atomic<std::uint64_t> interopImagesAcquired_ { 0 };
     std::atomic<std::uint64_t> interopImagesImported_ { 0 };
@@ -2149,7 +2130,7 @@ private:
         static_cast<int>(
             qtav::MediaCodecOpenGLHdrSamplingStatus::Disabled)
     };
-    std::atomic<std::int32_t> openGLLastDataSpace_ { 0 };
+    std::atomic<std::uint32_t> openGLHardwareBufferFormat_ { 0 };
     std::atomic<bool> openGLHdrSupportLogged_ { false };
     std::atomic<int> requestedFrameRateMilliHertz_ { 0 };
     std::atomic<int> frameRateRequestResult_ { 0 };
@@ -2159,7 +2140,6 @@ private:
     std::atomic<std::uint64_t>
         maximumPresentationGapMilliseconds_ { 0 };
     std::atomic<bool> unsupportedSoftwareFrame_ { false };
-    std::atomic<bool> zeroTimestampOpenGLDropLogged_ { false };
     ANativeWindow* frameRateWindow_ = nullptr;
     std::uint64_t timingGeneration_ = 0;
     std::array<std::int64_t, FrameRateSampleCount> frameRateDeltas_ {};
@@ -2178,7 +2158,6 @@ private:
     std::string activeMode_;
     std::string status_;
     std::string pipelineError_;
-    bool openGLDirectFallbackActive_ = false;
 
     std::shared_ptr<qtav::VideoRenderAPI> renderer_;
     std::shared_ptr<qtav::AndroidVulkanVideoRenderer> vulkanRenderer_;
@@ -2373,21 +2352,6 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetVideoSize(
         return static_cast<jlong>(controller->videoSizePacked());
     }
     return 0;
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_org_qtav_core_player_QtAVPlayerActivity_nativeApplyPendingVideoFallback(
-    JNIEnv*,
-    jobject,
-    jlong handle)
-{
-    if (AndroidPlayerController* controller =
-            controllerFromHandle(handle)) {
-        return controller->applyPendingVideoFallback()
-            ? JNI_TRUE
-            : JNI_FALSE;
-    }
-    return JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

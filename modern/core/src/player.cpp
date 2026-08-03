@@ -874,7 +874,18 @@ private:
                         currentPosition_ = transitionPosition;
                     }
                     if (requested == State::Playing) {
-                        if (!currentVideoFrame_ && !audioSinkOpen_) {
+                        if (audioSinkOpen_ && audioSinkHasClock_) {
+                            // A paused device clock cannot be extrapolated
+                            // across resume. Allow the first queued output to
+                            // prime the restarted sink, then wait for a fresh
+                            // device-clock sample before pacing later frames.
+                            primeOutputWaitLocked(
+                                currentPosition_,
+                                presentationGeneration_.load(
+                                    std::memory_order_acquire),
+                                false,
+                                true);
+                        } else if (!currentVideoFrame_ && !audioSinkOpen_) {
                             primeOutputWaitLocked(
                                 currentPosition_,
                                 presentationGeneration_.load(
@@ -2997,16 +3008,33 @@ private:
 
     void completeCachedAudioClock()
     {
+        std::optional<std::int64_t> completedPosition;
         {
             std::lock_guard<std::mutex> lock(audioClockMutex_);
-            if (!cachedAudioClock_.valid) {
-                return;
+            if (cachedAudioClock_.valid) {
+                cachedAudioClock_.position = std::max(
+                    cachedAudioClock_.position,
+                    cachedAudioClock_.submittedUntil);
+                cachedAudioClock_.sampledAt = Clock::now();
+                completedPosition = cachedAudioClock_.position;
             }
-            cachedAudioClock_.position = std::max(
-                cachedAudioClock_.position,
-                cachedAudioClock_.submittedUntil);
-            cachedAudioClock_.sampledAt = Clock::now();
         }
+        std::uint64_t generation = 0;
+        std::int64_t fallbackPosition = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Once all decoded audio has been submitted, the device clock
+            // must no longer cap trailing video or frame callbacks at the
+            // last audio timestamp. Continue on the monotonic playback clock
+            // while the remaining presentation queue drains.
+            audioSinkHasClock_ = false;
+            generation = presentationGeneration_.load(
+                std::memory_order_acquire);
+            fallbackPosition = currentPosition_;
+        }
+        resumeClockAfterOutput(
+            generation,
+            completedPosition.value_or(fallbackPosition));
         controlChanged_.notify_all();
         presentationChanged_.notify_all();
     }
@@ -3506,9 +3534,7 @@ private:
             std::lock_guard<std::mutex> sinkLock(audioSinkCallMutex_);
             drained = sink->drain();
         }
-        if (drained) {
-            completeCachedAudioClock();
-        }
+        completeCachedAudioClock();
         if (!drained) {
             publishEvent({
                 "audio.sink.drain",

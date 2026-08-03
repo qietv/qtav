@@ -36,7 +36,16 @@ The FFmpeg overlay applies this policy:
 - FFmpeg command-line programs are omitted because the parent player links the
   libraries directly.
 
-The libplacebo overlay builds with `-Dopengl=enabled`. Its build virtual
+The libplacebo overlay enables its built-in Dolby Vision reshaping component
+with `-Ddovi=enabled`. The separate optional `libdovi` raw-RPU parser remains
+disabled because FFmpeg supplies decoded Dolby Vision frame metadata to the
+libplacebo integration. The FFmpeg overlay also enables the built-in RPU
+decoder for `hevc_mediacodec` and associates parsed metadata with hardware
+output presentation timestamps; it does not add an external parser. This
+dependency capability is not a Dolby licensing, certification, or
+end-to-end playback claim.
+
+The overlay also builds libplacebo with `-Dopengl=enabled`. Its build virtual
 environment supplies glad 2 to generate the merged OpenGL, OpenGL ES, and EGL
 loader. Android and OHOS therefore install libplacebo with
 `PL_HAVE_OPENGL 1`; Windows retains the same capability even though QtAVCore

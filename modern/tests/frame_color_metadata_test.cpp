@@ -6,10 +6,13 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstring>
 
 extern "C" {
+#include <libavutil/dovi_meta.h>
 #include <libavutil/frame.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -58,6 +61,17 @@ int main()
     light->MaxCLL = 1000;
     light->MaxFALL = 400;
 
+    std::size_t doviSize = 0;
+    AVDOVIMetadata* dovi = av_dovi_metadata_alloc(&doviSize);
+    assert(dovi);
+    AVFrameSideData* doviSideData = av_frame_new_side_data(
+        native,
+        AV_FRAME_DATA_DOVI_METADATA,
+        doviSize);
+    assert(doviSideData);
+    std::memcpy(doviSideData->data, dovi, doviSize);
+    av_free(dovi);
+
     qtav::VideoFrame frame =
         qtav::detail::FrameFactory::video(native, 42, 24);
     av_frame_free(&native);
@@ -96,9 +110,11 @@ int main()
     assert(content.isValid());
     assert(content.maximumContentLightLevel == 1000);
     assert(content.maximumFrameAverageLightLevel == 400);
+    assert(frame.hasDolbyVisionMetadata());
 
     assert(!qtav::VideoFrame {}.colorSpaceInfo().isSpecified());
     assert(!qtav::VideoFrame {}.masteringDisplayMetadata().isValid());
     assert(!qtav::VideoFrame {}.contentLightMetadata().isValid());
+    assert(!qtav::VideoFrame {}.hasDolbyVisionMetadata());
     return 0;
 }

@@ -2,22 +2,23 @@
 
 #include <qtav/mediacodec_opengl_interop.h>
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
-#include <android/data_space.h>
-#include <android/surface_texture.h>
-#include <android/surface_texture_jni.h>
+#include <android/hardware_buffer.h>
+#include <media/NdkImage.h>
+#include <media/NdkImageReader.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
-#include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -25,75 +26,55 @@ namespace qtav {
 namespace {
 
 constexpr std::int64_t TimestampToleranceNanoseconds = 2'000'000;
-constexpr std::int64_t MaximumPresentationLagNanoseconds =
-    250'000'000;
+constexpr std::int64_t MaximumPresentationLagNanoseconds = 250'000'000;
+constexpr std::size_t MaximumRetiredFrameKeys = 64;
 
-class ScopedJNIEnv final {
-public:
-    explicit ScopedJNIEnv(JavaVM* vm) noexcept
-        : vm_(vm)
-    {
-        if (!vm_) {
-            return;
-        }
-        const jint status = vm_->GetEnv(
-            reinterpret_cast<void**>(&env_),
-            JNI_VERSION_1_6);
-        if (status == JNI_EDETACHED) {
-            if (vm_->AttachCurrentThread(&env_, nullptr) == JNI_OK) {
-                attached_ = true;
-            } else {
-                env_ = nullptr;
-            }
-        } else if (status != JNI_OK) {
-            env_ = nullptr;
-        }
-    }
-
-    ~ScopedJNIEnv()
-    {
-        if (attached_ && vm_) {
-            vm_->DetachCurrentThread();
-        }
-    }
-
-    JNIEnv* get() const noexcept
-    {
-        return env_;
-    }
-
-private:
-    JavaVM* vm_ = nullptr;
-    JNIEnv* env_ = nullptr;
-    bool attached_ = false;
-};
-
-bool clearJavaException(JNIEnv* env) noexcept
+void closeDescriptor(int& descriptor) noexcept
 {
-    if (!env || !env->ExceptionCheck()) {
-        return false;
+    if (descriptor >= 0) {
+        close(descriptor);
+        descriptor = -1;
     }
-    env->ExceptionClear();
-    return true;
 }
 
-bool hasExtension(const char* requested) noexcept
+bool hasExtension(const char* extensions, const char* name) noexcept
 {
-    if (!requested || !*requested) {
+    if (!extensions || !name || !*name) {
         return false;
     }
-    GLint count = 0;
-    glGetIntegerv(GL_NUM_EXTENSIONS, &count);
-    for (GLint index = 0; index < count; ++index) {
-        const auto* value = reinterpret_cast<const char*>(
-            glGetStringi(
-                GL_EXTENSIONS,
-                static_cast<GLuint>(index)));
-        if (value && std::string(value) == requested) {
+    const std::size_t length = std::strlen(name);
+    const char* current = extensions;
+    while ((current = std::strstr(current, name))) {
+        const bool left = current == extensions || current[-1] == ' ';
+        const bool right = current[length] == '\0'
+            || current[length] == ' ';
+        if (left && right) {
             return true;
         }
+        current += length;
     }
     return false;
+}
+
+struct PendingImage {
+    AImage* image = nullptr;
+    int acquireFence = -1;
+    std::int64_t timestampNanoseconds = 0;
+};
+
+void discardImage(PendingImage& pending) noexcept
+{
+    if (!pending.image) {
+        closeDescriptor(pending.acquireFence);
+        return;
+    }
+    if (pending.acquireFence >= 0) {
+        AImage_deleteAsync(pending.image, pending.acquireFence);
+        pending.acquireFence = -1;
+    } else {
+        AImage_delete(pending.image);
+    }
+    pending.image = nullptr;
 }
 
 struct FrameKey {
@@ -115,32 +96,13 @@ FrameKey frameKey(const VideoFrame& frame) noexcept
     if (!frame || !frame.hasHardwareFrame()) {
         return result;
     }
-    const NativeHandle output =
-        frame.hardwareFrame().nativeHandle(
-            HardwareHandleType::Frame);
+    const NativeHandle output = frame.hardwareFrame().nativeHandle(
+        HardwareHandleType::Frame);
     result.buffer = output.value;
     result.generation = output.subresource;
     result.timestampMilliseconds = frame.timestamp();
     return result;
 }
-
-struct AtomicStatistics {
-    std::atomic<std::uint64_t> codecOutputsQueued { 0 };
-    std::atomic<std::uint64_t> imagesLatched { 0 };
-    std::atomic<std::uint64_t> textureAttachments { 0 };
-    std::atomic<std::uint64_t> textureDetaches { 0 };
-    std::atomic<std::uint64_t> textureUpdates { 0 };
-    std::atomic<std::uint64_t> redrawSignals { 0 };
-    std::atomic<std::uint64_t> staleFramesDropped { 0 };
-    std::atomic<std::uint64_t> maximumPendingFrames { 0 };
-    std::atomic<std::int64_t> lastTimestampNanoseconds { 0 };
-    std::atomic<std::uint32_t> textureName { 0 };
-    std::atomic<int> hdrSamplingStatus {
-        static_cast<int>(
-            MediaCodecOpenGLHdrSamplingStatus::Disabled)
-    };
-    std::atomic<std::int32_t> lastDataSpace { ADATASPACE_UNKNOWN };
-};
 
 void updateMaximum(
     std::atomic<std::uint64_t>& maximum,
@@ -155,390 +117,632 @@ void updateMaximum(
     }
 }
 
-void convertSurfaceTextureTransformToTopLeft(
-    std::array<float, 16>& transform) noexcept
+struct AtomicStatistics {
+    std::atomic<std::uint64_t> codecOutputsQueued { 0 };
+    std::atomic<std::uint64_t> imagesAcquired { 0 };
+    std::atomic<std::uint64_t> eglImagesImported { 0 };
+    std::atomic<std::uint64_t> eglImagesDestroyed { 0 };
+    std::atomic<std::uint64_t> rawTextureBindings { 0 };
+    std::atomic<std::uint64_t> redrawSignals { 0 };
+    std::atomic<std::uint64_t> staleFramesDropped { 0 };
+    std::atomic<std::uint64_t> maximumPendingFrames { 0 };
+    std::atomic<std::int64_t> lastTimestampNanoseconds { 0 };
+    std::atomic<std::uint32_t> textureName { 0 };
+    std::atomic<std::uint64_t> acquireFencesWaited { 0 };
+    std::atomic<std::uint64_t> releaseFencesReturned { 0 };
+    std::atomic<std::uint64_t> releaseFenceFallbacks { 0 };
+    std::atomic<std::uint64_t> rawYcbcrImports { 0 };
+    std::atomic<std::uint32_t> lastHardwareBufferFormat { 0 };
+};
+
+struct SharedState {
+    ~SharedState()
+    {
+        if (reader) {
+            AImageReader_setImageListener(reader, nullptr);
+        }
+        std::deque<PendingImage> pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            shuttingDown = true;
+            pending.swap(images);
+            queuedFrames.clear();
+            retiredFrames.clear();
+            frameAvailable = {};
+        }
+        for (auto& image : pending) {
+            discardImage(image);
+        }
+        surface = {};
+        if (reader) {
+            AImageReader_delete(reader);
+            reader = nullptr;
+        }
+    }
+
+    MediaCodecOpenGLInteropConfig config;
+    AImageReader* reader = nullptr;
+    MediaCodecSurface surface;
+    mutable std::mutex mutex;
+    std::deque<PendingImage> images;
+    std::vector<FrameKey> queuedFrames;
+    std::deque<FrameKey> retiredFrames;
+    OpenGLHardwareFrameInterop::FrameAvailableCallback frameAvailable;
+    std::string asyncError;
+    std::string lastRuntimeError;
+    bool shuttingDown = false;
+    AtomicStatistics statistics;
+};
+
+void onImageAvailable(void* context, AImageReader* reader) noexcept
 {
-    // SurfaceTexture's matrix expects the conventional OpenGL texture
-    // coordinate origin. QtAV renderers use the same top-left source
-    // coordinate convention as Vulkan and software video frames. Compose a
-    // vertical origin conversion on the input side (M * flipY), preserving
-    // any crop, scale, or producer rotation already present in M.
-    const std::array<float, 16> original = transform;
-    for (std::size_t row = 0; row < 4; ++row) {
-        transform[4 + row] = -original[4 + row];
-        transform[12 + row] =
-            original[4 + row] + original[12 + row];
+    auto* state = static_cast<SharedState*>(context);
+    if (!state || !reader) {
+        return;
+    }
+    bool acquiredAny = false;
+    for (;;) {
+        PendingImage pending;
+        const media_status_t status =
+            AImageReader_acquireNextImageAsync(
+                reader,
+                &pending.image,
+                &pending.acquireFence);
+        if (status == AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE
+            || status == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED) {
+            break;
+        }
+        if (status != AMEDIA_OK || !pending.image) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->shuttingDown) {
+                state->asyncError =
+                    "AImageReader_acquireNextImageAsync failed: "
+                    + std::to_string(status);
+            }
+            break;
+        }
+        if (AImage_getTimestamp(
+                pending.image,
+                &pending.timestampNanoseconds)
+                != AMEDIA_OK
+            || pending.timestampNanoseconds < 0) {
+            discardImage(pending);
+            state->statistics.staleFramesDropped.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            continue;
+        }
+        acquiredAny = true;
+        state->statistics.imagesAcquired.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        PendingImage discarded;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->shuttingDown) {
+                discarded = pending;
+            } else {
+                state->images.push_back(pending);
+                if (static_cast<int>(state->images.size())
+                    > state->config.maximumPendingFrames) {
+                    discarded = state->images.front();
+                    state->images.pop_front();
+                    state->statistics.staleFramesDropped.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                }
+                updateMaximum(
+                    state->statistics.maximumPendingFrames,
+                    state->images.size());
+            }
+        }
+        // Do not retain evicted acquisitions until the callback has finished
+        // draining. Holding those AImages can hit maxImages and leave an
+        // already-queued producer buffer without a future listener edge.
+        discardImage(discarded);
+    }
+
+    OpenGLHardwareFrameInterop::FrameAvailableCallback callback;
+    bool hasError = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        callback = state->frameAvailable;
+        hasError = !state->asyncError.empty();
+    }
+    if ((acquiredAny || hasError) && callback) {
+        state->statistics.redrawSignals.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        callback();
     }
 }
+
+template <typename Function>
+Function eglFunction(const char* name) noexcept
+{
+    return reinterpret_cast<Function>(eglGetProcAddress(name));
+}
+
+struct EGLFunctions {
+    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC getNativeClientBuffer = nullptr;
+    PFNEGLCREATEIMAGEKHRPROC createImage = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC destroyImage = nullptr;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC imageTargetTexture = nullptr;
+    PFNEGLCREATESYNCKHRPROC createSync = nullptr;
+    PFNEGLDESTROYSYNCKHRPROC destroySync = nullptr;
+    PFNEGLWAITSYNCKHRPROC waitSync = nullptr;
+    PFNEGLDUPNATIVEFENCEFDANDROIDPROC duplicateFence = nullptr;
+
+    bool isValid() const noexcept
+    {
+        return getNativeClientBuffer && createImage && destroyImage
+            && imageTargetTexture && createSync && destroySync
+            && waitSync && duplicateFence;
+    }
+};
+
+struct CurrentImage {
+    AImage* image = nullptr;
+    int acquireFence = -1;
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLImageKHR eglImage = EGL_NO_IMAGE_KHR;
+    GLuint texture = 0;
+    OpenGLExternalTextureFrame frame;
+};
 
 } // namespace
 
 class MediaCodecOpenGLInterop::Impl {
 public:
     explicit Impl(MediaCodecOpenGLInteropConfig config)
-        : config_(config)
+        : state_(std::make_shared<SharedState>())
     {
-        config_.maximumPendingFrames = std::clamp(
-            config_.maximumPendingFrames,
-            2,
+        state_->config = config;
+        state_->config.width = std::max(1, state_->config.width);
+        state_->config.height = std::max(1, state_->config.height);
+        state_->config.maximumPendingFrames = std::clamp(
+            state_->config.maximumPendingFrames,
+            4,
             16);
-        config_.redrawRetryMilliseconds = std::clamp(
-            config_.redrawRetryMilliseconds,
-            1,
-            16);
-        config_.width = std::max(1, config_.width);
-        config_.height = std::max(1, config_.height);
-        setHdrSamplingStatus(
-            config_.hdrExternalOesSamplingEnabled
-                ? MediaCodecOpenGLHdrSamplingStatus::Supported
-                : config_.autoDetectHdrExternalOesSampling
-                    ? MediaCodecOpenGLHdrSamplingStatus::Unchecked
-                    : MediaCodecOpenGLHdrSamplingStatus::Disabled);
         initialize();
     }
 
     ~Impl()
     {
-        stopRetryWorker();
-        surface_ = {};
-        ScopedJNIEnv scoped(config_.javaVM);
-        JNIEnv* env = scoped.get();
-        if (env && surfaceTextureObject_) {
-            jclass type = env->GetObjectClass(surfaceTextureObject_);
-            if (type) {
-                const jmethodID release =
-                    env->GetMethodID(type, "release", "()V");
-                if (release) {
-                    env->CallVoidMethod(
-                        surfaceTextureObject_,
-                        release);
-                    clearJavaException(env);
-                } else {
-                    clearJavaException(env);
-                }
-                env->DeleteLocalRef(type);
+        // The renderer normally releases every imported image with its EGL
+        // context current. Return an exceptional leftover image without
+        // touching stale GL/EGL objects.
+        std::lock_guard<std::mutex> lock(currentMutex_);
+        if (current_.image) {
+            if (current_.acquireFence >= 0) {
+                AImage_deleteAsync(
+                    current_.image,
+                    current_.acquireFence);
+                current_.acquireFence = -1;
             } else {
-                clearJavaException(env);
+                AImage_delete(current_.image);
             }
+            current_.image = nullptr;
         }
-        if (surfaceTexture_) {
-            ASurfaceTexture_release(surfaceTexture_);
-            surfaceTexture_ = nullptr;
-        }
-        if (env && surfaceTextureObject_) {
-            env->DeleteGlobalRef(surfaceTextureObject_);
-        }
-        surfaceTextureObject_ = nullptr;
     }
 
     void initialize()
     {
-        if (!config_.javaVM) {
+        // Keep two acquisition slots outside the timestamp-correlation
+        // window. The listener may run while one matched image is being
+        // rendered, and it must still be able to acquire-and-retire a stale
+        // producer buffer without reaching MAX_IMAGES_ACQUIRED.
+        const int readerMaximumImages =
+            state_->config.maximumPendingFrames + 2;
+        const media_status_t status = AImageReader_newWithUsage(
+            state_->config.width,
+            state_->config.height,
+            AIMAGE_FORMAT_PRIVATE,
+            AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+            readerMaximumImages,
+            &state_->reader);
+        if (status != AMEDIA_OK || !state_->reader) {
             error_ =
-                "MediaCodec OpenGL ES interop requires the application's JavaVM";
+                "AImageReader_newWithUsage(PRIVATE, GPU_SAMPLED_IMAGE) failed: "
+                + std::to_string(status);
             return;
         }
-        ScopedJNIEnv scoped(config_.javaVM);
-        JNIEnv* env = scoped.get();
-        if (!env) {
-            error_ =
-                "Could not attach the MediaCodec OpenGL ES interop to the Java VM";
+        ANativeWindow* window = nullptr;
+        if (AImageReader_getWindow(state_->reader, &window) != AMEDIA_OK
+            || !window) {
+            error_ = "AImageReader_getWindow failed";
             return;
         }
-        jclass type =
-            env->FindClass("android/graphics/SurfaceTexture");
-        if (!type || clearJavaException(env)) {
-            if (type) {
-                env->DeleteLocalRef(type);
-            }
+        state_->surface = MediaCodecSurface(window);
+        if (!state_->surface) {
             error_ =
-                "Could not resolve android.graphics.SurfaceTexture";
+                "Could not retain the private AImageReader producer window";
             return;
         }
-        const jmethodID constructor =
-            env->GetMethodID(type, "<init>", "(Z)V");
-        const jmethodID setDefaultBufferSize =
-            env->GetMethodID(type, "setDefaultBufferSize", "(II)V");
-        if (!constructor || !setDefaultBufferSize
-            || clearJavaException(env)) {
-            env->DeleteLocalRef(type);
-            error_ =
-                "The Android SurfaceTexture detached constructor or buffer-size API is unavailable";
-            return;
-        }
-        if (!config_.hdrExternalOesSamplingEnabled
-            && config_.autoDetectHdrExternalOesSampling) {
-            getDataSpace_ =
-                env->GetMethodID(type, "getDataSpace", "()I");
-            if (!getDataSpace_ || clearJavaException(env)) {
-                getDataSpace_ = nullptr;
-                setHdrSamplingStatus(
-                    MediaCodecOpenGLHdrSamplingStatus::Unsupported);
-            }
-        }
-        jobject local =
-            env->NewObject(type, constructor, JNI_FALSE);
-        if (!local || clearJavaException(env)) {
-            if (local) {
-                env->DeleteLocalRef(local);
-            }
-            env->DeleteLocalRef(type);
-            error_ =
-                "Could not create a detached Android SurfaceTexture";
-            return;
-        }
-        env->CallVoidMethod(
-            local,
-            setDefaultBufferSize,
-            config_.width,
-            config_.height);
-        if (clearJavaException(env)) {
-            env->DeleteLocalRef(local);
-            env->DeleteLocalRef(type);
-            error_ =
-                "SurfaceTexture rejected the decoded buffer dimensions";
-            return;
-        }
-        surfaceTextureObject_ = env->NewGlobalRef(local);
-        env->DeleteLocalRef(local);
-        env->DeleteLocalRef(type);
-        if (!surfaceTextureObject_
-            || clearJavaException(env)) {
-            error_ =
-                "Could not retain the Android SurfaceTexture";
-            return;
-        }
-
-        surfaceTexture_ =
-            ASurfaceTexture_fromSurfaceTexture(
-                env,
-                surfaceTextureObject_);
-        if (!surfaceTexture_) {
-            error_ =
-                "ASurfaceTexture_fromSurfaceTexture failed";
-            return;
-        }
-        ANativeWindow* producer =
-            ASurfaceTexture_acquireANativeWindow(
-                surfaceTexture_);
-        if (!producer) {
-            error_ =
-                "ASurfaceTexture_acquireANativeWindow failed";
-            return;
-        }
-        surface_ = MediaCodecSurface(producer);
-        ANativeWindow_release(producer);
-        if (!surface_) {
-            error_ =
-                "Could not retain the SurfaceTexture producer window";
+        AImageReader_ImageListener listener {};
+        listener.context = state_.get();
+        listener.onImageAvailable = &onImageAvailable;
+        if (AImageReader_setImageListener(state_->reader, &listener)
+            != AMEDIA_OK) {
+            error_ = "AImageReader_setImageListener failed";
             return;
         }
         valid_ = true;
-        retryWorker_ =
-            std::thread([this] { retryLoop(); });
     }
 
-    MediaCodecOpenGLHdrSamplingStatus hdrSamplingStatus() const noexcept
+    bool supports(const HardwareFrame& frame) const noexcept
     {
-        return static_cast<MediaCodecOpenGLHdrSamplingStatus>(
-            statistics_.hdrSamplingStatus.load(
-                std::memory_order_relaxed));
+        if (!valid_ || !frame
+            || frame.deviceType() != HardwareDeviceType::MediaCodec) {
+            return false;
+        }
+        const NativeHandle output = frame.nativeHandle(
+            HardwareHandleType::Frame);
+        const NativeHandle sourceSurface = frame.nativeHandle(
+            HardwareHandleType::Surface);
+        return output && sourceSurface
+            && output.subresource == state_->surface.generation()
+            && sourceSurface.subresource == state_->surface.generation()
+            && sourceSurface.value
+                == reinterpret_cast<std::uintptr_t>(
+                    state_->surface.nativeWindow());
     }
 
-    void setHdrSamplingStatus(
-        MediaCodecOpenGLHdrSamplingStatus status) noexcept
-    {
-        statistics_.hdrSamplingStatus.store(
-            static_cast<int>(status),
-            std::memory_order_relaxed);
-    }
-
-    bool mayAttemptHdrSampling() const noexcept
-    {
-        const MediaCodecOpenGLHdrSamplingStatus status =
-            hdrSamplingStatus();
-        return status == MediaCodecOpenGLHdrSamplingStatus::Unchecked
-            || status == MediaCodecOpenGLHdrSamplingStatus::Supported;
-    }
-
-    bool validateHdrSamplingContext(std::string& detail) noexcept
-    {
-        const MediaCodecOpenGLHdrSamplingStatus status =
-            hdrSamplingStatus();
-        if (status == MediaCodecOpenGLHdrSamplingStatus::Supported) {
-            return true;
-        }
-        if (status != MediaCodecOpenGLHdrSamplingStatus::Unchecked) {
-            detail =
-                "P010/HDR SurfaceTexture sampling is unavailable because "
-                "native automatic capability detection is disabled or unsupported";
-            return false;
-        }
-        if (!getDataSpace_) {
-            setHdrSamplingStatus(
-                MediaCodecOpenGLHdrSamplingStatus::Unsupported);
-            detail =
-                "P010/HDR SurfaceTexture sampling requires Android 13 "
-                "SurfaceTexture dataspace reporting";
-            return false;
-        }
-        if (!hasExtension("GL_OES_EGL_image_external_essl3")
-            || !hasExtension("GL_EXT_YUV_target")) {
-            setHdrSamplingStatus(
-                MediaCodecOpenGLHdrSamplingStatus::Unsupported);
-            detail =
-                "P010/HDR SurfaceTexture sampling requires "
-                "GL_OES_EGL_image_external_essl3 and GL_EXT_YUV_target";
-            return false;
-        }
-        return true;
-    }
-
-    bool currentDataSpace(std::int32_t& dataSpace) noexcept
-    {
-        if (!getDataSpace_ || !surfaceTextureObject_) {
-            return false;
-        }
-        ScopedJNIEnv scoped(config_.javaVM);
-        JNIEnv* env = scoped.get();
-        if (!env) {
-            return false;
-        }
-        const jint value = env->CallIntMethod(
-            surfaceTextureObject_,
-            getDataSpace_);
-        if (clearJavaException(env)) {
-            return false;
-        }
-        dataSpace = static_cast<std::int32_t>(value);
-        statistics_.lastDataSpace.store(
-            dataSpace,
-            std::memory_order_relaxed);
-        return true;
-    }
-
-    bool dataSpaceMatchesFrame(
+    OpenGLHardwareImportStatus queueFrame(
         const VideoFrame& frame,
-        std::int32_t dataSpace) const noexcept
+        std::string& detail)
     {
-        if (dataSpace == ADATASPACE_UNKNOWN) {
+        const FrameKey key = frameKey(frame);
+        if (key.buffer == 0 || key.generation == 0) {
+            detail = "The frame is not a MediaCodec surface output";
+            return OpenGLHardwareImportStatus::Unsupported;
+        }
+        if (!supports(frame.hardwareFrame())) {
+            detail =
+                "The MediaCodec frame belongs to a stale or foreign AImageReader surface";
+            return OpenGLHardwareImportStatus::Stale;
+        }
+
+        std::deque<PendingImage> discarded;
+        bool imageReady = false;
+        bool alreadyQueued = false;
+        bool alreadyRetired = false;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (!state_->asyncError.empty()) {
+                detail = std::move(state_->asyncError);
+                state_->asyncError.clear();
+                return OpenGLHardwareImportStatus::Error;
+            }
+            const std::int64_t expected =
+                frame.timestamp() * 1'000'000LL;
+            for (auto iterator = state_->images.begin();
+                 iterator != state_->images.end();) {
+                if (iterator->timestampNanoseconds
+                    < expected - MaximumPresentationLagNanoseconds) {
+                    discarded.push_back(*iterator);
+                    iterator = state_->images.erase(iterator);
+                    state_->statistics.staleFramesDropped.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    continue;
+                }
+                const std::int64_t distance = std::llabs(
+                    iterator->timestampNanoseconds - expected);
+                if (distance <= TimestampToleranceNanoseconds) {
+                    imageReady = true;
+                }
+                ++iterator;
+            }
+            alreadyQueued = std::find(
+                state_->queuedFrames.begin(),
+                state_->queuedFrames.end(),
+                key) != state_->queuedFrames.end();
+            alreadyRetired = std::find(
+                state_->retiredFrames.begin(),
+                state_->retiredFrames.end(),
+                key) != state_->retiredFrames.end();
+            if (!imageReady && !alreadyQueued && !alreadyRetired) {
+                if (static_cast<int>(state_->queuedFrames.size())
+                    >= state_->config.maximumPendingFrames) {
+                    state_->retiredFrames.push_back(
+                        state_->queuedFrames.front());
+                    state_->queuedFrames.erase(
+                        state_->queuedFrames.begin());
+                    state_->statistics.staleFramesDropped.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                }
+                state_->queuedFrames.push_back(key);
+            }
+        }
+        for (auto& image : discarded) {
+            discardImage(image);
+        }
+        if (imageReady) {
+            return OpenGLHardwareImportStatus::Ready;
+        }
+        if (alreadyRetired) {
+            return OpenGLHardwareImportStatus::Stale;
+        }
+        if (alreadyQueued) {
+            return OpenGLHardwareImportStatus::Pending;
+        }
+
+        MediaCodecFrame output = mediaCodecFrame(frame, state_->surface);
+        const bool released =
+            output && output.isPending() && output.present();
+        if (!released) {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->queuedFrames.erase(
+                std::remove(
+                    state_->queuedFrames.begin(),
+                    state_->queuedFrames.end(),
+                    key),
+                state_->queuedFrames.end());
+            detail =
+                "Could not release the MediaCodec output into the private AImageReader";
+            return OpenGLHardwareImportStatus::Error;
+        }
+        state_->statistics.codecOutputsQueued.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        return OpenGLHardwareImportStatus::Pending;
+    }
+
+    bool queueFrameForPresentation(
+        const VideoFrame& frame,
+        std::string& detail)
+    {
+        const OpenGLHardwareImportStatus status = queueFrame(frame, detail);
+        return status == OpenGLHardwareImportStatus::Pending
+            || status == OpenGLHardwareImportStatus::Ready;
+    }
+
+    PendingImage takeImage(const VideoFrame& frame)
+    {
+        PendingImage matched;
+        std::deque<PendingImage> discarded;
+        const FrameKey key = frameKey(frame);
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            const std::int64_t expected =
+                frame.timestamp() * 1'000'000LL;
+            auto closest = state_->images.end();
+            std::int64_t closestDistance =
+                MaximumPresentationLagNanoseconds + 1;
+            for (auto iterator = state_->images.begin();
+                 iterator != state_->images.end();) {
+                if (iterator->timestampNanoseconds
+                    < expected - MaximumPresentationLagNanoseconds) {
+                    discarded.push_back(*iterator);
+                    iterator = state_->images.erase(iterator);
+                    state_->statistics.staleFramesDropped.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    continue;
+                }
+                const std::int64_t distance = std::llabs(
+                    iterator->timestampNanoseconds - expected);
+                if (distance <= TimestampToleranceNanoseconds
+                    && distance < closestDistance) {
+                    closest = iterator;
+                    closestDistance = distance;
+                }
+                ++iterator;
+            }
+            if (closest != state_->images.end()) {
+                matched = *closest;
+                state_->images.erase(closest);
+                state_->queuedFrames.erase(
+                    std::remove(
+                        state_->queuedFrames.begin(),
+                        state_->queuedFrames.end(),
+                        key),
+                    state_->queuedFrames.end());
+                state_->retiredFrames.push_back(key);
+                while (state_->retiredFrames.size()
+                       > MaximumRetiredFrameKeys) {
+                    state_->retiredFrames.pop_front();
+                }
+            }
+        }
+        for (auto& image : discarded) {
+            discardImage(image);
+        }
+        return matched;
+    }
+
+    bool loadEGL(std::string& detail)
+    {
+        const EGLDisplay display = eglGetCurrentDisplay();
+        const EGLContext context = eglGetCurrentContext();
+        if (display == EGL_NO_DISPLAY || context == EGL_NO_CONTEXT) {
+            detail =
+                "AHardwareBuffer OpenGL import requires a current EGL context";
             return false;
         }
-        const std::int32_t standard =
-            dataSpace & ADATASPACE_STANDARD_MASK;
-        const std::int32_t transfer =
-            dataSpace & ADATASPACE_TRANSFER_MASK;
-        const VideoColorSpace color = frame.colorSpaceInfo();
-        if (color.primaries == ColorPrimaries::BT2020
-            && standard != ADATASPACE_STANDARD_BT2020
-            && standard
-                != ADATASPACE_STANDARD_BT2020_CONSTANT_LUMINANCE) {
-            return false;
-        }
-        if (color.transfer == ColorTransfer::PQ) {
-            return transfer == ADATASPACE_TRANSFER_ST2084;
-        }
-        if (color.transfer == ColorTransfer::HLG) {
-            return transfer == ADATASPACE_TRANSFER_HLG;
-        }
-        // P010 can carry SDR or incomplete container metadata. In that case a
-        // concrete SurfaceTexture dataspace still proves that Android and the
-        // codec preserved the information needed by the external sampler.
-        return frame.hardwareFrame().softwareFormat()
-                == PixelFormat::P010
-            && standard != ADATASPACE_STANDARD_UNSPECIFIED
-            && transfer != ADATASPACE_TRANSFER_UNSPECIFIED;
-    }
-
-    void stopRetryWorker() noexcept
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopRetry_ = true;
-            retryRequested_ = false;
-            frameAvailable_ = {};
-        }
-        retryChanged_.notify_all();
-        if (retryWorker_.joinable()) {
-            retryWorker_.join();
-        }
-    }
-
-    void retryLoop()
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        while (!stopRetry_) {
-            retryChanged_.wait(lock, [this] {
-                return stopRetry_ || retryRequested_;
-            });
-            if (stopRetry_) {
-                break;
-            }
-            retryRequested_ = false;
-            const auto delay = std::chrono::milliseconds(
-                config_.redrawRetryMilliseconds);
-            if (retryChanged_.wait_for(
-                    lock,
-                    delay,
-                    [this] { return stopRetry_; })) {
-                break;
-            }
-            FrameAvailableCallback callback = frameAvailable_;
-            lock.unlock();
-            if (callback) {
-                statistics_.redrawSignals.fetch_add(
-                    1,
-                    std::memory_order_relaxed);
-                callback();
-            }
-            lock.lock();
-        }
-    }
-
-    void scheduleRetry() noexcept
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stopRetry_) {
-                return;
-            }
-            retryRequested_ = true;
-        }
-        retryChanged_.notify_one();
-    }
-
-    bool attachTexture(std::string& error)
-    {
-        if (texture_ != 0) {
+        if (eglDisplay_ == display && eglContext_ == context
+            && functions_.isValid()) {
             return true;
         }
+        const char* eglExtensions = eglQueryString(display, EGL_EXTENSIONS);
+        const char* glExtensions = reinterpret_cast<const char*>(
+            glGetString(GL_EXTENSIONS));
         if (!hasExtension(
-                "GL_OES_EGL_image_external_essl3")) {
-            error =
-                "The current OpenGL ES context lacks GL_OES_EGL_image_external_essl3";
+                eglExtensions,
+                "EGL_ANDROID_get_native_client_buffer")
+            || !hasExtension(
+                eglExtensions,
+                "EGL_ANDROID_image_native_buffer")
+            || !hasExtension(eglExtensions, "EGL_KHR_image_base")
+            || !hasExtension(
+                eglExtensions,
+                "EGL_ANDROID_native_fence_sync")
+            || !hasExtension(eglExtensions, "EGL_KHR_wait_sync")
+            || !hasExtension(
+                glExtensions,
+                "GL_OES_EGL_image_external_essl3")
+            || !hasExtension(glExtensions, "GL_EXT_YUV_target")) {
+            detail =
+                "Raw AHardwareBuffer OpenGL import requires EGL native-buffer/image/native-fence/wait-sync and GL external-YUV extensions";
             return false;
         }
-        while (glGetError() != GL_NO_ERROR) {
-        }
-        GLuint texture = 0;
-        glGenTextures(1, &texture);
-        if (!texture) {
-            error =
-                "glGenTextures failed for the SurfaceTexture external image";
+        EGLFunctions loaded;
+        loaded.getNativeClientBuffer =
+            eglFunction<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(
+                "eglGetNativeClientBufferANDROID");
+        loaded.createImage = eglFunction<PFNEGLCREATEIMAGEKHRPROC>(
+            "eglCreateImageKHR");
+        loaded.destroyImage = eglFunction<PFNEGLDESTROYIMAGEKHRPROC>(
+            "eglDestroyImageKHR");
+        loaded.imageTargetTexture =
+            eglFunction<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+                "glEGLImageTargetTexture2DOES");
+        loaded.createSync = eglFunction<PFNEGLCREATESYNCKHRPROC>(
+            "eglCreateSyncKHR");
+        loaded.destroySync = eglFunction<PFNEGLDESTROYSYNCKHRPROC>(
+            "eglDestroySyncKHR");
+        loaded.waitSync = eglFunction<PFNEGLWAITSYNCKHRPROC>(
+            "eglWaitSyncKHR");
+        loaded.duplicateFence =
+            eglFunction<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(
+                "eglDupNativeFenceFDANDROID");
+        if (!loaded.isValid()) {
+            detail =
+                "The EGL implementation did not expose the required AHardwareBuffer and native-fence entry points";
             return false;
         }
-        const int status =
-            ASurfaceTexture_attachToGLContext(
-                surfaceTexture_,
-                texture);
-        if (status != 0) {
-            glDeleteTextures(1, &texture);
-            error =
-                "ASurfaceTexture_attachToGLContext failed: "
-                + std::to_string(status);
+        functions_ = loaded;
+        eglDisplay_ = display;
+        eglContext_ = context;
+        return true;
+    }
+
+    bool waitForAcquireFence(CurrentImage& current, std::string& detail)
+    {
+        if (current.acquireFence < 0) {
+            return true;
+        }
+        const EGLint attributes[] {
+            EGL_SYNC_NATIVE_FENCE_FD_ANDROID,
+            current.acquireFence,
+            EGL_NONE,
+        };
+        EGLSyncKHR sync = functions_.createSync(
+            current.display,
+            EGL_SYNC_NATIVE_FENCE_ANDROID,
+            attributes);
+        if (sync == EGL_NO_SYNC_KHR) {
+            detail = "eglCreateSyncKHR(AImage acquire fence) failed";
             return false;
         }
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
+        // A successful native-fence sync import takes ownership of the fd.
+        current.acquireFence = -1;
+        const EGLint waitResult = functions_.waitSync(
+            current.display,
+            sync,
+            0);
+        functions_.destroySync(current.display, sync);
+        if (waitResult != EGL_TRUE) {
+            detail = "eglWaitSyncKHR(AImage acquire fence) failed";
+            return false;
+        }
+        state_->statistics.acquireFencesWaited.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        return true;
+    }
+
+    bool importImage(
+        PendingImage pending,
+        OpenGLExternalTextureFrame& output,
+        std::string& detail)
+    {
+        std::lock_guard<std::mutex> lock(currentMutex_);
+        if (current_.image) {
+            detail =
+                "The previous AHardwareBuffer OpenGL image has not been released";
+            discardImage(pending);
+            return false;
+        }
+        if (!loadEGL(detail)) {
+            discardImage(pending);
+            return false;
+        }
+
+        CurrentImage current;
+        current.image = pending.image;
+        current.acquireFence = pending.acquireFence;
+        current.display = eglDisplay_;
+        pending = {};
+        if (!waitForAcquireFence(current, detail)) {
+            cleanupCurrent(current, false);
+            return false;
+        }
+
+        AHardwareBuffer* hardwareBuffer = nullptr;
+        if (AImage_getHardwareBuffer(current.image, &hardwareBuffer)
+                != AMEDIA_OK
+            || !hardwareBuffer) {
+            detail = "AImage_getHardwareBuffer failed";
+            cleanupCurrent(current, false);
+            return false;
+        }
+        AHardwareBuffer_Desc description {};
+        AHardwareBuffer_describe(hardwareBuffer, &description);
+        if (description.layers != 1
+            || (description.usage
+                & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE)
+                == 0U
+            || (description.usage
+                & AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT)
+                != 0U) {
+            detail =
+                "The acquired AHardwareBuffer is not an unprotected single-layer sampled image";
+            cleanupCurrent(current, false);
+            return false;
+        }
+        AImageCropRect crop {};
+        if (AImage_getCropRect(current.image, &crop) != AMEDIA_OK
+            || crop.left < 0 || crop.top < 0
+            || crop.right <= crop.left || crop.bottom <= crop.top
+            || crop.right > static_cast<std::int32_t>(description.width)
+            || crop.bottom > static_cast<std::int32_t>(description.height)) {
+            detail =
+                "AImage returned a crop rectangle outside its AHardwareBuffer";
+            cleanupCurrent(current, false);
+            return false;
+        }
+        std::int64_t timestamp = 0;
+        if (AImage_getTimestamp(current.image, &timestamp) != AMEDIA_OK
+            || timestamp < 0) {
+            detail = "AImage returned an invalid timestamp";
+            cleanupCurrent(current, false);
+            return false;
+        }
+
+        const EGLClientBuffer clientBuffer =
+            functions_.getNativeClientBuffer(hardwareBuffer);
+        const EGLint imageAttributes[] {
+            EGL_IMAGE_PRESERVED_KHR,
+            EGL_TRUE,
+            EGL_NONE,
+        };
+        current.eglImage = functions_.createImage(
+            current.display,
+            EGL_NO_CONTEXT,
+            EGL_NATIVE_BUFFER_ANDROID,
+            clientBuffer,
+            imageAttributes);
+        if (!clientBuffer || current.eglImage == EGL_NO_IMAGE_KHR) {
+            detail =
+                "Could not create an EGLImage from the decoded AHardwareBuffer";
+            cleanupCurrent(current, false);
+            return false;
+        }
+        glGenTextures(1, &current.texture);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, current.texture);
         glTexParameteri(
             GL_TEXTURE_EXTERNAL_OES,
             GL_TEXTURE_MIN_FILTER,
@@ -555,79 +759,64 @@ public:
             GL_TEXTURE_EXTERNAL_OES,
             GL_TEXTURE_WRAP_T,
             GL_CLAMP_TO_EDGE);
+        functions_.imageTargetTexture(
+            GL_TEXTURE_EXTERNAL_OES,
+            reinterpret_cast<GLeglImageOES>(current.eglImage));
         const GLenum glError = glGetError();
-        if (glError != GL_NO_ERROR) {
-            ASurfaceTexture_detachFromGLContext(surfaceTexture_);
-            error =
-                "Could not configure the SurfaceTexture external image: "
+        if (!current.texture || glError != GL_NO_ERROR) {
+            detail =
+                "glEGLImageTargetTexture2DOES(raw AHardwareBuffer) failed: "
                 + std::to_string(glError);
+            cleanupCurrent(current, false);
             return false;
         }
-        texture_ = texture;
-        statistics_.textureName.store(
-            texture_,
-            std::memory_order_relaxed);
-        statistics_.textureAttachments.fetch_add(
+
+        current.frame.texture = current.texture;
+        current.frame.rawYcbcr = true;
+        current.frame.bitDepth = description.format
+                == AHARDWAREBUFFER_FORMAT_YCbCr_P010
+            ? 10
+            : 8;
+        current.frame.timestampNanoseconds = timestamp;
+        current.frame.generation = state_->surface.generation();
+        current.frame.transform.fill(0.0F);
+        current.frame.transform[0] =
+            static_cast<float>(crop.right - crop.left)
+            / static_cast<float>(description.width);
+        current.frame.transform[5] =
+            static_cast<float>(crop.bottom - crop.top)
+            / static_cast<float>(description.height);
+        current.frame.transform[10] = 1.0F;
+        current.frame.transform[12] = static_cast<float>(crop.left)
+            / static_cast<float>(description.width);
+        current.frame.transform[13] = static_cast<float>(crop.top)
+            / static_cast<float>(description.height);
+        current.frame.transform[15] = 1.0F;
+
+        output = current.frame;
+        current_ = current;
+        state_->statistics.eglImagesImported.fetch_add(
             1,
+            std::memory_order_relaxed);
+        state_->statistics.rawTextureBindings.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        state_->statistics.rawYcbcrImports.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        state_->statistics.lastTimestampNanoseconds.store(
+            timestamp,
+            std::memory_order_relaxed);
+        state_->statistics.textureName.store(
+            current.texture,
+            std::memory_order_relaxed);
+        state_->statistics.lastHardwareBufferFormat.store(
+            description.format,
             std::memory_order_relaxed);
         return true;
     }
 
-    void releaseCurrentContextResources() noexcept
-    {
-        if (!surfaceTexture_ || texture_ == 0) {
-            return;
-        }
-        const int status =
-            ASurfaceTexture_detachFromGLContext(
-                surfaceTexture_);
-        if (status == 0) {
-            statistics_.textureDetaches.fetch_add(
-                1,
-                std::memory_order_relaxed);
-        } else {
-            std::lock_guard<std::mutex> lock(mutex_);
-            lastRuntimeError_ =
-                "ASurfaceTexture_detachFromGLContext failed: "
-                + std::to_string(status);
-        }
-        texture_ = 0;
-        statistics_.textureName.store(
-            0,
-            std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            currentFrameKey_ = {};
-            currentTexture_ = {};
-        }
-    }
-
-    bool supports(const HardwareFrame& frame) const noexcept
-    {
-        if (!valid_ || !frame
-            || frame.deviceType()
-                != HardwareDeviceType::MediaCodec) {
-            return false;
-        }
-        if (frame.softwareFormat() == PixelFormat::P010
-            && !mayAttemptHdrSampling()) {
-            return false;
-        }
-        const NativeHandle output =
-            frame.nativeHandle(HardwareHandleType::Frame);
-        const NativeHandle sourceSurface =
-            frame.nativeHandle(HardwareHandleType::Surface);
-        return output && sourceSurface
-            && output.subresource == surface_.generation()
-            && sourceSurface.subresource
-                == surface_.generation()
-            && sourceSurface.value
-                == reinterpret_cast<std::uintptr_t>(
-                    surface_.nativeWindow());
-    }
-
-    OpenGLHardwareImportResult prepareFrame(
-        const VideoFrame& frame)
+    OpenGLHardwareImportResult prepareFrame(const VideoFrame& frame)
     {
         if (!valid_) {
             return {
@@ -636,279 +825,160 @@ public:
                 error_,
             };
         }
-        const FrameKey key = frameKey(frame);
-        if (key.buffer == 0 || key.generation == 0) {
-            return {
-                OpenGLHardwareImportStatus::Unsupported,
-                {},
-                "The frame is not a MediaCodec direct-surface output",
-            };
+        std::string detail;
+        const OpenGLHardwareImportStatus status = queueFrame(frame, detail);
+        if (status != OpenGLHardwareImportStatus::Ready) {
+            return { status, {}, std::move(detail) };
         }
-        const bool p010OrHdr =
-            frame.colorSpaceInfo().isHdr()
-            || frame.hardwareFrame().softwareFormat()
-                == PixelFormat::P010;
-        if (p010OrHdr) {
-            std::string capabilityDetail;
-            if (!validateHdrSamplingContext(capabilityDetail)) {
-                return {
-                    OpenGLHardwareImportStatus::Unsupported,
-                    {},
-                    std::move(capabilityDetail),
-                };
-            }
+        PendingImage pending = takeImage(frame);
+        if (!pending.image) {
+            return { OpenGLHardwareImportStatus::Pending, {}, {} };
         }
-        if (!supports(frame.hardwareFrame())) {
-            return {
-                OpenGLHardwareImportStatus::Stale,
-                {},
-                "The MediaCodec frame belongs to a stale or foreign SurfaceTexture generation",
-            };
-        }
-
-        std::string attachError;
-        if (!attachTexture(attachError)) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                lastRuntimeError_ = attachError;
-            }
-            return {
-                OpenGLHardwareImportStatus::Error,
-                {},
-                std::move(attachError),
-            };
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (key == currentFrameKey_ && currentTexture_) {
-                return {
-                    OpenGLHardwareImportStatus::Ready,
-                    currentTexture_,
-                    {},
-                };
-            }
-        }
-
-        bool alreadyQueued = false;
-        const std::int64_t expected =
-            frame.timestamp() * 1'000'000LL;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            pendingFrames_.erase(
-                std::remove_if(
-                    pendingFrames_.begin(),
-                    pendingFrames_.end(),
-                    [this, expected](const FrameKey& candidate) {
-                        const bool stale =
-                            candidate.timestampMilliseconds
-                                    * 1'000'000LL
-                                < expected
-                                    - MaximumPresentationLagNanoseconds;
-                        if (stale) {
-                            statistics_.staleFramesDropped.fetch_add(
-                                1,
-                                std::memory_order_relaxed);
-                        }
-                        return stale;
-                    }),
-                pendingFrames_.end());
-            alreadyQueued =
-                std::find(
-                    pendingFrames_.begin(),
-                    pendingFrames_.end(),
-                    key)
-                != pendingFrames_.end();
-            if (!alreadyQueued) {
-                if (static_cast<int>(pendingFrames_.size())
-                    >= config_.maximumPendingFrames) {
-                    pendingFrames_.erase(pendingFrames_.begin());
-                    statistics_.staleFramesDropped.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
-                }
-                pendingFrames_.push_back(key);
-                updateMaximum(
-                    statistics_.maximumPendingFrames,
-                    pendingFrames_.size());
-            }
-        }
-
-        if (!alreadyQueued) {
-            MediaCodecFrame output =
-                mediaCodecFrame(frame, surface_);
-            if (!output || !output.isPending()
-                || !output.present()) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                pendingFrames_.erase(
-                    std::remove(
-                        pendingFrames_.begin(),
-                        pendingFrames_.end(),
-                        key),
-                    pendingFrames_.end());
-                lastRuntimeError_ =
-                    "Could not release the MediaCodec output into SurfaceTexture";
-                return {
-                    OpenGLHardwareImportStatus::Error,
-                    {},
-                    lastRuntimeError_,
-                };
-            }
-            statistics_.codecOutputsQueued.fetch_add(
-                1,
-                std::memory_order_relaxed);
-        }
-
-        const int updateStatus =
-            ASurfaceTexture_updateTexImage(surfaceTexture_);
-        if (updateStatus != 0) {
-            const std::string updateError =
-                "ASurfaceTexture_updateTexImage failed: "
-                + std::to_string(updateStatus);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                lastRuntimeError_ = updateError;
-            }
-            return {
-                OpenGLHardwareImportStatus::Error,
-                {},
-                updateError,
-            };
-        }
-        statistics_.textureUpdates.fetch_add(
-            1,
-            std::memory_order_relaxed);
-        const std::int64_t timestamp =
-            ASurfaceTexture_getTimestamp(surfaceTexture_);
-        statistics_.lastTimestampNanoseconds.store(
-            timestamp,
-            std::memory_order_relaxed);
-
-        bool matched = false;
-        bool skipped = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const bool isNewImage =
-                timestamp > 0
-                && timestamp != ignoredTimestampNanoseconds_;
-            if (timestamp > 0
-                && std::llabs(timestamp - expected)
-                    <= TimestampToleranceNanoseconds
-                && (isNewImage
-                    || ignoredTimestampNanoseconds_ == 0)) {
-                matched = true;
-                ignoredTimestampNanoseconds_ = timestamp;
-                pendingFrames_.erase(
-                    std::remove(
-                        pendingFrames_.begin(),
-                        pendingFrames_.end(),
-                        key),
-                    pendingFrames_.end());
-            } else if (isNewImage
-                       && timestamp
-                           > expected
-                               + TimestampToleranceNanoseconds) {
-                skipped = true;
-                ignoredTimestampNanoseconds_ = timestamp;
-                pendingFrames_.erase(
-                    std::remove(
-                        pendingFrames_.begin(),
-                        pendingFrames_.end(),
-                        key),
-                    pendingFrames_.end());
-            }
-        }
-        if (skipped) {
-            statistics_.staleFramesDropped.fetch_add(
-                1,
-                std::memory_order_relaxed);
-            return {
-                OpenGLHardwareImportStatus::Stale,
-                {},
-                "SurfaceTexture advanced past this MediaCodec output",
-            };
-        }
-        if (!matched) {
-            scheduleRetry();
-            return {
-                OpenGLHardwareImportStatus::Pending,
-                {},
-                {},
-            };
-        }
-
-        if (p010OrHdr
-            && hdrSamplingStatus()
-                == MediaCodecOpenGLHdrSamplingStatus::Unchecked) {
-            std::int32_t dataSpace = ADATASPACE_UNKNOWN;
-            if (!currentDataSpace(dataSpace)
-                || !dataSpaceMatchesFrame(frame, dataSpace)) {
-                setHdrSamplingStatus(
-                    MediaCodecOpenGLHdrSamplingStatus::Unsupported);
-                return {
-                    OpenGLHardwareImportStatus::Unsupported,
-                    {},
-                    "P010/HDR SurfaceTexture sampling reported an "
-                    "unknown or incompatible dataspace "
-                        + std::to_string(dataSpace),
-                };
-            }
-            setHdrSamplingStatus(
-                MediaCodecOpenGLHdrSamplingStatus::Supported);
-        }
-
         OpenGLExternalTextureFrame texture;
-        texture.texture = texture_;
-        texture.timestampNanoseconds = timestamp;
-        texture.generation = surface_.generation();
-        ASurfaceTexture_getTransformMatrix(
-            surfaceTexture_,
-            texture.transform.data());
-        convertSurfaceTextureTransformToTopLeft(texture.transform);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            currentFrameKey_ = key;
-            currentTexture_ = texture;
+        if (!importImage(pending, texture, detail)) {
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->lastRuntimeError = detail;
+            }
+            return {
+                OpenGLHardwareImportStatus::Error,
+                {},
+                std::move(detail),
+            };
         }
-        statistics_.imagesLatched.fetch_add(
-            1,
-            std::memory_order_relaxed);
-        return {
-            OpenGLHardwareImportStatus::Ready,
-            std::move(texture),
-            {},
+        return { OpenGLHardwareImportStatus::Ready, texture, {} };
+    }
+
+    void cleanupCurrent(CurrentImage& current, bool commandsSubmitted) noexcept
+    {
+        if (commandsSubmitted) {
+            glFinish();
+        }
+        if (current.texture) {
+            glDeleteTextures(1, &current.texture);
+            current.texture = 0;
+        }
+        if (current.eglImage != EGL_NO_IMAGE_KHR
+            && current.display != EGL_NO_DISPLAY
+            && functions_.destroyImage) {
+            functions_.destroyImage(current.display, current.eglImage);
+            current.eglImage = EGL_NO_IMAGE_KHR;
+            state_->statistics.eglImagesDestroyed.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
+        if (current.image) {
+            if (current.acquireFence >= 0) {
+                AImage_deleteAsync(
+                    current.image,
+                    current.acquireFence);
+                current.acquireFence = -1;
+            } else {
+                AImage_delete(current.image);
+            }
+            current.image = nullptr;
+        }
+        current.frame = {};
+    }
+
+    bool releaseFrame(
+        const OpenGLExternalTextureFrame& frame,
+        std::string& detail) noexcept
+    {
+        std::lock_guard<std::mutex> lock(currentMutex_);
+        if (!current_.image
+            || current_.frame.texture != frame.texture
+            || current_.frame.timestampNanoseconds
+                != frame.timestampNanoseconds
+            || current_.frame.generation != frame.generation) {
+            detail =
+                "The OpenGL AHardwareBuffer release does not match the current image";
+            return false;
+        }
+        const EGLint attributes[] {
+            EGL_SYNC_NATIVE_FENCE_FD_ANDROID,
+            EGL_NO_NATIVE_FENCE_FD_ANDROID,
+            EGL_NONE,
         };
+        EGLSyncKHR sync = functions_.createSync(
+            current_.display,
+            EGL_SYNC_NATIVE_FENCE_ANDROID,
+            attributes);
+        int releaseFence = -1;
+        if (sync != EGL_NO_SYNC_KHR) {
+            glFlush();
+            releaseFence = functions_.duplicateFence(
+                current_.display,
+                sync);
+            functions_.destroySync(current_.display, sync);
+        }
+        if (current_.texture) {
+            glDeleteTextures(1, &current_.texture);
+            current_.texture = 0;
+        }
+        if (current_.eglImage != EGL_NO_IMAGE_KHR) {
+            functions_.destroyImage(
+                current_.display,
+                current_.eglImage);
+            current_.eglImage = EGL_NO_IMAGE_KHR;
+            state_->statistics.eglImagesDestroyed.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
+        if (releaseFence >= 0) {
+            AImage_deleteAsync(current_.image, releaseFence);
+            state_->statistics.releaseFencesReturned.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        } else {
+            glFinish();
+            AImage_delete(current_.image);
+            state_->statistics.releaseFenceFallbacks.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
+        current_.image = nullptr;
+        current_.frame = {};
+        state_->statistics.textureName.store(
+            0,
+            std::memory_order_relaxed);
+        return true;
+    }
+
+    void releaseCurrentContextResources() noexcept
+    {
+        std::lock_guard<std::mutex> lock(currentMutex_);
+        if (current_.image) {
+            cleanupCurrent(current_, true);
+        }
+        functions_ = {};
+        eglDisplay_ = EGL_NO_DISPLAY;
+        eglContext_ = EGL_NO_CONTEXT;
     }
 
     void flush() noexcept
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pendingFrames_.clear();
-        currentFrameKey_ = {};
-        currentTexture_ = {};
-        retryRequested_ = false;
-        lastRuntimeError_.clear();
+        std::deque<PendingImage> pending;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            pending.swap(state_->images);
+            state_->queuedFrames.clear();
+            state_->retiredFrames.clear();
+            state_->asyncError.clear();
+        }
+        for (auto& image : pending) {
+            discardImage(image);
+        }
     }
 
-    MediaCodecOpenGLInteropConfig config_;
-    ASurfaceTexture* surfaceTexture_ = nullptr;
-    jobject surfaceTextureObject_ = nullptr;
-    jmethodID getDataSpace_ = nullptr;
-    MediaCodecSurface surface_;
-    mutable std::mutex mutex_;
-    std::condition_variable retryChanged_;
-    std::vector<FrameKey> pendingFrames_;
-    FrameKey currentFrameKey_;
-    OpenGLExternalTextureFrame currentTexture_;
-    FrameAvailableCallback frameAvailable_;
-    std::thread retryWorker_;
+    std::shared_ptr<SharedState> state_;
     std::string error_;
-    std::string lastRuntimeError_;
-    std::int64_t ignoredTimestampNanoseconds_ = 0;
-    GLuint texture_ = 0;
-    bool retryRequested_ = false;
-    bool stopRetry_ = false;
     bool valid_ = false;
-    AtomicStatistics statistics_;
+    std::mutex currentMutex_;
+    EGLFunctions functions_;
+    EGLDisplay eglDisplay_ = EGL_NO_DISPLAY;
+    EGLContext eglContext_ = EGL_NO_CONTEXT;
+    CurrentImage current_;
 };
 
 MediaCodecOpenGLInterop::MediaCodecOpenGLInterop(
@@ -920,8 +990,7 @@ MediaCodecOpenGLInterop::MediaCodecOpenGLInterop(
 MediaCodecOpenGLInterop::~MediaCodecOpenGLInterop() = default;
 MediaCodecOpenGLInterop::MediaCodecOpenGLInterop(
     MediaCodecOpenGLInterop&&) noexcept = default;
-MediaCodecOpenGLInterop&
-MediaCodecOpenGLInterop::operator=(
+MediaCodecOpenGLInterop& MediaCodecOpenGLInterop::operator=(
     MediaCodecOpenGLInterop&&) noexcept = default;
 
 MediaCodecOpenGLInterop::operator bool() const noexcept
@@ -939,26 +1008,22 @@ std::string MediaCodecOpenGLInterop::lastError() const
     if (!impl_) {
         return {};
     }
-    std::lock_guard<std::mutex> lock(impl_->mutex_);
-    return !impl_->lastRuntimeError_.empty()
-        ? impl_->lastRuntimeError_
+    std::lock_guard<std::mutex> lock(impl_->state_->mutex);
+    return !impl_->state_->lastRuntimeError.empty()
+        ? impl_->state_->lastRuntimeError
         : impl_->error_;
 }
 
-MediaCodecSurface
-MediaCodecOpenGLInterop::surface() const noexcept
+MediaCodecSurface MediaCodecOpenGLInterop::surface() const noexcept
 {
-    return impl_ ? impl_->surface_ : MediaCodecSurface {};
+    return impl_ ? impl_->state_->surface : MediaCodecSurface {};
 }
 
-HardwareInteropCapabilities
-MediaCodecOpenGLInterop::capabilities() const
+HardwareInteropCapabilities MediaCodecOpenGLInterop::capabilities() const
 {
     HardwareInteropCapabilities result;
     if (isValid()) {
-        result.sourceDevices = {
-            HardwareDeviceType::MediaCodec,
-        };
+        result.sourceDevices = { HardwareDeviceType::MediaCodec };
         result.targetDevice = HardwareDeviceType::OpenGL;
         result.zeroCopy = true;
         result.cpuFallback = false;
@@ -972,8 +1037,18 @@ bool MediaCodecOpenGLInterop::supports(
     return impl_ && impl_->supports(frame);
 }
 
-OpenGLHardwareImportResult
-MediaCodecOpenGLInterop::prepareFrame(
+bool MediaCodecOpenGLInterop::queueFrame(
+    const VideoFrame& frame,
+    std::string& detail)
+{
+    if (!impl_) {
+        detail = "The MediaCodec OpenGL ES interop object is empty";
+        return false;
+    }
+    return impl_->queueFrameForPresentation(frame, detail);
+}
+
+OpenGLHardwareImportResult MediaCodecOpenGLInterop::prepareFrame(
     const VideoFrame& frame)
 {
     if (!impl_) {
@@ -984,6 +1059,13 @@ MediaCodecOpenGLInterop::prepareFrame(
         };
     }
     return impl_->prepareFrame(frame);
+}
+
+bool MediaCodecOpenGLInterop::releaseFrame(
+    const OpenGLExternalTextureFrame& frame,
+    std::string& detail) noexcept
+{
+    return impl_ && impl_->releaseFrame(frame, detail);
 }
 
 void MediaCodecOpenGLInterop::releaseCurrentContextResources() noexcept
@@ -999,8 +1081,8 @@ void MediaCodecOpenGLInterop::setFrameAvailableCallback(
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::mutex> lock(impl_->mutex_);
-    impl_->frameAvailable_ = std::move(callback);
+    std::lock_guard<std::mutex> lock(impl_->state_->mutex);
+    impl_->state_->frameAvailable = std::move(callback);
 }
 
 void MediaCodecOpenGLInterop::flush() noexcept
@@ -1017,34 +1099,46 @@ MediaCodecOpenGLInterop::statistics() const noexcept
     if (!impl_) {
         return result;
     }
-    const AtomicStatistics& source = impl_->statistics_;
-    result.codecOutputsQueued =
-        source.codecOutputsQueued.load(std::memory_order_relaxed);
-    result.imagesLatched =
-        source.imagesLatched.load(std::memory_order_relaxed);
-    result.textureAttachments =
-        source.textureAttachments.load(std::memory_order_relaxed);
-    result.textureDetaches =
-        source.textureDetaches.load(std::memory_order_relaxed);
-    result.textureUpdates =
-        source.textureUpdates.load(std::memory_order_relaxed);
-    result.redrawSignals =
-        source.redrawSignals.load(std::memory_order_relaxed);
-    result.staleFramesDropped =
-        source.staleFramesDropped.load(std::memory_order_relaxed);
-    result.maximumPendingFrames =
-        source.maximumPendingFrames.load(std::memory_order_relaxed);
+    const AtomicStatistics& source = impl_->state_->statistics;
+    result.codecOutputsQueued = source.codecOutputsQueued.load(
+        std::memory_order_relaxed);
+    result.imagesLatched = source.imagesAcquired.load(
+        std::memory_order_relaxed);
+    result.textureAttachments = source.eglImagesImported.load(
+        std::memory_order_relaxed);
+    result.textureDetaches = source.eglImagesDestroyed.load(
+        std::memory_order_relaxed);
+    result.textureUpdates = source.rawTextureBindings.load(
+        std::memory_order_relaxed);
+    result.redrawSignals = source.redrawSignals.load(
+        std::memory_order_relaxed);
+    result.staleFramesDropped = source.staleFramesDropped.load(
+        std::memory_order_relaxed);
+    result.maximumPendingFrames = source.maximumPendingFrames.load(
+        std::memory_order_relaxed);
     result.lastTimestampNanoseconds =
-        source.lastTimestampNanoseconds.load(
-            std::memory_order_relaxed);
-    result.textureName =
-        source.textureName.load(std::memory_order_relaxed);
-    result.hdrSamplingStatus =
-        static_cast<MediaCodecOpenGLHdrSamplingStatus>(
-            source.hdrSamplingStatus.load(
-                std::memory_order_relaxed));
-    result.lastDataSpace =
-        source.lastDataSpace.load(std::memory_order_relaxed);
+        source.lastTimestampNanoseconds.load(std::memory_order_relaxed);
+    result.textureName = source.textureName.load(std::memory_order_relaxed);
+    result.hdrSamplingStatus = result.rawYcbcrImports > 0
+        ? MediaCodecOpenGLHdrSamplingStatus::Supported
+        : MediaCodecOpenGLHdrSamplingStatus::Unchecked;
+    result.acquireFencesWaited = source.acquireFencesWaited.load(
+        std::memory_order_relaxed);
+    result.releaseFencesReturned = source.releaseFencesReturned.load(
+        std::memory_order_relaxed);
+    result.releaseFenceFallbacks = source.releaseFenceFallbacks.load(
+        std::memory_order_relaxed);
+    result.rawYcbcrImports = source.rawYcbcrImports.load(
+        std::memory_order_relaxed);
+    result.lastHardwareBufferFormat =
+        source.lastHardwareBufferFormat.load(std::memory_order_relaxed);
+    // The implementation contains no decoded-pixel map, software transfer,
+    // CPU staging, or renderer upload operation.
+    result.cpuMapCalls = 0;
+    result.softwareTransferCalls = 0;
+    result.stagingCopies = 0;
+    result.rendererUploads = 0;
+    result.lastDataSpace = 0;
     return result;
 }
 

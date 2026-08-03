@@ -375,11 +375,23 @@ public:
             : 0;
         const auto latencyFrames =
             pipelineFrames + queue_.queuedFrames();
+        std::int64_t positionMilliseconds = std::max<std::int64_t>(
+            0,
+            positionNanoseconds / 1'000'000LL);
+        auto previous = lastClockPositionMilliseconds_.load(
+            std::memory_order_relaxed);
+        while (previous < positionMilliseconds
+               && !lastClockPositionMilliseconds_.compare_exchange_weak(
+                   previous,
+                   positionMilliseconds,
+                   std::memory_order_relaxed)) {
+        }
+        positionMilliseconds = std::max(
+            positionMilliseconds,
+            previous);
         return {
             true,
-            std::max<std::int64_t>(
-                0,
-                positionNanoseconds / 1'000'000LL),
+            positionMilliseconds,
             millisecondsForFrames(
                 latencyFrames,
                 deviceFormat_.sampleRate),
@@ -776,6 +788,9 @@ private:
             }
         }
         lastAudioEndFrame_.store(0, std::memory_order_release);
+        lastClockPositionMilliseconds_.store(
+            0,
+            std::memory_order_release);
         underrunReported_.store(false, std::memory_order_release);
         pendingUnderrun_.store(false, std::memory_order_release);
     }
@@ -938,6 +953,8 @@ private:
     std::atomic<std::int64_t> anchorMediaNanoseconds_ { 0 };
     std::atomic<std::int64_t> callbackFramePosition_ { 0 };
     std::atomic<std::int64_t> lastAudioEndFrame_ { 0 };
+    mutable std::atomic<std::int64_t>
+        lastClockPositionMilliseconds_ { 0 };
     std::atomic<bool> underrunReported_ { false };
     std::atomic<bool> pendingUnderrun_ { false };
 

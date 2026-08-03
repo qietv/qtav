@@ -36,6 +36,7 @@ public:
     VideoColorSpace colorSpaceInfo() const noexcept;
     MasteringDisplayMetadata masteringDisplayMetadata() const noexcept;
     ContentLightMetadata contentLightMetadata() const noexcept;
+    bool hasDolbyVisionMetadata() const noexcept;
     bool hasHardwareFrame() const noexcept;
     HardwareFrame hardwareFrame() const;
 

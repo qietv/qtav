@@ -38,7 +38,10 @@ target_link_libraries(qtav_interop_mediacodec_opengl
         QtAV::RenderOpenGL
     PRIVATE
         android
+        EGL
         GLESv3
+        mediandk
+        nativewindow
 )
 
 if(NOT BUILD_SHARED_LIBS)

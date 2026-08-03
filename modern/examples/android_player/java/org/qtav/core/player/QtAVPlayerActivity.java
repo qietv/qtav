@@ -96,12 +96,6 @@ public final class QtAVPlayerActivity extends Activity
                     publishSurface(currentSurface);
                 }
             }
-            if (nativeApplyPendingVideoFallback(nativeHandle)) {
-                zeroCopySwitch.setChecked(false);
-                updateOptionAvailability();
-                applyHdrPreference();
-                applyVideoSurfaceLayout();
-            }
             long packedVideoSize = nativeGetVideoSize(nativeHandle);
             int nextVideoWidth = (int) (packedVideoSize >>> 32);
             int nextVideoHeight = (int) packedVideoSize;
@@ -474,9 +468,11 @@ public final class QtAVPlayerActivity extends Activity
         decodeOptions.setOrientation(LinearLayout.HORIZONTAL);
         vulkanSwitch = optionSwitch("Vulkan", true);
         hdrSwitch = optionSwitch("HDR", true);
-        // Direct Surface is the smooth playback default. The private
-        // AImageReader/SurfaceTexture paths remain an explicit interop test.
-        zeroCopySwitch = optionSwitch("ZeroCopy", false);
+        // Keep decoded images on the GPU and route them through the selected
+        // application renderer by default. This is required for libplacebo
+        // Dolby Vision reshaping and tone mapping instead of relying on the
+        // device-specific MediaCodec direct-Surface Dolby path.
+        zeroCopySwitch = optionSwitch("ZeroCopy", true);
         hardwareSwitch = optionSwitch("Hardware decode", true);
         debugSwitch = optionSwitch("Debug", true);
         addWeighted(renderOptions, vulkanSwitch);
@@ -1006,7 +1002,6 @@ public final class QtAVPlayerActivity extends Activity
     private native long nativeGetPosition(long handle);
     private native long nativeGetDuration(long handle);
     private native long nativeGetVideoSize(long handle);
-    private native boolean nativeApplyPendingVideoFallback(long handle);
     private native boolean nativeIsPlaying(long handle);
     private native int nativeGetRequestedFrameRate(long handle);
     private native String nativeGetStatus(long handle);

@@ -79,7 +79,7 @@ struct VulkanContext {
             VK_STRUCTURE_TYPE_APPLICATION_INFO,
         };
         application.pApplicationName = "QtAVCore Vulkan renderer test";
-        application.apiVersion = VK_API_VERSION_1_0;
+        application.apiVersion = VK_API_VERSION_1_2;
         VkInstanceCreateInfo instanceInfo {
             VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         };
@@ -149,8 +149,28 @@ struct VulkanContext {
         VkDeviceCreateInfo deviceInfo {
             VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         };
+        VkPhysicalDeviceVulkan12Features supportedFeatures12 {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        };
+        VkPhysicalDeviceFeatures2 supportedFeatures {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        };
+        supportedFeatures.pNext = &supportedFeatures12;
+        vkGetPhysicalDeviceFeatures2(physicalDevice, &supportedFeatures);
+        if (supportedFeatures12.timelineSemaphore != VK_TRUE
+            || supportedFeatures12.hostQueryReset != VK_TRUE) {
+            error =
+                "The Vulkan device lacks libplacebo's required Vulkan 1.2 features";
+            return false;
+        }
+        VkPhysicalDeviceVulkan12Features enabledFeatures12 {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        };
+        enabledFeatures12.timelineSemaphore = VK_TRUE;
+        enabledFeatures12.hostQueryReset = VK_TRUE;
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
+        deviceInfo.pNext = &enabledFeatures12;
         result = vkCreateDevice(
             physicalDevice,
             &deviceInfo,
@@ -167,7 +187,15 @@ struct VulkanContext {
 
     qtav::BorrowedVulkanDevice borrowed() const noexcept
     {
-        return { physicalDevice, device, queue, queueFamilyIndex };
+        return {
+            instance,
+            physicalDevice,
+            device,
+            queue,
+            queueFamilyIndex,
+            true,
+            true,
+        };
     }
 
     VkInstance instance = VK_NULL_HANDLE;

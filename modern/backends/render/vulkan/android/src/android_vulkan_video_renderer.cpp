@@ -93,7 +93,8 @@ VkHdrMetadataEXT hdrMetadata(const VideoFrame& frame) noexcept
 
 bool BorrowedAndroidVulkanContext::isValid() const noexcept
 {
-    return instance != VK_NULL_HANDLE && device.isValid();
+    return instance != VK_NULL_HANDLE && device.isValid()
+        && instance == device.instance;
 }
 
 class AndroidVulkanVideoRenderer::Impl {

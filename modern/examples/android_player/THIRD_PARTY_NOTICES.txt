@@ -1,12 +1,19 @@
 QtAVCore Android Player third-party notices
 
-This APK contains QtAVCore and FFmpeg 8.1.2 under the GNU Lesser General
-Public License version 2.1 or later. The corresponding source and the complete
+This APK contains QtAVCore under the GNU Lesser General Public License version
+2.1 or later and statically links the repository's FFmpeg 8.1.2 dependency
+package. That FFmpeg package enables GPL/version3 features and is distributed
+under GNU GPL version 3 terms. The corresponding source and the complete
 relinkable Android build procedure are provided by the QtAV repository that
 contains this example.
 
-This APK statically links OpenSSL 3.5.7 under the Apache License 2.0.
+This APK statically links OpenSSL 3.6.3 under the Apache License 2.0.
 OpenSSL source: https://github.com/openssl/openssl
 
-The complete LGPL-2.1 and Apache-2.0 license texts are included alongside this
-notice in the APK assets directory.
+This APK statically links libplacebo 7.351.0 under the GNU Lesser General
+Public License version 2.1 or later. Its built-in Dolby Vision reshaping is
+used with metadata parsed by FFmpeg; the optional libdovi parser is not linked.
+libplacebo source: https://code.videolan.org/videolan/libplacebo
+
+The dependency copyright and license texts are included alongside this notice
+in the APK assets directory.

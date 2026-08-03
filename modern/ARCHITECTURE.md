@@ -1,0 +1,291 @@
+# QtAVCore architecture
+
+This document describes the current structure and ownership boundaries of the
+active Qt-free rewrite under `modern/`. Milestone status and task ordering live
+in [`PLAN.md`](PLAN.md); durable trade-offs live in
+[`DECISIONS.md`](DECISIONS.md); migration from legacy QtAV is documented in
+[`MIGRATION.md`](MIGRATION.md).
+
+## Supported scope
+
+QtAVCore's maintained support matrix remains Windows, Android, and OHOS. The
+implemented production paths today are Windows and Android; OHOS production
+implementation is deferred. macOS and iOS code is archived under
+`../archived_apple/`, and Linux is outside the support matrix.
+
+The active implementation has these non-negotiable boundaries:
+
+- no Qt dependency in `modern/`;
+- FFmpeg 8.0 or newer, supplied for supported targets by `../ffmpeg/`;
+- no FFmpeg, graphics API, window-system, or platform-audio types in core
+  public headers;
+- hardware decode, hardware-frame interop, rendering, audio output, and native
+  window ownership remain separate responsibilities;
+- native frames use reference-counted lifetime and explicit synchronization;
+- zero-copy means no decoded-source CPU map, software transfer, CPU staging,
+  or re-upload. Final render-target readback is allowed only for validation.
+
+## Repository layers
+
+```text
+modern/
+├── core/                         toolkit- and platform-neutral player/API
+├── backends/
+│   ├── render/
+│   │   ├── cpu/                  libswscale image-buffer reference
+│   │   ├── d3d11/                Windows external-context renderer
+│   │   ├── libplacebo/           shared FFmpeg/libplacebo frame bridge
+│   │   ├── vulkan/               libplacebo Vulkan renderer
+│   │   ├── opengl/               libplacebo OpenGL ES renderer
+│   │   └── mobile/               Vulkan/OpenGL selection and recovery
+│   ├── audio/                    resample, file, WASAPI, and AAudio
+│   ├── hwaccel/                  D3D11VA and MediaCodec decoder adapters
+│   ├── interop/                  D3D11 and MediaCodec GPU-frame bridges
+│   └── output/d3d11/             high-level Windows composition output
+├── platform/                     small Windows/Android/OHOS OS helpers
+├── examples/                     integration applications and harnesses
+└── tests/                        deterministic and connected-device coverage
+```
+
+`qtav_core` is installed as `QtAV::Core`. Optional backends are separate CMake
+targets and link only the SDKs and libraries they own. Applications choose and
+compose the required targets; the core does not discover runtime plugins.
+
+## Core playback model
+
+`qtav::Player` is a PIMPL facade. Public calls enqueue asynchronous work and do
+not expose decoder or platform objects. The current data flow is:
+
+```text
+application control
+       │
+       ▼
+demux/control worker
+       ├── bounded audio packets ──► audio decode worker
+       │                                  │
+       │                                  ▼
+       │                            bounded PCM queue
+       │                                  │
+       │                                  ▼
+       │                            audio-output worker
+       │                            + device-clock cache
+       │
+       └── bounded video packets ──► video decode worker
+                                          │
+                                          ▼
+                              timestamp-ordered presentation queue
+                                          │
+                                          ▼
+                              callbacks and render scheduling
+                                          │
+                                          ▼
+                              application graphics-owner thread
+```
+
+Audio and video decode are isolated so an audio-device write, GPU import, or
+render callback cannot stop packet delivery to the other stream. Queues are
+bounded. Late video is dropped rather than converted into unbounded latency.
+The audio device clock is the playback master when valid; otherwise a bounded
+monotonic fallback is used.
+
+Decoded `AudioFrame` and `VideoFrame` objects are cheap reference-counted
+views. Copying a frame retains its backing FFmpeg frame or hardware token. A
+pending hardware import must retain the exact decoded frame it is correlating;
+it may not substitute the player's newer current frame.
+
+## Rendering contract
+
+`VideoRenderAPI` defines renderer lifecycle and target geometry without naming
+a graphics API. `Player::setRenderCallback()` requests a redraw, and the
+application calls `renderVideo()` on the thread that owns the native graphics
+context. Multiple renderer instances may be keyed by application opaque
+pointers.
+
+The renderer owns resources derived from its API device/context. Native window
+and presentation ownership stays in a platform adapter or high-level output:
+
+- `QtAV::RenderVulkan` borrows a Vulkan instance/device/queue and current
+  image; `QtAV::RenderVulkanAndroid` owns the Android surface and swapchain;
+- `QtAV::RenderOpenGL` borrows the current OpenGL ES context/framebuffer;
+  `QtAV::RenderOpenGLAndroid` owns EGL display/context/window-surface/swap;
+- `QtAV::RenderD3D11` borrows Windows D3D11 resources;
+  `QtAV::OutputD3D11` is the high-level composition owner for ordinary Windows
+  presentation.
+
+`QtAV::RenderMobile` owns neither graphics API. It keeps a stable renderer
+contract attached to the player, prefers Vulkan at session start, performs
+bounded same-API surface recovery, and makes a one-way switch to OpenGL ES
+after fatal Vulkan failure. Decoder and interop reconfiguration is an explicit
+application/platform decision; a frame produced for a retired native surface
+is never retried through another API.
+
+## libplacebo color pipeline
+
+libplacebo is the shader and color-pipeline authority for the Vulkan and
+OpenGL ES renderers. QtAVCore no longer maintains handwritten mobile shaders
+for YCbCr-to-RGB matrices, transfer functions, primaries conversion, Dolby
+Vision reshaping, tone mapping, gamut mapping, scaling, or SDR/HDR output
+encoding.
+
+The shared target `QtAV::RenderLibplaceboCommon` bridges an internal FFmpeg
+frame to libplacebo's FFmpeg mapping API. Both GPU renderers then supply:
+
+- the source frame and its structured range, matrix, transfer, primaries,
+  chroma-location, HDR10, and Dolby Vision metadata;
+- crop and display geometry;
+- an SDR, BT.2020/PQ, BT.2020/HLG, or extended-linear output contract;
+- a borrowed target texture/framebuffer and synchronization hooks.
+
+libplacebo generates the backend shaders and performs the complete semantic
+color pipeline. A backend-local shader is permitted only for unavoidable
+representation conversion that preserves raw source components. It must not
+apply a color matrix, inverse/forward transfer, gamut conversion, Dolby
+Vision reshape, tone mapping, or output encoding.
+
+This boundary currently allows two normalization passes:
+
+- Vulkan external-format hardware images may be normalized to an explicit raw
+  Y/Cb/Cr representation when libplacebo cannot wrap the opaque external
+  format directly;
+- OpenGL ES samples an AHardwareBuffer-backed EGLImage with
+  `GL_EXT_YUV_target` and stores crop-aware raw Y, Cb, and Cr in RGBA16F before
+  libplacebo renders it.
+
+These passes are GPU-to-GPU representation work, not decoded-source copies and
+not alternative color pipelines.
+
+## Dolby Vision and HDR behavior
+
+FFmpeg parses Dolby Vision RPU data into frame side data. libdovi is not
+required or enabled. QtAVCore correlates MediaCodec output with the parsed RPU
+by presentation timestamp and retains it on the hardware-backed `VideoFrame`.
+
+Profile 5 has no conventional HDR10-compatible base layer. Its raw base-layer
+components must reach libplacebo before ordinary color conversion:
+
+```text
+MediaCodec + parsed RPU
+       │
+       ▼
+private AImageReader / AHardwareBuffer
+       ├── Vulkan external image ──► raw Y/Cb/Cr ──┐
+       └── EGLImage + GL_EXT_YUV_target ──────────┤
+                                                  ▼
+                                      libplacebo DOVI reshape
+                                      + color/tone/gamut pipeline
+                                                  │
+                         ┌────────────────────────┴──────────────────────┐
+                         ▼                                               ▼
+                  SDR target                                      HDR target
+                  tone-mapped sRGB                                BT.2020/PQ
+```
+
+An Android import that cannot prove the raw-component contract is rejected for
+Dolby Vision. Implicit `SurfaceTexture`/external-OES conversion is not treated
+as a valid Profile 5 source.
+
+The user-facing HDR policy selects the application renderer's output target:
+
+- HDR enabled requests a supported native HDR surface and preserves HDR
+  through libplacebo;
+- HDR disabled selects an SDR surface and libplacebo performs Dolby Vision
+  reshape before tone mapping to SDR;
+- when ZeroCopy is disabled while MediaCodec hardware decode remains enabled,
+  Android uses direct-Surface presentation. That path is owned by MediaCodec
+  and Android composition and bypasses libplacebo, so renderer HDR/tone-map
+  controls do not apply to it.
+
+## Android hardware-frame paths
+
+Hardware decode is provided by `QtAV::HWMediaCodec`; it owns codec interaction
+but not the destination surface. Each surface token has a generation, and each
+decoded output receives exactly one present or drop decision.
+
+Application-rendered Vulkan path:
+
+```text
+MediaCodec
+  -> private AImageReader
+  -> retained AHardwareBuffer + acquire fence
+  -> Vulkan external memory / raw components
+  -> libplacebo Vulkan renderer
+  -> release semaphore/sync fd
+  -> asynchronous AImage release
+```
+
+Application-rendered OpenGL ES path:
+
+```text
+MediaCodec
+  -> private AImageReader
+  -> retained AHardwareBuffer + acquire fence
+  -> EGLImage
+  -> GL_EXT_YUV_target raw Y/Cb/Cr normalization
+  -> libplacebo OpenGL renderer
+  -> EGL native release fence
+  -> asynchronous AImage release
+```
+
+Both paths preserve crop, timestamp/generation, exact-frame ownership, and
+producer/consumer fence order. Native-buffer queues remain bounded. Cache
+entries may reuse GPU imports by AHardwareBuffer identity, but a codec output
+and its AImage remain retained until the GPU has finished consuming them.
+
+Direct-Surface mode is a third, separate path. It has no application-readable
+texture and therefore cannot be described as Vulkan, OpenGL ES, libplacebo, or
+application-side tone mapping.
+
+## Audio architecture
+
+`AudioSink` is a platform-neutral lifecycle and timing contract. Decoded PCM
+crosses a bounded queue to an audio-output worker. If the device negotiates a
+different format, `QtAV::AudioResample` performs conversion before submission.
+
+- `QtAV::AudioWASAPI` owns Windows shared-mode device output and clocking;
+- `QtAV::AudioAAudio` feeds Android's realtime callback from a bounded SPSC
+  queue and rebuilds disconnected streams outside the callback;
+- `QtAV::AudioFile` is a diagnostic RIFF/WAVE sink and never becomes a device
+  clock.
+
+No platform audio header reaches the core API.
+
+## Build and package boundaries
+
+Supported-target FFmpeg and transitive dependencies come only from the
+repository `../ffmpeg/` vcpkg subproject. Vulkan and OpenGL ES rendering both
+require the packaged libplacebo build; Android requires libplacebo's OpenGL
+support (`pl_has_opengl=1`) for `QtAV::RenderOpenGL`.
+
+Public targets expose only their required installed dependencies. Build-tree,
+NDK, SDK, and producer-machine paths must not leak into exported CMake targets.
+Static and shared installs are validated with external `find_package` consumers.
+
+## Platform status and next work
+
+Windows D3D11/D3D11VA/WASAPI and Android Vulkan/OpenGL ES/MediaCodec/AAudio
+are the current production paths. OHOS backend implementation is deferred; its
+planned responsibilities remain separate OHAudio, OHCodec, Vulkan/OpenGL
+interop, and platform-window adapters.
+
+The active next task is the Android example playback-stutter investigation in
+[`PLAN.md`](PLAN.md). It applies to Dolby and non-Dolby media, so diagnosis must
+measure scheduling, queue starvation, interop backpressure, graphics-thread
+waits, and libplacebo render cost independently before changing the color
+pipeline.
+
+## Architectural invariants for changes
+
+Before accepting a backend change, verify that:
+
+1. core public headers still contain no Qt, FFmpeg, graphics, or platform SDK
+   types;
+2. the graphics-owner thread performs rendering and API-context work;
+3. bounded queues and reference-counted exact-frame lifetime are preserved;
+4. native-buffer release occurs only after GPU completion;
+5. a zero-copy claim keeps decoded-source map/transfer/staging/upload counters
+   at zero;
+6. libplacebo remains the sole semantic color/shader authority for Vulkan and
+   OpenGL ES;
+7. direct-Surface and application-rendered modes are reported distinctly;
+8. unsupported capabilities fail or fall back explicitly rather than silently
+   changing color interpretation or copying decoded pixels.

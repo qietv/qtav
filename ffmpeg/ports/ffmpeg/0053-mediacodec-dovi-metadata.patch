@@ -1,0 +1,315 @@
+diff --git a/configure b/configure
+index aa1b0a1..19733cb 100755
+--- a/configure
++++ b/configure
+@@ -3606,7 +3606,7 @@
+ hevc_cuvid_decoder_select="hevc_mp4toannexb_bsf"
+ hevc_d3d12va_encoder_select="cbs_h265 d3d12va_encode"
+ hevc_mediacodec_decoder_deps="mediacodec"
+-hevc_mediacodec_decoder_select="hevc_mp4toannexb_bsf hevc_parser"
++hevc_mediacodec_decoder_select="dovi_rpudec hevc_mp4toannexb_bsf hevc_parser"
+ hevc_mediacodec_encoder_deps="mediacodec"
+ hevc_mediacodec_encoder_select="extract_extradata_bsf hevc_metadata"
+ hevc_mf_encoder_deps="mediafoundation"
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 4d8f38c..8478807 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -36,8 +36,11 @@
+ #include "avcodec.h"
+ #include "codec_internal.h"
+ #include "decode.h"
++#include "dovi_rpu.h"
+ #include "h264_parse.h"
++#include "h2645_parse.h"
+ #include "h264_ps.h"
++#include "hevc/hevc.h"
+ #include "hevc/parse.h"
+ #include "hwconfig.h"
+ #include "internal.h"
+@@ -45,6 +48,12 @@
+ #include "mediacodec_wrapper.h"
+ #include "mediacodecdec_common.h"
+ 
++typedef struct MediaCodecDOVIMetadata {
++    int64_t presentation_time_us;
++    AVBufferRef *metadata;
++    struct MediaCodecDOVIMetadata *next;
++} MediaCodecDOVIMetadata;
++
+ typedef struct MediaCodecH264DecContext {
+ 
+     AVClass *avclass;
+@@ -59,7 +68,169 @@ typedef struct MediaCodecH264DecContext {
+     int use_ndk_codec;
+     // Ref. MediaFormat KEY_OPERATING_RATE
+     int operating_rate;
++
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++    DOVIContext dovi;
++    MediaCodecDOVIMetadata *dovi_head;
++    MediaCodecDOVIMetadata *dovi_tail;
++    int dovi_depth;
++#endif
+ } MediaCodecH264DecContext;
++
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++static int64_t mediacodec_presentation_time_us(AVCodecContext *avctx,
++                                               int64_t pts)
++{
++    if (pts == AV_NOPTS_VALUE)
++        return 0;
++    if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den)
++        return av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
++    return pts;
++}
++
++static void mediacodec_dovi_queue_pop(MediaCodecH264DecContext *s,
++                                      MediaCodecDOVIMetadata *previous,
++                                      MediaCodecDOVIMetadata *entry)
++{
++    if (previous)
++        previous->next = entry->next;
++    else
++        s->dovi_head = entry->next;
++    if (s->dovi_tail == entry)
++        s->dovi_tail = previous;
++    av_buffer_unref(&entry->metadata);
++    av_free(entry);
++    s->dovi_depth--;
++}
++
++static void mediacodec_dovi_queue_flush(MediaCodecH264DecContext *s)
++{
++    while (s->dovi_head)
++        mediacodec_dovi_queue_pop(s, NULL, s->dovi_head);
++}
++
++static int mediacodec_dovi_queue_packet(AVCodecContext *avctx,
++                                        MediaCodecH264DecContext *s,
++                                        const AVPacket *pkt)
++{
++    H2645Packet h2645_pkt = { 0 };
++    AVDOVIMetadata *metadata = NULL;
++    AVBufferRef *metadata_buf = NULL;
++    MediaCodecDOVIMetadata *entry = NULL;
++    const uint8_t *sd;
++    size_t sd_size;
++    int metadata_size;
++    int has_vcl = 0;
++    int rpu_parsed = 0;
++    int ret;
++
++    sd = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF, &sd_size);
++    if (sd && sd_size >= sizeof(s->dovi.cfg))
++        s->dovi.cfg = *(const AVDOVIDecoderConfigurationRecord *) sd;
++
++    ret = ff_h2645_packet_split(&h2645_pkt, pkt->data, pkt->size, avctx, 0,
++                                AV_CODEC_ID_HEVC, 0);
++    if (ret < 0) {
++        ret = 0;
++        goto out;
++    }
++
++    for (int i = h2645_pkt.nb_nals - 1; i >= 0; i--) {
++        const H2645NAL *nal = &h2645_pkt.nals[i];
++        if (nal->type < 32)
++            has_vcl = 1;
++        if (rpu_parsed || nal->type != HEVC_NAL_UNSPEC62 || nal->size <= 2 ||
++            nal->nuh_layer_id || nal->temporal_id)
++            continue;
++
++        ret = ff_dovi_rpu_parse(&s->dovi, nal->data + 2, nal->size - 2,
++                                avctx->err_recognition);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Error parsing Dolby Vision RPU for MediaCodec output.\n");
++            ret = 0;
++            goto out;
++        }
++        rpu_parsed = 1;
++    }
++
++    if (!has_vcl) {
++        ret = 0;
++        goto out;
++    }
++
++    metadata_size = ff_dovi_get_metadata(&s->dovi, &metadata);
++    if (metadata_size <= 0) {
++        ret = metadata_size;
++        goto out;
++    }
++    metadata_buf = av_buffer_create((uint8_t *) metadata, metadata_size,
++                                    NULL, NULL, 0);
++    if (!metadata_buf) {
++        av_free(metadata);
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    metadata = NULL;
++
++    entry = av_mallocz(sizeof(*entry));
++    if (!entry) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    entry->presentation_time_us =
++        mediacodec_presentation_time_us(avctx, pkt->pts);
++    entry->metadata = metadata_buf;
++    metadata_buf = NULL;
++    if (s->dovi_tail)
++        s->dovi_tail->next = entry;
++    else
++        s->dovi_head = entry;
++    s->dovi_tail = entry;
++    s->dovi_depth++;
++
++    if (s->dovi_depth > 256) {
++        av_log(avctx, AV_LOG_WARNING,
++               "Dropping stale Dolby Vision metadata queued for MediaCodec.\n");
++        mediacodec_dovi_queue_pop(s, NULL, s->dovi_head);
++    }
++    ret = 0;
++
++out:
++    ff_h2645_packet_uninit(&h2645_pkt);
++    av_buffer_unref(&metadata_buf);
++    av_free(metadata);
++    return ret;
++}
++
++static int mediacodec_dovi_attach_frame(AVCodecContext *avctx,
++                                        MediaCodecH264DecContext *s,
++                                        AVFrame *frame)
++{
++    const int64_t presentation_time_us =
++        mediacodec_presentation_time_us(avctx, frame->pts);
++    MediaCodecDOVIMetadata *previous = NULL;
++    MediaCodecDOVIMetadata *entry = s->dovi_head;
++
++    while (entry) {
++        if (entry->presentation_time_us == presentation_time_us) {
++            AVBufferRef *metadata = av_buffer_ref(entry->metadata);
++            if (!metadata)
++                return AVERROR(ENOMEM);
++            if (!av_frame_new_side_data_from_buf(
++                    frame, AV_FRAME_DATA_DOVI_METADATA, metadata)) {
++                av_buffer_unref(&metadata);
++                return AVERROR(ENOMEM);
++            }
++            mediacodec_dovi_queue_pop(s, previous, entry);
++            return 0;
++        }
++        previous = entry;
++        entry = entry->next;
++    }
++    return 0;
++}
++#endif
+ 
+ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+ {
+@@ -70,6 +241,11 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+ 
+     av_packet_unref(&s->buffered_pkt);
+ 
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++    mediacodec_dovi_queue_flush(s);
++    ff_dovi_ctx_unref(&s->dovi);
++#endif
++
+     return 0;
+ }
+ 
+@@ -315,6 +491,16 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     FFAMediaFormat *format = NULL;
+     MediaCodecH264DecContext *s = avctx->priv_data;
+ 
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++    s->dovi.logctx = avctx;
++    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
++        const AVPacketSideData *sd =
++            ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
++        if (sd && sd->size >= sizeof(s->dovi.cfg))
++            s->dovi.cfg = *(const AVDOVIDecoderConfigurationRecord *) sd->data;
++    }
++#endif
++
+     if (s->use_ndk_codec < 0)
+         s->use_ndk_codec = !av_jni_get_java_vm(avctx);
+ 
+@@ -483,6 +669,21 @@ done:
+         mediacodec_decode_close(avctx);
+     }
+ 
++    return ret;
++}
++
++static int mediacodec_receive_output(AVCodecContext *avctx,
++                                     MediaCodecH264DecContext *s,
++                                     AVFrame *frame, bool wait)
++{
++    int ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, wait);
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++    if (ret >= 0 && avctx->codec_id == AV_CODEC_ID_HEVC) {
++        ret = mediacodec_dovi_attach_frame(avctx, s, frame);
++        if (ret < 0)
++            av_frame_unref(frame);
++    }
++#endif
+     return ret;
+ }
+ 
+@@ -501,7 +702,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+     }
+ 
+     /* poll for new frame */
+-    ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, false);
++    ret = mediacodec_receive_output(avctx, s, frame, false);
+     if (ret != AVERROR(EAGAIN))
+         return ret;
+ 
+@@ -512,7 +713,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+             index = ff_AMediaCodec_dequeueInputBuffer(s->ctx->codec, 0);
+             if (index < 0) {
+                 /* no space, block for an output frame to appear */
+-                ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
++                ret = mediacodec_receive_output(avctx, s, frame, true);
+                 /* Try again if both input port and output port return EAGAIN.
+                  * If no data is consumed and no frame in output, it can make
+                  * both avcodec_send_packet() and avcodec_receive_frame()
+@@ -558,12 +759,19 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+             ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
+             if (ret < 0)
+                 return ret;
+-            return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
++            return mediacodec_receive_output(avctx, s, frame, true);
+         } else if (ret == AVERROR(EAGAIN) && s->ctx->current_input_buffer < 0) {
+-            return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
++            return mediacodec_receive_output(avctx, s, frame, true);
+         } else if (ret < 0) {
+             return ret;
+         }
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++        if (avctx->codec_id == AV_CODEC_ID_HEVC) {
++            ret = mediacodec_dovi_queue_packet(avctx, s, &s->buffered_pkt);
++            if (ret < 0)
++                return ret;
++        }
++#endif
+     }
+ 
+     return AVERROR(EAGAIN);
+@@ -575,6 +783,11 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
+ 
+     av_packet_unref(&s->buffered_pkt);
+ 
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++    mediacodec_dovi_queue_flush(s);
++    ff_dovi_ctx_flush(&s->dovi);
++#endif
++
+     ff_mediacodec_dec_flush(avctx, s->ctx);
+ }
+ 

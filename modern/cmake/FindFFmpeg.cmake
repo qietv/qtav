@@ -20,7 +20,13 @@ foreach(_component IN LISTS _ffmpeg_requested_components)
     endif()
 
     if(PkgConfig_FOUND)
-        pkg_check_modules(PC_FFMPEG_${_component} QUIET "lib${_component}")
+        pkg_check_modules(
+            PC_FFMPEG_${_component}
+            QUIET
+            IMPORTED_TARGET
+            GLOBAL
+            "lib${_component}"
+        )
     endif()
 
     find_path(
@@ -127,6 +133,20 @@ foreach(_component IN LISTS _ffmpeg_requested_components)
                 set_target_properties(FFmpeg::${_component} PROPERTIES
                     IMPORTED_LOCATION
                         "${FFmpeg_${_component}_LIBRARY}"
+                )
+            endif()
+
+            # Static FFmpeg packages carry their third-party dependency
+            # closure in pkg-config metadata.  Keep the primary archive as
+            # the imported location, then propagate that closure so mobile
+            # consumers also link dependencies such as OpenSSL, dav1d, and
+            # libsmb2 from the same target prefix.
+            if(FFmpeg_${_component}_LIBRARY MATCHES "\\.a$"
+               AND TARGET PkgConfig::PC_FFMPEG_${_component})
+                target_link_libraries(
+                    FFmpeg::${_component}
+                    INTERFACE
+                        "$<LINK_ONLY:PkgConfig::PC_FFMPEG_${_component}>"
                 )
             endif()
         endif()

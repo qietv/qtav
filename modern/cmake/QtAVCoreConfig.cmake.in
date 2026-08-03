@@ -11,6 +11,16 @@ find_dependency(
 if(@QTAV_CORE_PACKAGE_NEEDS_VULKAN@)
     find_dependency(Vulkan)
 endif()
+if(@QTAV_CORE_PACKAGE_NEEDS_LIBPLACEBO@)
+    find_dependency(PkgConfig)
+    pkg_check_modules(
+        QTAV_LIBPLACEBO
+        REQUIRED
+        IMPORTED_TARGET
+        GLOBAL
+        "libplacebo>=7.351.0"
+    )
+endif()
 if(NOT DEFINED FFmpeg_avcodec_VERSION_MAJOR
    OR FFmpeg_avcodec_VERSION_MAJOR STREQUAL "")
     set(QtAVCore_FOUND FALSE)

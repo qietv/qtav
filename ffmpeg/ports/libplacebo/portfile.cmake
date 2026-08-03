@@ -36,7 +36,7 @@ vcpkg_configure_meson(
         -Dshaderc=disabled
         -Dglslang=enabled
         -Dlcms=disabled
-        -Ddovi=disabled
+        -Ddovi=enabled
         -Dlibdovi=disabled
         -Dxxhash=disabled
         -Dunwind=disabled

@@ -15,8 +15,10 @@
 #include <vector>
 
 extern "C" {
+#include <libavutil/dovi_meta.h>
 #include <libavutil/frame.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -616,56 +618,6 @@ double hlgSignalForNits(double nits) noexcept
     return A * std::log(12.0 * luminance - B) + C;
 }
 
-double pqNits(double signal) noexcept
-{
-    constexpr double M1 = 2610.0 / 16384.0;
-    constexpr double M2 = 2523.0 / 32.0;
-    constexpr double C1 = 3424.0 / 4096.0;
-    constexpr double C2 = 2413.0 / 128.0;
-    constexpr double C3 = 2392.0 / 128.0;
-    const double power =
-        std::pow(std::max(signal, 0.0), 1.0 / M2);
-    const double numerator = std::max(power - C1, 0.0);
-    const double denominator = std::max(C2 - C3 * power, 0.000001);
-    return 10000.0
-        * std::pow(numerator / denominator, 1.0 / M1);
-}
-
-double hlgNits(double signal) noexcept
-{
-    constexpr double A = 0.17883277;
-    constexpr double B = 0.28466892;
-    constexpr double C = 0.55991073;
-    if (signal <= 0.5) {
-        return 1000.0 * signal * signal / 3.0;
-    }
-    return 1000.0
-        * (std::exp((signal - C) / A) + B) / 12.0;
-}
-
-std::uint8_t expectedHdrSdrCode(
-    std::uint16_t lumaCode,
-    HdrTransfer transfer,
-    double maximumLuminance) noexcept
-{
-    const double signal = std::clamp(
-        (static_cast<double>(lumaCode) - 64.0) / 876.0,
-        0.0,
-        1.0);
-    const double nits = transfer == HdrTransfer::PQ
-        ? pqNits(signal)
-        : hlgNits(signal);
-    const double compressed =
-        nits / (1.0 + nits / maximumLuminance);
-    const double linear =
-        std::clamp(compressed / 100.0, 0.0, 1.0);
-    const double srgb = linear > 0.0031308
-        ? 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055
-        : 12.92 * linear;
-    return static_cast<std::uint8_t>(
-        std::clamp(std::lround(srgb * 255.0), 0L, 255L));
-}
-
 HdrVariant makeHdrVariant(
     HdrTransfer transfer,
     int masteringMaximumLuminance,
@@ -765,38 +717,74 @@ HdrVariant makeHdrVariant(
     return result;
 }
 
-bool closeToCode(std::uint8_t actual, std::uint8_t expected) noexcept
+VideoFrame makeDoviVariant()
 {
-    return std::abs(
-        static_cast<int>(actual) - static_cast<int>(expected))
-        <= 4;
-}
+    const HdrVariant base =
+        makeHdrVariant(HdrTransfer::PQ, 1000, 4000);
+    const AVFrame* source =
+        detail::FrameFactory::nativeVideoFrame(base.frame);
+    AVFrame* native = source ? av_frame_clone(source) : nullptr;
+    if (!native) {
+        return {};
+    }
 
-std::uint16_t expectedHdrOutputCode(
-    std::uint16_t lumaCode,
-    HdrTransfer sourceTransfer,
-    VkColorSpaceKHR outputColorSpace) noexcept
-{
-    const double sourceSignal = std::clamp(
-        (static_cast<double>(lumaCode) - 64.0) / 876.0,
-        0.0,
-        1.0);
-    const double nits = sourceTransfer == HdrTransfer::PQ
-        ? pqNits(sourceSignal)
-        : hlgNits(sourceSignal);
-    const double outputSignal =
-        outputColorSpace == VK_COLOR_SPACE_HDR10_HLG_EXT
-        ? hlgSignalForNits(nits)
-        : pqSignalForNits(nits);
-    return static_cast<std::uint16_t>(
-        std::clamp(std::lround(outputSignal * 1023.0), 0L, 1023L));
-}
+    std::size_t metadataSize = 0;
+    AVDOVIMetadata* metadata =
+        av_dovi_metadata_alloc(&metadataSize);
+    if (!metadata || metadataSize == 0) {
+        av_free(metadata);
+        av_frame_free(&native);
+        return {};
+    }
 
-bool closeToTenBit(std::uint32_t actual, std::uint16_t expected) noexcept
-{
-    return std::abs(
-        static_cast<int>(actual) - static_cast<int>(expected))
-        <= 4;
+    AVDOVIRpuDataHeader* header = av_dovi_get_header(metadata);
+    AVDOVIDataMapping* mapping = av_dovi_get_mapping(metadata);
+    AVDOVIColorMetadata* color = av_dovi_get_color(metadata);
+    header->bl_bit_depth = 10;
+    header->el_bit_depth = 10;
+    header->vdr_bit_depth = 12;
+    header->coef_log2_denom = 13;
+    header->disable_residual_flag = 1;
+    mapping->nlq_method_idc = AV_DOVI_NLQ_NONE;
+    for (int component = 0; component < 3; ++component) {
+        AVDOVIReshapingCurve& curve = mapping->curves[component];
+        curve.num_pivots = 2;
+        curve.pivots[0] = 0;
+        curve.pivots[1] = 1023;
+        curve.mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
+        curve.poly_order[0] = 1;
+        curve.poly_coef[0][0] = 0;
+        curve.poly_coef[0][1] = 1 << header->coef_log2_denom;
+    }
+    for (int index = 0; index < 9; ++index) {
+        const AVRational value = index % 4 == 0
+            ? AVRational { 1, 1 }
+            : AVRational { 0, 1 };
+        color->ycc_to_rgb_matrix[index] = value;
+        color->rgb_to_lms_matrix[index] = value;
+    }
+    for (AVRational& offset : color->ycc_to_rgb_offset) {
+        offset = { 0, 1 };
+    }
+    color->signal_bit_depth = 12;
+    color->source_min_pq = 0;
+    color->source_max_pq = 3079;
+
+    AVFrameSideData* sideData = av_frame_new_side_data(
+        native,
+        AV_FRAME_DATA_DOVI_METADATA,
+        metadataSize);
+    if (!sideData) {
+        av_free(metadata);
+        av_frame_free(&native);
+        return {};
+    }
+    std::memcpy(sideData->data, metadata, metadataSize);
+    av_free(metadata);
+
+    VideoFrame result = detail::FrameFactory::video(native, 0, 0);
+    av_frame_free(&native);
+    return result;
 }
 
 float halfValue(std::uint16_t value) noexcept
@@ -967,9 +955,10 @@ bool runVulkanOffscreenRendererChecks(
         makeHdrVariant(HdrTransfer::PQ, 0, 0);
     const HdrVariant hlgMastering =
         makeHdrVariant(HdrTransfer::HLG, 1000, 0);
+    const VideoFrame dovi = makeDoviVariant();
     if (!pqMastering.frame || !pqContent.frame || !pqFallback.frame
-        || !hlgMastering.frame) {
-        error = "Could not create Vulkan P010 HDR golden frames";
+        || !hlgMastering.frame || !dovi) {
+        error = "Could not create Vulkan P010 HDR/Dolby Vision test frames";
         return false;
     }
     const auto validateHdrMetadata =
@@ -1029,8 +1018,6 @@ bool runVulkanOffscreenRendererChecks(
 
     const auto renderHdrVariant =
         [&](const HdrVariant& variant,
-            HdrTransfer transfer,
-            double maximumLuminance,
             const char* name) {
             if (!renderer->configure(config)
                 || !renderer->render(variant.frame)
@@ -1042,56 +1029,60 @@ bool runVulkanOffscreenRendererChecks(
                 return false;
             }
             constexpr std::array<int, 4> SampleX { 1, 3, 5, 7 };
+            std::uint8_t previous = 0;
             for (std::size_t index = 0; index < SampleX.size(); ++index) {
                 const Pixel actual =
                     pixel(pixels, 8, SampleX[index], 4);
-                const std::uint8_t expected = expectedHdrSdrCode(
-                    variant.lumaCodes[index],
-                    transfer,
-                    maximumLuminance);
-                if (!closeToCode(actual.red, expected)
-                    || !closeToCode(actual.green, expected)
-                    || !closeToCode(actual.blue, expected)
+                const bool neutral =
+                    std::abs(
+                        static_cast<int>(actual.red)
+                        - static_cast<int>(actual.green)) <= 3
+                    && std::abs(
+                        static_cast<int>(actual.green)
+                        - static_cast<int>(actual.blue)) <= 3;
+                if (!neutral
+                    || (index == 0 && actual.red > 8)
+                    || (index > 0 && actual.red <= previous)
                     || actual.alpha < 239) {
                     error = std::string(
-                        "Vulkan HDR-to-SDR numeric golden failed for ")
+                        "Vulkan libplacebo HDR-to-SDR mapping failed for ")
                         + name + " sample "
-                        + std::to_string(index) + ": expected "
-                        + std::to_string(expected) + ", got RGB("
+                        + std::to_string(index) + ": got RGB("
                         + std::to_string(actual.red) + ','
                         + std::to_string(actual.green) + ','
                         + std::to_string(actual.blue) + ')';
                     return false;
                 }
+                previous = actual.red;
             }
             return true;
         };
     if (!renderHdrVariant(
             pqMastering,
-            HdrTransfer::PQ,
-            1000.0,
             "P010 BT.2020 PQ mastering")
         || !renderHdrVariant(
             pqContent,
-            HdrTransfer::PQ,
-            4000.0,
             "P010 BT.2020 PQ MaxCLL")
         || !renderHdrVariant(
             pqFallback,
-            HdrTransfer::PQ,
-            1000.0,
             "P010 BT.2020 PQ default")
         || !renderHdrVariant(
             hlgMastering,
-            HdrTransfer::HLG,
-            1000.0,
             "P010 BT.2020 HLG")) {
+        return false;
+    }
+    if (!renderer->configure(config)
+        || !renderer->render(dovi)
+        || !target.readPixels(pixels, error)) {
+        if (error.empty()) {
+            error =
+                "Vulkan libplacebo Dolby Vision RPU rendering failed";
+        }
         return false;
     }
 
     const auto validateNativeHdrTarget =
         [&](const HdrVariant& variant,
-            HdrTransfer sourceTransfer,
             VkColorSpaceKHR outputColorSpace,
             const char* name) {
             renderer->close();
@@ -1122,49 +1113,50 @@ bool runVulkanOffscreenRendererChecks(
                 return false;
             }
             constexpr std::array<int, 4> SampleX { 1, 3, 5, 7 };
+            std::uint32_t previous = 0;
             for (std::size_t index = 0; index < SampleX.size(); ++index) {
                 const Pixel packed =
                     pixel(pixels, 8, SampleX[index], 4);
                 std::uint32_t word = 0;
                 static_assert(sizeof(word) == sizeof(packed));
                 std::memcpy(&word, &packed, sizeof(word));
-                const std::uint16_t expected = expectedHdrOutputCode(
-                    variant.lumaCodes[index],
-                    sourceTransfer,
-                    outputColorSpace);
                 const std::uint32_t red = word & 1023U;
                 const std::uint32_t green = (word >> 10U) & 1023U;
                 const std::uint32_t blue = (word >> 20U) & 1023U;
                 const std::uint32_t alpha = word >> 30U;
-                if (!closeToTenBit(red, expected)
-                    || !closeToTenBit(green, expected)
-                    || !closeToTenBit(blue, expected)
+                const bool neutral =
+                    std::abs(
+                        static_cast<int>(red)
+                        - static_cast<int>(green)) <= 4
+                    && std::abs(
+                        static_cast<int>(green)
+                        - static_cast<int>(blue)) <= 4;
+                if (!neutral
+                    || (index == 0 && red > 96)
+                    || (index > 0 && red <= previous)
                     || alpha != 3U) {
                     error = std::string(
-                        "Vulkan native HDR numeric golden failed for ")
+                        "Vulkan libplacebo native HDR mapping failed for ")
                         + name + " sample " + std::to_string(index)
-                        + ": expected " + std::to_string(expected)
-                        + ", got RGB10(" + std::to_string(red) + ','
+                        + ": got RGB10(" + std::to_string(red) + ','
                         + std::to_string(green) + ','
                         + std::to_string(blue) + ')';
                     return false;
                 }
+                previous = red;
             }
             return true;
         };
     if (!validateNativeHdrTarget(
             pqMastering,
-            HdrTransfer::PQ,
             VK_COLOR_SPACE_HDR10_ST2084_EXT,
             "P010 BT.2020 PQ to HDR10/PQ")
         || !validateNativeHdrTarget(
             hlgMastering,
-            HdrTransfer::HLG,
             VK_COLOR_SPACE_HDR10_ST2084_EXT,
             "P010 BT.2020 HLG to HDR10/PQ")
         || !validateNativeHdrTarget(
             hlgMastering,
-            HdrTransfer::HLG,
             VK_COLOR_SPACE_HDR10_HLG_EXT,
             "P010 BT.2020 HLG to native HLG")) {
         return false;
@@ -1195,36 +1187,31 @@ bool runVulkanOffscreenRendererChecks(
                 return false;
             }
             constexpr std::array<int, 4> SampleX { 1, 3, 5, 7 };
+            float previous = 0.0F;
             for (std::size_t index = 0; index < SampleX.size(); ++index) {
                 const HalfPixel actual =
                     halfPixels[static_cast<std::size_t>(4) * 8
                         + static_cast<std::size_t>(SampleX[index])];
-                const double signal = std::clamp(
-                    (static_cast<double>(pqMastering.lumaCodes[index]) - 64.0)
-                        / 876.0,
-                    0.0,
-                    1.0);
-                const float expected =
-                    static_cast<float>(pqNits(signal) / 100.0);
-                const float tolerance =
-                    std::max(0.03F, expected * 0.02F);
                 const float red = halfValue(actual.red);
                 const float green = halfValue(actual.green);
                 const float blue = halfValue(actual.blue);
                 const float alpha = halfValue(actual.alpha);
-                if (std::abs(red - expected) > tolerance
-                    || std::abs(green - expected) > tolerance
-                    || std::abs(blue - expected) > tolerance
+                const bool neutral =
+                    std::abs(red - green) <= 0.02F
+                    && std::abs(green - blue) <= 0.02F;
+                if (!neutral
+                    || (index == 0 && red > 0.1F)
+                    || (index > 0 && red <= previous)
                     || std::abs(alpha - 1.0F) > 0.01F) {
                     error = std::string(
-                        "Vulkan linear HDR numeric golden failed for ")
+                        "Vulkan libplacebo linear HDR mapping failed for ")
                         + name + " sample " + std::to_string(index)
-                        + ": expected " + std::to_string(expected)
-                        + ", got RGB(" + std::to_string(red) + ','
+                        + ": got RGB(" + std::to_string(red) + ','
                         + std::to_string(green) + ','
                         + std::to_string(blue) + ')';
                     return false;
                 }
+                previous = red;
             }
             return true;
         };

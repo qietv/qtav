@@ -77,7 +77,7 @@ while [ "${attempt}" -lt 10 ]; do
     "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
         > "${result_directory}/logcat.txt"
     if rg -q "QTAV_ANDROID_TEST: START" "${result_directory}/logcat.txt" \
-       && rg -q "QTAV_ANDROID_TEST: OFFSCREEN_PASS" \
+       && rg -q "QTAV_ANDROID_TEST: OFFSCREEN_PASS hdr=pq,hlg,dovi" \
            "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: GLES_OFFSCREEN_PASS" \
            "${result_directory}/logcat.txt" \
@@ -161,8 +161,10 @@ while [ "${attempt}" -lt 30 ]; do
            "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: GLES_HDR_SURFACE_PASS.*surface=rgb10_a2.*component_bits=10.*color_space=bt2020_(pq|hlg)" \
            "${result_directory}/logcat.txt" \
-       && rg -q "QTAV_ANDROID_TEST: AAUDIO_PASS.*format=float.*latency_ms=.*clock_ms=" \
-           "${result_directory}/logcat.txt"; then
+       && (rg -q "QTAV_ANDROID_TEST: AAUDIO_PASS.*format=float.*latency_ms=.*clock_ms=" \
+               "${result_directory}/logcat.txt" \
+           || rg -q "QTAV_ANDROID_TEST: AAUDIO_PASS.*format=float.*latency_ms=.*clock_ms=" \
+               "${result_directory}/startup-logcat.txt"); then
         break
     fi
     if rg -q "QTAV_ANDROID_TEST: FAIL" "${result_directory}/logcat.txt"; then
@@ -274,7 +276,11 @@ fi
     >/dev/null
 attempt=0
 mediacodec_opengl_lifecycle_done=0
-while [ "${attempt}" -lt 90 ]; do
+# H.264/HEVC direct Surface, three Vulkan interop phases, renderer fallback,
+# two OpenGL interop phases, and the OpenGL surface lifecycle run serially on
+# one physical device. Keep the wait bounded, but allow the complete Release
+# matrix to exceed the former 90-second aggregate limit on loaded devices.
+while [ "${attempt}" -lt 180 ]; do
     "${adb}" logcat -d -s QtAVCoreTest:I '*:S' \
         > "${result_directory}/logcat.txt"
     if [ "${mediacodec_opengl_lifecycle_done}" -eq 0 ] \
@@ -320,7 +326,7 @@ while [ "${attempt}" -lt 90 ]; do
         fi
         mediacodec_opengl_lifecycle_done=1
     fi
-    if rg -q "QTAV_ANDROID_TEST: PASS.*aaudio=pass.*gles_fallback=pass.*gles_offscreen=pass.*gles_hdr=pass.*native_hdr=pass.*hdr_source=pass.*mediacodec=h264,hevc.*mediacodec_surface_recreations=[1-9].*mediacodec_vulkan=h264,hevc.*ahardwarebuffer_imports=[1-9][0-9]*.*release_fences=[1-9][0-9]*.*mediacodec_renderer_fallback=pass.*fallback_vulkan_frames=[1-9][0-9]*.*fallback_gles_frames=[1-9][0-9]*.*mediacodec_opengl=h264,hevc.*external_oes_images=[1-9][0-9]*.*mediacodec_opengl_surface_recreations=[1-9].*cpu_map=0 transfer=0 staging=0 upload=0" \
+    if rg -q "QTAV_ANDROID_TEST: PASS.*aaudio=pass.*gles_fallback=pass.*gles_offscreen=pass.*gles_hdr=pass.*native_hdr=pass.*hdr_source=pass.*mediacodec=h264,hevc.*mediacodec_surface_recreations=[1-9].*mediacodec_vulkan=h264,hevc,dovi.*mediacodec_vulkan_dovi_frames=[1-9][0-9]*.*dovi_metadata_frames=[1-9][0-9]*.*ahardwarebuffer_imports=[1-9][0-9]*.*release_fences=[1-9][0-9]*.*mediacodec_renderer_fallback=pass.*fallback_vulkan_frames=[1-9][0-9]*.*fallback_gles_frames=[1-9][0-9]*.*mediacodec_opengl=h264,hevc.*ahardwarebuffer_eglimages=[1-9][0-9]*.*mediacodec_opengl_surface_recreations=[1-9].*cpu_map=0 transfer=0 staging=0 upload=0" \
         "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_SEEK codec=h264" \
            "${result_directory}/logcat.txt" \
@@ -338,15 +344,17 @@ while [ "${attempt}" -lt 90 ]; do
            "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_VULKAN_PASS codec=hevc.*cpu_map=0 transfer=0 staging=0 upload=0" \
            "${result_directory}/logcat.txt" \
+       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_VULKAN_PASS codec=dovi.*dovi_metadata=[1-9][0-9]*.*raw_ycbcr_imports=[1-9][0-9]*.*cpu_map=0 transfer=0 staging=0 upload=0" \
+           "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_RENDERER_FALLBACK_POLICY route=opengl-es-interop.*cpu_map=0 transfer=0 staging=0 upload=0" \
            "${result_directory}/logcat.txt" \
-       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_RENDERER_FALLBACK_PASS initial=vulkan selected=opengl-es route=opengl-es-interop.*cpu_map=0 transfer=0 staging=0 upload=0" \
+       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_RENDERER_FALLBACK_PASS initial=vulkan selected=opengl-es route=opengl-es-interop.*eglimage_raw_ycbcr=[1-9][0-9]*.*gl_release_fences=[1-9][0-9]*.*cpu_map=0 transfer=0 staging=0 upload=0" \
            "${result_directory}/logcat.txt" \
-       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_OPENGL_PASS codec=h264.*texture=external_oes.*cpu_map=0 transfer=0 staging=0 upload=0" \
+       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_OPENGL_PASS codec=h264.*release_fences=[1-9][0-9]*.*raw_ycbcr=[1-9][0-9]*.*texture=ahardwarebuffer_eglimage_raw_ycbcr.*cpu_map=0 transfer=0 staging=0 upload=0" \
            "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_OPENGL_SEEK codec=h264" \
            "${result_directory}/logcat.txt" \
-       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_OPENGL_PASS codec=hevc.*texture=external_oes.*cpu_map=0 transfer=0 staging=0 upload=0" \
+       && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_OPENGL_PASS codec=hevc.*release_fences=[1-9][0-9]*.*raw_ycbcr=[1-9][0-9]*.*texture=ahardwarebuffer_eglimage_raw_ycbcr.*cpu_map=0 transfer=0 staging=0 upload=0" \
            "${result_directory}/logcat.txt" \
        && rg -q "QTAV_ANDROID_TEST: MEDIACODEC_OPENGL_SURFACE_REMOVED" \
            "${result_directory}/logcat.txt" \

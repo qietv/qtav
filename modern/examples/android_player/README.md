@@ -27,11 +27,21 @@ full-screen mode.
 The build is Gradle-free and reproducible from the recorded Darwin
 cross-compilation host. macOS is not a supported QtAVCore target; its former
 native backends are archived and unmaintained. By default this script uses the
-same NDK/API/tool versions as the Android regression harness and builds
-checksum-pinned OpenSSL 3.5.7 plus FFmpeg 8.1.2. The FFmpeg configuration has
-networking and its OpenSSL TLS backend enabled, together with common MP4/MOV,
+same NDK/API/tool versions as the Android regression harness and consumes the
+repository-local arm64/API 28 vcpkg package containing FFmpeg 8.1.2, OpenSSL,
+libplacebo 7.351.0, and their transitive dependencies. The FFmpeg
+configuration has networking and its OpenSSL TLS backend enabled, together
+with common MP4/MOV,
 Matroska, AVI, MPEG-TS, FLV, Ogg, MP3, AAC, AC-3, FLAC, and WAV
 demux/decode support.
+
+Vulkan application-rendered playback delegates color conversion, tone
+mapping, output encoding, and FFmpeg-parsed Dolby Vision RPU reshaping to
+libplacebo. The optional libdovi parser is intentionally disabled; FFmpeg's
+per-frame `AVDOVIMetadata` is used directly. MediaCodec/AImageReader keeps
+decoded pixels off the CPU, with only an external-format-to-FP16 GPU
+normalization pass before libplacebo. Dolby Vision frames use an identity
+sampler in that pass to preserve raw Y/Cb/Cr for RPU reshaping.
 
 ```sh
 modern/examples/android_player/build-android-player.sh
@@ -45,8 +55,10 @@ build/android-player/qtav-core-player.apk
 
 No device installation occurs during the build.
 
-The APK assets include third-party notices plus the LGPL-2.1 and Apache-2.0
-license texts for the statically packaged QtAVCore/FFmpeg and OpenSSL code.
+The APK assets include third-party notices plus the FFmpeg package's GPLv3,
+OpenSSL Apache-2.0, and libplacebo LGPL-2.1-or-later license texts. QtAVCore
+source files remain LGPL-2.1-or-later; the selected repository FFmpeg feature
+package is a GPLv3 build.
 
 The usual Android tool overrides are supported:
 
@@ -58,7 +70,14 @@ QTAV_ANDROID_COMPILE_SDK
 QTAV_ANDROID_BUILD_TOOLS
 QTAV_ANDROID_CMAKE_VERSION
 QTAV_BUILD_JOBS
+QTAV_HOST_PKG_CONFIG
 ```
+
+Before running the script, build the local dependency package with
+`ffmpeg/scripts/build-android.sh` or extract the latest successful workflow
+artifact into
+`ffmpeg/build/arm64-android-28-static/vcpkg_installed/`. The player build does
+not download or independently compile target FFmpeg, OpenSSL, or libplacebo.
 
 ## Install gate
 
@@ -88,16 +107,18 @@ it stops instead of retrying or bypassing the prompt.
 | off | either | on | software decode → Vulkan upload/render |
 | off | either | off | software decode → OpenGL ES upload/render |
 | on | on | on | MediaCodec → private AImageReader/AHardwareBuffer → Vulkan |
-| on | on | off | MediaCodec → SurfaceTexture/external-OES → OpenGL ES |
+| on | on | off | MediaCodec → AImageReader/AHardwareBuffer → EGLImage raw YCbCr → OpenGL ES |
 | on | off | either | MediaCodec direct Surface presentation |
 
-Hardware decode is enabled and ZeroCopy is disabled by default, selecting
-MediaCodec direct-Surface presentation. On the connected 4K test device this
-path keeps every player callback (`callbacks/presented N/N`); enable ZeroCopy
-explicitly when testing GPU texture interop or application-side video
-processing. While direct-Surface presentation is selected, changing the
-Vulkan switch only preserves the renderer preference for the next
-application-rendered path: enabled selects Vulkan and disabled selects OpenGL
+Hardware decode, ZeroCopy, Vulkan, and HDR are enabled by default, selecting
+the MediaCodec/AImageReader/Vulkan/libplacebo path. This keeps Dolby Vision
+Profile 5 base-layer Y/Cb/Cr on the GPU while ensuring that FFmpeg's parsed
+RPU metadata reaches libplacebo; direct-Surface presentation would bypass
+that application-side reshaping and tone mapping. Disable ZeroCopy explicitly
+to test codec direct-Surface presentation. While direct-Surface presentation
+is selected, changing the Vulkan switch only preserves the renderer preference
+for the next application-rendered path: enabled selects Vulkan and disabled
+selects OpenGL
 ES. The Debug control remains available because it only shows or hides the
 top-left diagnostics. HDR remains independent: MediaCodec/Android supplies
 the decoded HDR surface and, on Android 15 or newer, the switch controls that
@@ -114,16 +135,16 @@ hands MediaCodec frames to the application inside the bounded decode window,
 together with their monotonic presentation deadlines. Direct Surface output
 uses the core's independent video-decode and presentation workers: encoded
 packets are paced before decode and the application releases each small-window
-output when its ordinary presentation callback arrives. The Vulkan ZeroCopy
-path reserves one of four application pipeline slots before releasing an output,
-waits up to 100 ms for the private AImageReader to acquire it, and only then
-allows the video-decode worker to advance. Audio packets are decoded on a
-separate worker, so E-AC-3 conversion/output backpressure cannot periodically
-starve video packet delivery. This prevents producer
-bursts from silently coalescing AImages without waiting for the later Vulkan
-render deadline. Renderer `RedrawRequested` events are routed back to the
-native render thread. A pending frame older than the 250 ms timestamp
-correlation window is retired instead of being presented in a recovery burst.
+output when its ordinary presentation callback arrives. Both private
+AImageReader ZeroCopy paths reserve one of four application pipeline slots,
+including the frame currently in the graphics-thread attempt, before releasing
+another output. Vulkan waits up to 100 ms for image ownership. OpenGL releases
+non-blockingly, retains the exact frame/deadline, and lets the AImageReader
+callback wake the native render thread; the reader has two acquisition slots
+outside the four-image correlation window so callback coalescing cannot strand
+an available image at `MAX_IMAGES_ACQUIRED`. Audio decode/output remains on
+separate workers. A pending frame older than the 250 ms timestamp-correlation
+window is retired instead of being presented in a recovery burst.
 
 The Debug switch shows or hides the top-left status window without rebuilding
 the playback pipeline. Its first lines report the actual Vulkan swapchain or
@@ -149,7 +170,9 @@ matching advertised display mode: the lowest exact multiple when available,
 otherwise the fastest mode. Android remains free to keep another physical
 mode; the status line reports the source-rate hint and requested display
 target. Playback has no per-frame application logcat output; normal logging is
-limited to setup, first presentation, and errors.
+limited to setup, the first Dolby Vision RPU frame, first presentation, and
+errors. The diagnostics count Dolby Vision RPU frames and raw YCbCr imports so
+the Profile 5 libplacebo path can be distinguished from codec passthrough.
 
 `HDR` selects `PreferHdr`; disabling it selects deterministic SDR output on an
 application renderer. The status line reports whether the actual Vulkan/EGL
@@ -169,27 +192,27 @@ application-renderer presents over a rolling wall-clock window. It is distinct
 from the inferred source `rate hint` and Android's requested `display target`;
 it falls to `0.0` when presentation stops.
 
-The OpenGL ES MediaCodec ZeroCopy path probes HDR external-OES source sampling
-natively on the first P010/HDR image. It requires the external-YUV GL
-extensions plus Android 13+ SurfaceTexture dataspace reporting that matches
-the decoded BT.2020/PQ or BT.2020/HLG frame. A successful result is cached for
-that interop instance and reported in the status line. If the device path does
-not pass the probe, the demo stops retrying the rejected frame, switches
-ZeroCopy off, and resumes at the same position through MediaCodec
-direct-Surface presentation instead of leaving a black surface.
-The external-OES SurfaceTexture matrix is converted to the renderer's
-top-left source-coordinate convention, so OpenGL ES and Vulkan present the
-same picture orientation in portrait and after an EGL surface resize.
+The OpenGL ES MediaCodec ZeroCopy path creates a private GPU-sampled
+`AImageReader`, imports each AHardwareBuffer as an EGLImage, and requires
+`GL_OES_EGL_image_external_essl3`, `GL_EXT_YUV_target`, and native-fence EGL
+sync. The external sampler exposes normalized Y/Cb/Cr in R/G/B. A crop-aware
+RGBA16F normalization pass preserves those components without performing
+color conversion; libplacebo then applies Dolby Vision reshaping, color
+conversion, tone mapping, and output encoding. A device that cannot provide
+this raw contract rejects the hardware frame rather than interpreting Profile
+5 samples through an implicit RGB conversion.
+Android window submission occurs through the renderer's present callback
+before the AImage is returned. The exported EGL native fence therefore covers
+`eglSwapBuffers()` as well as sampling; presenting only after `render()`
+returned could accumulate unsignalled release fences and stall both video and
+the shared demux feed after the AImageReader acquisition quota was exhausted.
 For SDR output, the renderer also detects the Android EGL window's sRGB
 framebuffer encoding and leaves the final linear-to-sRGB conversion to GL.
 This prevents the HDR-off OpenGL ES path from applying sRGB encoding twice and
 lifting midtones compared with Vulkan.
 
-SurfaceTexture cannot distinguish a legitimate zero presentation timestamp
-from its initial no-image timestamp. That path therefore drops only a
-zero-PTS first codec output and begins correlation at the first positive
-timestamp; the counter can consequently end at `callbacks/presented N/N-1`.
-The Vulkan AImageReader path accepts and correlates a valid zero timestamp.
+Both Vulkan and OpenGL ES AImageReader paths accept and correlate a valid zero
+timestamp.
 
 FFmpeg's planar 10-bit 4:2:0 software frames map to
 `PixelFormat::YUV420P10` and are supported by both Vulkan and OpenGL ES.
@@ -215,10 +238,10 @@ adaptive-streaming example. The demo manifest explicitly allows cleartext
 HTTP for manual test servers; production applications should remove that
 allowance unless their own network-security policy requires it.
 
-Hardware ZeroCopy does not pre-probe the coded video dimensions. The private
-`AImageReader` or `SurfaceTexture` starts with a minimal default buffer size;
-MediaCodec overrides that default with its decoded output size, and the
-interop reads each produced image's actual dimensions and crop. Opening a
+Hardware ZeroCopy does not pre-probe the coded video dimensions. Each private
+`AImageReader` starts with a minimal default buffer size; MediaCodec overrides
+that default with its decoded output size, and the interop reads each produced
+image's actual dimensions and crop. Opening a
 remote URL therefore performs one FFmpeg open for playback instead of a
 separate metadata request followed by playback.
 
@@ -266,8 +289,9 @@ background/foreground Surface recreation:
 Also open one file through the Storage Access Framework and one remote file
 through both HTTP and HTTPS where test hosting permits. Treat unsupported
 device HDR/codec capabilities as explicit unavailable results, not
-as successful coverage. For long-form 4K Vulkan ZeroCopy playback, let the
+as successful coverage. For long-form 4K Vulkan or OpenGL ZeroCopy playback, let the
 sample run for at least one minute and verify core queue/late drops `0/0`, zero
-render-queue drops, equal interop queued/acquired counts, and no unbounded
-growth in the at-most-three callback/presented frames in flight instead of
-merely checking that a picture appeared.
+recurring render-queue drops, bounded interop queued/acquired/imported trailing
+counts, and no unbounded callback/presented growth instead of merely checking
+that a picture appeared. Repeat OpenGL after fully closing and reopening the
+application because surface/buffer-pool reuse is part of this regression gate.

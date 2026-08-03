@@ -209,6 +209,19 @@ public:
               };
           })
     {
+        renderer_.setPresentCallback(
+            [this](std::string& detail) {
+                lastPresentEglError_ = EGL_SUCCESS;
+                if (eglSwapBuffers(display_, surface_) == EGL_TRUE) {
+                    return true;
+                }
+                lastPresentEglError_ = eglGetError();
+                detail = std::string(
+                    "EGL window surface presentation failed: ")
+                    + eglErrorName(lastPresentEglError_) + " ("
+                    + std::to_string(lastPresentEglError_) + ')';
+                return false;
+            });
         renderer_.setEventCallback(
             [this](const VideoRenderEvent& event) {
                 if (event.type == VideoRenderEventType::Error) {
@@ -623,6 +636,7 @@ public:
     bool open_ = false;
     bool engineOpen_ = false;
     std::string lastEngineError_;
+    EGLint lastPresentEglError_ = EGL_SUCCESS;
     OpenGLVideoRenderer renderer_;
 };
 
@@ -730,6 +744,7 @@ bool AndroidOpenGLVideoRenderer::render(
             eglCode = eglGetError();
         } else {
             impl_->lastEngineError_.clear();
+            impl_->lastPresentEglError_ = EGL_SUCCESS;
             OpenGLHardwareImportStatus hardwareStatus =
                 OpenGLHardwareImportStatus::Ready;
             if (frame.hasHardwareFrame()) {
@@ -756,15 +771,12 @@ bool AndroidOpenGLVideoRenderer::render(
                 error = impl_->lastEngineError_.empty()
                     ? "The OpenGL ES engine could not render the frame"
                     : impl_->lastEngineError_;
-            } else if (eglSwapBuffers(
-                           impl_->display_,
-                           impl_->surface_) != EGL_TRUE) {
-                eglCode = eglGetError();
-                error = std::string("eglSwapBuffers failed: ")
-                    + eglErrorName(eglCode) + " ("
-                    + std::to_string(eglCode) + ')';
             } else {
                 rendered = true;
+            }
+            if (!rendered
+                && impl_->lastPresentEglError_ != EGL_SUCCESS) {
+                eglCode = impl_->lastPresentEglError_;
             }
         }
         impl_->doneCurrent();

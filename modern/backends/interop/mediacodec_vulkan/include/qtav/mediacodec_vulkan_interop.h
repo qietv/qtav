@@ -52,6 +52,9 @@ MediaCodecVulkanInteropStatistics {
     std::uint64_t hardwareBufferImportCacheHits = 0;
     std::uint64_t hardwareBufferImportsRemoved = 0;
     std::uint64_t maximumCachedHardwareBufferImports = 0;
+    // Persistent imports that also expose raw Y/Cb/Cr for libplacebo Dolby
+    // Vision reshaping without a decoded-pixel CPU copy.
+    std::uint64_t unconvertedYcbcrImports = 0;
     std::uint64_t cpuMapCalls = 0;
     std::uint64_t softwareTransferCalls = 0;
     std::uint64_t stagingCopies = 0;
@@ -63,8 +66,8 @@ MediaCodecVulkanInteropStatistics {
 
 // On Android API 26 or newer, owns a private AImageReader whose GPU-sampled
 // ANativeWindow is supplied to FFmpeg's MediaCodec wrapper. Decoded outputs
-// are timestamp-correlated with asynchronously acquired AImages, imported
-// through
+// are timestamp-correlated with asynchronously acquired PRIVATE AImages,
+// imported through
 // VK_ANDROID_external_memory_android_hardware_buffer, and returned with a
 // Vulkan-exported sync fd. No decoded pixel is CPU-mapped or uploaded.
 class QTAV_INTEROP_MEDIACODEC_VULKAN_EXPORT

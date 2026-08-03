@@ -2,26 +2,33 @@
 
 #include <qtav/opengl_video_renderer.h>
 
+#include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 
+#include <libplacebo/log.h>
+#include <libplacebo/opengl.h>
+#include <libplacebo/renderer.h>
+#include <libplacebo/swapchain.h>
+
 #include <algorithm>
 #include <array>
-#include <cmath>
-#include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <mutex>
 #include <string>
 #include <utility>
-#include <vector>
+
+#include "frame_internal.h"
+#include "qtav_libplacebo_ffmpeg_bridge.h"
 
 namespace qtav {
 namespace {
 
-constexpr char VertexShader[] = R"qtav(
+constexpr char NormalizeVertexShader[] = R"qtav(
 #version 300 es
+
+out vec2 textureCoordinate;
 
 void main()
 {
@@ -29,471 +36,41 @@ void main()
         vec2(-1.0, -1.0),
         vec2( 3.0, -1.0),
         vec2(-1.0,  3.0));
+    const vec2 coordinates[3] = vec2[](
+        vec2(0.0, 0.0),
+        vec2(2.0, 0.0),
+        vec2(0.0, 2.0));
     gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+    textureCoordinate = coordinates[gl_VertexID];
 }
 )qtav";
 
-constexpr char FragmentShader[] = R"qtav(
+constexpr char NormalizeFragmentShader[] = R"qtav(
 #version 300 es
-
-#if defined(QTAV_EXTERNAL_OES)
 #extension GL_OES_EGL_image_external_essl3 : require
-#endif
+#extension GL_EXT_YUV_target : require
 
 precision highp float;
-precision highp int;
-precision highp sampler2D;
-precision highp usampler2D;
-#if defined(QTAV_EXTERNAL_OES)
-precision highp samplerExternalOES;
-#endif
+precision highp __samplerExternal2DY2YEXT;
 
+in vec2 textureCoordinate;
 layout(location = 0) out vec4 outputColor;
 
-uniform sampler2D plane0;
-uniform sampler2D plane1;
-uniform sampler2D plane2;
-uniform usampler2D p010Luma;
-uniform usampler2D p010Chroma;
-#if defined(QTAV_EXTERNAL_OES)
-uniform samplerExternalOES externalImage;
+uniform __samplerExternal2DY2YEXT externalImage;
 uniform mat4 externalTransform;
-#endif
-
-// width, height, format, output color space/attachment encoding
-uniform uvec4 source;
-// surface width, height, transfer, primaries
-uniform uvec4 surface;
-// top-left x, y, width, height
-uniform ivec4 viewport;
-// rotation, aspect ratio, matrix, range
-uniform uvec4 presentation;
-// reference white and maximum source luminance
-uniform vec2 luminance;
-
-vec3 yuvToRgb(float y, float u, float v, uint matrix, uint range)
-{
-    if (range == 1U) {
-        u -= 0.5;
-        v -= 0.5;
-    } else {
-        y = (y - 16.0 / 255.0) * (255.0 / 219.0);
-        u = (u - 128.0 / 255.0) * (255.0 / 224.0);
-        v = (v - 128.0 / 255.0) * (255.0 / 224.0);
-    }
-
-    float kr = 0.2126;
-    float kb = 0.0722;
-    if (matrix == 1U) {
-        kr = 0.2990;
-        kb = 0.1140;
-    } else if (matrix == 2U) {
-        kr = 0.2627;
-        kb = 0.0593;
-    }
-    float kg = 1.0 - kr - kb;
-    return vec3(
-        y + 2.0 * (1.0 - kr) * v,
-        y - 2.0 * kb * (1.0 - kb) / kg * u
-            - 2.0 * kr * (1.0 - kr) / kg * v,
-        y + 2.0 * (1.0 - kb) * u);
-}
-
-vec3 p010ToRgb(float y, float u, float v, uint matrix, uint range)
-{
-    const float normalizedCodeScale = 65535.0 / 65472.0;
-    y *= normalizedCodeScale;
-    u *= normalizedCodeScale;
-    v *= normalizedCodeScale;
-    if (range == 1U) {
-        u -= 512.0 / 1023.0;
-        v -= 512.0 / 1023.0;
-    } else {
-        y = (y - 64.0 / 1023.0) * (1023.0 / 876.0);
-        u = (u - 512.0 / 1023.0) * (1023.0 / 896.0);
-        v = (v - 512.0 / 1023.0) * (1023.0 / 896.0);
-    }
-    return yuvToRgb(y, u + 0.5, v + 0.5, matrix, 1U);
-}
-
-vec3 pqToNits(vec3 value)
-{
-    const float m1 = 2610.0 / 16384.0;
-    const float m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0;
-    const float c2 = 2413.0 / 128.0;
-    const float c3 = 2392.0 / 128.0;
-    vec3 power = pow(max(value, vec3(0.0)), vec3(1.0 / m2));
-    vec3 numerator = max(power - c1, vec3(0.0));
-    vec3 denominator = max(c2 - c3 * power, vec3(0.000001));
-    return 10000.0 * pow(numerator / denominator, vec3(1.0 / m1));
-}
-
-vec3 hlgToNits(vec3 value)
-{
-    const float a = 0.17883277;
-    const float b = 0.28466892;
-    const float c = 0.55991073;
-    vec3 low = value * value / 3.0;
-    vec3 high = (exp((value - c) / a) + b) / 12.0;
-    return 1000.0 * mix(low, high, greaterThan(value, vec3(0.5)));
-}
-
-vec3 sdrToLinear(vec3 value)
-{
-    vec3 low = value / 4.5;
-    vec3 high = pow((value + 0.099) / 1.099, vec3(1.0 / 0.45));
-    return mix(low, high, greaterThanEqual(value, vec3(0.081)));
-}
-
-vec3 linearToSrgb(vec3 value)
-{
-    vec3 low = 12.92 * value;
-    vec3 high =
-        1.055 * pow(max(value, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
-    return mix(low, high, greaterThan(value, vec3(0.0031308)));
-}
-
-vec3 sourceToBt709(vec3 value, uint primaries)
-{
-    if (primaries == 1U) {
-        return mat3(
-             1.6605, -0.1246, -0.0182,
-            -0.5876,  1.1329, -0.1006,
-            -0.0728, -0.0083,  1.1187) * value;
-    }
-    if (primaries == 2U) {
-        return mat3(
-             1.2249, -0.0420, -0.0197,
-            -0.2247,  1.0420, -0.0786,
-            -0.0002,  0.0000,  1.0983) * value;
-    }
-    return value;
-}
-
-vec3 sourceToBt2020(vec3 value, uint primaries)
-{
-    if (primaries == 0U) {
-        return mat3(
-            0.6274, 0.0691, 0.0164,
-            0.3293, 0.9195, 0.0880,
-            0.0433, 0.0114, 0.8956) * value;
-    }
-    if (primaries == 2U) {
-        return mat3(
-             0.7538, 0.0457, -0.0012,
-             0.1986, 0.9418,  0.0176,
-             0.0475, 0.0125,  0.9836) * value;
-    }
-    return value;
-}
-
-vec3 nitsToPq(vec3 value)
-{
-    const float m1 = 2610.0 / 16384.0;
-    const float m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0;
-    const float c2 = 2413.0 / 128.0;
-    const float c3 = 2392.0 / 128.0;
-    vec3 power =
-        pow(clamp(value / 10000.0, 0.0, 1.0), vec3(m1));
-    return pow(
-        (c1 + c2 * power) / (1.0 + c3 * power),
-        vec3(m2));
-}
-
-vec3 nitsToHlg(vec3 value)
-{
-    const float a = 0.17883277;
-    const float b = 0.28466892;
-    const float c = 0.55991073;
-    vec3 linear = max(value, vec3(0.0)) / 1000.0;
-    vec3 low = sqrt(3.0 * linear);
-    vec3 high =
-        a * log(max(12.0 * linear - b, vec3(0.000001))) + c;
-    return mix(low, high, greaterThan(linear, vec3(1.0 / 12.0)));
-}
-
-vec3 presentColor(vec3 rgb)
-{
-    uint transfer = surface.z;
-    uint primaries = surface.w;
-    uint outputMode = source.w;
-    vec3 linear;
-    float sourceWhite = luminance.x;
-    if (transfer == 1U) {
-        linear = pqToNits(max(rgb, vec3(0.0)));
-    } else if (transfer == 2U) {
-        linear = hlgToNits(max(rgb, vec3(0.0)));
-    } else if (transfer == 3U) {
-        linear = max(rgb, vec3(0.0)) * sourceWhite;
-    } else {
-        linear = sdrToLinear(clamp(rgb, 0.0, 1.0)) * sourceWhite;
-    }
-    if (outputMode == 1U || outputMode == 2U) {
-        linear = sourceToBt2020(linear, primaries);
-    } else {
-        linear = sourceToBt709(linear, primaries);
-    }
-    if (outputMode == 1U) {
-        return nitsToPq(linear);
-    }
-    if (outputMode == 2U) {
-        return nitsToHlg(linear);
-    }
-
-    // SDR targets keep the deterministic HDR-to-SDR shoulder.
-    float maximum = max(luminance.y, sourceWhite);
-    if (maximum > sourceWhite) {
-        linear = linear / (vec3(1.0) + linear / maximum);
-    }
-    vec3 normalized = clamp(linear / sourceWhite, 0.0, 1.0);
-    // An sRGB framebuffer converts linear fragment output to sRGB during the
-    // fixed-function write. Linear/UNORM attachments need explicit encoding.
-    return outputMode == 3U ? normalized : linearToSrgb(normalized);
-}
-
-bool sourceCoordinate(out vec2 coordinate)
-{
-    // OpenGL has a bottom-left framebuffer origin. Convert to the common
-    // top-left viewport contract before applying shared geometry semantics.
-    vec2 pixel = vec2(
-        gl_FragCoord.x,
-        float(surface.y) - gl_FragCoord.y);
-    vec2 origin = vec2(viewport.xy);
-    vec2 size = vec2(viewport.zw);
-    if (any(lessThan(pixel, origin))
-        || any(greaterThanEqual(pixel, origin + size))) {
-        return false;
-    }
-
-    vec2 destination = (pixel - origin) / size;
-    bool swapsAxes =
-        presentation.x == 1U || presentation.x == 3U;
-    float sourceAspect = swapsAxes
-        ? float(source.y) / float(source.x)
-        : float(source.x) / float(source.y);
-    float viewportAspect = size.x / size.y;
-
-    if (presentation.y == 0U) {
-        if (sourceAspect > viewportAspect) {
-            float height = viewportAspect / sourceAspect;
-            float top = (1.0 - height) * 0.5;
-            if (destination.y < top || destination.y >= top + height) {
-                return false;
-            }
-            destination.y = (destination.y - top) / height;
-        } else {
-            float width = sourceAspect / viewportAspect;
-            float left = (1.0 - width) * 0.5;
-            if (destination.x < left || destination.x >= left + width) {
-                return false;
-            }
-            destination.x = (destination.x - left) / width;
-        }
-    } else if (presentation.y == 1U) {
-        if (sourceAspect > viewportAspect) {
-            float width = sourceAspect / viewportAspect;
-            destination.x = (destination.x - 0.5) * width + 0.5;
-        } else {
-            float height = viewportAspect / sourceAspect;
-            destination.y = (destination.y - 0.5) * height + 0.5;
-        }
-    }
-
-    if (presentation.x == 1U) {
-        coordinate = vec2(destination.y, 1.0 - destination.x);
-    } else if (presentation.x == 2U) {
-        coordinate = 1.0 - destination;
-    } else if (presentation.x == 3U) {
-        coordinate = vec2(1.0 - destination.y, destination.x);
-    } else {
-        coordinate = destination;
-    }
-    coordinate = clamp(coordinate, vec2(0.0), vec2(0.999999));
-    return true;
-}
 
 void main()
 {
-    vec2 coordinate;
-    if (!sourceCoordinate(coordinate)) {
-        outputColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
-
-    uint x = min(
-        uint(coordinate.x * float(source.x)),
-        source.x - 1U);
-    uint y = min(
-        uint(coordinate.y * float(source.y)),
-        source.y - 1U);
-    ivec2 position = ivec2(int(x), int(y));
-
-    vec3 rgb;
-    uint format = source.z;
-#if defined(QTAV_EXTERNAL_OES)
-    if (format == 13U) {
-        vec4 transformed =
-            externalTransform * vec4(coordinate, 0.0, 1.0);
-        rgb = texture(externalImage, transformed.xy).rgb;
-    } else
-#endif
-    if (format <= 5U || format == 12U) {
-        float luma;
-        float chromaU;
-        float chromaV;
-        if (format == 12U) {
-            luma = float(
-                texelFetch(p010Luma, position, 0).r & 1023U)
-                / 1023.0;
-            ivec2 chromaPosition =
-                ivec2(int(x / 2U), int(y / 2U));
-            uvec2 chroma =
-                texelFetch(p010Chroma, chromaPosition, 0).rg;
-            chromaU = float(chroma.r & 1023U) / 1023.0;
-            chromaV = float(chroma.g & 1023U) / 1023.0;
-            rgb = p010ToRgb(
-                luma * (65472.0 / 65535.0),
-                chromaU * (65472.0 / 65535.0),
-                chromaV * (65472.0 / 65535.0),
-                presentation.z,
-                presentation.w);
-        } else if (format == 5U) {
-            luma = float(texelFetch(p010Luma, position, 0).r) / 65535.0;
-            ivec2 chromaPosition =
-                ivec2(int(x / 2U), int(y / 2U));
-            uvec2 chroma =
-                texelFetch(p010Chroma, chromaPosition, 0).rg;
-            chromaU = float(chroma.r) / 65535.0;
-            chromaV = float(chroma.g) / 65535.0;
-            rgb = p010ToRgb(
-                luma,
-                chromaU,
-                chromaV,
-                presentation.z,
-                presentation.w);
-        } else {
-            luma = texelFetch(plane0, position, 0).r;
-            ivec2 chromaPosition = position;
-            if (format == 0U) {
-                chromaPosition /= 2;
-            } else if (format == 1U) {
-                chromaPosition.x /= 2;
-            } else if (format == 3U || format == 4U) {
-                chromaPosition /= 2;
-            }
-
-            if (format <= 2U) {
-                chromaU =
-                    texelFetch(plane1, chromaPosition, 0).r;
-                chromaV =
-                    texelFetch(plane2, chromaPosition, 0).r;
-            } else {
-                vec2 chroma =
-                    texelFetch(plane1, chromaPosition, 0).rg;
-                chromaU = format == 3U ? chroma.r : chroma.g;
-                chromaV = format == 3U ? chroma.g : chroma.r;
-            }
-            rgb = yuvToRgb(
-                luma,
-                chromaU,
-                chromaV,
-                presentation.z,
-                presentation.w);
-        }
-    } else {
-        vec4 packed = texelFetch(plane0, position, 0);
-        if (format == 6U || format == 8U) {
-            rgb = packed.rgb;
-        } else if (format == 7U || format == 9U) {
-            rgb = packed.bgr;
-        } else if (format == 10U) {
-            rgb = packed.gba;
-        } else {
-            rgb = vec3(packed.r);
-        }
-    }
-    outputColor = vec4(presentColor(rgb), 1.0);
+    vec4 coordinate = externalTransform * vec4(
+        clamp(textureCoordinate, vec2(0.0), vec2(1.0)),
+        0.0,
+        1.0);
+    // GL_EXT_YUV_target defines the sampled R/G/B components as raw
+    // normalized Y/Cb/Cr. This pass deliberately performs no matrix,
+    // transfer, gamut, tone-mapping, or output-encoding operation.
+    outputColor = vec4(texture(externalImage, coordinate.xy).rgb, 1.0);
 }
 )qtav";
-
-enum class ShaderPixelFormat : std::uint32_t {
-    YUV420P,
-    YUV422P,
-    YUV444P,
-    NV12,
-    NV21,
-    P010,
-    RGB24,
-    BGR24,
-    RGBA,
-    BGRA,
-    ARGB,
-    Gray8,
-    YUV420P10,
-    ExternalOES,
-};
-
-enum class ShaderColorMatrix : std::uint32_t {
-    BT709,
-    BT601,
-    BT2020,
-};
-
-enum class ShaderColorTransfer : std::uint32_t {
-    SDR,
-    PQ,
-    HLG,
-    Linear,
-};
-
-enum class ShaderColorPrimaries : std::uint32_t {
-    BT709,
-    BT2020,
-    DisplayP3,
-};
-
-std::uint32_t shaderOutputColorSpace(
-    OpenGLOutputColorSpace colorSpace,
-    bool framebufferSrgb) noexcept
-{
-    switch (colorSpace) {
-    case OpenGLOutputColorSpace::HDR10PQ:
-        return 1;
-    case OpenGLOutputColorSpace::HDR10HLG:
-        return 2;
-    default:
-        return framebufferSrgb ? 3 : 0;
-    }
-}
-
-bool framebufferUsesSrgbEncoding(std::uint32_t framebuffer) noexcept
-{
-    GLint encoding = GL_LINEAR;
-    glGetFramebufferAttachmentParameteriv(
-        GL_FRAMEBUFFER,
-        framebuffer == 0 ? GL_BACK : GL_COLOR_ATTACHMENT0,
-        GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING,
-        &encoding);
-    return encoding == GL_SRGB;
-}
-
-struct PlaneLayout {
-    int width = 0;
-    int height = 0;
-    int bytesPerPixel = 0;
-    GLenum internalFormat = GL_R8;
-    GLenum format = GL_RED;
-    GLenum type = GL_UNSIGNED_BYTE;
-};
-
-struct PackedFrame {
-    ShaderPixelFormat format = ShaderPixelFormat::YUV420P;
-    std::array<PlaneLayout, 3> layouts {};
-    std::array<std::vector<std::uint8_t>, 3> bytes;
-    int planeCount = 0;
-};
 
 bool validViewport(
     const VideoViewport& viewport,
@@ -503,10 +80,8 @@ bool validViewport(
         return true;
     }
     return viewport.x >= 0 && viewport.y >= 0
-        && viewport.x <= surface.width
-        && viewport.y <= surface.height
-        && viewport.width <= surface.width - viewport.x
-        && viewport.height <= surface.height - viewport.y;
+        && viewport.x <= surface.width - viewport.width
+        && viewport.y <= surface.height - viewport.height;
 }
 
 bool supportedConfig(const VideoRenderConfig& config) noexcept
@@ -518,8 +93,7 @@ bool supportedConfig(const VideoRenderConfig& config) noexcept
         && config.surfaceOwnership == NativeResourceOwnership::Borrowed;
 }
 
-VideoViewport effectiveViewport(
-    const VideoRenderConfig& config) noexcept
+VideoViewport effectiveViewport(const VideoRenderConfig& config) noexcept
 {
     return config.viewport.isValid()
         ? config.viewport
@@ -531,270 +105,234 @@ VideoViewport effectiveViewport(
           };
 }
 
-ShaderColorMatrix shaderColorMatrix(ColorMatrix matrix) noexcept
+pl_rotation rotation(VideoRotation value) noexcept
 {
-    switch (matrix) {
+    switch (value) {
+    case VideoRotation::Rotate90:
+        return PL_ROTATION_90;
+    case VideoRotation::Rotate180:
+        return PL_ROTATION_180;
+    case VideoRotation::Rotate270:
+        return PL_ROTATION_270;
+    default:
+        return PL_ROTATION_0;
+    }
+}
+
+enum pl_color_levels levels(ColorRange value) noexcept
+{
+    switch (value) {
+    case ColorRange::Limited:
+        return PL_COLOR_LEVELS_LIMITED;
+    case ColorRange::Full:
+        return PL_COLOR_LEVELS_FULL;
+    default:
+        return PL_COLOR_LEVELS_UNKNOWN;
+    }
+}
+
+enum pl_color_system system(ColorMatrix value) noexcept
+{
+    switch (value) {
+    case ColorMatrix::RGB:
+        return PL_COLOR_SYSTEM_RGB;
     case ColorMatrix::BT709:
-        return ShaderColorMatrix::BT709;
+        return PL_COLOR_SYSTEM_BT_709;
+    case ColorMatrix::SMPTE240M:
+        return PL_COLOR_SYSTEM_SMPTE_240M;
     case ColorMatrix::BT2020NCL:
+        return PL_COLOR_SYSTEM_BT_2020_NC;
     case ColorMatrix::BT2020CL:
-        return ShaderColorMatrix::BT2020;
+        return PL_COLOR_SYSTEM_BT_2020_C;
+    case ColorMatrix::ICtCp:
+        return PL_COLOR_SYSTEM_BT_2100_PQ;
+    case ColorMatrix::YCgCo:
+        return PL_COLOR_SYSTEM_YCGCO;
     default:
-        return ShaderColorMatrix::BT601;
+        return PL_COLOR_SYSTEM_BT_601;
     }
 }
 
-ShaderColorTransfer shaderColorTransfer(ColorTransfer transfer) noexcept
+enum pl_color_primaries primaries(ColorPrimaries value) noexcept
 {
-    switch (transfer) {
-    case ColorTransfer::PQ:
-        return ShaderColorTransfer::PQ;
-    case ColorTransfer::HLG:
-        return ShaderColorTransfer::HLG;
-    case ColorTransfer::Linear:
-        return ShaderColorTransfer::Linear;
-    default:
-        return ShaderColorTransfer::SDR;
-    }
-}
-
-ShaderColorPrimaries shaderColorPrimaries(
-    ColorPrimaries primaries) noexcept
-{
-    switch (primaries) {
+    switch (value) {
+    case ColorPrimaries::BT470M:
+        return PL_COLOR_PRIM_BT_470M;
+    case ColorPrimaries::BT470BG:
+        return PL_COLOR_PRIM_BT_601_625;
+    case ColorPrimaries::SMPTE170M:
+    case ColorPrimaries::SMPTE240M:
+        return PL_COLOR_PRIM_BT_601_525;
     case ColorPrimaries::BT2020:
-        return ShaderColorPrimaries::BT2020;
+        return PL_COLOR_PRIM_BT_2020;
+    case ColorPrimaries::SMPTE431:
+        return PL_COLOR_PRIM_DCI_P3;
     case ColorPrimaries::SMPTE432:
-        return ShaderColorPrimaries::DisplayP3;
+        return PL_COLOR_PRIM_DISPLAY_P3;
+    case ColorPrimaries::EBU3213:
+        return PL_COLOR_PRIM_EBU_3213;
+    case ColorPrimaries::BT709:
     default:
-        return ShaderColorPrimaries::BT709;
+        return PL_COLOR_PRIM_BT_709;
     }
 }
 
-float maximumLuminance(const VideoFrame& frame) noexcept
+enum pl_color_transfer transfer(ColorTransfer value) noexcept
+{
+    switch (value) {
+    case ColorTransfer::Gamma22:
+        return PL_COLOR_TRC_GAMMA22;
+    case ColorTransfer::Gamma28:
+        return PL_COLOR_TRC_GAMMA28;
+    case ColorTransfer::Linear:
+        return PL_COLOR_TRC_LINEAR;
+    case ColorTransfer::SRGB:
+        return PL_COLOR_TRC_SRGB;
+    case ColorTransfer::PQ:
+        return PL_COLOR_TRC_PQ;
+    case ColorTransfer::HLG:
+        return PL_COLOR_TRC_HLG;
+    case ColorTransfer::SMPTE428:
+        return PL_COLOR_TRC_ST428;
+    default:
+        return PL_COLOR_TRC_BT_1886;
+    }
+}
+
+enum pl_chroma_location chromaLocation(ChromaLocation value) noexcept
+{
+    switch (value) {
+    case ChromaLocation::Left:
+        return PL_CHROMA_LEFT;
+    case ChromaLocation::Center:
+        return PL_CHROMA_CENTER;
+    case ChromaLocation::TopLeft:
+        return PL_CHROMA_TOP_LEFT;
+    case ChromaLocation::Top:
+        return PL_CHROMA_TOP_CENTER;
+    case ChromaLocation::BottomLeft:
+        return PL_CHROMA_BOTTOM_LEFT;
+    case ChromaLocation::Bottom:
+        return PL_CHROMA_BOTTOM_CENTER;
+    default:
+        return PL_CHROMA_UNKNOWN;
+    }
+}
+
+void setHdrMetadata(
+    const VideoFrame& frame,
+    struct pl_hdr_metadata& destination) noexcept
 {
     const MasteringDisplayMetadata mastering =
         frame.masteringDisplayMetadata();
-    if (mastering.hasLuminance && mastering.maximumLuminance > 0.0) {
-        return static_cast<float>(mastering.maximumLuminance);
+    if (mastering.hasPrimaries) {
+        destination.prim.red = {
+            static_cast<float>(mastering.primaries[0].x),
+            static_cast<float>(mastering.primaries[0].y),
+        };
+        destination.prim.green = {
+            static_cast<float>(mastering.primaries[1].x),
+            static_cast<float>(mastering.primaries[1].y),
+        };
+        destination.prim.blue = {
+            static_cast<float>(mastering.primaries[2].x),
+            static_cast<float>(mastering.primaries[2].y),
+        };
+        destination.prim.white = {
+            static_cast<float>(mastering.whitePoint.x),
+            static_cast<float>(mastering.whitePoint.y),
+        };
     }
-    const ContentLightMetadata content = frame.contentLightMetadata();
-    if (content.maximumContentLightLevel > 0) {
-        return static_cast<float>(
-            content.maximumContentLightLevel);
+    if (mastering.hasLuminance) {
+        destination.min_luma = static_cast<float>(
+            std::max(mastering.minimumLuminance, 0.000001));
+        destination.max_luma = static_cast<float>(
+            mastering.maximumLuminance);
     }
-    return frame.colorSpaceInfo().isHdr() ? 1000.0F : 100.0F;
+    const ContentLightMetadata light = frame.contentLightMetadata();
+    destination.max_cll = static_cast<float>(
+        light.maximumContentLightLevel);
+    destination.max_fall = static_cast<float>(
+        light.maximumFrameAverageLightLevel);
 }
 
-bool copyPlane(
-    const VideoFrame& frame,
-    int plane,
-    const PlaneLayout& layout,
-    std::vector<std::uint8_t>& destination) noexcept
+void setSourceColor(const VideoFrame& source, struct pl_frame& frame) noexcept
 {
-    const int rowBytes = layout.width * layout.bytesPerPixel;
-    const int lineSize = frame.lineSize(plane);
-    const auto* source = frame.data(plane);
-    if (!source || lineSize == 0 || rowBytes <= 0 || layout.height <= 0
-        || std::abs(static_cast<long long>(lineSize)) < rowBytes) {
-        return false;
-    }
-    const std::size_t rowSize = static_cast<std::size_t>(rowBytes);
-    const std::size_t height =
-        static_cast<std::size_t>(layout.height);
-    if (height > std::numeric_limits<std::size_t>::max() / rowSize) {
-        return false;
-    }
-    destination.resize(rowSize * height);
-    for (int row = 0; row < layout.height; ++row) {
-        std::memcpy(
-            destination.data()
-                + static_cast<std::size_t>(row) * rowSize,
-            source
-                + static_cast<std::ptrdiff_t>(row) * lineSize,
-            rowSize);
-    }
-    return true;
+    const VideoColorSpace color = source.colorSpaceInfo();
+    frame.repr.sys = system(color.matrix);
+    frame.repr.levels = levels(color.range);
+    frame.repr.alpha = PL_ALPHA_NONE;
+    frame.color.primaries = primaries(color.primaries);
+    frame.color.transfer = transfer(color.transfer);
+    setHdrMetadata(source, frame.color.hdr);
+    pl_frame_set_chroma_location(&frame, chromaLocation(color.chromaLocation));
 }
 
-bool interleavePlanar10Chroma(
-    const VideoFrame& frame,
-    const PlaneLayout& layout,
-    std::vector<std::uint8_t>& destination) noexcept
+void setTargetColor(
+    OpenGLOutputColorSpace colorSpace,
+    struct pl_frame& target) noexcept
 {
-    const int sourceRowBytes = layout.width * 2;
-    const int destinationRowBytes = layout.width * 4;
-    const int uLineSize = frame.lineSize(1);
-    const int vLineSize = frame.lineSize(2);
-    const auto* u = frame.data(1);
-    const auto* v = frame.data(2);
-    if (!u || !v || uLineSize == 0 || vLineSize == 0
-        || sourceRowBytes <= 0 || destinationRowBytes <= 0
-        || layout.height <= 0
-        || std::abs(static_cast<long long>(uLineSize)) < sourceRowBytes
-        || std::abs(static_cast<long long>(vLineSize)) < sourceRowBytes) {
-        return false;
-    }
-    const std::size_t rowSize =
-        static_cast<std::size_t>(destinationRowBytes);
-    const std::size_t height = static_cast<std::size_t>(layout.height);
-    if (height > std::numeric_limits<std::size_t>::max() / rowSize) {
-        return false;
-    }
-    destination.resize(rowSize * height);
-    for (int row = 0; row < layout.height; ++row) {
-        const auto* uRow =
-            u + static_cast<std::ptrdiff_t>(row) * uLineSize;
-        const auto* vRow =
-            v + static_cast<std::ptrdiff_t>(row) * vLineSize;
-        auto* output = destination.data()
-            + static_cast<std::size_t>(row) * rowSize;
-        for (int column = 0; column < layout.width; ++column) {
-            std::memcpy(output + column * 4, uRow + column * 2, 2);
-            std::memcpy(output + column * 4 + 2, vRow + column * 2, 2);
-        }
-    }
-    return true;
-}
-
-bool packFrame(
-    const VideoFrame& frame,
-    PackedFrame& result,
-    std::string& error)
-{
-    if (!frame) {
-        error = "The OpenGL ES renderer received an invalid frame";
-        return false;
-    }
-    const int width = frame.width();
-    const int height = frame.height();
-    const int halfWidth = (width + 1) / 2;
-    const int halfHeight = (height + 1) / 2;
-    switch (frame.format()) {
-    case PixelFormat::YUV420P:
-        result.format = ShaderPixelFormat::YUV420P;
-        result.planeCount = 3;
-        result.layouts = {{
-            { width, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-            { halfWidth, halfHeight, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-            { halfWidth, halfHeight, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-        }};
+    target.repr.sys = PL_COLOR_SYSTEM_RGB;
+    target.repr.levels = PL_COLOR_LEVELS_FULL;
+    target.repr.alpha = PL_ALPHA_NONE;
+    switch (colorSpace) {
+    case OpenGLOutputColorSpace::HDR10PQ:
+        target.color = pl_color_space_hdr10;
         break;
-    case PixelFormat::YUV422P:
-        result.format = ShaderPixelFormat::YUV422P;
-        result.planeCount = 3;
-        result.layouts = {{
-            { width, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-            { halfWidth, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-            { halfWidth, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-        }};
-        break;
-    case PixelFormat::YUV444P:
-        result.format = ShaderPixelFormat::YUV444P;
-        result.planeCount = 3;
-        result.layouts = {{
-            { width, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-            { width, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-            { width, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-        }};
-        break;
-    case PixelFormat::NV12:
-    case PixelFormat::NV21:
-        result.format = frame.format() == PixelFormat::NV12
-            ? ShaderPixelFormat::NV12
-            : ShaderPixelFormat::NV21;
-        result.planeCount = 2;
-        result.layouts = {{
-            { width, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-            { halfWidth, halfHeight, 2, GL_RG8, GL_RG, GL_UNSIGNED_BYTE },
-            {},
-        }};
-        break;
-    case PixelFormat::P010:
-        if (frame.formatName().find("p010le") == std::string::npos) {
-            error =
-                "The OpenGL ES renderer currently supports little-endian P010";
-            return false;
-        }
-        result.format = ShaderPixelFormat::P010;
-        result.planeCount = 2;
-        result.layouts = {{
-            { width, height, 2, GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT },
-            { halfWidth, halfHeight, 4, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT },
-            {},
-        }};
-        break;
-    case PixelFormat::YUV420P10:
-        if (frame.formatName().find("yuv420p10le") == std::string::npos) {
-            error = "The OpenGL ES renderer currently supports little-endian "
-                    "10-bit planar YUV";
-            return false;
-        }
-        result.format = ShaderPixelFormat::YUV420P10;
-        result.planeCount = 2;
-        result.layouts = {{
-            { width, height, 2, GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT },
-            { halfWidth, halfHeight, 4, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT },
-            {},
-        }};
-        if (!copyPlane(frame, 0, result.layouts[0], result.bytes[0])
-            || !interleavePlanar10Chroma(
-                frame,
-                result.layouts[1],
-                result.bytes[1])) {
-            error = "The OpenGL ES renderer could not pack a 10-bit planar "
-                    "YUV frame";
-            return false;
-        }
-        return true;
-    case PixelFormat::RGB24:
-    case PixelFormat::BGR24:
-        result.format = frame.format() == PixelFormat::RGB24
-            ? ShaderPixelFormat::RGB24
-            : ShaderPixelFormat::BGR24;
-        result.planeCount = 1;
-        result.layouts[0] = {
-            width, height, 3, GL_RGB8, GL_RGB, GL_UNSIGNED_BYTE
-        };
-        break;
-    case PixelFormat::RGBA:
-    case PixelFormat::BGRA:
-    case PixelFormat::ARGB:
-        result.format = frame.format() == PixelFormat::RGBA
-            ? ShaderPixelFormat::RGBA
-            : frame.format() == PixelFormat::BGRA
-                ? ShaderPixelFormat::BGRA
-                : ShaderPixelFormat::ARGB;
-        result.planeCount = 1;
-        result.layouts[0] = {
-            width, height, 4, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE
-        };
-        break;
-    case PixelFormat::Gray8:
-        result.format = ShaderPixelFormat::Gray8;
-        result.planeCount = 1;
-        result.layouts[0] = {
-            width, height, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE
-        };
+    case OpenGLOutputColorSpace::HDR10HLG:
+        target.color = pl_color_space_bt2020_hlg;
         break;
     default:
-        error =
-            "The OpenGL ES renderer does not support this software pixel format";
-        return false;
+        target.color = pl_color_space_srgb;
+        break;
     }
+}
 
-    for (int plane = 0; plane < result.planeCount; ++plane) {
-        if (!copyPlane(
-                frame,
-                plane,
-                result.layouts[plane],
-                result.bytes[plane])) {
-            error =
-                "The OpenGL ES renderer could not copy a software frame plane";
-            return false;
-        }
+void applyGeometry(
+    struct pl_frame& image,
+    struct pl_frame& target,
+    const VideoRenderConfig& config) noexcept
+{
+    image.rotation = rotation(config.rotation);
+    const VideoViewport viewport = effectiveViewport(config);
+    target.crop = {
+        static_cast<float>(viewport.x),
+        static_cast<float>(viewport.y),
+        static_cast<float>(viewport.x + viewport.width),
+        static_cast<float>(viewport.y + viewport.height),
+    };
+    if (config.aspectRatio == VideoAspectRatioMode::Stretch) {
+        return;
     }
-    return true;
+    if (config.aspectRatio == VideoAspectRatioMode::Fit) {
+        const float sourceAspect = pl_aspect_rotate(
+            pl_rect2df_aspect(&image.crop),
+            image.rotation);
+        pl_rect2df_aspect_set(&target.crop, sourceAspect, 0.0F);
+        return;
+    }
+    const float targetAspect = pl_rect2df_aspect(&target.crop);
+    const float sourceAspect = pl_aspect_rotate(
+        targetAspect,
+        image.rotation);
+    pl_rect2df_aspect_set(&image.crop, sourceAspect, 0.0F);
+}
+
+void initializePlane(
+    struct pl_plane& plane,
+    pl_tex texture,
+    int components,
+    int firstComponent) noexcept
+{
+    plane.texture = texture;
+    plane.components = components;
+    std::fill(
+        std::begin(plane.component_mapping),
+        std::end(plane.component_mapping),
+        -1);
+    for (int component = 0; component < components; ++component) {
+        plane.component_mapping[component] = firstComponent + component;
+    }
 }
 
 std::string shaderLog(GLuint object, bool program)
@@ -811,25 +349,19 @@ std::string shaderLog(GLuint object, bool program)
     std::string result(static_cast<std::size_t>(length), '\0');
     GLsizei written = 0;
     if (program) {
-        glGetProgramInfoLog(
-            object, length, &written, result.data());
+        glGetProgramInfoLog(object, length, &written, result.data());
     } else {
-        glGetShaderInfoLog(
-            object, length, &written, result.data());
+        glGetShaderInfoLog(object, length, &written, result.data());
     }
-    result.resize(
-        written > 0 ? static_cast<std::size_t>(written) : 0U);
+    result.resize(written > 0 ? static_cast<std::size_t>(written) : 0U);
     return result;
 }
 
-GLuint compileShader(
-    GLenum type,
-    const char* source,
-    std::string& error)
+GLuint compileShader(GLenum type, const char* source, std::string& error)
 {
     const GLuint shader = glCreateShader(type);
     if (!shader) {
-        error = "glCreateShader failed";
+        error = "glCreateShader(raw external normalization) failed";
         return 0;
     }
     glShaderSource(shader, 1, &source, nullptr);
@@ -837,7 +369,7 @@ GLuint compileShader(
     GLint compiled = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
     if (compiled != GL_TRUE) {
-        error = "OpenGL ES shader compilation failed: "
+        error = "Raw external normalization shader compilation failed: "
             + shaderLog(shader, false);
         glDeleteShader(shader);
         return 0;
@@ -845,57 +377,23 @@ GLuint compileShader(
     return shader;
 }
 
-GLuint createProgram(bool externalOES, std::string& error)
+bool hasExtension(const char* extensions, const char* name) noexcept
 {
-    const GLuint vertex =
-        compileShader(GL_VERTEX_SHADER, VertexShader, error);
-    if (!vertex) {
-        return 0;
+    if (!extensions || !name || !*name) {
+        return false;
     }
-    std::string fragmentSource = FragmentShader;
-    if (externalOES) {
-        const std::size_t versionStart =
-            fragmentSource.find("#version 300 es");
-        const std::size_t versionEnd =
-            versionStart == std::string::npos
-            ? std::string::npos
-            : fragmentSource.find('\n', versionStart);
-        if (versionEnd == std::string::npos) {
-            error = "The OpenGL ES fragment shader has no version line";
-            glDeleteShader(vertex);
-            return 0;
+    const std::size_t length = std::strlen(name);
+    const char* current = extensions;
+    while ((current = std::strstr(current, name))) {
+        const bool left = current == extensions || current[-1] == ' ';
+        const bool right = current[length] == '\0'
+            || current[length] == ' ';
+        if (left && right) {
+            return true;
         }
-        fragmentSource.insert(
-            versionEnd + 1,
-            "#define QTAV_EXTERNAL_OES 1\n");
+        current += length;
     }
-    const GLuint fragment =
-        compileShader(
-            GL_FRAGMENT_SHADER,
-            fragmentSource.c_str(),
-            error);
-    if (!fragment) {
-        glDeleteShader(vertex);
-        return 0;
-    }
-    const GLuint program = glCreateProgram();
-    if (!program) {
-        error = "glCreateProgram failed";
-    } else {
-        glAttachShader(program, vertex);
-        glAttachShader(program, fragment);
-        glLinkProgram(program);
-        GLint linked = GL_FALSE;
-        glGetProgramiv(program, GL_LINK_STATUS, &linked);
-        if (linked != GL_TRUE) {
-            error = "OpenGL ES program link failed: "
-                + shaderLog(program, true);
-            glDeleteProgram(program);
-        }
-    }
-    glDeleteShader(fragment);
-    glDeleteShader(vertex);
-    return error.empty() ? program : 0;
+    return false;
 }
 
 const char* glErrorName(GLenum error) noexcept
@@ -931,14 +429,219 @@ bool checkError(const char* operation, std::string& error)
     return false;
 }
 
-struct ProgramResources {
-    GLuint program = 0;
-    GLint source = -1;
-    GLint surface = -1;
-    GLint viewport = -1;
-    GLint presentation = -1;
-    GLint luminance = -1;
-    GLint externalTransform = -1;
+pl_voidfunc_t openGLProcAddress(const char* name) noexcept
+{
+    return reinterpret_cast<pl_voidfunc_t>(eglGetProcAddress(name));
+}
+
+class ExternalImageNormalizer {
+public:
+    ~ExternalImageNormalizer()
+    {
+        destroy();
+    }
+
+    GLuint texture() const noexcept
+    {
+        return texture_;
+    }
+
+    bool convert(
+        const OpenGLExternalTextureFrame& source,
+        int width,
+        int height,
+        std::string& error)
+    {
+        if (!source || !source.rawYcbcr || width <= 0 || height <= 0) {
+            error = "The raw OpenGL external image is incomplete";
+            return false;
+        }
+        if (!ensure(width, height, error)) {
+            return false;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
+        glViewport(0, 0, width, height);
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glUseProgram(program_);
+        glUniformMatrix4fv(
+            transform_,
+            1,
+            GL_FALSE,
+            source.transform.data());
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, source.texture);
+        glBindVertexArray(vertexArray_);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        return checkError("Raw Y/Cb/Cr normalization", error);
+    }
+
+    void destroy() noexcept
+    {
+        if (framebuffer_) {
+            glDeleteFramebuffers(1, &framebuffer_);
+            framebuffer_ = 0;
+        }
+        if (texture_) {
+            glDeleteTextures(1, &texture_);
+            texture_ = 0;
+        }
+        if (vertexArray_) {
+            glDeleteVertexArrays(1, &vertexArray_);
+            vertexArray_ = 0;
+        }
+        if (program_) {
+            glDeleteProgram(program_);
+            program_ = 0;
+        }
+        transform_ = -1;
+        width_ = 0;
+        height_ = 0;
+    }
+
+private:
+    bool ensureProgram(std::string& error)
+    {
+        if (program_) {
+            return true;
+        }
+        const char* extensions = reinterpret_cast<const char*>(
+            glGetString(GL_EXTENSIONS));
+        if (!hasExtension(extensions, "GL_EXT_YUV_target")
+            || !hasExtension(
+                extensions,
+                "GL_OES_EGL_image_external_essl3")) {
+            error =
+                "Raw AHardwareBuffer Y/Cb/Cr normalization requires GL_EXT_YUV_target and GL_OES_EGL_image_external_essl3";
+            return false;
+        }
+        if (!hasExtension(extensions, "GL_EXT_color_buffer_float")
+            && !hasExtension(
+                extensions,
+                "GL_EXT_color_buffer_half_float")) {
+            error =
+                "Raw AHardwareBuffer normalization requires a renderable RGBA16F texture";
+            return false;
+        }
+        std::string shaderError;
+        const GLuint vertex = compileShader(
+            GL_VERTEX_SHADER,
+            NormalizeVertexShader,
+            shaderError);
+        if (!vertex) {
+            error = std::move(shaderError);
+            return false;
+        }
+        const GLuint fragment = compileShader(
+            GL_FRAGMENT_SHADER,
+            NormalizeFragmentShader,
+            shaderError);
+        if (!fragment) {
+            glDeleteShader(vertex);
+            error = std::move(shaderError);
+            return false;
+        }
+        program_ = glCreateProgram();
+        if (program_) {
+            glAttachShader(program_, vertex);
+            glAttachShader(program_, fragment);
+            glLinkProgram(program_);
+            GLint linked = GL_FALSE;
+            glGetProgramiv(program_, GL_LINK_STATUS, &linked);
+            if (linked != GL_TRUE) {
+                error = "Raw external normalization program link failed: "
+                    + shaderLog(program_, true);
+                glDeleteProgram(program_);
+                program_ = 0;
+            }
+        } else {
+            error = "glCreateProgram(raw external normalization) failed";
+        }
+        glDeleteShader(fragment);
+        glDeleteShader(vertex);
+        if (!program_) {
+            return false;
+        }
+        glUseProgram(program_);
+        const GLint sampler = glGetUniformLocation(
+            program_,
+            "externalImage");
+        transform_ = glGetUniformLocation(
+            program_,
+            "externalTransform");
+        if (sampler < 0 || transform_ < 0) {
+            error = "Raw external normalization uniforms are unavailable";
+            return false;
+        }
+        glUniform1i(sampler, 0);
+        glGenVertexArrays(1, &vertexArray_);
+        if (!vertexArray_) {
+            error = "Raw external normalization VAO creation failed";
+            return false;
+        }
+        return checkError("Raw external normalization program", error);
+    }
+
+    bool ensure(int width, int height, std::string& error)
+    {
+        if (!ensureProgram(error)) {
+            return false;
+        }
+        if (texture_ && width_ == width && height_ == height) {
+            return true;
+        }
+        if (framebuffer_) {
+            glDeleteFramebuffers(1, &framebuffer_);
+            framebuffer_ = 0;
+        }
+        if (texture_) {
+            glDeleteTextures(1, &texture_);
+            texture_ = 0;
+        }
+        glGenTextures(1, &texture_);
+        glBindTexture(GL_TEXTURE_2D, texture_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA16F,
+            width,
+            height,
+            0,
+            GL_RGBA,
+            GL_HALF_FLOAT,
+            nullptr);
+        glGenFramebuffers(1, &framebuffer_);
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            texture_,
+            0);
+        if (!texture_ || !framebuffer_
+            || glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                != GL_FRAMEBUFFER_COMPLETE) {
+            error =
+                "The raw Y/Cb/Cr RGBA16F normalization target is incomplete";
+            return false;
+        }
+        width_ = width;
+        height_ = height;
+        return checkError("Raw Y/Cb/Cr normalization target", error);
+    }
+
+    GLuint program_ = 0;
+    GLuint vertexArray_ = 0;
+    GLuint texture_ = 0;
+    GLuint framebuffer_ = 0;
+    GLint transform_ = -1;
+    int width_ = 0;
+    int height_ = 0;
 };
 
 struct HardwareFrameKey {
@@ -954,8 +657,7 @@ struct HardwareFrameKey {
     }
 };
 
-HardwareFrameKey hardwareFrameKey(
-    const VideoFrame& frame) noexcept
+HardwareFrameKey hardwareFrameKey(const VideoFrame& frame) noexcept
 {
     HardwareFrameKey result;
     if (!frame || !frame.hasHardwareFrame()) {
@@ -1001,19 +703,26 @@ bool OpenGLRenderTarget::isHdr() const noexcept
     return isValid() && openGLColorSpaceIsHdr(colorSpace);
 }
 
-bool openGLColorSpaceIsHdr(
-    OpenGLOutputColorSpace colorSpace) noexcept
+bool openGLColorSpaceIsHdr(OpenGLOutputColorSpace colorSpace) noexcept
 {
     return colorSpace == OpenGLOutputColorSpace::HDR10PQ
         || colorSpace == OpenGLOutputColorSpace::HDR10HLG;
 }
 
+bool OpenGLHardwareFrameInterop::releaseFrame(
+    const OpenGLExternalTextureFrame&,
+    std::string&) noexcept
+{
+    return true;
+}
+
+OpenGLHardwareFrameInterop::~OpenGLHardwareFrameInterop() = default;
+
 class OpenGLVideoRenderer::Impl {
 public:
     Impl(
         OpenGLCurrentTargetCallback currentTarget,
-        std::shared_ptr<OpenGLHardwareFrameInterop>
-            hardwareInterop)
+        std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop)
         : currentTarget_(std::move(currentTarget))
         , hardwareInterop_(std::move(hardwareInterop))
         , eventState_(std::make_shared<RendererEventState>())
@@ -1032,19 +741,27 @@ public:
         close();
     }
 
-    void connectHardwareInterop()
+    static void logCallback(
+        void* privateData,
+        enum pl_log_level level,
+        const char* message)
     {
-        if (!hardwareInterop_ || !eventState_) {
+        if (!privateData || !message || level > PL_LOG_ERR) {
             return;
         }
-        std::weak_ptr<RendererEventState> weak = eventState_;
-        hardwareInterop_->setFrameAvailableCallback([weak] {
-            if (const auto state = weak.lock()) {
-                state->notify(
-                    VideoRenderEventType::RedrawRequested,
-                    {});
-            }
-        });
+        auto* self = static_cast<Impl*>(privateData);
+        std::lock_guard<std::mutex> lock(self->logMutex_);
+        self->lastLogError_ = message;
+    }
+
+    std::string takeLogError(std::string fallback)
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        if (!lastLogError_.empty()) {
+            fallback += ": " + lastLogError_;
+            lastLogError_.clear();
+        }
+        return fallback;
     }
 
     void notify(VideoRenderEventType type, std::string detail)
@@ -1054,143 +771,238 @@ public:
         }
     }
 
-    bool createProgramResources(
-        bool externalOES,
-        ProgramResources& result,
-        std::string& error)
+    void connectHardwareInterop()
     {
-        result.program = createProgram(externalOES, error);
-        if (!result.program) {
-            return false;
+        if (!hardwareInterop_ || !eventState_) {
+            return;
         }
-        glUseProgram(result.program);
-        const std::array<const char*, 5> samplerNames {
-            "plane0", "plane1", "plane2", "p010Luma", "p010Chroma"
-        };
-        for (std::size_t index = 0;
-             index < samplerNames.size();
-             ++index) {
-            const GLint location =
-                glGetUniformLocation(result.program, samplerNames[index]);
-            if (location < 0) {
-                error = std::string("Missing OpenGL ES uniform ")
-                    + samplerNames[index];
-                return false;
+        std::weak_ptr<RendererEventState> weak = eventState_;
+        hardwareInterop_->setFrameAvailableCallback([weak] {
+            if (const auto state = weak.lock()) {
+                state->notify(VideoRenderEventType::RedrawRequested, {});
             }
-            glUniform1i(location, static_cast<GLint>(index));
-        }
-        if (externalOES) {
-            const GLint externalImage =
-                glGetUniformLocation(result.program, "externalImage");
-            result.externalTransform =
-                glGetUniformLocation(
-                    result.program,
-                    "externalTransform");
-            if (externalImage < 0
-                || result.externalTransform < 0) {
-                error =
-                    "The external-OES OpenGL ES shader parameters are unavailable";
-                return false;
-            }
-            glUniform1i(externalImage, 5);
-        }
-        result.source =
-            glGetUniformLocation(result.program, "source");
-        result.surface =
-            glGetUniformLocation(result.program, "surface");
-        result.viewport =
-            glGetUniformLocation(result.program, "viewport");
-        result.presentation =
-            glGetUniformLocation(result.program, "presentation");
-        result.luminance =
-            glGetUniformLocation(result.program, "luminance");
-        if (result.source < 0 || result.surface < 0
-            || result.viewport < 0 || result.presentation < 0
-            || result.luminance < 0) {
-            error =
-                "The OpenGL ES renderer could not resolve shader parameters";
-            return false;
-        }
-        return true;
-    }
-
-    bool ensureExternalProgram(std::string& error)
-    {
-        if (externalProgram_.program) {
-            return true;
-        }
-        if (!createProgramResources(
-                true,
-                externalProgram_,
-                error)) {
-            if (externalProgram_.program) {
-                glDeleteProgram(externalProgram_.program);
-            }
-            externalProgram_ = {};
-            return false;
-        }
-        return checkError(
-            "OpenGL ES external-OES resource creation",
-            error);
+        });
     }
 
     bool createResources(std::string& error)
     {
         const GLubyte* version = glGetString(GL_VERSION);
-        if (!version) {
-            error =
-                "The OpenGL ES renderer requires a current context";
-            return false;
-        }
         GLint major = 0;
         glGetIntegerv(GL_MAJOR_VERSION, &major);
-        if (major < 3) {
+        if (!version || major < 3) {
             error =
-                "The OpenGL ES renderer requires OpenGL ES 3.x";
+                "The libplacebo OpenGL renderer requires a current OpenGL ES 3.x context";
             return false;
         }
-        if (!createProgramResources(
-                false,
-                softwareProgram_,
-                error)) {
+        pl_log_params logParams {};
+        logParams.log_cb = &Impl::logCallback;
+        logParams.log_priv = this;
+        logParams.log_level = PL_LOG_ERR;
+        log_ = pl_log_create(PL_API_VER, &logParams);
+
+        pl_opengl_params openGLParams {};
+        openGLParams.get_proc_addr = &openGLProcAddress;
+        openGLParams.no_compute = true;
+        openGLParams.egl_display = eglGetCurrentDisplay();
+        openGLParams.egl_context = eglGetCurrentContext();
+        openGL_ = pl_opengl_create(log_, &openGLParams);
+        if (!openGL_) {
+            error = takeLogError(
+                "libplacebo could not attach to the current OpenGL ES context");
+            destroyResources();
             return false;
         }
-        glGenVertexArrays(1, &vertexArray_);
-        glGenTextures(
-            static_cast<GLsizei>(textures_.size()),
-            textures_.data());
-        if (!vertexArray_
-            || std::any_of(
-                textures_.begin(),
-                textures_.end(),
-                [](GLuint texture) { return texture == 0; })) {
+        renderer_ = pl_renderer_create(log_, openGL_->gpu);
+        if (!renderer_) {
+            error = takeLogError(
+                "libplacebo could not create its OpenGL renderer");
+            destroyResources();
+            return false;
+        }
+        pl_opengl_swapchain_params swapchainParams {};
+        swapchainParams.framebuffer.id = 0;
+        swapchainParams.framebuffer.flipped = false;
+        swapchainParams.max_swapchain_depth = 0;
+        swapchain_ = pl_opengl_create_swapchain(
+            openGL_,
+            &swapchainParams);
+        if (!swapchain_) {
+            error = takeLogError(
+                "libplacebo could not create its borrowed OpenGL framebuffer wrapper");
+            destroyResources();
+            return false;
+        }
+        return true;
+    }
+
+    void destroyResources() noexcept
+    {
+        if (hardwareInterop_) {
+            hardwareInterop_->releaseCurrentContextResources();
+        }
+        preparedHardware_ = {};
+        preparedKey_ = {};
+        if (openGL_) {
+            pl_gpu_finish(openGL_->gpu);
+        }
+        normalizer_.destroy();
+        for (pl_tex& texture : uploadTextures_) {
+            if (texture && openGL_) {
+                pl_tex_destroy(openGL_->gpu, &texture);
+            }
+        }
+        if (swapchain_) {
+            pl_swapchain_destroy(&swapchain_);
+        }
+        if (renderer_) {
+            pl_renderer_destroy(&renderer_);
+        }
+        if (openGL_) {
+            pl_opengl_destroy(&openGL_);
+        }
+        if (log_) {
+            pl_log_destroy(&log_);
+        }
+        targetGeneration_ = 0;
+        targetFramebuffer_ = 0;
+        targetSize_ = {};
+    }
+
+    void close() noexcept
+    {
+        std::lock_guard<std::mutex> renderLock(renderMutex_);
+        std::lock_guard<std::mutex> stateLock(stateMutex_);
+        if (open_ || openGL_) {
+            destroyResources();
+        }
+        open_ = false;
+        config_ = {};
+    }
+
+    bool beginTarget(
+        const OpenGLRenderTarget& native,
+        struct pl_swapchain_frame& swapchainFrame,
+        struct pl_frame& target,
+        std::string& error)
+    {
+        if (targetGeneration_ != native.generation
+            || targetFramebuffer_ != native.framebuffer) {
+            pl_opengl_framebuffer framebuffer {};
+            framebuffer.id = static_cast<int>(native.framebuffer);
+            framebuffer.flipped = false;
+            pl_opengl_swapchain_update_fb(swapchain_, &framebuffer);
+            targetGeneration_ = native.generation;
+            targetFramebuffer_ = native.framebuffer;
+            targetSize_ = {};
+        }
+        if (targetSize_.width != native.size.width
+            || targetSize_.height != native.size.height) {
+            int width = native.size.width;
+            int height = native.size.height;
+            if (!pl_swapchain_resize(swapchain_, &width, &height)
+                || width != native.size.width
+                || height != native.size.height) {
+                error = takeLogError(
+                    "libplacebo could not resize the borrowed OpenGL framebuffer");
+                return false;
+            }
+            targetSize_ = native.size;
+        }
+        struct pl_color_space hint {};
+        switch (native.colorSpace) {
+        case OpenGLOutputColorSpace::HDR10PQ:
+            hint = pl_color_space_hdr10;
+            break;
+        case OpenGLOutputColorSpace::HDR10HLG:
+            hint = pl_color_space_bt2020_hlg;
+            break;
+        default:
+            hint = pl_color_space_srgb;
+            break;
+        }
+        pl_swapchain_colorspace_hint(swapchain_, &hint);
+        if (!pl_swapchain_start_frame(swapchain_, &swapchainFrame)) {
+            error = takeLogError(
+                "libplacebo could not acquire the borrowed OpenGL framebuffer");
+            return false;
+        }
+        pl_frame_from_swapchain(&target, &swapchainFrame);
+        setTargetColor(native.colorSpace, target);
+        return true;
+    }
+
+    bool wrapHardwareSource(
+        const VideoFrame& source,
+        const OpenGLExternalTextureFrame& external,
+        pl_tex& texture,
+        struct pl_frame& frame,
+        struct pl_dovi_metadata& dovi,
+        std::string& error)
+    {
+        const AVFrame* native =
+            detail::FrameFactory::nativeVideoFrame(source);
+        const int doviBitDepth = native
+            ? qtav_pl_dovi_bit_depth(native)
+            : 0;
+        const bool hasDovi = doviBitDepth != 0;
+        GLuint sourceTexture = external.texture;
+        GLenum target = GL_TEXTURE_EXTERNAL_OES;
+        GLint internalFormat = GL_RGBA8;
+        if (external.rawYcbcr) {
+            if (!normalizer_.convert(
+                    external,
+                    source.width(),
+                    source.height(),
+                    error)) {
+                return false;
+            }
+            sourceTexture = normalizer_.texture();
+            target = GL_TEXTURE_2D;
+            internalFormat = GL_RGBA16F;
+        } else if (hasDovi) {
             error =
-                "The OpenGL ES renderer could not create draw resources";
+                "Dolby Vision requires the raw AHardwareBuffer Y/Cb/Cr OpenGL import path";
             return false;
         }
-
-        if (hardwareInterop_
-            && !ensureExternalProgram(error)) {
+        pl_opengl_wrap_params wrapParams {};
+        wrapParams.texture = sourceTexture;
+        wrapParams.width = source.width();
+        wrapParams.height = source.height();
+        wrapParams.target = target;
+        wrapParams.iformat = internalFormat;
+        texture = pl_opengl_wrap(openGL_->gpu, &wrapParams);
+        if (!texture) {
+            error = takeLogError(
+                "libplacebo could not wrap the OpenGL hardware texture");
             return false;
         }
-
-        const std::uint8_t normalizedZero[4] {};
-        const std::uint16_t integerZero[2] {};
-        for (int index = 0; index < 3; ++index) {
-            uploadTexture(
-                index,
-                { 1, 1, 1, GL_R8, GL_RED, GL_UNSIGNED_BYTE },
-                normalizedZero);
+        frame.num_planes = 1;
+        initializePlane(frame.planes[0], texture, 3, 0);
+        frame.crop = {
+            0.0F,
+            0.0F,
+            static_cast<float>(source.width()),
+            static_cast<float>(source.height()),
+        };
+        setSourceColor(source, frame);
+        if (hasDovi
+            && !qtav_pl_map_dovi(&frame, &dovi, native)) {
+            error =
+                "FFmpeg Dolby Vision metadata changed during OpenGL frame mapping";
+            return false;
         }
-        uploadTexture(
-            3,
-            { 1, 1, 2, GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT },
-            integerZero);
-        uploadTexture(
-            4,
-            { 1, 1, 4, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT },
-            integerZero);
-        return checkError("OpenGL ES resource creation", error);
+        if (external.rawYcbcr) {
+            const int depth = hasDovi
+                ? doviBitDepth
+                : external.bitDepth > 0 ? external.bitDepth : 8;
+            frame.repr.bits = { depth, depth, 0 };
+        } else {
+            frame.repr.sys = PL_COLOR_SYSTEM_RGB;
+            frame.repr.levels = PL_COLOR_LEVELS_FULL;
+            frame.repr.alpha = PL_ALPHA_NONE;
+            frame.repr.bits = { 8, 8, 0 };
+        }
+        return true;
     }
 
     OpenGLHardwareImportStatus prepareHardwareFrame(
@@ -1202,8 +1014,6 @@ public:
             std::lock_guard<std::mutex> stateLock(stateMutex_);
             if (!open_) {
                 detail = "The OpenGL ES renderer is not open";
-                preparedHardware_ = {};
-                preparedKey_ = {};
                 return OpenGLHardwareImportStatus::Error;
             }
             interop = hardwareInterop_;
@@ -1211,38 +1021,24 @@ public:
         if (!frame || !frame.hasHardwareFrame()) {
             detail =
                 "The frame is not an OpenGL ES-interoperable hardware frame";
-            preparedHardware_ = {};
-            preparedKey_ = {};
             return OpenGLHardwareImportStatus::Unsupported;
         }
-        if (!interop
-            || !interop->supports(frame.hardwareFrame())) {
+        if (!interop || !interop->supports(frame.hardwareFrame())) {
             detail =
                 "The OpenGL ES renderer has no compatible interop for this hardware frame";
-            preparedHardware_ = {};
-            preparedKey_ = {};
             return OpenGLHardwareImportStatus::Unsupported;
         }
-        if (!ensureExternalProgram(detail)) {
-            preparedHardware_ = {};
-            preparedKey_ = {};
-            return OpenGLHardwareImportStatus::Error;
-        }
-        OpenGLHardwareImportResult imported =
-            interop->prepareFrame(frame);
-        if (imported.status
-                == OpenGLHardwareImportStatus::Ready
+        OpenGLHardwareImportResult imported = interop->prepareFrame(frame);
+        if (imported.status == OpenGLHardwareImportStatus::Ready
             && !imported) {
-            imported.status =
-                OpenGLHardwareImportStatus::Error;
+            imported.status = OpenGLHardwareImportStatus::Error;
             if (imported.detail.empty()) {
                 imported.detail =
                     "The OpenGL ES interop returned an invalid external texture";
             }
         }
         detail = imported.detail;
-        if (imported.status
-            == OpenGLHardwareImportStatus::Ready) {
+        if (imported.status == OpenGLHardwareImportStatus::Ready) {
             preparedKey_ = hardwareFrameKey(frame);
             preparedHardware_ = std::move(imported.texture);
         } else {
@@ -1252,90 +1048,28 @@ public:
         return imported.status;
     }
 
-    void uploadTexture(
-        int unit,
-        const PlaneLayout& layout,
-        const void* data)
-    {
-        glActiveTexture(GL_TEXTURE0 + unit);
-        glBindTexture(GL_TEXTURE_2D, textures_[unit]);
-        glTexParameteri(
-            GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(
-            GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(
-            GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(
-            GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            static_cast<GLint>(layout.internalFormat),
-            layout.width,
-            layout.height,
-            0,
-            layout.format,
-            layout.type,
-            data);
-    }
-
-    void destroyResources() noexcept
-    {
-        if (hardwareInterop_) {
-            hardwareInterop_->releaseCurrentContextResources();
-        }
-        preparedHardware_ = {};
-        preparedKey_ = {};
-        if (std::any_of(
-                textures_.begin(),
-                textures_.end(),
-                [](GLuint texture) { return texture != 0; })) {
-            glDeleteTextures(
-                static_cast<GLsizei>(textures_.size()),
-                textures_.data());
-        }
-        textures_.fill(0);
-        if (vertexArray_) {
-            glDeleteVertexArrays(1, &vertexArray_);
-            vertexArray_ = 0;
-        }
-        if (externalProgram_.program) {
-            glDeleteProgram(externalProgram_.program);
-        }
-        externalProgram_ = {};
-        if (softwareProgram_.program) {
-            glDeleteProgram(softwareProgram_.program);
-        }
-        softwareProgram_ = {};
-    }
-
-    void close() noexcept
-    {
-        std::lock_guard<std::mutex> renderLock(renderMutex_);
-        std::lock_guard<std::mutex> stateLock(stateMutex_);
-        if (open_ || softwareProgram_.program || vertexArray_) {
-            destroyResources();
-        }
-        open_ = false;
-        config_ = {};
-    }
-
-    std::mutex stateMutex_;
+    mutable std::mutex stateMutex_;
     std::mutex renderMutex_;
+    std::mutex logMutex_;
     OpenGLCurrentTargetCallback currentTarget_;
+    OpenGLPresentCallback present_;
     std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop_;
     std::shared_ptr<RendererEventState> eventState_;
     VideoRenderConfig config_;
     bool open_ = false;
-    GLuint vertexArray_ = 0;
-    std::array<GLuint, 5> textures_ {};
-    ProgramResources softwareProgram_;
-    ProgramResources externalProgram_;
+    std::string lastLogError_;
+    pl_log log_ = nullptr;
+    pl_opengl openGL_ = nullptr;
+    pl_renderer renderer_ = nullptr;
+    pl_swapchain swapchain_ = nullptr;
+    std::array<pl_tex, 4> uploadTextures_ {};
+    ExternalImageNormalizer normalizer_;
+    std::uint64_t targetGeneration_ = 0;
+    std::uint32_t targetFramebuffer_ = 0;
+    VideoSize targetSize_;
     HardwareFrameKey preparedKey_;
     OpenGLExternalTextureFrame preparedHardware_;
 };
-
-OpenGLHardwareFrameInterop::~OpenGLHardwareFrameInterop() = default;
 
 OpenGLVideoRenderer::OpenGLVideoRenderer(
     OpenGLCurrentTargetCallback currentTarget,
@@ -1347,8 +1081,8 @@ OpenGLVideoRenderer::OpenGLVideoRenderer(
 }
 
 OpenGLVideoRenderer::~OpenGLVideoRenderer() = default;
-OpenGLVideoRenderer::OpenGLVideoRenderer(
-    OpenGLVideoRenderer&&) noexcept = default;
+OpenGLVideoRenderer::OpenGLVideoRenderer(OpenGLVideoRenderer&&) noexcept =
+    default;
 OpenGLVideoRenderer& OpenGLVideoRenderer::operator=(
     OpenGLVideoRenderer&&) noexcept = default;
 
@@ -1376,9 +1110,7 @@ VideoRenderCapabilities OpenGLVideoRenderer::capabilities() const
         std::lock_guard<std::mutex> lock(impl_->stateMutex_);
         if (impl_->hardwareInterop_) {
             result.hardwareDevices =
-                impl_->hardwareInterop_
-                    ->capabilities()
-                    .sourceDevices;
+                impl_->hardwareInterop_->capabilities().sourceDevices;
         }
     }
     return result;
@@ -1386,10 +1118,9 @@ VideoRenderCapabilities OpenGLVideoRenderer::capabilities() const
 
 void OpenGLVideoRenderer::setEventCallback(EventCallback callback)
 {
-    if (!impl_) {
-        return;
+    if (impl_) {
+        impl_->eventState_->set(std::move(callback));
     }
-    impl_->eventState_->set(std::move(callback));
 }
 
 bool OpenGLVideoRenderer::open(const VideoRenderConfig& config)
@@ -1411,14 +1142,10 @@ bool OpenGLVideoRenderer::open(const VideoRenderConfig& config)
         } else if (impl_->open_) {
             impl_->config_ = config;
             opened = true;
-        } else {
-            if (impl_->createResources(error)) {
-                impl_->config_ = config;
-                impl_->open_ = true;
-                opened = true;
-            } else {
-                impl_->destroyResources();
-            }
+        } else if (impl_->createResources(error)) {
+            impl_->config_ = config;
+            impl_->open_ = true;
+            opened = true;
         }
     }
     if (!opened) {
@@ -1427,8 +1154,7 @@ bool OpenGLVideoRenderer::open(const VideoRenderConfig& config)
     return opened;
 }
 
-bool OpenGLVideoRenderer::configure(
-    const VideoRenderConfig& config)
+bool OpenGLVideoRenderer::configure(const VideoRenderConfig& config)
 {
     if (!impl_) {
         return false;
@@ -1453,18 +1179,21 @@ bool OpenGLVideoRenderer::configure(
 
 bool OpenGLVideoRenderer::render(const VideoFrame& frame)
 {
-    if (!impl_) {
+    if (!impl_ || !frame) {
         return false;
     }
     std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
-
     VideoRenderConfig config;
     OpenGLCurrentTargetCallback currentTarget;
+    OpenGLPresentCallback present;
+    std::shared_ptr<OpenGLHardwareFrameInterop> hardwareInterop;
     {
         std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
         if (impl_->open_) {
             config = impl_->config_;
             currentTarget = impl_->currentTarget_;
+            present = impl_->present_;
+            hardwareInterop = impl_->hardwareInterop_;
         }
     }
     if (!config.surfaceSize.isValid()) {
@@ -1473,152 +1202,139 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
             "The OpenGL ES renderer is not open");
         return false;
     }
-    const OpenGLRenderTarget target =
-        currentTarget ? currentTarget() : OpenGLRenderTarget {};
-    if (!target.isValid()) {
+    const OpenGLRenderTarget nativeTarget = currentTarget
+        ? currentTarget()
+        : OpenGLRenderTarget {};
+    if (!nativeTarget.isValid()) {
         impl_->notify(
             VideoRenderEventType::SurfaceLost,
             "The current OpenGL ES target is unavailable");
         return false;
     }
-    if (target.size.width != config.surfaceSize.width
-        || target.size.height != config.surfaceSize.height) {
+    if (nativeTarget.size.width != config.surfaceSize.width
+        || nativeTarget.size.height != config.surfaceSize.height) {
         impl_->notify(
             VideoRenderEventType::Error,
             "The current OpenGL ES target size does not match the configured surface");
         return false;
     }
-    PackedFrame packed;
-    OpenGLExternalTextureFrame externalTexture;
-    ProgramResources* program = &impl_->softwareProgram_;
-    ShaderPixelFormat shaderFormat = ShaderPixelFormat::YUV420P;
+
     std::string error;
+    OpenGLExternalTextureFrame external;
     if (frame.hasHardwareFrame()) {
         const HardwareFrameKey key = hardwareFrameKey(frame);
-        if (!(impl_->preparedKey_ == key)
-            || !impl_->preparedHardware_) {
+        if (!(impl_->preparedKey_ == key) || !impl_->preparedHardware_) {
             const OpenGLHardwareImportStatus status =
                 impl_->prepareHardwareFrame(frame, error);
-            if (status == OpenGLHardwareImportStatus::Pending) {
-                return false;
-            }
-            if (status == OpenGLHardwareImportStatus::Stale) {
+            if (status == OpenGLHardwareImportStatus::Pending
+                || status == OpenGLHardwareImportStatus::Stale) {
                 return false;
             }
             if (status != OpenGLHardwareImportStatus::Ready) {
-                impl_->notify(
-                    VideoRenderEventType::Error,
-                    error.empty()
-                        ? "The OpenGL ES hardware-frame preparation failed"
-                        : std::move(error));
+                impl_->notify(VideoRenderEventType::Error, std::move(error));
                 return false;
             }
         }
-        externalTexture = impl_->preparedHardware_;
-        program = &impl_->externalProgram_;
-        shaderFormat = ShaderPixelFormat::ExternalOES;
-    } else {
-        if (!packFrame(frame, packed, error)) {
-            impl_->notify(
-                VideoRenderEventType::Error,
-                std::move(error));
-            return false;
-        }
-        shaderFormat = packed.format;
+        external = impl_->preparedHardware_;
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-    if (target.framebuffer != 0
-        && glCheckFramebufferStatus(GL_FRAMEBUFFER)
-            != GL_FRAMEBUFFER_COMPLETE) {
-        impl_->notify(
-            VideoRenderEventType::SurfaceLost,
-            "The current OpenGL ES framebuffer is incomplete");
+    struct pl_swapchain_frame swapchainFrame {};
+    struct pl_frame target {};
+    if (!impl_->beginTarget(
+            nativeTarget,
+            swapchainFrame,
+            target,
+            error)) {
+        if (external && hardwareInterop) {
+            std::string releaseError;
+            hardwareInterop->releaseFrame(external, releaseError);
+            impl_->preparedHardware_ = {};
+            impl_->preparedKey_ = {};
+            if (error.empty()) {
+                error = std::move(releaseError);
+            }
+        }
+        impl_->notify(VideoRenderEventType::Error, std::move(error));
         return false;
     }
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    if (externalTexture) {
-        glActiveTexture(GL_TEXTURE5);
-        glBindTexture(
-            GL_TEXTURE_EXTERNAL_OES,
-            externalTexture.texture);
-    } else if (packed.format == ShaderPixelFormat::P010
-               || packed.format == ShaderPixelFormat::YUV420P10) {
-        impl_->uploadTexture(
-            3, packed.layouts[0], packed.bytes[0].data());
-        impl_->uploadTexture(
-            4, packed.layouts[1], packed.bytes[1].data());
+
+    struct pl_frame image {};
+    struct pl_dovi_metadata dovi {};
+    pl_tex hardwareTexture = nullptr;
+    bool mappedSoftware = false;
+    if (external) {
+        impl_->wrapHardwareSource(
+            frame,
+            external,
+            hardwareTexture,
+            image,
+            dovi,
+            error);
     } else {
-        for (int plane = 0; plane < packed.planeCount; ++plane) {
-            impl_->uploadTexture(
-                plane,
-                packed.layouts[plane],
-                packed.bytes[plane].data());
+        const AVFrame* native =
+            detail::FrameFactory::nativeVideoFrame(frame);
+        if (!native
+            || !qtav_pl_map_avframe(
+                impl_->openGL_->gpu,
+                &image,
+                impl_->uploadTextures_.data(),
+                native)) {
+            error = impl_->takeLogError(
+                "libplacebo could not map the decoded software frame for OpenGL");
+        } else {
+            mappedSoftware = true;
         }
     }
 
-    const VideoColorSpace color = frame.colorSpaceInfo();
-    const VideoViewport viewport = effectiveViewport(config);
-    glUseProgram(program->program);
-    const bool framebufferSrgb =
-        target.colorSpace == OpenGLOutputColorSpace::SdrSrgb
-        && framebufferUsesSrgbEncoding(target.framebuffer);
-    glUniform4ui(
-        program->source,
-        static_cast<GLuint>(frame.width()),
-        static_cast<GLuint>(frame.height()),
-        static_cast<GLuint>(shaderFormat),
-        shaderOutputColorSpace(
-            target.colorSpace,
-            framebufferSrgb));
-    glUniform4ui(
-        program->surface,
-        static_cast<GLuint>(config.surfaceSize.width),
-        static_cast<GLuint>(config.surfaceSize.height),
-        static_cast<GLuint>(shaderColorTransfer(color.transfer)),
-        static_cast<GLuint>(shaderColorPrimaries(color.primaries)));
-    glUniform4i(
-        program->viewport,
-        viewport.x,
-        viewport.y,
-        viewport.width,
-        viewport.height);
-    glUniform4ui(
-        program->presentation,
-        static_cast<GLuint>(config.rotation),
-        static_cast<GLuint>(config.aspectRatio),
-        static_cast<GLuint>(shaderColorMatrix(color.matrix)),
-        color.range == ColorRange::Full ? 1U : 0U);
-    glUniform2f(
-        program->luminance,
-        100.0F,
-        maximumLuminance(frame));
-    if (externalTexture) {
-        glUniformMatrix4fv(
-            program->externalTransform,
-            1,
-            GL_FALSE,
-            externalTexture.transform.data());
+    bool rendered = error.empty();
+    if (rendered) {
+        applyGeometry(image, target, config);
+        rendered = pl_render_image(
+            impl_->renderer_,
+            &image,
+            &target,
+            &pl_render_default_params);
+        if (!rendered) {
+            error = impl_->takeLogError(
+                "libplacebo could not render the OpenGL video frame");
+        }
     }
-    glViewport(
-        0,
-        0,
-        config.surfaceSize.width,
-        config.surfaceSize.height);
-    glDisable(GL_BLEND);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_SCISSOR_TEST);
-    glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glBindVertexArray(impl_->vertexArray_);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    glFlush();
-    if (externalTexture) {
+    if (mappedSoftware) {
+        qtav_pl_unmap_avframe(impl_->openGL_->gpu, &image);
+    }
+    const bool submitted = pl_swapchain_submit_frame(impl_->swapchain_);
+    if (!submitted && error.empty()) {
+        error = impl_->takeLogError(
+            "libplacebo could not submit the OpenGL framebuffer");
+    }
+    bool presented = submitted;
+    if (rendered && submitted && error.empty()
+        && present && !present(error)) {
+        presented = false;
+        if (error.empty()) {
+            error = "The platform could not present the OpenGL framebuffer";
+        }
+    }
+    if (hardwareTexture) {
+        pl_tex_destroy(impl_->openGL_->gpu, &hardwareTexture);
+    }
+    if (external && hardwareInterop) {
+        std::string releaseError;
+        if (!hardwareInterop->releaseFrame(external, releaseError)
+            && error.empty()) {
+            error = releaseError.empty()
+                ? "The OpenGL hardware image could not be returned to its producer"
+                : std::move(releaseError);
+        }
         impl_->preparedHardware_ = {};
         impl_->preparedKey_ = {};
     }
-    if (!checkError("OpenGL ES frame rendering", error)) {
-        impl_->notify(VideoRenderEventType::Error, std::move(error));
+    if (!rendered || !submitted || !presented || !error.empty()) {
+        impl_->notify(
+            VideoRenderEventType::Error,
+            error.empty()
+                ? "libplacebo OpenGL rendering failed"
+                : std::move(error));
         return false;
     }
     return true;
@@ -1641,8 +1357,17 @@ void OpenGLVideoRenderer::setCurrentTargetCallback(
     impl_->currentTarget_ = std::move(callback);
 }
 
-OpenGLHardwareImportStatus
-OpenGLVideoRenderer::prepareHardwareFrame(
+void OpenGLVideoRenderer::setPresentCallback(
+    OpenGLPresentCallback callback)
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    impl_->present_ = std::move(callback);
+}
+
+OpenGLHardwareImportStatus OpenGLVideoRenderer::prepareHardwareFrame(
     const VideoFrame& frame,
     std::string* detail)
 {
@@ -1678,10 +1403,6 @@ void OpenGLVideoRenderer::setHardwareFrameInterop(
     if (previous) {
         previous->setFrameAvailableCallback({});
         previous->releaseCurrentContextResources();
-    }
-    if (impl_->externalProgram_.program) {
-        glDeleteProgram(impl_->externalProgram_.program);
-        impl_->externalProgram_ = {};
     }
     impl_->preparedHardware_ = {};
     impl_->preparedKey_ = {};

@@ -1,3 +1,5 @@
+add_subdirectory(libplacebo)
+
 qtav_add_optional_backend(QTAV_RENDER_CPU qtav_render_cpu cpu)
 qtav_add_optional_backend(QTAV_RENDER_MOBILE qtav_render_mobile mobile)
 qtav_add_optional_backend(QTAV_RENDER_OPENGL qtav_render_opengl opengl)

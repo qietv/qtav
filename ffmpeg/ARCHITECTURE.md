@@ -64,7 +64,8 @@ FFmpeg 8.1.2
 ├── libplacebo
 │   ├── Vulkan-Headers       Vulkan API definitions
 │   ├── glslang              shader compilation
-│   └── OpenGL/OpenGL ES     GL/GLES/EGL rendering backend
+│   ├── OpenGL/OpenGL ES     GL/GLES/EGL rendering backend
+│   └── DOVI reshaping       built-in Dolby Vision shader processing
 └── dav1d                    AV1 software decoding
 ```
 
@@ -133,10 +134,15 @@ project-specific behavior:
 - libass avoids desktop system-font discovery on mobile/OHOS, so the
   application must provide subtitle fonts explicitly.
 - libplacebo enables its Vulkan and OpenGL backends, including OpenGL ES/EGL
-  support on Android and OHOS. Its overlay supplies the Python glad generator,
-  receives pinned glslang discovery, and normalizes Windows system library
-  flags for FFmpeg's pkg-config probes. Windows retains the libplacebo OpenGL
+  support on Android and OHOS, plus its built-in Dolby Vision reshaping
+  component. Its overlay supplies the Python glad generator, receives pinned
+  glslang discovery, and normalizes Windows system library flags for FFmpeg's
+  pkg-config probes. The optional external `libdovi` raw-RPU parser is not
+  part of the dependency closure. Windows retains the libplacebo OpenGL
   capability even though QtAVCore's preferred Windows renderer is DirectX.
+- the Android FFmpeg overlay enables FFmpeg's built-in RPU decoder for the
+  HEVC MediaCodec wrapper and PTS-correlates parsed Dolby Vision metadata with
+  hardware output frames before QtAVCore receives them.
 - libsmb2 supplies the missing private Winsock link metadata required by a
   static Windows consumer.
 
@@ -171,8 +177,8 @@ Every entry script runs `cmake/verify-install.cmake` after vcpkg installation.
 The verifier checks:
 
 - required FFmpeg 8/libavcodec 62 headers and metadata;
-- OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES, dav1d, and
-  Vulkan;
+- OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES/Dolby Vision
+  reshaping, dav1d, and Vulkan;
 - the required FFmpeg feature records;
 - absence of wolfSSL and VVenC;
 - relocatable installed FFmpeg CMake metadata.

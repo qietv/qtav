@@ -17,6 +17,10 @@ built, tested, packaged, or installed. Linux is not part of the active target
 matrix or roadmap. A macOS development machine may still act only as a
 cross-compilation host for Android/OHOS.
 
+OHOS remains a supported future target, but its production implementation is
+intentionally deferred. Current work stays on Android playback correctness and
+performance until the OHOS milestone is explicitly resumed.
+
 The archival removes the former Apple backend options/targets and the
 `VideoToolbox`/`Metal` public hardware-device identifiers. The unused Linux
 backend placeholders and `VAAPI` identifier are removed as part of the same
@@ -82,8 +86,9 @@ Continuation checkpoint:
   statistics;
   its progress slider observes already-handled thumb pointer events and
   commits only one seek when a drag ends instead of issuing intermediate seeks;
-  Milestones 5 and 6 are complete and the active next platform task is the
-  OHOS production path; the shared Android/OHOS
+  Milestones 5 and 6 are complete; the OHOS production path is intentionally
+  deferred, and the Android example playback-stutter regression recorded
+  below is fixed and connected-device verified; the shared Android/OHOS
   responsibility and lifecycle design is now recorded in `MOBILE.md`, and the
   Android arm64 Vulkan checkpoint cross-builds FFmpeg 8.1.2 plus QtAVCore,
   packages a minimal NativeActivity APK, verifies generated software A/V
@@ -117,19 +122,29 @@ Continuation checkpoint:
   foreign-queue and sync-fd release fencing, and aligned-allocation cropping
   without decoded-pixel mapping, staging, transfer, or re-upload;
   `QtAV::InteropMediaCodecOpenGL` now supplies the detached
-  `SurfaceTexture`/external-OES path, and `QtAV::RenderMobile` connects fatal
+  private-`AImageReader`/AHardwareBuffer/EGLImage raw-YCbCr path, non-blocking
+  bounded output scheduling, acquisition slack for coalesced image callbacks,
+  and release fencing ordered after Android window presentation; and
+  `QtAV::RenderMobile` connects fatal
   Vulkan hardware-frame fallback to an explicit synchronous application
   decision that rebinds subsequent output to compatible OpenGL ES interop or
   selects direct surface, software decode, or no video without retrying or
   mapping the retired frame;
+- the Vulkan and OpenGL ES renderers now use libplacebo as their shader and
+  color-pipeline authority. The former handwritten color-conversion,
+  transfer, tone-mapping, gamut-mapping, and output-encoding shaders are no
+  longer used. A shared FFmpeg/libplacebo bridge maps software frames and
+  FFmpeg-parsed Dolby Vision RPU metadata; backend-owned shaders are limited
+  to unavoidable representation normalization, including crop-aware raw
+  Y/Cb/Cr normalization before libplacebo on Android hardware frames;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
   Android arm64/API 28 and OHOS arm64/API 23 cross-builds on macOS plus native
   Windows x64/Visual Studio builds. Its FFmpeg 8.1.2 policy enables OpenSSL,
-  libsmb2, Vulkan, libass, libplacebo with OpenGL/OpenGL ES, dav1d and native
-  VVC decode while avoiding the unrelated desktop dependencies pulled by
-  `ffmpeg[all]`; the
+  libsmb2, Vulkan, libass, libplacebo with OpenGL/OpenGL ES and built-in Dolby
+  Vision reshaping, dav1d and native VVC decode while avoiding the unrelated
+  desktop dependencies pulled by `ffmpeg[all]`; the
   Android, OHOS, and Windows dependency packages have been built, verified,
   and uploaded by self-hosted CI; the Windows validation uses Visual Studio
   18's clang-cl 22.1.3 with lld-link and preserves FFmpeg LTO;
@@ -182,6 +197,7 @@ Current implementation:
 - `modern/backends/audio/aaudio/src/aaudio_audio_sink.cpp`
 - `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
 - `modern/backends/render/vulkan/src/vulkan_video_renderer.cpp`
+- `modern/backends/render/libplacebo/src/libplacebo_ffmpeg_bridge.c`
 - `modern/backends/render/vulkan/android/src/android_vulkan_video_renderer.cpp`
 - `modern/backends/render/opengl/src/opengl_video_renderer.cpp`
 - `modern/backends/render/opengl/android/src/android_opengl_video_renderer.cpp`
@@ -361,25 +377,31 @@ Current verification:
   from the device's aligned 160x96 native allocations.
 - the Android MediaCodec/OpenGL ES checkpoint cross-builds and exports
   `QtAV::InteropMediaCodecOpenGL`. On the same Android 16/Adreno 830 device,
-  H.264 and HEVC decoded through independent detached `SurfaceTexture`
-  producers and rendered as `GL_TEXTURE_EXTERNAL_OES`; the final run latched
-  223 H.264 plus 179 HEVC images, kept the pending high-water mark at two,
-  attached/detached one external texture per codec phase, recreated the EGL
-  window surface during H.264, flushed and sought without replacing the
-  decoder surface, and completed clean shutdown with zero decoded-source
-  CPU-map, software-transfer, staging-copy, or renderer-upload calls. SDR
-  8-bit sampling is enabled; P010/HDR remains explicitly capability-gated.
+  H.264 and HEVC decoded through private GPU-sampled `AImageReader` producers,
+  imported retained AHardwareBuffers as EGLImages, sampled raw Y/Cb/Cr with
+  `GL_EXT_YUV_target`, normalized the visible crop into RGBA16F, and then
+  rendered through libplacebo. Independent phases completed 99 H.264 and 180
+  HEVC imports with matching release fences, seek/surface-recreation coverage,
+  and zero decoded-source CPU-map, software-transfer, staging-copy, or upload
+  calls.
 - the explicit MediaCodec renderer-fallback checkpoint adds
   `MobileHardwareFrameFallbackRoute` and a synchronous selector callback.
   Deterministic tests cover compatible OpenGL ES interop, direct-surface,
   software-decode, no-video, missing-policy, retired-surface rejection, and
   retryable asynchronous interop without a CPU map. The connected Android
   run injected a fatal Vulkan error after 30 successful AImageReader imports,
-  rebound the same H.264 media session from generation 5 to a generation 6
-  SurfaceTexture, and continued with 32 Vulkan-generation plus 180 OpenGL
-  ES-generation decoded frames, 30 matching Vulkan release fences, 179
-  external-OES images, and zero decoded-source map, transfer, staging, or
-  upload calls.
+  rebound the same H.264 media session to a new OpenGL AImageReader producer,
+  and continued with 180 OpenGL ES raw-YCbCr imports and matching release
+  fences without retrying the retired Vulkan image or introducing a
+  decoded-source map, transfer, staging, or upload.
+- the Android player and NativeActivity builds now use the repository
+  libplacebo package with Vulkan and OpenGL enabled (`pl_has_opengl=1`), while
+  libdovi remains disabled because FFmpeg supplies parsed RPU metadata. Real
+  Profile 5 playback of `/sdcard/Download/Wednesday.mp4` was validated through
+  both AHardwareBuffer paths: native BT.2020/PQ HDR output when HDR is enabled,
+  and libplacebo SDR tone mapping when HDR is disabled. Color/RPU/raw-import
+  diagnostics remained active and decoded-source zero-copy counters remained
+  zero.
 
 ## Milestone 0 — Qt-free playback core
 
@@ -601,8 +623,9 @@ Completed file-output checkpoint:
 
 ## Android manual final-test player gate
 
-Complete the user-requested Android player validation before resuming the
-Milestone 7 OHOS clarification gate:
+This user-requested Android player gate is complete. Its results remain the
+baseline for the active Android stutter regression; the Milestone 7 OHOS gate
+is now deferred:
 
 1. [x] Add a user-facing standard Android activity under
    `modern/examples/android_player/` with an upper video surface, current
@@ -611,8 +634,8 @@ Milestone 7 OHOS clarification gate:
    layer controls.
 2. [x] Connect the switches to real native paths: software decode through
    Vulkan/OpenGL ES, MediaCodec direct-Surface output, private-AImageReader
-   Vulkan ZeroCopy, SurfaceTexture external-OES OpenGL ES ZeroCopy, explicit
-   SDR/HDR output policy, and exact optional
+   Vulkan ZeroCopy, private-AImageReader/AHardwareBuffer/EGLImage OpenGL ES
+   ZeroCopy, explicit SDR/HDR output policy, and exact optional
    `VK_LAYER_KHRONOS_validation` enablement.
 3. [x] Add a reproducible arm64 NDK, OpenSSL 3.5.7, and FFmpeg 8.1.2 build,
    Java/D8 packaging, debug signing, 16 KB ELF alignment, and an install
@@ -666,11 +689,48 @@ Milestone 7 OHOS clarification gate:
    `legend.mkv` reached 1307/1307 at 00:52 through 4K MediaCodec/AImageReader
    Vulkan HDR ZeroCopy, with about 4% app CPU. The H.264 SurfaceTexture
    regression completed at 180/179 after its documented zero-PTS drop.
+8. [x] Fix the OpenGL ES ZeroCopy reopen/long-form regression without changing
+   the completed core worker split. The player now reserves four exact-frame
+   slots including the graphics-thread in-flight attempt; OpenGL releases
+   MediaCodec output non-blockingly; AImageReader keeps two acquisition slots
+   beyond its four-image correlation window and immediately returns callback
+   evictions; and `OpenGLPresentCallback` submits the EGL window before the
+   interop exports its native release fence. On the same Android 16/Adreno 830
+   device, a Release APK reopened `wednesday.mp4` and sustained 3,632 callbacks
+   / 3,626 presents at 23.8 fps with core queue/late drops `0/0` and no AAudio
+   underrun. Pause/resume, a seek to 13:17, and background/foreground surface
+   recreation resumed at 24.0 fps. `legend.mkv` sustained 25.0 fps with
+   1,454/1,450 callbacks/presents and core drops `0/0`; Debug-off playback
+   continued beyond 01:42. The full connected NativeActivity matrix also
+   passed, including OpenGL H.264/HEVC raw-YCbCr import, seek, surface
+   recreation, native release fences, Vulkan-to-OpenGL fallback, zero decoded
+   source map/transfer/staging/upload, and clean shutdown.
 
 ## Next task
 
-After the Android manual player gate is complete, begin the OHOS production
-path after the completed Android reference:
+The Android example playback-stutter task is complete:
+
+1. [x] Reproduced the issue in a Release APK with Debug visible and hidden,
+   using ordinary HDR `legend.mkv` and Dolby Vision Profile 5
+   `wednesday.mp4`, including the failure after fully reopening the app.
+2. [x] Measured the failing stage: successful GL work stayed within budget,
+   while callbacks outran presents, AImageReader acquisition/release depth
+   grew to its bound, the EGL release fence excluded the later window swap,
+   and the resulting video-packet backpressure eventually produced an AAudio
+   underrun.
+3. [x] Implemented the bounded, non-blocking correction while preserving exact
+   frame correlation, graphics-thread ownership, native-buffer/fence lifetime,
+   libplacebo processing, and zero decoded-source CPU copies.
+4. [x] Validated sustained source-rate playback, app close/reopen, Debug
+   on/off, pause/resume, seek, and surface recreation on the connected device
+   for both representative files.
+
+No further Android correctness task is currently queued. OHOS production work
+remains intentionally deferred until the user explicitly resumes Milestone 7;
+until then, preserve this OpenGL reopen/long-form run as an Android regression
+gate.
+
+Completed platform prerequisites:
 
 Windows Advanced Color validation is complete: on a PHL 27B1U7903,
 `qtav_render_d3d11_advanced_color_test` passed with
@@ -707,35 +767,28 @@ passed 34/34.
    replacement, surface recreation, stale-generation rejection, and shutdown.
 10. [x] Add the confirmed private, GPU-sampled
     `AImageReader`/`AHardwareBuffer` Vulkan zero-CPU-copy texture path.
-11. [x] Add the confirmed `SurfaceTexture` external-OES OpenGL ES
-    zero-CPU-copy texture path.
+11. [x] Add the confirmed private-AImageReader/AHardwareBuffer/EGLImage raw
+    YCbCr OpenGL ES zero-CPU-copy texture path.
 12. [x] Connect the explicit renderer-fallback policy: on a fatal Vulkan
     transition, reconfigure subsequent MediaCodec output through compatible
     GLES native interop or select the caller's direct-surface,
     software-decode, or no-video policy without mapping a hardware frame.
-
-The first unchecked item, and therefore the next implementation task, is the
-Milestone 7 target clarification gate: record whether the initial target is a
-HarmonyOS NEXT commercial device application, a specific OpenHarmony
-distribution/device, or both, together with its SDK/API, signing, system
-capabilities, and connected-device workflow before fixing OHOS backend
-availability rules.
 
 ### Shared Android/OHOS mobile design checkpoint
 
 Complete this checkpoint once and reuse it for both mobile production paths:
 
 1. [x] Define a platform-neutral Vulkan renderer engine for software-frame
-   upload, YUV/RGB conversion, range/matrix/transfer/primaries handling,
-   viewport, aspect ratio, rotation, synchronization, and retained in-flight
-   resources.
+   mapping, libplacebo-generated color/render shaders, viewport, aspect ratio,
+   rotation, synchronization, and retained in-flight resources.
 2. [x] Keep Android `ANativeWindow`/EGL/Vulkan objects and OHOS
    `OHNativeWindow`/XComponent/EGL/Vulkan objects in separate platform or
    backend-specific adapters; do not expose either SDK through core public
    headers or merge the two SDK lifecycles into one platform class.
-3. [x] Reuse shader inputs, color-conversion math, geometry generation,
-   staging/upload helpers, capability rules, golden test vectors, and
-   renderer contract tests between Android and OHOS. Share OpenGL ES code only
+3. [x] Reuse the FFmpeg/libplacebo frame bridge, output-color contracts,
+   geometry rules, capability rules, golden test vectors, and renderer
+   contract tests between Android and OHOS. Color-conversion and tone-mapping
+   shaders come from libplacebo; share only representation-normalization code
    where the API and resource-lifetime behavior actually match.
 4. [x] Define a surface-backed hardware-decode presentation contract shared
    by MediaCodec and FFmpeg 8 OHCodec: explicit decoder selection, frame
@@ -789,12 +842,13 @@ Completed Android Vulkan implementation checkpoint:
   physical/logical device and queue handles plus an application-supplied
   current-image target; Vulkan declarations remain in its backend-specific
   header and do not reach core public headers;
-- the engine submission path packs YUV420/422/444, NV12/NV21, P010,
-  RGB/BGR/RGBA/BGRA/ARGB, or Gray8 software planes into a coherent storage
-  buffer and applies range, matrix, transfer, primaries, viewport, aspect, and
-  rotation logic in generated SPIR-V shaders; the current-target contract now
-  carries `VkColorSpaceKHR` and the shader emits SDR sRGB, native HDR10/PQ,
-  native HDR10/HLG, extended-linear sRGB, or linear BT.2020 as requested;
+- the shared FFmpeg/libplacebo bridge maps YUV420/422/444, NV12/NV21, P010,
+  RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames, including structured
+  color and Dolby Vision RPU metadata. libplacebo generates the Vulkan shaders
+  and owns color conversion, scaling, reshape, tone/gamut mapping, and final
+  encoding; the current-target contract carries `VkColorSpaceKHR` and selects
+  SDR sRGB, native HDR10/PQ, native HDR10/HLG, extended-linear sRGB, or linear
+  BT.2020 output;
 - the engine uses a bounded three-frame in-flight ring and retains each source
   `VideoFrame` until its slot fence completes;
 - `QtAV::RenderVulkanAndroid` retains the active `ANativeWindow` generation
@@ -839,13 +893,15 @@ Completed Android OpenGL ES fallback checkpoint:
 - `QtAV::RenderOpenGL` is a reusable OpenGL ES 3.x `VideoRenderAPI` target
   that draws into a caller-supplied current framebuffer and keeps EGL/window
   ownership outside the engine;
-- software uploads cover YUV420/422/444, NV12/NV21, little-endian P010,
-  RGB/BGR/RGBA/BGRA/ARGB, and Gray8, with structured range, matrix, transfer,
-  and primaries handling plus the common Fit/Fill/Stretch, custom viewport,
-  and right-angle rotation contract;
+- the shared FFmpeg/libplacebo bridge covers YUV420/422/444, NV12/NV21,
+  little-endian P010, RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames.
+  libplacebo's OpenGL backend generates the color/render shaders and owns
+  range, matrix, transfer, primaries, scaling, reshape, tone/gamut mapping,
+  and final encoding while QtAVCore supplies the common Fit/Fill/Stretch,
+  custom viewport, and right-angle rotation contract;
 - `OpenGLRenderTarget` explicitly selects SDR sRGB, BT.2020/PQ, or
-  BT.2020/HLG output. PQ/HLG inputs use the deterministic HDR-to-SDR shoulder
-  only for SDR; HDR targets preserve luminance and emit the selected native
+  BT.2020/HLG output. libplacebo tone maps HDR/Dolby Vision to SDR when the
+  target is SDR; HDR targets preserve HDR intent and emit the selected native
   transfer/primaries encoding;
 - `QtAV::RenderOpenGLAndroid` retains the active `ANativeWindow` generation
   and owns its EGL display, OpenGL ES 3.x context, window surface, and swap
@@ -1235,14 +1291,15 @@ Completed D3D11 Video Processor interop checkpoint:
 
 Following platform slice:
 
-1. [~] Begin the Android production path with the shared Android/OHOS mobile
-   design checkpoint and connected-device build harness.
+1. [ ] Resolve the Android example playback-stutter regression described in
+   `Next task`.
 
 Platform implementation order after the contracts are stable:
 
 1. Windows reference path.
 2. Android production path with connected-device validation.
-3. OHOS production path with connected-device validation.
+3. Android playback performance/regression work.
+4. OHOS production path with connected-device validation when resumed.
 
 ## Milestone 3 — Portable reference backends
 
@@ -1314,8 +1371,8 @@ Acceptance:
   swap-chain/display-switch tests.
 - [x] No Windows type leaks into core public headers.
 
-Status: complete; Milestone 6 is also complete, so resume Milestone 7 from its
-target clarification gate.
+Status: complete; Milestone 6 is also complete. The Android playback-stutter
+regression is the active next task, and Milestone 7 is deferred.
 
 ## Milestone 6 — Android production path
 
@@ -1347,8 +1404,12 @@ target clarification gate.
   validation.
 - [x] Application/platform renderer selector implementing the accepted
   startup, recovery, fatal-error, one-way fallback, and no-renderer behavior.
-- [x] Software YUV/NV12/P010/RGB upload, structured color conversion, viewport,
-  aspect ratio, rotation, resize, redraw, and surface recreation.
+- [x] Software YUV/NV12/P010/RGB mapping through the shared FFmpeg/libplacebo
+  bridge, libplacebo-generated color/render shaders, viewport, aspect ratio,
+  rotation, resize, redraw, and surface recreation.
+- [x] Replace the Vulkan and OpenGL ES handwritten color pipelines with
+  libplacebo backends for color conversion, Dolby Vision RPU reshaping, tone
+  and gamut mapping, scaling, and SDR/HDR output encoding.
 
 ### Audio and hardware decode
 
@@ -1368,12 +1429,12 @@ target clarification gate.
   YCbCr/external-format capability checks, bridge acquire/release fences, and
   return the release fence through asynchronous `AImage` deletion without
   `AHardwareBuffer_lock*()` or a staging upload.
-- [x] Android MediaCodec OpenGL ES interop using a `SurfaceTexture` producer
-  and `GL_TEXTURE_EXTERNAL_OES` as the primary path, with explicit
-  timestamp/generation and current-image lifetime handling. Keep private
-  `AImageReader` plus `AHardwareBuffer`/`EGLImage` import as a
-  capability-gated alternative; neither path may map or re-upload decoded
-  pixels.
+- [x] Android MediaCodec OpenGL ES interop using a private GPU-sampled
+  `AImageReader`, retained `AHardwareBuffer`/EGLImage imports, explicit
+  timestamp/generation and fence lifetime, and crop-aware raw Y/Cb/Cr
+  normalization before libplacebo. The normalization shader performs no color
+  conversion, reshape, tone/gamut mapping, or output encoding; the path never
+  maps or re-uploads decoded pixels.
 - [x] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
   interop for subsequent frames; otherwise follow an explicit direct-surface,
   software-decode, or no-video policy without implicit hardware-frame mapping.
@@ -1401,10 +1462,14 @@ Acceptance:
   as unavailable or skipped, not counted as zero-CPU-copy success;
 - Android SDK types remain outside core public headers.
 
-Status: complete; proceed to Milestone 7 only after its target clarification
-gate is recorded.
+Status: complete. Resolve the active Android playback-stutter task first;
+Milestone 7 remains deferred until explicitly resumed.
 
-## Milestone 7 — OHOS production path
+## Deferred milestone 7 — OHOS production path
+
+This milestone remains in the supported roadmap, but it is not the active next
+task. Do not begin its target-clarification or implementation work until the
+Android playback regression is resolved and the user explicitly resumes OHOS.
 
 Target clarification gate:
 
@@ -1524,7 +1589,12 @@ Acceptance:
 - [ ] Windows HDMI/WASAPI passthrough.
 - [ ] Atmos object-metadata preservation/rendering feasibility.
 - [x] HDR10 metadata propagation.
-- [ ] Dolby Vision metadata and rendering feasibility.
+- [x] Dolby Vision Profile 5 application-rendered playback: FFmpeg parses RPU
+  metadata, the Vulkan and OpenGL ES backends pass raw base-layer components
+  to libplacebo for reshaping, and libplacebo performs target-aware SDR tone
+  mapping or native HDR output. Connected-device validation covers both GPU
+  backends without decoded-source CPU copies. Enhancement-layer residual
+  reconstruction and product certification remain out of scope.
 - [ ] Licensing and certification review before product claims.
 
 Codec decoding must never be described as Dolby certification or Atmos
