@@ -71,6 +71,8 @@ private:
 
 // Retains one D3D11 device and its immediate context. Components which share
 // this value must hold contextGuard() while issuing immediate-context calls.
+// create() also enables native multithread protection on the context and
+// returns null when that protection is unavailable.
 class QTAV_PLATFORM_WINDOWS_EXPORT D3D11DeviceAccess final {
 public:
     static std::shared_ptr<D3D11DeviceAccess> create(

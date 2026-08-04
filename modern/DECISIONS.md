@@ -394,10 +394,11 @@ look like a process leak.
    flip-model frame latency at one, coalesces redraws, and uses non-blocking
    `Present()` plus bounded waitable-object backpressure when available before
    retrying.
-4. Except for the Intel driver workaround in AD-007, a hardware-frame import
-   remains alive through libplacebo draw-command submission and is retained by
-   the renderer's bounded GPU-completion queue. Decoder, interop, and renderer
-   submissions share one serialized immediate context.
+4. A hardware-frame import remains alive through libplacebo draw-command
+   submission and is retained by the renderer's bounded GPU-completion queue.
+   AD-007 requires native immediate-context multithread protection and keeps
+   successful imported-frame submission asynchronous. Decoder, interop, and
+   renderer submissions also share the QtAVCore recursive context guard.
 5. Interop retains the decoder's raw NV12/P010 slice and owns no conversion
    texture pool. Per-frame libplacebo wrappers are released after submission;
    libplacebo's renderer owns its bounded reusable shader/render caches and
@@ -473,8 +474,8 @@ Vulkan or OpenGL to its supported rendering path.
    conversion itself.
 6. AD-005 remains binding: render/context acquisition is non-blocking,
    submission uses the shared immediate context, and the exact imported frame
-   stays alive through submission. AD-007 defines the narrow Intel exception
-   that completes imported hardware-frame work per frame.
+   stays alive through completion-query retirement. AD-007 keeps imported
+   hardware frames on fast parameters without a per-frame completion drain.
 
 ### Consequences
 
@@ -490,12 +491,15 @@ Vulkan or OpenGL to its supported rendering path.
   residual reconstruction, and compressed passthrough remain outside this
   decision.
 
-## AD-007: Windows uses native PQ presentation and an Intel hardware-frame synchronization workaround
+## AD-007: Windows protects shared D3D11 contexts and imported frames
 
-- Date: 2026-08-03
+- Date: 2026-08-03; native-context correction and vendor-neutral asynchronous
+  policy accepted across NVIDIA, Intel, and AMD 2026-08-04
 - Status: Accepted
-- Scope: Windows D3D11VA/libplacebo resource completion and Advanced Color
-  presentation
+- Validation: current protected asynchronous policy accepted on NVIDIA, Intel,
+  and AMD; AMD integrated-GPU 4K cadence is a separate performance follow-up
+- Scope: Windows D3D11 immediate-context threading, D3D11VA/libplacebo
+  resource completion, and Advanced Color presentation
 
 ### Context
 
@@ -508,6 +512,25 @@ targets, and D3D11 completion queries did not prevent the failure. Copying the
 Dolby Vision decoder array slice GPU-to-GPU into a private single-slice
 shader-resource texture also reproduced the same crash. `legend.mkv` then
 proved that the trigger was not Dolby-Vision-specific.
+
+The complete imported-frame workaround subsequently stabilized the same path
+on an AMD Radeon 880M, and playback was manually verified as normal on the
+tested Intel and AMD adapters. On an NVIDIA GeForce RTX 3050, however, the
+same build either crashed in `nvwgf2umx.dll` or left a high-priority NVIDIA
+driver thread spinning while playback and shutdown remained blocked. The
+fault was not codec- or color-specific: generated H.264/NV12, HDR10/P010
+`legend.mkv`, and Dolby Vision Profile 5 `wednesday.mp4` all reproduced it.
+
+Controlled A/B builds showed that disabling fast render parameters did not
+change the access violation; disabling the Dolby decoder-surface copy only
+delayed the failure into a hang; removing `pl_gpu_finish()` changed the early
+access violation into an unfinished first-frame submission; and forcing an
+SDR BGRA8 target still crashed. The common condition was the output-owned
+D3D11 immediate context shared between FFmpeg decode workers and the
+libplacebo render worker. Enabling the context's native multithread protection
+before constructing `D3D11DeviceAccess` eliminated the NVIDIA failure while
+retaining D3D11VA, raw-plane color processing, and zero decoded-source CPU
+transfer.
 
 Separately, FP16 scRGB readback produced the expected Windows absolute
 luminance and the compositor reported an active HDR layer, yet both files
@@ -523,38 +546,57 @@ need alpha blending.
 2. The WinUI 3 player is an opaque video host and selects RGB10/PQ. libplacebo
    remains the color authority and encodes the target as BT.2020/PQ; the
    application does not add another tone-mapping or transfer pass.
-3. On Intel adapters, every successfully submitted imported D3D11VA hardware
-   frame calls `pl_gpu_finish()` before copied or directly imported resources
-   can be recycled. The condition is Intel plus hardware import, not Dolby
-   Vision metadata.
-4. Non-Intel submissions retain the bounded asynchronous GPU-completion queue.
-   Intel software-frame rendering also remains outside the hardware-import
-   workaround.
-5. Intel rendering uses libplacebo's fast parameters without the optional GPU
-   histogram peak-detection pass. Dolby Vision decoder-surface copies remain
-   GPU-only and preserve raw NV12/P010 semantics for the RPU reshape.
-6. The Intel synchronization rule is a driver workaround, not a permanent
-   claim about D3D11 resource semantics. It must not be removed from the stable
-   path until a newer driver passes both ordinary HDR10 and Dolby Vision
-   asynchronous-import regression runs. The investigation procedure is
-   recorded in `examples/winui3_player/INTEL_DRIVER_HANDOFF.md`.
+3. Every successfully submitted imported D3D11VA hardware frame remains alive
+   with its libplacebo wrappers and target through the bounded completion-query
+   queue. Successful per-frame submission does not call `pl_gpu_finish()`;
+   explicit drains remain in flush, resize, media replacement, failure
+   cleanup, and teardown paths.
+4. Software frames and hardware frames that take the explicit software-mapping
+   fallback retain libplacebo's default parameters and the same bounded
+   asynchronous GPU-completion model.
+5. Imported hardware frames use libplacebo's fast parameters without the
+   optional GPU histogram peak-detection pass. Dolby Vision raw NV12/P010
+   imports sample the retained decoder array slice directly and do not create
+   a same-device decoder-surface copy.
+6. This asynchronous policy is vendor-neutral and accepted on NVIDIA, Intel,
+   and AMD. A future synchronization or driver-failure regression may reopen
+   the policy for a narrowly evidenced fallback; a cadence or throughput issue
+   remains a separate performance investigation and does not justify silently
+   weakening native context protection.
+7. `D3D11DeviceAccess::create()` enables the immediate context's native
+   multithread protection and rejects a context that cannot expose or enable
+   it. The existing recursive guard remains required around application-owned
+   immediate-context calls; native protection covers context calls made inside
+   FFmpeg and libplacebo before user-mode-driver dispatch.
 
 ### Consequences
 
-- The affected Intel hardware path trades some peak rendering throughput for
-  stability. Ordinary HDR10 sustained close to source rate in validation;
-  Dolby Vision remained more expensive and showed scene-dependent dips.
+- Imported D3D11VA paths avoid the former per-frame GPU-wide completion wait
+  and Dolby copy while retaining fast parameters and bounded source lifetime.
+  Ordinary HDR10 sustained source rate on the recorded NVIDIA host; Dolby
+  Vision remains more expensive and can show scene-dependent dips.
+- The protected asynchronous path is accepted across NVIDIA, Intel, and AMD,
+  closing the original crash/correctness scope. The user's separate report of
+  visually dropped 4K frames on an AMD integrated GPU requires objective
+  cadence and stage timing before it is attributed to the renderer.
 - RGB10/PQ avoids the observed scRGB/DWM brightness mismatch for this opaque
   surface but cannot provide premultiplied-alpha video composition.
 - `colorInfo()` remains useful evidence for format, color space, SDR white,
   and display peak, but perceived brightness still requires comparison with a
   trusted player on the same monitor.
-- A future Intel-driver retest must isolate the synchronization change from the
-  RGB10/PQ presentation decision. Removing `pl_gpu_finish()` cannot be used to
-  evaluate brightness, and changing output encoding cannot be used to evaluate
-  the driver crash.
+- A future vendor-driver retest must isolate the synchronization change from
+  the RGB10/PQ presentation decision. Removing `pl_gpu_finish()` cannot be
+  used to evaluate brightness, and changing output encoding cannot be used to
+  evaluate the driver crash.
 
 ### Windows validation
+
+Current manual acceptance is explicit: the former full imported-frame
+workaround was accepted on the earlier Intel and AMD adapters, the exact
+protected asynchronous direct decoder-surface policy was measured on the
+recorded NVIDIA adapter, and the user subsequently confirmed that the same
+current modification is usable on Intel and AMD platforms. AD-007 is therefore
+closed across all three vendors.
 
 The failing adapter was Intel Iris Xe (`PCI\VEN_8086&DEV_A7A0`), driver
 `32.0.101.6733`. With Intel-wide imported-frame completion and native RGB10/PQ
@@ -568,4 +610,94 @@ presentation:
   was recorded after the corrected build started testing;
 - the user compared both output paths with MPC-BE on the same HDR display and
   confirmed matching brightness;
-- the Windows Release build completed and all 36 registered CTest tests passed.
+- the same full workaround was subsequently exercised on an AMD Radeon 880M.
+  Without it, both representative files and a generated H.264/NV12 clip
+  failed in `amdxx64.dll`. With it, six alternating cold starts, 120-second
+  and 90-second continuous runs, and 20 combined seeks completed without
+  software decoding or decoded-frame CPU mapping;
+- the vendor-neutral VS 2026 Release build completed and all 36 registered
+  CTest tests passed. On the AMD host, fresh 15-second debugger observations
+  of both files retained D3D11VA decode and completed without a crash;
+  `wednesday.mp4` also reported active decoder-surface copies.
+
+The NVIDIA validation host ran Windows 10 Enterprise 25H2 build
+`26200.8246` with a GeForce RTX 3050
+(`PCI\VEN_10DE&DEV_2584&SUBSYS_184610DE`, driver `32.0.15.9186`, NVIDIA
+591.86). Before native context protection, Windows Error Reporting recorded
+five QtAV failures in `nvwgf2umx.dll` at exception `0xc0000005` and offset
+`0x59f589`; the ordinary HDR path also produced a full dump with an NVIDIA
+UMD thread spinning and shutdown blocked. Debug logs retained D3D11VA and raw
+NV12/P010 import, with no software decode or decoded-source CPU map.
+
+After native context protection:
+
+- a generated 1920x1080 H.264/NV12 clip rendered 900 frames through D3D11VA
+  to natural end and closed cleanly; the unprotected control crashed at the
+  same NVIDIA offset after about 22 seconds;
+- `wednesday.mp4` sustained 45 seconds at about 23-24 rendered fps with active
+  decoder-surface copies, then completed four seeks to 10:00, 30:00, 02:00,
+  and 50:00 in a separate run and closed cleanly;
+- `legend.mkv` sustained 45 seconds at about 24.4-24.6 rendered fps with
+  active RGB10/PQ output and closed cleanly;
+- one process completed `legend.mkv` -> `wednesday.mp4` -> `legend.mkv` media
+  replacement and shutdown without a driver or application failure.
+- the updated ClangCL/Visual Studio 2026 shared and static Release builds each
+  completed with all 36 registered Windows CTest tests passing, including
+  native H.264/AAC A/V, D3D11VA lifecycle, Main10/P010 zero-copy interop,
+  high-level composition, and the native multithread-protection contract.
+
+A follow-up NVIDIA-only control retained native context protection while
+simultaneously disabling all three earlier imported-frame workarounds: it used
+libplacebo default parameters instead of fast parameters, sampled the Dolby
+Vision decoder array slice directly instead of copying it, and omitted the
+per-import `pl_gpu_finish()`. On the same RTX 3050/591.86 host:
+
+- the generated H.264/NV12 clip rendered 900 frames to natural end at about
+  29.4-29.8 fps and closed cleanly;
+- `legend.mkv` sustained 60 seconds at about 24.1-24.9 rendered fps with
+  D3D11VA and RGB10/PQ, then closed cleanly;
+- `wednesday.mp4` sustained 60 seconds at about 23.2-24.1 rendered fps with
+  D3D11VA, RGB10/PQ, and `decoder-copies=0`, then closed cleanly;
+- one additional process completed four seeks split across both files, two
+  media replacements, and close while playing without a driver/application
+  failure or software decode.
+
+This establishes that native context protection is sufficient for correctness
+on this NVIDIA configuration and that the three earlier workarounds are not
+required there. It motivated the explicit vendor-neutral policy above: retain
+fast parameters for performance and remove the Dolby copy and successful
+per-import finish. The all-disabled control used default libplacebo parameters,
+which increased warm steady-state `legend.mkv` draw time from roughly 17-19 ms
+to 36-40 ms on this host despite retaining source rate; the current policy
+therefore keeps fast parameters.
+
+The exact retained-fast policy was then rebuilt and exercised on the same
+NVIDIA host. Both ClangCL/Visual Studio 2026 shared and static Release trees
+passed all 36 registered CTest tests. In one WinUI process:
+
+- `legend.mkv` retained D3D11VA and active RGB10/PQ, sustained about
+  24.2-25.0 rendered fps after startup with warm draw maxima around
+  12.2-13.7 ms, and kept `decoder-copies=0`;
+- `wednesday.mp4` retained D3D11VA and active RGB10/PQ, sustained about
+  22.9-23.8 rendered fps after startup with warm draw maxima around
+  11.9-14.7 ms, kept `decoder-copies=0`, and recovered from a seek to 26:09;
+- the generated H.264/NV12 control rendered all 900 frames to natural end at
+  about 29.5-29.8 fps through D3D11VA with `decoder-copies=0`;
+- three media replacements completed, and a final separate P5 run closed the
+  main window while playing. The process exited within the three-second
+  observation window, and Windows recorded no new QtAV Application Error or
+  Error Reporting event during the run.
+
+This accepts the exact current policy on the recorded NVIDIA configuration.
+The user then validated the supplied modification on separate Intel and AMD
+platforms and reported it usable, closing the cross-vendor AD-007 gate. The
+adapter/driver details and objective cadence from those final two runs were not
+supplied in this handoff, so that confirmation is a correctness acceptance,
+not a performance benchmark.
+
+The user separately reported that 4K playback on the AMD integrated GPU looks
+slightly frame-droppy by eye. No cadence trace or failing stage accompanied the
+observation. This does not reopen AD-007: `PLAN.md` tracks an AMD integrated-GPU
+performance investigation to distinguish input/decode/clock scheduling,
+libplacebo draw cost, context contention, and compositor backpressure before
+any implementation change is selected.

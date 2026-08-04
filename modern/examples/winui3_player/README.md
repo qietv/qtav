@@ -15,18 +15,18 @@ The example demonstrates:
   libplacebo's D3D11 renderer when the media and device support them, with the
   library's software fallback;
 - monitor-aware SDR/HDR composition output in a WinUI `SwapChainPanel`;
-- an optional Debug window with playback, decode, render, device, cadence, and
-  decoder-surface GPU-copy diagnostics.
+- an optional Debug window with playback, decode, render, device, and cadence
+  diagnostics.
 
 The D3D11 renderer keeps submitted decoder slices and swap-chain back buffers
-alive until their GPU completion event. On Intel adapters it uses libplacebo's
-fast sampling policy without an additional GPU histogram peak-detection pass.
-Dolby Vision NV12/P010 slices are copied GPU-to-GPU into pooled shader-resource
-textures without sampling the decoder surface directly. Because the copy alone
-still reproduced the Intel user-mode-driver access violation, and ordinary
-HDR10 reproduced the same fault through direct import, every Intel
-hardware-frame submission completes GPU work synchronously before resource
-recycling. Non-Intel submissions remain asynchronously queued.
+alive until their GPU completion event. Every successfully imported D3D11VA
+frame uses libplacebo's fast sampling policy without an additional GPU
+histogram peak-detection pass. Submission stays asynchronous without a
+per-frame `pl_gpu_finish()`, and Dolby Vision raw NV12/P010 frames sample the
+retained decoder slice directly instead of creating a GPU copy. Native D3D11
+multithread protection, the shared recursive guard, the bounded completion
+queue, and lifecycle drains remain active. Software frames keep the default
+render parameters.
 
 The example's video surface is opaque, so it explicitly selects RGB10/PQ
 presentation with `DXGI_ALPHA_MODE_IGNORE`. This bypasses the extra scRGB/DWM

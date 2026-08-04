@@ -248,7 +248,10 @@ Applications that do not need to share a D3D11 device should prefer
 `D3D11VideoOutput`. Its `attach()` call takes exclusive ownership of the
 player's default render slot and render callback until `detach()`, configures
 D3D11VA against the output-owned device, and installs the D3D11 raw-plane
-interop path. With a hosting HWND, its default `PreferHdr` policy
+interop path. The retained `D3D11DeviceAccess` enables native immediate-context
+multithread protection before the decoder and renderer workers share the
+device; wrapping an external device now fails if that protection is
+unavailable. With a hosting HWND, its default `PreferHdr` policy
 creates an FP16 scRGB composition layer, resolves the current monitor through
 `IDXGIOutput6`, configures the swap-chain color space, and preserves PQ/HLG
 output while Windows HDR is active. `RequireHdr` reports unavailable HDR
@@ -298,18 +301,20 @@ contract remains documented in [D3D11VA.md](D3D11VA.md).
 
 Hardware imports, their copied core frames, and borrowed targets are retained
 until a D3D11 completion event reports that the libplacebo draw has finished.
-The renderer bounds this asynchronous queue at three submissions, and
+The renderer bounds this queue at three submissions, and
 `D3D11VideoRenderer::flush()` explicitly drains it before target resize or
-replacement. All decoder, interop, and renderer GPU submissions use the same
-serialized immediate context. Intel adapters additionally use libplacebo's
-fast sampling policy without the optional GPU histogram peak-detection pass.
-For Dolby Vision NV12/P010 input, a pooled GPU-to-GPU copy moves the selected
-decoder slice into a single-slice shader-resource texture before libplacebo
-sampling without a CPU transfer. Copying alone still reproduced the observed
-D3D11 user-mode-driver access violation, and ordinary HDR10 reproduced the same
-fault through direct import. All Intel hardware-frame submissions therefore
-complete synchronously before resource recycling; non-Intel frames keep the
-bounded asynchronous queue.
+replacement. Decoder, interop, and renderer submissions share a natively
+multithread-protected immediate context plus QtAVCore's recursive guard.
+Every successfully imported D3D11VA frame uses libplacebo's fast sampling
+policy without the optional GPU histogram peak-detection pass. Successful
+per-frame submission remains asynchronous, without `pl_gpu_finish()`, and
+Dolby Vision raw NV12/P010 input samples the retained decoder array slice
+directly without a GPU copy. Software frames keep the default render
+parameters. Normal flush, resize, media replacement, failure cleanup, and
+teardown still perform the explicit drains required by their lifecycles.
+This vendor-neutral policy is accepted on NVIDIA, Intel, and AMD. A separately
+reported visual 4K cadence issue on an AMD integrated GPU remains a performance
+investigation rather than an imported-frame correctness regression.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

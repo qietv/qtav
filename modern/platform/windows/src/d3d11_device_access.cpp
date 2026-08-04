@@ -2,6 +2,7 @@
 
 #include <qtav/d3d11_device_access.h>
 
+#include <d3d10_1.h>
 #include <wrl/client.h>
 
 #include <mutex>
@@ -140,6 +141,20 @@ std::shared_ptr<D3D11DeviceAccess> D3D11DeviceAccess::create(
     if (!sameComObject(
             immediateContext.get(),
             selectedImmediateContext.Get())) {
+        return {};
+    }
+
+    // FFmpeg decoding and GPU rendering can share this immediate context
+    // from different worker threads. The application-level recursive mutex
+    // serializes their public entry points; native protection also covers
+    // context calls performed inside either component before driver dispatch.
+    ComPtr<ID3D10Multithread> multithread;
+    if (FAILED(immediateContext.get()->QueryInterface(
+            IID_PPV_ARGS(&multithread)))) {
+        return {};
+    }
+    multithread->SetMultithreadProtected(TRUE);
+    if (!multithread->GetMultithreadProtected()) {
         return {};
     }
 

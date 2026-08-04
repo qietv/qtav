@@ -1229,9 +1229,10 @@ The composition output caps DXGI frame latency at one, uses non-blocking
 and retries when the compositor is busy. It never waits for presentation
 capacity on the UI thread. `takeStatistics()` returns and resets render
 requests/passes, presented frames, coalesced requests, busy presents, skipped
-renders, Intel Dolby Vision decoder-surface GPU-copy counts, long gaps,
+renders, the retained decoder-surface-copy diagnostic counter, long gaps,
 render/present maxima, and the renderer's color, interop, buffer-update, and
-draw-stage maxima.
+draw-stage maxima. The copy counter remains zero under the current direct
+decoder-surface policy.
 
 ### D3D11 renderer (advanced external-context path)
 
@@ -1261,12 +1262,17 @@ player.setVideoRenderAPI(renderer);
 ```
 
 `D3D11DeviceAccess::create()` rejects null, foreign-device, and deferred
-contexts, retains the selected device and verified immediate context, and
-provides the recursive lock shared by the renderer and D3D11VA/interop
-backends. `contextGuard()` waits for ownership; `tryContextGuard()` is its
+contexts, enables native D3D11 multithread protection on the verified
+immediate context, retains the selected device and context, and provides the
+recursive lock shared by the renderer and D3D11VA/interop backends. Creation
+also fails if the context cannot expose or enable native multithread
+protection. `contextGuard()` waits for ownership; `tryContextGuard()` is its
 non-blocking real-time form and returns a false guard when the context is
-busy. The older renderer constructor taking the two borrowed wrappers remains
-a convenience path and creates the same retained access internally.
+busy. The native guard covers context calls made inside FFmpeg and libplacebo
+before driver dispatch; it does not replace the explicit guard required around
+application context calls. The older renderer constructor taking the two
+borrowed wrappers remains a convenience path and creates the same retained
+access internally.
 The callback and returned `ID3D11RenderTargetView`/`IDXGISwapChain3` remain
 application-owned. The swap chain is optional for offscreen rendering, but it
 is required for native Advanced Color presentation. Composition swap chains
@@ -1347,18 +1353,19 @@ and RGB10/PQ data correctly.
 
 The imported wrapper and copied `VideoFrame` are retained through GPU
 completion of the libplacebo draw. Decode, interop, and rendering use the same
-serialized immediate context, so a later decoder submission remains ordered
-after preceding GPU reads. Non-Intel submissions use a bounded asynchronous
-three-frame completion-query queue. Intel adapters use
-libplacebo's fast sampling policy without the additional GPU histogram
-peak-detection pass. For Dolby Vision NV12/P010 frames, the renderer copies the
-selected decoder array slice GPU-to-GPU into a pooled single-slice
-shader-resource texture before libplacebo plane sampling, without a CPU map,
-staging upload, or RGB conversion. The copy alone still reproduced the same
-`igd10um64xe.dll` access violation on the affected driver. Ordinary HDR10 then
-reproduced that driver fault through direct import at the same module offset,
-so all Intel hardware-frame submissions complete libplacebo GPU work before
-copied or directly imported resources can be recycled.
+native-multithread-protected immediate context, with an additional shared
+recursive guard around QtAVCore-owned context sequences. The renderer keeps a
+bounded three-frame completion-query queue, and normal flush, resize, media
+replacement, and teardown paths explicitly drain it. Every successfully
+imported D3D11VA frame, regardless of adapter vendor, uses libplacebo's fast
+sampling policy without the optional GPU histogram peak-detection pass.
+Successful per-frame submission remains asynchronous: it does not call
+`pl_gpu_finish()`, and Dolby Vision raw NV12/P010 input samples the retained
+decoder array slice directly instead of creating a GPU copy. Software frames
+retain the default render parameters. This vendor-neutral policy is accepted
+on NVIDIA, Intel, and AMD. A separately reported visual 4K cadence issue on an
+AMD integrated GPU remains under performance investigation and is not treated
+as an imported-frame correctness regression without stage-level evidence.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly

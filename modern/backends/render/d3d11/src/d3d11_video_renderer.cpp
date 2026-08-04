@@ -104,20 +104,6 @@ std::string hresultText(const char* operation, HRESULT result)
     return stream.str();
 }
 
-bool isIntelD3D11Device(ID3D11Device* device) noexcept
-{
-    if (!device) {
-        return false;
-    }
-    ComPtr<IDXGIDevice> dxgiDevice;
-    ComPtr<IDXGIAdapter> adapter;
-    DXGI_ADAPTER_DESC description {};
-    return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)))
-        && SUCCEEDED(dxgiDevice->GetAdapter(&adapter))
-        && SUCCEEDED(adapter->GetDesc(&description))
-        && description.VendorId == 0x8086U;
-}
-
 bool sameAdvancedColorInfo(
     const D3D11AdvancedColorInfo& left,
     const D3D11AdvancedColorInfo& right) noexcept
@@ -810,7 +796,6 @@ public:
     struct InFlightRender {
         ComPtr<ID3D11Query> completion;
         ComPtr<ID3D11Texture2D> target;
-        ComPtr<ID3D11Texture2D> decoderSurfaceCopy;
         VideoFrame source;
         std::shared_ptr<D3D11TextureFrame> imported;
         std::array<pl_tex, 2> sourceTextures {};
@@ -828,7 +813,6 @@ public:
         , context_(deviceAccess_ ? deviceAccess_->immediateContext()
                                  : BorrowedD3D11DeviceContext {})
         , currentTarget_(std::move(currentTarget))
-        , intelDevice_(isIntelD3D11Device(device_.get()))
     {
         scRgbOutputHook_.stages = PL_HOOK_OUTPUT;
         scRgbOutputHook_.input = PL_HOOK_SIG_COLOR;
@@ -952,10 +936,6 @@ public:
         if (render.targetTexture && d3d11_) {
             pl_tex_destroy(d3d11_->gpu, &render.targetTexture);
         }
-        if (render.decoderSurfaceCopy) {
-            availableDecoderSurfaceCopies_.push_back(
-                std::move(render.decoderSurfaceCopy));
-        }
         render.imported.reset();
         render.source = {};
         render.target.Reset();
@@ -968,7 +948,6 @@ public:
         }
         inFlightRenders_.clear();
         availableCompletionQueries_.clear();
-        availableDecoderSurfaceCopies_.clear();
     }
 
     bool retireCompletedRenders(std::string& error)
@@ -1032,60 +1011,6 @@ public:
         if (FAILED(result)) {
             error = hresultText(
                 "Creating a D3D11 render-completion query",
-                result);
-            return false;
-        }
-        return true;
-    }
-
-    bool acquireDecoderSurfaceCopy(
-        const D3D11_TEXTURE2D_DESC& sourceDescription,
-        ComPtr<ID3D11Texture2D>& texture,
-        std::string& error)
-    {
-        const auto compatible = [&](ID3D11Texture2D* candidate) {
-            if (!candidate) {
-                return false;
-            }
-            D3D11_TEXTURE2D_DESC description {};
-            candidate->GetDesc(&description);
-            return description.Width == sourceDescription.Width
-                && description.Height == sourceDescription.Height
-                && description.Format == sourceDescription.Format
-                && description.ArraySize == 1
-                && description.MipLevels == 1
-                && description.SampleDesc.Count == 1
-                && description.Usage == D3D11_USAGE_DEFAULT
-                && (description.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
-        };
-        const auto existing = std::find_if(
-            availableDecoderSurfaceCopies_.begin(),
-            availableDecoderSurfaceCopies_.end(),
-            [&](const ComPtr<ID3D11Texture2D>& candidate) {
-                return compatible(candidate.Get());
-            });
-        if (existing != availableDecoderSurfaceCopies_.end()) {
-            texture = std::move(*existing);
-            availableDecoderSurfaceCopies_.erase(existing);
-            return true;
-        }
-
-        // Do not retain stale pools across a resolution or format change.
-        availableDecoderSurfaceCopies_.clear();
-        D3D11_TEXTURE2D_DESC description = sourceDescription;
-        description.ArraySize = 1;
-        description.MipLevels = 1;
-        description.Usage = D3D11_USAGE_DEFAULT;
-        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        description.CPUAccessFlags = 0;
-        description.MiscFlags = 0;
-        const HRESULT result = device_.get()->CreateTexture2D(
-            &description,
-            nullptr,
-            &texture);
-        if (FAILED(result)) {
-            error = hresultText(
-                "Creating a shader-readable D3D11 decoder-surface copy",
                 result);
             return false;
         }
@@ -1168,7 +1093,6 @@ public:
     bool wrapHardwareSource(
         const VideoFrame& source,
         const std::shared_ptr<D3D11TextureFrame>& imported,
-        ComPtr<ID3D11Texture2D>& decoderSurfaceCopy,
         std::array<pl_tex, 2>& textures,
         pl_frame& frame,
         pl_dovi_metadata& dovi,
@@ -1226,46 +1150,11 @@ public:
                 static_cast<int>(description.Height),
                 static_cast<int>((description.Height + 1U) / 2U),
             };
-            ID3D11Texture2D* sampledTexture = imported->texture();
-            UINT sampledArraySlice = imported->arraySlice();
-            if (detail::d3d11ShouldCopyDecoderSurface(
-                    intelDevice_,
-                    source.hasDolbyVisionMetadata(),
-                    rawYuv)) {
-                std::string copyError;
-                if (acquireDecoderSurfaceCopy(
-                        description,
-                        decoderSurfaceCopy,
-                        copyError)) {
-                    const UINT sourceSubresource = D3D11CalcSubresource(
-                        0,
-                        imported->arraySlice(),
-                        description.MipLevels);
-                    context_.get()->CopySubresourceRegion(
-                        decoderSurfaceCopy.Get(),
-                        0,
-                        0,
-                        0,
-                        0,
-                        imported->texture(),
-                        sourceSubresource,
-                        nullptr);
-                    sampledTexture = decoderSurfaceCopy.Get();
-                    sampledArraySlice = 0;
-                    decoderSurfaceCopies_.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
-                } else {
-                    // Direct decoder-surface sampling remains the established
-                    // fallback and keeps the synchronous Intel workaround
-                    // below. A failed optional copy must not disable video.
-                    decoderSurfaceCopy.Reset();
-                }
-            }
             for (std::size_t plane = 0; plane < textures.size(); ++plane) {
                 pl_d3d11_wrap_params params {};
-                params.tex = sampledTexture;
-                params.array_slice = static_cast<int>(sampledArraySlice);
+                params.tex = imported->texture();
+                params.array_slice =
+                    static_cast<int>(imported->arraySlice());
                 params.fmt = planeFormats[plane];
                 params.w = widths[plane];
                 params.h = heights[plane];
@@ -1363,7 +1252,6 @@ public:
     D3D11AdvancedColorInfo advancedColorInfo_;
     bool allowSoftwareMappingFallback_ = false;
     bool open_ = false;
-    bool intelDevice_ = false;
 
     pl_log log_ = nullptr;
     pl_d3d11 d3d11_ = nullptr;
@@ -1372,8 +1260,6 @@ public:
     std::array<pl_tex, 4> uploadTextures_ {};
     std::deque<InFlightRender> inFlightRenders_;
     std::vector<ComPtr<ID3D11Query>> availableCompletionQueries_;
-    std::vector<ComPtr<ID3D11Texture2D>>
-        availableDecoderSurfaceCopies_;
     std::string lastLogError_;
 
     std::atomic<std::uint64_t> decoderSurfaceCopies_ { 0 };
@@ -1658,7 +1544,6 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     pl_frame image {};
     std::array<pl_tex, 2> hardwareTextures {};
     std::shared_ptr<D3D11TextureFrame> imported;
-    ComPtr<ID3D11Texture2D> decoderSurfaceCopy;
     std::shared_ptr<HardwareFrameMapping> mappedFrame;
     std::unique_ptr<AVFrame, AVFrameDeleter> mappedNative;
     pl_dovi_metadata dovi {};
@@ -1683,7 +1568,6 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                 || !impl_->wrapHardwareSource(
                     frame,
                     imported,
-                    decoderSurfaceCopy,
                     hardwareTextures,
                     image,
                     dovi,
@@ -1747,7 +1631,10 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         impl_->context_.get()->ClearRenderTargetView(
             target.view,
             clearColor);
-        pl_render_params renderParams = impl_->intelDevice_
+        const bool useHardwareImportFastParams =
+            detail::d3d11ShouldUseHardwareImportFastParams(
+                static_cast<bool>(imported));
+        pl_render_params renderParams = useHardwareImportFastParams
             ? pl_render_fast_params
             : pl_render_default_params;
         const pl_hook* outputHooks[] { &impl_->scRgbOutputHook_ };
@@ -1762,21 +1649,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             &renderParams);
         if (rendered) {
             impl_->context_.get()->End(completion.Get());
-            if (impl_->intelDevice_ && imported) {
-                // Intel's D3D11 UMD can access-violate when libplacebo
-                // pipelines imported D3D11VA NV12/P010 frames, even while
-                // application-owned source and target wrappers remain retained
-                // by event query. Both ordinary HDR10 and Dolby Vision reproduce
-                // the same fault on the affected driver. Copying a decoder array
-                // slice into a private shader-readable texture does not avoid it,
-                // so every Intel hardware-frame submission completes here.
-                pl_gpu_finish(impl_->d3d11_->gpu);
-            }
             Impl::InFlightRender inFlight;
             inFlight.completion = std::move(completion);
             inFlight.target = std::move(targetTextureNative);
-            inFlight.decoderSurfaceCopy =
-                std::move(decoderSurfaceCopy);
             inFlight.source = frame;
             inFlight.imported = std::move(imported);
             inFlight.sourceTextures = hardwareTextures;

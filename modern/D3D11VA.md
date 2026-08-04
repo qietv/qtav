@@ -23,8 +23,10 @@ contracts shared by `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`,
   PQ/HLG conversion, tone mapping, gamut mapping, or output encoding.
 - A Dolby Vision RPU belongs to one exact `VideoFrame`; it is never reused by
   timestamp approximation or applied after ordinary YCbCr conversion.
-- Real-time render/context contention is retryable and non-blocking. There is
-  no per-frame completion query, `Flush()`, or `pl_gpu_finish()`.
+- Real-time render/context contention is retryable and non-blocking. The
+  immediate context has native multithread protection in addition to the
+  shared QtAVCore recursive guard; successful imported-frame submissions do
+  not add a per-frame GPU drain.
 
 ## Target and dependency boundaries
 
@@ -157,17 +159,19 @@ FFmpeg decode callbacks and QtAVCore D3D11 rendering share the recursive
 both renderer state and immediate-context ownership; contention declines the
 render so the output can retry instead of blocking its render/UI thread.
 
-The imported frame and libplacebo plane wrappers remain alive until
-`pl_render_image()` has submitted its commands. They are then released without
-waiting for GPU completion. Because decode and render submissions use the same
-serialized immediate context, later decoder-surface reuse is ordered after the
-earlier reads and D3D11 retains queued resource references.
-
-Per-frame `pl_gpu_finish()`, D3D11 event queries, and synchronous flushes are
-forbidden. `pl_gpu_finish()` is used only during renderer teardown before its
-reusable libplacebo resources are destroyed. The high-level output separately
-uses a frame-latency-one flip-model swap chain, redraw coalescing, non-blocking
-`Present()`, and bounded compositor backpressure as specified by AD-005.
+The imported frame, libplacebo plane wrappers, and borrowed target remain
+alive in a completion-query queue bounded at three submissions. Decode and
+render calls share a natively multithread-protected immediate context and the
+QtAVCore recursive guard. Successfully imported D3D11VA frames use
+libplacebo's fast render parameters, remain asynchronous after submission,
+and keep their source resources alive until the completion query retires.
+Dolby Vision raw NV12/P010 input samples the retained decoder array slice
+directly; it does not receive a same-device copy. Software frames keep the
+default render parameters. Explicit GPU drains remain in flush, resize,
+replacement, failure cleanup, and teardown paths. The high-level output
+separately uses a frame-latency-one flip-model swap chain, redraw coalescing,
+non-blocking `Present()`, and bounded compositor backpressure as specified by
+AD-005.
 
 ## Fallback and failure policy
 
