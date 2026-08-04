@@ -8,6 +8,7 @@
 #  define NOMINMAX
 #endif
 
+#include <d3d10_1.h>
 #include <d3d11.h>
 #include <wrl/client.h>
 
@@ -104,6 +105,9 @@ int main()
     assert(access);
     assert(access->device().get() == first.device.Get());
     assert(access->immediateContext().get() == first.context.Get());
+    ComPtr<ID3D10Multithread> multithread;
+    assert(SUCCEEDED(first.context.As(&multithread)));
+    assert(multithread->GetMultithreadProtected());
 
     {
         auto outerGuard = access->contextGuard();

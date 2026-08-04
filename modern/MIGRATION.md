@@ -248,7 +248,10 @@ Applications that do not need to share a D3D11 device should prefer
 `D3D11VideoOutput`. Its `attach()` call takes exclusive ownership of the
 player's default render slot and render callback until `detach()`, configures
 D3D11VA against the output-owned device, and installs the D3D11 raw-plane
-interop path. With a hosting HWND, its default `PreferHdr` policy
+interop path. The retained `D3D11DeviceAccess` enables native immediate-context
+multithread protection before the decoder and renderer workers share the
+device; wrapping an external device now fails if that protection is
+unavailable. With a hosting HWND, its default `PreferHdr` policy
 creates an FP16 scRGB composition layer, resolves the current monitor through
 `IDXGIOutput6`, configures the swap-chain color space, and preserves PQ/HLG
 output while Windows HDR is active. `RequireHdr` reports unavailable HDR

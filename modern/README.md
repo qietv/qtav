@@ -1261,12 +1261,17 @@ player.setVideoRenderAPI(renderer);
 ```
 
 `D3D11DeviceAccess::create()` rejects null, foreign-device, and deferred
-contexts, retains the selected device and verified immediate context, and
-provides the recursive lock shared by the renderer and D3D11VA/interop
-backends. `contextGuard()` waits for ownership; `tryContextGuard()` is its
+contexts, enables native D3D11 multithread protection on the verified
+immediate context, retains the selected device and context, and provides the
+recursive lock shared by the renderer and D3D11VA/interop backends. Creation
+also fails if the context cannot expose or enable native multithread
+protection. `contextGuard()` waits for ownership; `tryContextGuard()` is its
 non-blocking real-time form and returns a false guard when the context is
-busy. The older renderer constructor taking the two borrowed wrappers remains
-a convenience path and creates the same retained access internally.
+busy. The native guard covers context calls made inside FFmpeg and libplacebo
+before driver dispatch; it does not replace the explicit guard required around
+application context calls. The older renderer constructor taking the two
+borrowed wrappers remains a convenience path and creates the same retained
+access internally.
 The callback and returned `ID3D11RenderTargetView`/`IDXGISwapChain3` remain
 application-owned. The swap chain is optional for offscreen rendering, but it
 is required for native Advanced Color presentation. Composition swap chains

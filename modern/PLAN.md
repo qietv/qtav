@@ -18,9 +18,10 @@ matrix or roadmap. A macOS development machine may still act only as a
 cross-compilation host for Android/OHOS.
 
 OHOS remains a supported future target, but its production implementation is
-intentionally deferred. Current work stays on the NVIDIA discrete-GPU
-D3D11VA/libplacebo crash until AD-007 is isolated and validated on that device;
-all previously queued roadmap work remains postponed.
+intentionally deferred. The NVIDIA discrete-GPU D3D11VA/libplacebo failure is
+fixed and validated on the recorded RTX 3050 host. Current work stays on the
+remaining AD-007 proportional Intel/AMD regression gate; all previously queued
+roadmap work remains postponed until that gate closes.
 
 The archival removes the former Apple backend options/targets and the
 `VideoToolbox`/`Metal` public hardware-device identifiers. The unused Linux
@@ -317,9 +318,14 @@ Current verification:
   2026 and all 36 registered CTest tests passed. Fresh 15-second debugger
   observations on the AMD host kept both `legend.mkv` and `wednesday.mp4` on
   D3D11VA and completed without a crash; the Dolby Vision run reported active
-  decoder-surface copies. Manual testing of the same vendor-neutral policy on
-  an NVIDIA discrete GPU still crashes; controlled failure capture and the
-  independent validation specified in `Next task` remain open;
+  decoder-surface copies. On the later NVIDIA host, the same build failed in
+  `nvwgf2umx.dll+0x59f589` for H.264/NV12, HDR10/P010, and Dolby Vision. The
+  shared access now enables native D3D11 immediate-context multithread
+  protection before decoder/render sharing. The RTX 3050 then passed
+  sustained playback, four seeks, two media replacements, and
+  close-while-playing with D3D11VA and no decoded-source CPU transfer.
+  The updated Windows shared/static Release suites both pass 36/36;
+  proportional Intel/AMD regression remains in `Next task`;
 - `legend.mkv` confirms that the brightness report is not Dolby-Vision-only:
   its decoded metadata is BT.2020/PQ and the current sample reports active
   RGB10/PQ output with 240-nit system SDR white and a 1405-nit display peak.
@@ -786,40 +792,43 @@ Milestone 7 OHOS gate remains deferred:
 
 ## Next task
 
-The current blocking priority is the NVIDIA discrete-GPU D3D11VA/libplacebo
-crash. Intel and AMD manual playback is normal, but NVIDIA still crashes and
-AD-007 has not yet passed independent validation on that device. All existing
-post-Android and OHOS roadmap work is postponed until this task meets its exit
-criteria.
+The NVIDIA discrete-GPU D3D11VA/libplacebo failure is fixed on the recorded
+RTX 3050 host. The active blocking work is the final AD-007 cross-vendor
+regression gate. All existing post-Android and OHOS roadmap work remains
+postponed until this task meets its exit criteria.
 
-Known result: the current vendor-neutral AD-007 build still crashes during
-manual playback on an NVIDIA discrete GPU. The exact driver and fault evidence
-has not yet been recorded.
+Known result: native immediate-context multithread protection eliminates the
+NVIDIA user-mode-driver failure while preserving D3D11VA, raw NV12/P010
+libplacebo rendering, RGB10/PQ output, and zero decoded-source CPU transfer.
 
-1. [ ] On the NVIDIA discrete-GPU device, record the adapter model, PCI vendor
+1. [x] On the NVIDIA discrete-GPU device, record the adapter model, PCI vendor
    and device IDs, driver version, Windows version, faulting module, exception
    code, and module offset; reproduce with both `legend.mkv` and
    `wednesday.mp4` using the current vendor-neutral AD-007 build.
-2. [ ] Confirm from the Debug log that the failing run remains on D3D11VA and
+2. [x] Confirm from the Debug log that the failing run remains on D3D11VA and
    the raw NV12/P010 import path. Locate the failure relative to
    `pl_render_image()`, `pl_gpu_finish()`, completion-query retention, decoder
    resource recycling, and `Present()` without enabling software decode or a
    decoded-frame CPU map.
-3. [ ] Run a controlled NVIDIA A/B matrix covering ordinary H.264/NV12,
-   HDR10/P010, and Dolby Vision where supported. Isolate the AD-007 components:
-   fast render parameters, the Dolby Vision decoder-surface GPU copy, and
-   per-import `pl_gpu_finish()`.
-4. [ ] Implement the narrowest correction supported by the NVIDIA evidence.
-   Preserve the accepted Intel/AMD path, hardware decode, raw-plane color
-   processing, and zero decoded-source CPU transfer.
-5. [ ] Rebuild with Visual Studio 2026, pass the full Windows CTest suite, and
-   validate NVIDIA cold starts, sustained playback, repeated seeks, and close
-   while playing for both representative files. Re-run proportional Intel/AMD
-   regression coverage before closing AD-007.
+3. [x] Run a controlled NVIDIA A/B matrix covering ordinary H.264/NV12,
+   HDR10/P010, and Dolby Vision. Fast parameters, the Dolby Vision
+   decoder-surface copy, per-import `pl_gpu_finish()`, and HDR-versus-SDR
+   output were not the common cause; the shared unprotected immediate context
+   was.
+4. [x] Enable native multithread protection in `D3D11DeviceAccess::create()`
+   and add a Windows contract assertion. Preserve hardware decode, raw-plane
+   color processing, the accepted imported-frame workaround, and zero
+   decoded-source CPU transfer.
+5. [~] The ClangCL/Visual Studio 2026 shared and static Release builds each
+   pass all 36 Windows CTest tests. NVIDIA H.264 natural-end, 45-second
+   sustained runs of both representative files, four P5 seeks, two media
+   replacements, cold starts, and close while playing also pass. Re-run
+   proportional Intel and AMD playback before closing AD-007.
 
-Exit criteria: the NVIDIA discrete-GPU device completes the matrix without a
-driver/application crash or software decode, Intel and AMD remain normal, and
-the final driver/version-specific evidence is recorded in `DECISIONS.md`.
+Exit criteria: the NVIDIA matrix is complete without a driver/application
+crash or software decode and its exact evidence is recorded in
+`DECISIONS.md`. Current-driver Intel/AMD proportional regression remains before
+the cross-vendor decision is closed.
 
 The prior Android task is retained below as completed history, not as the
 active next step.
@@ -1411,8 +1420,9 @@ libplacebo own plane sampling, Dolby Vision/HDR processing, and final output.
 
 Following platform slice:
 
-1. [ ] Resolve the NVIDIA discrete-GPU D3D11VA/libplacebo crash described in
-   `Next task`; defer all previously queued platform work until it passes.
+1. [~] Complete the Intel/AMD regression gate for the NVIDIA
+   D3D11VA/libplacebo correction described in `Next task`; defer all previously
+   queued platform work until AD-007 closes.
 
 Platform implementation order after the contracts are stable:
 
@@ -1492,7 +1502,8 @@ Acceptance:
 - [x] No Windows type leaks into core public headers.
 
 Status: complete; Milestone 6 is also complete. The NVIDIA discrete-GPU
-D3D11VA/libplacebo crash is the active next task, and Milestone 7 is deferred.
+D3D11VA/libplacebo correction is validated on the RTX 3050 and awaits its
+Intel/AMD regression gate; Milestone 7 is deferred.
 
 ## Milestone 6 — Android production path
 
@@ -1582,14 +1593,14 @@ Acceptance:
   as unavailable or skipped, not counted as zero-CPU-copy success;
 - Android SDK types remain outside core public headers.
 
-Status: complete. Resolve the active NVIDIA discrete-GPU crash first;
+Status: complete. Finish the active AD-007 cross-vendor regression gate first;
 Milestone 7 remains deferred until explicitly resumed.
 
 ## Deferred milestone 7 — OHOS production path
 
 This milestone remains in the supported roadmap, but it is not the active next
 task. Do not begin its target-clarification or implementation work until the
-NVIDIA discrete-GPU crash is resolved and the user explicitly resumes OHOS.
+AD-007 Intel/AMD regression gate closes and the user explicitly resumes OHOS.
 
 Target clarification gate:
 
