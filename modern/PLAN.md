@@ -799,7 +799,10 @@ postponed until this task meets its exit criteria.
 
 Known result: native immediate-context multithread protection eliminates the
 NVIDIA user-mode-driver failure while preserving D3D11VA, raw NV12/P010
-libplacebo rendering, RGB10/PQ output, and zero decoded-source CPU transfer.
+libplacebo rendering, RGB10/PQ output, and zero decoded-source CPU transfer. A
+follow-up RTX 3050 control also passed with all three earlier imported-frame
+workarounds disabled simultaneously, but the vendor-neutral default remains
+unchanged pending an explicit policy decision and wider NVIDIA coverage.
 
 1. [x] On the NVIDIA discrete-GPU device, record the adapter model, PCI vendor
    and device IDs, driver version, Windows version, faulting module, exception
@@ -814,7 +817,10 @@ libplacebo rendering, RGB10/PQ output, and zero decoded-source CPU transfer.
    HDR10/P010, and Dolby Vision. Fast parameters, the Dolby Vision
    decoder-surface copy, per-import `pl_gpu_finish()`, and HDR-versus-SDR
    output were not the common cause; the shared unprotected immediate context
-   was.
+   was. With native protection retained, a second control disabled all three
+   workarounds simultaneously and passed H.264 natural end, 60-second runs of
+   both user files, four seeks, two media replacements, and close while
+   playing without software decode.
 4. [x] Enable native multithread protection in `D3D11DeviceAccess::create()`
    and add a Windows contract assertion. Preserve hardware decode, raw-plane
    color processing, the accepted imported-frame workaround, and zero

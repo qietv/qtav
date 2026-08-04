@@ -640,3 +640,28 @@ After native context protection:
   completed with all 36 registered Windows CTest tests passing, including
   native H.264/AAC A/V, D3D11VA lifecycle, Main10/P010 zero-copy interop,
   high-level composition, and the native multithread-protection contract.
+
+A follow-up NVIDIA-only control retained native context protection while
+simultaneously disabling all three earlier imported-frame workarounds: it used
+libplacebo default parameters instead of fast parameters, sampled the Dolby
+Vision decoder array slice directly instead of copying it, and omitted the
+per-import `pl_gpu_finish()`. On the same RTX 3050/591.86 host:
+
+- the generated H.264/NV12 clip rendered 900 frames to natural end at about
+  29.4-29.8 fps and closed cleanly;
+- `legend.mkv` sustained 60 seconds at about 24.1-24.9 rendered fps with
+  D3D11VA and RGB10/PQ, then closed cleanly;
+- `wednesday.mp4` sustained 60 seconds at about 23.2-24.1 rendered fps with
+  D3D11VA, RGB10/PQ, and `decoder-copies=0`, then closed cleanly;
+- one additional process completed four seeks split across both files, two
+  media replacements, and close while playing without a driver/application
+  failure or software decode.
+
+This establishes that native context protection is sufficient for correctness
+on this NVIDIA configuration and that the three earlier workarounds are not
+required there. It does not change the vendor-neutral default: Intel and AMD
+previously required imported-frame synchronization, and a vendor-specific
+policy needs an explicit decision plus wider NVIDIA driver coverage. Default
+libplacebo parameters also increased warm steady-state `legend.mkv` draw time
+from roughly 17-19 ms to 36-40 ms on this host despite retaining source rate,
+so removing fast parameters is not automatically a performance improvement.
