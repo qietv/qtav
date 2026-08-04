@@ -303,17 +303,17 @@ Hardware imports, their copied core frames, and borrowed targets are retained
 until a D3D11 completion event reports that the libplacebo draw has finished.
 The renderer bounds this queue at three submissions, and
 `D3D11VideoRenderer::flush()` explicitly drains it before target resize or
-replacement. All decoder, interop, and renderer GPU submissions use the same
-serialized immediate context. Every successfully imported D3D11VA frame uses
-libplacebo's fast sampling policy without the optional GPU histogram
-peak-detection pass and completes GPU work synchronously before its decoder
-resources can be recycled, regardless of adapter vendor. Software frames keep
-the default render parameters and asynchronous queue. For Dolby Vision raw
-NV12/P010 input, a pooled GPU-to-GPU copy moves the selected decoder slice into
-a single-slice shader-resource texture before libplacebo sampling without a
-CPU transfer. Intel, AMD, and NVIDIA have all reproduced a crash on the
-asynchronous imported-frame path, which is why the workaround is
-vendor-neutral.
+replacement. Decoder, interop, and renderer submissions share a natively
+multithread-protected immediate context plus QtAVCore's recursive guard.
+Every successfully imported D3D11VA frame uses libplacebo's fast sampling
+policy without the optional GPU histogram peak-detection pass. Successful
+per-frame submission remains asynchronous, without `pl_gpu_finish()`, and
+Dolby Vision raw NV12/P010 input samples the retained decoder array slice
+directly without a GPU copy. Software frames keep the default render
+parameters. Normal flush, resize, media replacement, failure cleanup, and
+teardown still perform the explicit drains required by their lifecycles.
+This vendor-neutral policy is validated on the recorded NVIDIA configuration;
+proportional current-driver Intel and AMD playback remains pending.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

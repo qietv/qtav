@@ -1229,9 +1229,10 @@ The composition output caps DXGI frame latency at one, uses non-blocking
 and retries when the compositor is busy. It never waits for presentation
 capacity on the UI thread. `takeStatistics()` returns and resets render
 requests/passes, presented frames, coalesced requests, busy presents, skipped
-renders, Dolby Vision decoder-surface GPU-copy counts, long gaps,
+renders, the retained decoder-surface-copy diagnostic counter, long gaps,
 render/present maxima, and the renderer's color, interop, buffer-update, and
-draw-stage maxima.
+draw-stage maxima. The copy counter remains zero under the current direct
+decoder-surface policy.
 
 ### D3D11 renderer (advanced external-context path)
 
@@ -1352,19 +1353,18 @@ and RGB10/PQ data correctly.
 
 The imported wrapper and copied `VideoFrame` are retained through GPU
 completion of the libplacebo draw. Decode, interop, and rendering use the same
-serialized immediate context, so a later decoder submission remains ordered
-after preceding GPU reads. The renderer keeps a bounded three-frame
-completion-query queue. Every successfully imported D3D11VA frame, regardless
-of adapter vendor, uses libplacebo's fast sampling policy without the optional
-GPU histogram peak-detection pass and completes libplacebo GPU work before its
-decoder resources can be recycled. Software frames retain the default render
-parameters and do not add the per-frame completion wait. For Dolby Vision raw
-NV12/P010 input, the renderer also copies the selected decoder array slice
-GPU-to-GPU into a pooled single-slice shader-resource texture before
-libplacebo plane sampling, without a CPU map, staging upload, or RGB
-conversion. Intel, AMD, and NVIDIA have all reproduced a crash on the
-asynchronous imported-frame path, so the workaround is intentionally
-vendor-neutral.
+native-multithread-protected immediate context, with an additional shared
+recursive guard around QtAVCore-owned context sequences. The renderer keeps a
+bounded three-frame completion-query queue, and normal flush, resize, media
+replacement, and teardown paths explicitly drain it. Every successfully
+imported D3D11VA frame, regardless of adapter vendor, uses libplacebo's fast
+sampling policy without the optional GPU histogram peak-detection pass.
+Successful per-frame submission remains asynchronous: it does not call
+`pl_gpu_finish()`, and Dolby Vision raw NV12/P010 input samples the retained
+decoder array slice directly instead of creating a GPU copy. Software frames
+retain the default render parameters. This vendor-neutral policy is accepted
+on the recorded NVIDIA configuration; proportional current-driver Intel and
+AMD playback remains the cross-vendor regression gate.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly

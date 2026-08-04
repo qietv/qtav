@@ -175,8 +175,8 @@ resets output counters. Important interpretations are:
 - normal scheduled cadence with low rendered cadence points at render
   contention, surface state, or the graphics driver;
 - `present-busy` means non-blocking `Present()` found compositor backpressure;
-- `decoder-copies` counts Dolby Vision hardware frames isolated from their
-  decoder surfaces by the GPU-to-GPU shader-resource copy;
+- `decoder-copies` is a retained compatibility counter and remains zero while
+  the renderer samples Dolby Vision decoder slices directly;
 - `coalesced` means multiple redraw notifications were intentionally combined;
 - `render-skipped` is retryable Player/backend contention, not necessarily a
   fatal error;

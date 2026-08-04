@@ -73,8 +73,10 @@ Continuation checkpoint:
   D3D11 render attempts now use non-blocking player/render/context locks,
   preserve the imminent queued presentation frame under pressure, and retain
   imported hardware frames plus borrowed targets through a bounded
-  GPU-completion queue; every successfully imported D3D11VA hardware frame
-  additionally completes its submission before decoder-surface reuse;
+  GPU-completion queue; the immediate context now enables native multithread
+  protection before decoder/render sharing, imported frames retain
+  libplacebo's fast parameters, and successful per-frame submissions remain
+  asynchronous without a Dolby decoder-surface copy;
   `QtAV::OutputD3D11` now owns the Windows device, composition swap chain,
   render target, display/HDR tracking, render scheduling thread,
   D3D11VA/interop wiring, `renderVideo()`, `Present()`, resize, and teardown;
@@ -302,11 +304,12 @@ Current verification:
   cold starts, sustained 120-second and 90-second runs, and 20 combined seeks
   passed with no software decode or decoded-source CPU map. The user then
   reproduced the crash on the prior asynchronous path on an NVIDIA adapter.
-  The policy is therefore vendor-neutral: every successfully imported D3D11VA
-  frame uses libplacebo's fast parameters and `pl_gpu_finish()` before copied
-  or direct decoder resources can be recycled. Software frames retain the
-  default parameters and do not take the per-frame wait. Under the corrected
-  Intel validation policy, `legend.mkv`
+  The then-current workaround was therefore made vendor-neutral: every
+  successfully imported D3D11VA frame used libplacebo's fast parameters and
+  `pl_gpu_finish()` before copied or direct decoder resources could be
+  recycled. Software frames retained the default parameters and did not take
+  the per-frame wait. Under that corrected Intel validation policy,
+  `legend.mkv`
   reached 01:12 with 25 fps scheduled and mostly 23.3-24.4 fps rendered;
   `wednesday.mp4` reached 02:05 with 24 fps scheduled, mostly 21-23.5 fps
   rendered, and a scene-dependent low near 16 fps before recovery. Both used
@@ -324,8 +327,14 @@ Current verification:
   protection before decoder/render sharing. The RTX 3050 then passed
   sustained playback, four seeks, two media replacements, and
   close-while-playing with D3D11VA and no decoded-source CPU transfer.
+  A further NVIDIA control passed with fast parameters, the Dolby copy, and
+  per-import finish all disabled. The current vendor-neutral policy therefore
+  keeps native protection, the recursive guard, completion-query retention,
+  lifecycle drains, and imported-frame fast parameters while removing the
+  successful per-import `pl_gpu_finish()` and Dolby decoder-surface copy.
   The updated Windows shared/static Release suites both pass 36/36;
-  proportional Intel/AMD regression remains in `Next task`;
+  proportional Intel/AMD regression of the current policy remains in
+  `Next task`;
 - `legend.mkv` confirms that the brightness report is not Dolby-Vision-only:
   its decoded metadata is BT.2020/PQ and the current sample reports active
   RGB10/PQ output with 240-nit system SDR white and a 1405-nit display peak.
@@ -801,8 +810,10 @@ Known result: native immediate-context multithread protection eliminates the
 NVIDIA user-mode-driver failure while preserving D3D11VA, raw NV12/P010
 libplacebo rendering, RGB10/PQ output, and zero decoded-source CPU transfer. A
 follow-up RTX 3050 control also passed with all three earlier imported-frame
-workarounds disabled simultaneously, but the vendor-neutral default remains
-unchanged pending an explicit policy decision and wider NVIDIA coverage.
+workarounds disabled simultaneously. The current vendor-neutral policy keeps
+fast parameters for imported frames but removes the Dolby decoder-surface copy
+and successful per-import `pl_gpu_finish()`; current-driver Intel and AMD
+playback remains required before cross-vendor closure.
 
 1. [x] On the NVIDIA discrete-GPU device, record the adapter model, PCI vendor
    and device IDs, driver version, Windows version, faulting module, exception
@@ -823,13 +834,21 @@ unchanged pending an explicit policy decision and wider NVIDIA coverage.
    playing without software decode.
 4. [x] Enable native multithread protection in `D3D11DeviceAccess::create()`
    and add a Windows contract assertion. Preserve hardware decode, raw-plane
-   color processing, the accepted imported-frame workaround, and zero
+   color processing, bounded completion-query lifetime, and zero
    decoded-source CPU transfer.
-5. [~] The ClangCL/Visual Studio 2026 shared and static Release builds each
-   pass all 36 Windows CTest tests. NVIDIA H.264 natural-end, 45-second
-   sustained runs of both representative files, four P5 seeks, two media
-   replacements, cold starts, and close while playing also pass. Re-run
-   proportional Intel and AMD playback before closing AD-007.
+5. [x] Adopt the provisional vendor-neutral imported-frame policy: keep fast
+   parameters, native multithread protection, the recursive guard, completion
+   queries, and lifecycle drains; remove successful per-import
+   `pl_gpu_finish()` and the Dolby decoder-surface copy.
+6. [~] The exact retained-fast current policy rebuilds in both ClangCL/Visual
+   Studio 2026 shared and static Release trees, with 36/36 CTest tests passing
+   in each. On the RTX 3050, H.264/NV12 rendered all 900 frames to natural end
+   at about 29.5-29.8 fps; `legend.mkv` sustained about 24.2-25.0 fps;
+   `wednesday.mp4` sustained about 22.9-23.8 fps, recovered from a seek to
+   26:09, and closed cleanly while playing in a second run. All three retained
+   D3D11VA, reported `decoder-copies=0`, and completed three media
+   replacements without a driver/application failure. Proportional Intel and
+   AMD playback remains before closing AD-007.
 
 Exit criteria: the NVIDIA matrix is complete without a driver/application
 crash or software decode and its exact evidence is recorded in
