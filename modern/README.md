@@ -1363,8 +1363,9 @@ Successful per-frame submission remains asynchronous: it does not call
 `pl_gpu_finish()`, and Dolby Vision raw NV12/P010 input samples the retained
 decoder array slice directly instead of creating a GPU copy. Software frames
 retain the default render parameters. This vendor-neutral policy is accepted
-on the recorded NVIDIA configuration; proportional current-driver Intel and
-AMD playback remains the cross-vendor regression gate.
+on NVIDIA, Intel, and AMD. A separately reported visual 4K cadence issue on an
+AMD integrated GPU remains under performance investigation and is not treated
+as an imported-frame correctness regression without stage-level evidence.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly

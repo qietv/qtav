@@ -493,11 +493,11 @@ Vulkan or OpenGL to its supported rendering path.
 
 ## AD-007: Windows protects shared D3D11 contexts and imported frames
 
-- Date: 2026-08-03; native-context correction and provisional vendor-neutral
-  asynchronous policy accepted 2026-08-04
+- Date: 2026-08-03; native-context correction and vendor-neutral asynchronous
+  policy accepted across NVIDIA, Intel, and AMD 2026-08-04
 - Status: Accepted
-- Validation: Intel/AMD imported-frame workaround manually accepted; NVIDIA
-  RTX 3050 native-context correction accepted; current Intel/AMD retest pending
+- Validation: current protected asynchronous policy accepted on NVIDIA, Intel,
+  and AMD; AMD integrated-GPU 4K cadence is a separate performance follow-up
 - Scope: Windows D3D11 immediate-context threading, D3D11VA/libplacebo
   resource completion, and Advanced Color presentation
 
@@ -558,12 +558,11 @@ need alpha blending.
    optional GPU histogram peak-detection pass. Dolby Vision raw NV12/P010
    imports sample the retained decoder array slice directly and do not create
    a same-device decoder-surface copy.
-6. This asynchronous policy is vendor-neutral while the cross-vendor gate is
-   open. It is accepted on the recorded NVIDIA configuration; Intel and AMD
-   must pass ordinary H.264/NV12, HDR10/P010, and Dolby Vision regression runs
-   on current drivers before AD-007 closes. A failure reopens the policy for a
-   narrowly evidenced fallback rather than silently weakening native context
-   protection.
+6. This asynchronous policy is vendor-neutral and accepted on NVIDIA, Intel,
+   and AMD. A future synchronization or driver-failure regression may reopen
+   the policy for a narrowly evidenced fallback; a cadence or throughput issue
+   remains a separate performance investigation and does not justify silently
+   weakening native context protection.
 7. `D3D11DeviceAccess::create()` enables the immediate context's native
    multithread protection and rejects a context that cannot expose or enable
    it. The existing recursive guard remains required around application-owned
@@ -576,9 +575,10 @@ need alpha blending.
   and Dolby copy while retaining fast parameters and bounded source lifetime.
   Ordinary HDR10 sustained source rate on the recorded NVIDIA host; Dolby
   Vision remains more expensive and can show scene-dependent dips.
-- NVIDIA discrete-GPU playback is accepted on the recorded RTX 3050/591.86
-  configuration. A current-driver Intel/AMD proportional retest remains the
-  final cross-vendor closure gate.
+- The protected asynchronous path is accepted across NVIDIA, Intel, and AMD,
+  closing the original crash/correctness scope. The user's separate report of
+  visually dropped 4K frames on an AMD integrated GPU requires objective
+  cadence and stage timing before it is attributed to the renderer.
 - RGB10/PQ avoids the observed scRGB/DWM brightness mismatch for this opaque
   surface but cannot provide premultiplied-alpha video composition.
 - `colorInfo()` remains useful evidence for format, color space, SDR white,
@@ -592,11 +592,11 @@ need alpha blending.
 ### Windows validation
 
 Current manual acceptance is explicit: the former full imported-frame
-workaround was accepted on the tested Intel and AMD adapters, while native
-context protection and asynchronous direct decoder-surface sampling are
-accepted on the tested NVIDIA adapter. The current policy still needs
-proportional current-driver Intel/AMD regression before AD-007 is described as
-fully revalidated across all three vendors.
+workaround was accepted on the earlier Intel and AMD adapters, the exact
+protected asynchronous direct decoder-surface policy was measured on the
+recorded NVIDIA adapter, and the user subsequently confirmed that the same
+current modification is usable on Intel and AMD platforms. AD-007 is therefore
+closed across all three vendors.
 
 The failing adapter was Intel Iris Xe (`PCI\VEN_8086&DEV_A7A0`), driver
 `32.0.101.6733`. With Intel-wide imported-frame completion and native RGB10/PQ
@@ -664,10 +664,9 @@ per-import `pl_gpu_finish()`. On the same RTX 3050/591.86 host:
 
 This establishes that native context protection is sufficient for correctness
 on this NVIDIA configuration and that the three earlier workarounds are not
-required there. It motivated the explicit provisional vendor-neutral policy
-above: retain fast parameters for performance, remove the Dolby copy and
-successful per-import finish, and use Intel/AMD regression as the remaining
-closure gate. The all-disabled control used default libplacebo parameters,
+required there. It motivated the explicit vendor-neutral policy above: retain
+fast parameters for performance and remove the Dolby copy and successful
+per-import finish. The all-disabled control used default libplacebo parameters,
 which increased warm steady-state `legend.mkv` draw time from roughly 17-19 ms
 to 36-40 ms on this host despite retaining source rate; the current policy
 therefore keeps fast parameters.
@@ -690,4 +689,15 @@ passed all 36 registered CTest tests. In one WinUI process:
   Error Reporting event during the run.
 
 This accepts the exact current policy on the recorded NVIDIA configuration.
-It does not substitute for the remaining current-driver Intel/AMD regression.
+The user then validated the supplied modification on separate Intel and AMD
+platforms and reported it usable, closing the cross-vendor AD-007 gate. The
+adapter/driver details and objective cadence from those final two runs were not
+supplied in this handoff, so that confirmation is a correctness acceptance,
+not a performance benchmark.
+
+The user separately reported that 4K playback on the AMD integrated GPU looks
+slightly frame-droppy by eye. No cadence trace or failing stage accompanied the
+observation. This does not reopen AD-007: `PLAN.md` tracks an AMD integrated-GPU
+performance investigation to distinguish input/decode/clock scheduling,
+libplacebo draw cost, context contention, and compositor backpressure before
+any implementation change is selected.

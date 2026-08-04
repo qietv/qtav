@@ -312,8 +312,9 @@ Dolby Vision raw NV12/P010 input samples the retained decoder array slice
 directly without a GPU copy. Software frames keep the default render
 parameters. Normal flush, resize, media replacement, failure cleanup, and
 teardown still perform the explicit drains required by their lifecycles.
-This vendor-neutral policy is validated on the recorded NVIDIA configuration;
-proportional current-driver Intel and AMD playback remains pending.
+This vendor-neutral policy is accepted on NVIDIA, Intel, and AMD. A separately
+reported visual 4K cadence issue on an AMD integrated GPU remains a performance
+investigation rather than an imported-frame correctness regression.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
