@@ -1365,7 +1365,10 @@ decoder array slice directly instead of creating a GPU copy. Software frames
 retain the default render parameters. This vendor-neutral policy is accepted
 on NVIDIA, Intel, and AMD. A separately reported visual 4K cadence issue on an
 AMD integrated GPU remains under performance investigation and is not treated
-as an imported-frame correctness regression without stage-level evidence.
+as an imported-frame correctness regression without stage-level evidence. The
+performance task also requires a same-build Intel regression; it cannot close
+until both final devices have recorded hardware/driver details and objective
+cadence and stage-timing data.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly

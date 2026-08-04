@@ -21,8 +21,11 @@ OHOS remains a supported future target, but its production implementation is
 intentionally deferred. AD-007 is closed after the current vendor-neutral
 D3D11VA/libplacebo policy was accepted on NVIDIA, Intel, and AMD platforms.
 Current work investigates the user's separate observation that 4K playback on
-an AMD integrated GPU appears to drop frames; previously queued roadmap work
-remains postponed while this performance question is active.
+an AMD integrated GPU appears to drop frames. The investigation cannot close
+until the final AMD test device and an Intel regression device have both
+recorded exact hardware/driver details and objective cadence data under the
+current build; previously queued roadmap work remains postponed while this
+performance question is active.
 
 The archival removes the former Apple backend options/targets and the
 `VideoToolbox`/`Metal` public hardware-device identifiers. The unused Linux
@@ -335,9 +338,11 @@ Current verification:
   successful per-import `pl_gpu_finish()` and Dolby decoder-surface copy.
   The updated Windows shared/static Release suites both pass 36/36. The user
   subsequently confirmed that this exact current policy is usable on Intel and
-  AMD platforms, closing AD-007 across all three vendors. A subjective report
-  of 4K dropped frames on an AMD integrated GPU is tracked separately as a
-  performance investigation in `Next task`;
+  AMD platforms, closing AD-007 across all three vendors. Those final two
+  confirmations did not include exact adapter/driver and objective cadence
+  data, so they are not performance baselines. A subjective report of 4K
+  dropped frames on an AMD integrated GPU is tracked separately as a paired
+  AMD investigation and Intel performance regression in `Next task`;
 - `legend.mkv` confirms that the brightness report is not Dolby-Vision-only:
   its decoded metadata is BT.2020/PQ and the current sample reports active
   RGB10/PQ output with 240-nit system SDR white and a 1405-nit display peak.
@@ -807,47 +812,60 @@ Milestone 7 OHOS gate remains deferred:
 AD-007 is complete: the current protected, asynchronous imported-frame policy
 is accepted on NVIDIA, Intel, and AMD. The active task is to determine whether
 the WinUI 3/D3D11 path has a rendering-performance problem on an AMD integrated
-GPU. The current evidence is subjective: 4K video appears to drop frames by
-eye, but no cadence trace has yet located the loss. Do not treat this as an
-AD-007 correctness regression unless new synchronization or driver-failure
-evidence appears.
+GPU and to regress the same performance path on an Intel platform before
+closure. The current AMD evidence is subjective: 4K video appears to drop
+frames by eye, but no cadence trace has yet located the loss. The earlier Intel
+correctness observations used older workaround combinations and do not satisfy
+this performance baseline. Do not treat this as an AD-007 correctness
+regression unless new synchronization or driver-failure evidence appears.
 
-1. [ ] Record the AMD integrated-GPU model, PCI IDs, driver and Windows
-   versions, system memory configuration, power mode, display resolution and
-   refresh rate, Windows HDR state, output color mode, and whether the system
-   is on AC power. Record the exact test files' codec, pixel format, dimensions,
-   frame rate, color metadata, duration, and audio layout.
-2. [ ] Reproduce in a Release WinUI build with a local 4K file. Capture at
-   least two consecutive settled cadence windows and one 60-120 second run,
-   recording source fps, scheduled and rendered fps, coalesced redraws,
-   `present-busy`, `render-skipped`, gaps over 80 ms, and color/interop/
-   buffer/draw stage maxima. Confirm D3D11VA and zero decoded-source CPU map.
-3. [ ] Locate the first stage that misses the frame budget. Separate input,
+1. [ ] Record both final test systems: AMD and Intel GPU names, PCI vendor/
+   device/subsystem IDs, driver and Windows versions, CPU and system-memory
+   configuration, power mode, display resolution and refresh rate, Windows HDR
+   state, output color mode, and whether each system is on AC power. Record the
+   tested commit/build configuration and the exact files' codec, pixel format,
+   dimensions, frame rate, color metadata, duration, and audio layout.
+2. [ ] Reproduce on the AMD integrated GPU in a Release WinUI build with a
+   local 4K file. Capture at least two consecutive settled cadence windows and
+   one 60-120 second run, recording source fps, scheduled and rendered fps,
+   coalesced redraws, `present-busy`, `render-skipped`, gaps over 80 ms, and
+   color/interop/buffer/draw stage maxima. Confirm D3D11VA and zero
+   decoded-source CPU map.
+3. [ ] Run the Intel performance regression from the same commit and Release
+   configuration, using the same source scenes, duration, output resolution,
+   color mode, window state, and cadence/stage counters. Match display refresh,
+   HDR, and power conditions where practical and record every unavoidable
+   difference. Capture at least two settled windows and one 60-120 second run;
+   a subjective "looks smooth" result is not a baseline.
+4. [ ] Locate the first AMD stage that misses the frame budget. Separate input,
    decode, audio-clock, and Player scheduling loss from renderer/context loss
-   and swap-chain/compositor backpressure; a visual comparison alone is not a
-   renderer diagnosis.
-4. [ ] Run a proportional local matrix: generated 1080p H.264/NV12 control,
-   4K SDR when available, HDR10/P010 `legend.mkv`, and Dolby Vision Profile 5
-   `wednesday.mp4`. Include cold start, sustained playback, seek, media
-   replacement, and close while playing, while preserving the accepted AD-007
-   synchronization policy.
-5. [ ] Run controlled diagnostic A/Bs only after the failing stage is known.
+   and swap-chain/compositor backpressure. Compare AMD and Intel only after
+   accounting for source frame rate, display refresh, output mode, and power;
+   a visual comparison or raw cross-device fps alone is not a diagnosis.
+5. [ ] Run the common matrix on both devices: generated 1080p H.264/NV12
+   control, 4K SDR when available, HDR10/P010 `legend.mkv`, and Dolby Vision
+   Profile 5 `wednesday.mp4`. Include cold start, sustained playback, seek,
+   media replacement, and close while playing, while preserving the accepted
+   AD-007 synchronization policy.
+6. [ ] Run controlled diagnostic A/Bs only after the failing stage is known.
    Candidate renderer-side isolates are native-size versus reduced-size output,
    HDR RGB10/PQ versus SDR BGRA8, and windowed versus display-sized
    presentation. Record AMD GPU decode/3D/copy utilization, clocks, power, and
    memory pressure alongside cadence. Do not disable native D3D11 multithread
    protection or infer a fix from lower image quality.
-6. [ ] Compare the same scenes with a trusted player on the same display and
-   power state, with interpolation and post-processing differences recorded.
-   If QtAVCore is slower, identify the responsible backend stage and implement
-   only an evidence-backed optimization with regression coverage.
+7. [ ] Compare the same scenes with a trusted player on each device under the
+   recorded display and power conditions, with interpolation and
+   post-processing differences recorded. If QtAVCore is slower, identify the
+   responsible backend stage and implement only an evidence-backed optimization
+   with regression coverage on AMD and Intel.
 
 Exit criteria: either confirm a QtAVCore AMD integrated-GPU render bottleneck
 with a repeatable stage-level trace and validate its fix, or reject the renderer
-hypothesis by locating the loss elsewhere. The final record must include exact
-hardware/software conditions, objective source-versus-rendered cadence,
-frame-budget maxima, D3D11VA/zero-map confirmation, lifecycle coverage, and any
-remaining device or workload limits.
+hypothesis by locating the loss elsewhere. Do not close the task until the
+final AMD and Intel devices both have exact adapter/PCI and driver details,
+Windows/build and test conditions, objective source/scheduled/rendered cadence,
+gap/drop/backpressure counters, frame-budget stage maxima, D3D11VA/zero-map
+confirmation, lifecycle coverage, and any remaining device or workload limits.
 
 The prior Android task is retained below as completed history, not as the
 active next step.
@@ -870,8 +888,9 @@ The Android example playback-stutter task is complete:
    for both representative files.
 
 No further Android correctness task is currently queued. Preserve this OpenGL
-reopen/long-form run as an Android regression gate while the AMD integrated-GPU
-performance investigation is active. OHOS production work remains
+reopen/long-form run as an Android regression gate while the paired AMD
+integrated-GPU investigation and Intel performance regression are active. OHOS
+production work remains
 intentionally deferred until that investigation closes and the user explicitly
 resumes Milestone 7.
 
@@ -1441,8 +1460,8 @@ libplacebo own plane sampling, Dolby Vision/HDR processing, and final output.
 Following platform slice:
 
 1. [~] Complete the AMD integrated-GPU 4K playback-performance investigation
-   described in `Next task`; defer previously queued platform work while this
-   user-prioritized task remains active.
+   and Intel performance regression described in `Next task`; defer previously
+   queued platform work while this user-prioritized task remains active.
 
 Platform implementation order after the contracts are stable:
 
@@ -1522,8 +1541,8 @@ Acceptance:
 - [x] No Windows type leaks into core public headers.
 
 Status: complete; Milestone 6 is also complete. AD-007 is accepted across
-NVIDIA, Intel, and AMD; the separate AMD integrated-GPU 4K performance
-investigation is active, and Milestone 7 is deferred.
+NVIDIA, Intel, and AMD; the separate AMD integrated-GPU 4K investigation and
+Intel performance regression are active, and Milestone 7 is deferred.
 
 ## Milestone 6 — Android production path
 
@@ -1613,15 +1632,16 @@ Acceptance:
   as unavailable or skipped, not counted as zero-CPU-copy success;
 - Android SDK types remain outside core public headers.
 
-Status: complete. Finish the active AMD integrated-GPU 4K performance
-investigation first; Milestone 7 remains deferred until explicitly resumed.
+Status: complete. Finish the active AMD integrated-GPU 4K investigation and
+Intel performance regression first; Milestone 7 remains deferred until
+explicitly resumed.
 
 ## Deferred milestone 7 — OHOS production path
 
 This milestone remains in the supported roadmap, but it is not the active next
 task. Do not begin its target-clarification or implementation work until the
-AMD integrated-GPU performance investigation closes and the user explicitly
-resumes OHOS.
+AMD integrated-GPU investigation and Intel performance regression close and
+the user explicitly resumes OHOS.
 
 Target clarification gate:
 

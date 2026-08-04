@@ -497,7 +497,8 @@ Vulkan or OpenGL to its supported rendering path.
   policy accepted across NVIDIA, Intel, and AMD 2026-08-04
 - Status: Accepted
 - Validation: current protected asynchronous policy accepted on NVIDIA, Intel,
-  and AMD; AMD integrated-GPU 4K cadence is a separate performance follow-up
+  and AMD; AMD integrated-GPU 4K cadence plus an Intel baseline regression are
+  a separate performance follow-up
 - Scope: Windows D3D11 immediate-context threading, D3D11VA/libplacebo
   resource completion, and Advanced Color presentation
 
@@ -569,6 +570,17 @@ need alpha blending.
    immediate-context calls; native protection covers context calls made inside
    FFmpeg and libplacebo before user-mode-driver dispatch.
 
+A source audit of the accepted implementation confirms the boundary of this
+decision. Of the former three imported-frame workarounds, only fast render
+parameters remain. Successful imported-frame submission has no per-frame
+`pl_gpu_finish()`, Dolby Vision wraps the retained decoder texture and selected
+array slice directly, and there is no adapter-vendor branch. The retained
+`decoder-copies` diagnostic therefore has no increment path and reports zero.
+Native immediate-context multithread protection is a separate required fix;
+the recursive context guard, bounded completion-query lifetime retention, and
+explicit failure/flush/teardown drains also remain as general correctness and
+lifecycle mechanisms rather than per-import workarounds.
+
 ### Consequences
 
 - Imported D3D11VA paths avoid the former per-frame GPU-wide completion wait
@@ -578,7 +590,9 @@ need alpha blending.
 - The protected asynchronous path is accepted across NVIDIA, Intel, and AMD,
   closing the original crash/correctness scope. The user's separate report of
   visually dropped 4K frames on an AMD integrated GPU requires objective
-  cadence and stage timing before it is attributed to the renderer.
+  cadence and stage timing before it is attributed to the renderer. That
+  performance investigation also requires an Intel regression from the same
+  build and workloads before closure.
 - RGB10/PQ avoids the observed scRGB/DWM brightness mismatch for this opaque
   surface but cannot provide premultiplied-alpha video composition.
 - `colorInfo()` remains useful evidence for format, color space, SDR white,
@@ -700,4 +714,7 @@ slightly frame-droppy by eye. No cadence trace or failing stage accompanied the
 observation. This does not reopen AD-007: `PLAN.md` tracks an AMD integrated-GPU
 performance investigation to distinguish input/decode/clock scheduling,
 libplacebo draw cost, context contention, and compositor backpressure before
-any implementation change is selected.
+any implementation change is selected. It cannot close until the final AMD and
+Intel test devices both record exact adapter/PCI and driver details, Windows
+and build conditions, and objective source/scheduled/rendered cadence plus
+stage timing from the same current policy and representative 4K workloads.
