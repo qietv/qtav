@@ -70,6 +70,15 @@ For regressions, repeat a representative scenario for at least several minutes
 and include multiple seeks. A short successful startup is not enough evidence
 for queue growth, cadence, or shutdown behavior.
 
+For cross-vendor D3D11 handoff, record the adapter PCI vendor and driver
+version. Every vendor uses the complete AD-007 workaround only for successfully
+imported D3D11VA frames; software frames and explicit software-mapping fallback
+retain their original behavior. Exercise ordinary H.264/NV12, HDR10/P010, and
+Dolby Vision when supported, including cold starts, a sustained run, repeated
+seeks, and close while playing. `decoder-copies` is expected only for Dolby
+Vision raw NV12/P010 imports; a zero count on ordinary HDR10/H.264 does not
+mean the synchronous workaround is inactive.
+
 ## Diagnosing cadence and stalls
 
 Capture at least two consecutive five-second cadence lines after startup has

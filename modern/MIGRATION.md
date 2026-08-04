@@ -298,18 +298,19 @@ contract remains documented in [D3D11VA.md](D3D11VA.md).
 
 Hardware imports, their copied core frames, and borrowed targets are retained
 until a D3D11 completion event reports that the libplacebo draw has finished.
-The renderer bounds this asynchronous queue at three submissions, and
+The renderer bounds this queue at three submissions, and
 `D3D11VideoRenderer::flush()` explicitly drains it before target resize or
 replacement. All decoder, interop, and renderer GPU submissions use the same
-serialized immediate context. Intel adapters additionally use libplacebo's
-fast sampling policy without the optional GPU histogram peak-detection pass.
-For Dolby Vision NV12/P010 input, a pooled GPU-to-GPU copy moves the selected
-decoder slice into a single-slice shader-resource texture before libplacebo
-sampling without a CPU transfer. Copying alone still reproduced the observed
-D3D11 user-mode-driver access violation, and ordinary HDR10 reproduced the same
-fault through direct import. All Intel hardware-frame submissions therefore
-complete synchronously before resource recycling; non-Intel frames keep the
-bounded asynchronous queue.
+serialized immediate context. Every successfully imported D3D11VA frame uses
+libplacebo's fast sampling policy without the optional GPU histogram
+peak-detection pass and completes GPU work synchronously before its decoder
+resources can be recycled, regardless of adapter vendor. Software frames keep
+the default render parameters and asynchronous queue. For Dolby Vision raw
+NV12/P010 input, a pooled GPU-to-GPU copy moves the selected decoder slice into
+a single-slice shader-resource texture before libplacebo sampling without a
+CPU transfer. Intel, AMD, and NVIDIA have all reproduced a crash on the
+asynchronous imported-frame path, which is why the workaround is
+vendor-neutral.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

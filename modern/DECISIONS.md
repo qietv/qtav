@@ -394,9 +394,10 @@ look like a process leak.
    flip-model frame latency at one, coalesces redraws, and uses non-blocking
    `Present()` plus bounded waitable-object backpressure when available before
    retrying.
-4. Except for the Intel driver workaround in AD-007, a hardware-frame import
-   remains alive through libplacebo draw-command submission and is retained by
-   the renderer's bounded GPU-completion queue. Decoder, interop, and renderer
+4. A hardware-frame import remains alive through libplacebo draw-command
+   submission and is retained by the renderer's bounded GPU-completion queue.
+   AD-007 additionally completes every imported D3D11VA submission before its
+   decoder resources can be recycled. Decoder, interop, and renderer
    submissions share one serialized immediate context.
 5. Interop retains the decoder's raw NV12/P010 slice and owns no conversion
    texture pool. Per-frame libplacebo wrappers are released after submission;
@@ -473,8 +474,8 @@ Vulkan or OpenGL to its supported rendering path.
    conversion itself.
 6. AD-005 remains binding: render/context acquisition is non-blocking,
    submission uses the shared immediate context, and the exact imported frame
-   stays alive through submission. AD-007 defines the narrow Intel exception
-   that completes imported hardware-frame work per frame.
+   stays alive through submission. AD-007 defines the imported-hardware-frame
+   exception that completes GPU work per frame on every adapter vendor.
 
 ### Consequences
 
@@ -490,10 +491,11 @@ Vulkan or OpenGL to its supported rendering path.
   residual reconstruction, and compressed passthrough remain outside this
   decision.
 
-## AD-007: Windows uses native PQ presentation and an Intel hardware-frame synchronization workaround
+## AD-007: Windows uses native PQ presentation and imported-frame synchronization
 
-- Date: 2026-08-03
+- Date: 2026-08-03; vendor-neutral synchronization scope accepted 2026-08-04
 - Status: Accepted
+- Validation: Intel/AMD manually accepted; NVIDIA discrete-GPU failing/open
 - Scope: Windows D3D11VA/libplacebo resource completion and Advanced Color
   presentation
 
@@ -509,6 +511,16 @@ Dolby Vision decoder array slice GPU-to-GPU into a private single-slice
 shader-resource texture also reproduced the same crash. `legend.mkv` then
 proved that the trigger was not Dolby-Vision-specific.
 
+The complete workaround subsequently stabilized the same imported-frame path
+on an AMD Radeon 880M. Playback is now manually verified as normal on the
+tested Intel and AMD adapters. An NVIDIA discrete adapter still reproduces the
+crash with the current vendor-neutral AD-007 build, so AD-007 is not yet closed
+for NVIDIA. Device-side investigation must determine which part of the
+workaround is insufficient there, or whether NVIDIA has an additional
+synchronization or lifetime requirement. Because all three major Windows GPU
+vendors can exhibit the crash, PCI vendor identity is not a sound initial
+boundary; the shared condition under test is an imported D3D11VA frame.
+
 Separately, FP16 scRGB readback produced the expected Windows absolute
 luminance and the compositor reported an active HDR layer, yet both files
 looked dim beside MPC-BE on the same display. An HDR-active diagnostic is not a
@@ -523,38 +535,46 @@ need alpha blending.
 2. The WinUI 3 player is an opaque video host and selects RGB10/PQ. libplacebo
    remains the color authority and encodes the target as BT.2020/PQ; the
    application does not add another tone-mapping or transfer pass.
-3. On Intel adapters, every successfully submitted imported D3D11VA hardware
-   frame calls `pl_gpu_finish()` before copied or directly imported resources
-   can be recycled. The condition is Intel plus hardware import, not Dolby
-   Vision metadata.
-4. Non-Intel submissions retain the bounded asynchronous GPU-completion queue.
-   Intel software-frame rendering also remains outside the hardware-import
-   workaround.
-5. Intel rendering uses libplacebo's fast parameters without the optional GPU
-   histogram peak-detection pass. Dolby Vision decoder-surface copies remain
-   GPU-only and preserve raw NV12/P010 semantics for the RPU reshape.
-6. The Intel synchronization rule is a driver workaround, not a permanent
-   claim about D3D11 resource semantics. It must not be removed from the stable
-   path until a newer driver passes both ordinary HDR10 and Dolby Vision
-   asynchronous-import regression runs. The investigation procedure is
-   recorded in `examples/winui3_player/INTEL_DRIVER_HANDOFF.md`.
+3. Every successfully submitted imported D3D11VA hardware frame calls
+   `pl_gpu_finish()` before copied or directly imported decoder resources can
+   be recycled. The condition is hardware import, regardless of adapter vendor
+   or Dolby Vision metadata.
+4. Software frames and hardware frames that take the explicit software-mapping
+   fallback remain outside the workaround. They retain libplacebo's default
+   parameters and the bounded asynchronous GPU-completion queue.
+5. Imported hardware frames use libplacebo's fast parameters without the
+   optional GPU histogram peak-detection pass. Dolby Vision raw NV12/P010
+   decoder surfaces also receive the same-device GPU copy before sampling;
+   the copy preserves raw component semantics for the RPU reshape.
+6. The synchronization rule is a compatibility workaround, not a permanent
+   claim about D3D11 resource semantics. It must not be removed until Intel,
+   AMD, and NVIDIA pass ordinary H.264/NV12, HDR10/P010, and Dolby Vision
+   asynchronous-import regression runs on current drivers.
 
 ### Consequences
 
-- The affected Intel hardware path trades some peak rendering throughput for
-  stability. Ordinary HDR10 sustained close to source rate in validation;
+- Imported D3D11VA paths on every vendor trade some peak rendering throughput
+  for stability. Ordinary HDR10 sustained close to source rate in validation;
   Dolby Vision remained more expensive and showed scene-dependent dips.
+- Intel and AMD are the only manually accepted vendors at this checkpoint.
+  NVIDIA discrete-GPU playback remains an open correctness issue and blocks
+  subsequent roadmap work until its AD-007 path is isolated and validated.
 - RGB10/PQ avoids the observed scRGB/DWM brightness mismatch for this opaque
   surface but cannot provide premultiplied-alpha video composition.
 - `colorInfo()` remains useful evidence for format, color space, SDR white,
   and display peak, but perceived brightness still requires comparison with a
   trusted player on the same monitor.
-- A future Intel-driver retest must isolate the synchronization change from the
-  RGB10/PQ presentation decision. Removing `pl_gpu_finish()` cannot be used to
-  evaluate brightness, and changing output encoding cannot be used to evaluate
-  the driver crash.
+- A future vendor-driver retest must isolate the synchronization change from
+  the RGB10/PQ presentation decision. Removing `pl_gpu_finish()` cannot be
+  used to evaluate brightness, and changing output encoding cannot be used to
+  evaluate the driver crash.
 
 ### Windows validation
+
+Current manual acceptance is explicit: playback is normal on the tested Intel
+and AMD adapters, while an NVIDIA discrete adapter still crashes. AD-007 needs
+independent NVIDIA-device testing and must not be described as cross-vendor
+validated until that work passes.
 
 The failing adapter was Intel Iris Xe (`PCI\VEN_8086&DEV_A7A0`), driver
 `32.0.101.6733`. With Intel-wide imported-frame completion and native RGB10/PQ
@@ -568,4 +588,15 @@ presentation:
   was recorded after the corrected build started testing;
 - the user compared both output paths with MPC-BE on the same HDR display and
   confirmed matching brightness;
-- the Windows Release build completed and all 36 registered CTest tests passed.
+- the same full workaround was subsequently exercised on an AMD Radeon 880M.
+  Without it, both representative files and a generated H.264/NV12 clip
+  failed in `amdxx64.dll`. With it, six alternating cold starts, 120-second
+  and 90-second continuous runs, and 20 combined seeks completed without
+  software decoding or decoded-frame CPU mapping;
+- an NVIDIA discrete adapter still crashes in manual testing with the current
+  vendor-neutral workaround. Controlled device-side reproduction and failure
+  capture remain pending;
+- the vendor-neutral VS 2026 Release build completed and all 36 registered
+  CTest tests passed. On the AMD host, fresh 15-second debugger observations
+  of both files retained D3D11VA decode and completed without a crash;
+  `wednesday.mp4` also reported active decoder-surface copies.

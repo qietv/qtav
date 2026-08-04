@@ -772,20 +772,17 @@ void testHdrPresentation(
 int main(int argc, char** argv)
 {
     assert(argc == 4);
+    assert(qtav::detail::d3d11ShouldUseHardwareImportWorkaround(
+        true));
+    assert(!qtav::detail::d3d11ShouldUseHardwareImportWorkaround(
+        false));
     assert(qtav::detail::d3d11ShouldCopyDecoderSurface(
         true,
-        true,
         true));
     assert(!qtav::detail::d3d11ShouldCopyDecoderSurface(
         false,
-        true,
         true));
     assert(!qtav::detail::d3d11ShouldCopyDecoderSurface(
-        true,
-        false,
-        true));
-    assert(!qtav::detail::d3d11ShouldCopyDecoderSurface(
-        true,
         true,
         false));
     assert(qtav::detail::d3d11FailureEvent(DXGI_ERROR_DEVICE_HUNG)

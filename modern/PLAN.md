@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-03
+Last updated: 2026-08-04
 
 Status legend:
 
@@ -18,8 +18,9 @@ matrix or roadmap. A macOS development machine may still act only as a
 cross-compilation host for Android/OHOS.
 
 OHOS remains a supported future target, but its production implementation is
-intentionally deferred. Current work stays on Android playback correctness and
-performance until the OHOS milestone is explicitly resumed.
+intentionally deferred. Current work stays on the NVIDIA discrete-GPU
+D3D11VA/libplacebo crash until AD-007 is isolated and validated on that device;
+all previously queued roadmap work remains postponed.
 
 The archival removes the former Apple backend options/targets and the
 `VideoToolbox`/`Metal` public hardware-device identifiers. The unused Linux
@@ -71,8 +72,8 @@ Continuation checkpoint:
   D3D11 render attempts now use non-blocking player/render/context locks,
   preserve the imminent queued presentation frame under pressure, and retain
   imported hardware frames plus borrowed targets through a bounded
-  GPU-completion queue; the exercised Intel hardware-frame path additionally
-  completes each submission before decoder-surface reuse;
+  GPU-completion queue; every successfully imported D3D11VA hardware frame
+  additionally completes its submission before decoder-surface reuse;
   `QtAV::OutputD3D11` now owns the Windows device, composition swap chain,
   render target, display/HDR tracking, render scheduling thread,
   D3D11VA/interop wiring, `renderVideo()`, `Present()`, resize, and teardown;
@@ -294,18 +295,31 @@ Current verification:
   at 19:39:57 the process again failed in `igd10um64xe.dll` at offset
   `0x5e56b`. A subsequent `legend.mkv` run at 20:18:59 reproduced that exact
   driver module and offset through ordinary HDR10 direct import, proving the
-  hazard is not Dolby-Vision-only. Every Intel hardware-frame submission now
-  uses `pl_gpu_finish()` before copied or direct decoder resources can be
-  recycled; non-Intel submissions retain the asynchronous bounded queue.
-  Intel rendering uses libplacebo's fast parameters without a histogram
-  peak-detection pass. Under the corrected Intel-wide policy, `legend.mkv`
+  hazard is not Dolby-Vision-only. The same complete workaround was then
+  exercised on an AMD Radeon 880M: both representative files and a generated
+  H.264/NV12 clip crashed in `amdxx64.dll` without it, while six alternating
+  cold starts, sustained 120-second and 90-second runs, and 20 combined seeks
+  passed with no software decode or decoded-source CPU map. The user then
+  reproduced the crash on the prior asynchronous path on an NVIDIA adapter.
+  The policy is therefore vendor-neutral: every successfully imported D3D11VA
+  frame uses libplacebo's fast parameters and `pl_gpu_finish()` before copied
+  or direct decoder resources can be recycled. Software frames retain the
+  default parameters and do not take the per-frame wait. Under the corrected
+  Intel validation policy, `legend.mkv`
   reached 01:12 with 25 fps scheduled and mostly 23.3-24.4 fps rendered;
   `wednesday.mp4` reached 02:05 with 24 fps scheduled, mostly 21-23.5 fps
   rendered, and a scene-dependent low near 16 fps before recovery. Both used
   active RGB10/PQ output and were closed normally. No new QtAV application
   error was recorded after 20:20. These local observations pass the original
   six-second failure point. The user subsequently confirmed that brightness
-  matches MPC-BE on the same display and accepted the fix for closure;
+  matches MPC-BE on the same display and accepted the Intel fix for closure;
+- the vendor-neutral imported-frame AD-007 build completed with Visual Studio
+  2026 and all 36 registered CTest tests passed. Fresh 15-second debugger
+  observations on the AMD host kept both `legend.mkv` and `wednesday.mp4` on
+  D3D11VA and completed without a crash; the Dolby Vision run reported active
+  decoder-surface copies. Manual testing of the same vendor-neutral policy on
+  an NVIDIA discrete GPU still crashes; controlled failure capture and the
+  independent validation specified in `Next task` remain open;
 - `legend.mkv` confirms that the brightness report is not Dolby-Vision-only:
   its decoded metadata is BT.2020/PQ and the current sample reports active
   RGB10/PQ output with 240-nit system SDR white and a 1405-nit display peak.
@@ -688,8 +702,8 @@ Completed file-output checkpoint:
 ## Android manual final-test player gate
 
 This user-requested Android player gate is complete. Its results remain the
-baseline for the active Android stutter regression; the Milestone 7 OHOS gate
-is now deferred:
+Android regression baseline while the NVIDIA discrete-GPU task is active; the
+Milestone 7 OHOS gate remains deferred:
 
 1. [x] Add a user-facing standard Android activity under
    `modern/examples/android_player/` with an upper video surface, current
@@ -772,8 +786,43 @@ is now deferred:
 
 ## Next task
 
-The user-prioritized Windows D3D11/libplacebo migration above was completed
-without advancing or replacing this queued plan state.
+The current blocking priority is the NVIDIA discrete-GPU D3D11VA/libplacebo
+crash. Intel and AMD manual playback is normal, but NVIDIA still crashes and
+AD-007 has not yet passed independent validation on that device. All existing
+post-Android and OHOS roadmap work is postponed until this task meets its exit
+criteria.
+
+Known result: the current vendor-neutral AD-007 build still crashes during
+manual playback on an NVIDIA discrete GPU. The exact driver and fault evidence
+has not yet been recorded.
+
+1. [ ] On the NVIDIA discrete-GPU device, record the adapter model, PCI vendor
+   and device IDs, driver version, Windows version, faulting module, exception
+   code, and module offset; reproduce with both `legend.mkv` and
+   `wednesday.mp4` using the current vendor-neutral AD-007 build.
+2. [ ] Confirm from the Debug log that the failing run remains on D3D11VA and
+   the raw NV12/P010 import path. Locate the failure relative to
+   `pl_render_image()`, `pl_gpu_finish()`, completion-query retention, decoder
+   resource recycling, and `Present()` without enabling software decode or a
+   decoded-frame CPU map.
+3. [ ] Run a controlled NVIDIA A/B matrix covering ordinary H.264/NV12,
+   HDR10/P010, and Dolby Vision where supported. Isolate the AD-007 components:
+   fast render parameters, the Dolby Vision decoder-surface GPU copy, and
+   per-import `pl_gpu_finish()`.
+4. [ ] Implement the narrowest correction supported by the NVIDIA evidence.
+   Preserve the accepted Intel/AMD path, hardware decode, raw-plane color
+   processing, and zero decoded-source CPU transfer.
+5. [ ] Rebuild with Visual Studio 2026, pass the full Windows CTest suite, and
+   validate NVIDIA cold starts, sustained playback, repeated seeks, and close
+   while playing for both representative files. Re-run proportional Intel/AMD
+   regression coverage before closing AD-007.
+
+Exit criteria: the NVIDIA discrete-GPU device completes the matrix without a
+driver/application crash or software decode, Intel and AMD remain normal, and
+the final driver/version-specific evidence is recorded in `DECISIONS.md`.
+
+The prior Android task is retained below as completed history, not as the
+active next step.
 
 The Android example playback-stutter task is complete:
 
@@ -792,10 +841,10 @@ The Android example playback-stutter task is complete:
    on/off, pause/resume, seek, and surface recreation on the connected device
    for both representative files.
 
-No further Android correctness task is currently queued. OHOS production work
-remains intentionally deferred until the user explicitly resumes Milestone 7;
-until then, preserve this OpenGL reopen/long-form run as an Android regression
-gate.
+No further Android correctness task is currently queued. Preserve this OpenGL
+reopen/long-form run as an Android regression gate while the NVIDIA task is
+active. OHOS production work remains intentionally deferred until the NVIDIA
+crash is resolved and the user explicitly resumes Milestone 7.
 
 Completed platform prerequisites:
 
@@ -1362,8 +1411,8 @@ libplacebo own plane sampling, Dolby Vision/HDR processing, and final output.
 
 Following platform slice:
 
-1. [ ] Resolve the Android example playback-stutter regression described in
-   `Next task`.
+1. [ ] Resolve the NVIDIA discrete-GPU D3D11VA/libplacebo crash described in
+   `Next task`; defer all previously queued platform work until it passes.
 
 Platform implementation order after the contracts are stable:
 
@@ -1442,8 +1491,8 @@ Acceptance:
   swap-chain/display-switch tests.
 - [x] No Windows type leaks into core public headers.
 
-Status: complete; Milestone 6 is also complete. The Android playback-stutter
-regression is the active next task, and Milestone 7 is deferred.
+Status: complete; Milestone 6 is also complete. The NVIDIA discrete-GPU
+D3D11VA/libplacebo crash is the active next task, and Milestone 7 is deferred.
 
 ## Milestone 6 — Android production path
 
@@ -1533,14 +1582,14 @@ Acceptance:
   as unavailable or skipped, not counted as zero-CPU-copy success;
 - Android SDK types remain outside core public headers.
 
-Status: complete. Resolve the active Android playback-stutter task first;
+Status: complete. Resolve the active NVIDIA discrete-GPU crash first;
 Milestone 7 remains deferred until explicitly resumed.
 
 ## Deferred milestone 7 — OHOS production path
 
 This milestone remains in the supported roadmap, but it is not the active next
 task. Do not begin its target-clarification or implementation work until the
-Android playback regression is resolved and the user explicitly resumes OHOS.
+NVIDIA discrete-GPU crash is resolved and the user explicitly resumes OHOS.
 
 Target clarification gate:
 

@@ -1229,7 +1229,7 @@ The composition output caps DXGI frame latency at one, uses non-blocking
 and retries when the compositor is busy. It never waits for presentation
 capacity on the UI thread. `takeStatistics()` returns and resets render
 requests/passes, presented frames, coalesced requests, busy presents, skipped
-renders, Intel Dolby Vision decoder-surface GPU-copy counts, long gaps,
+renders, Dolby Vision decoder-surface GPU-copy counts, long gaps,
 render/present maxima, and the renderer's color, interop, buffer-update, and
 draw-stage maxima.
 
@@ -1348,17 +1348,18 @@ and RGB10/PQ data correctly.
 The imported wrapper and copied `VideoFrame` are retained through GPU
 completion of the libplacebo draw. Decode, interop, and rendering use the same
 serialized immediate context, so a later decoder submission remains ordered
-after preceding GPU reads. Non-Intel submissions use a bounded asynchronous
-three-frame completion-query queue. Intel adapters use
-libplacebo's fast sampling policy without the additional GPU histogram
-peak-detection pass. For Dolby Vision NV12/P010 frames, the renderer copies the
-selected decoder array slice GPU-to-GPU into a pooled single-slice
-shader-resource texture before libplacebo plane sampling, without a CPU map,
-staging upload, or RGB conversion. The copy alone still reproduced the same
-`igd10um64xe.dll` access violation on the affected driver. Ordinary HDR10 then
-reproduced that driver fault through direct import at the same module offset,
-so all Intel hardware-frame submissions complete libplacebo GPU work before
-copied or directly imported resources can be recycled.
+after preceding GPU reads. The renderer keeps a bounded three-frame
+completion-query queue. Every successfully imported D3D11VA frame, regardless
+of adapter vendor, uses libplacebo's fast sampling policy without the optional
+GPU histogram peak-detection pass and completes libplacebo GPU work before its
+decoder resources can be recycled. Software frames retain the default render
+parameters and do not add the per-frame completion wait. For Dolby Vision raw
+NV12/P010 input, the renderer also copies the selected decoder array slice
+GPU-to-GPU into a pooled single-slice shader-resource texture before
+libplacebo plane sampling, without a CPU map, staging upload, or RGB
+conversion. Intel, AMD, and NVIDIA have all reproduced a crash on the
+asynchronous imported-frame path, so the workaround is intentionally
+vendor-neutral.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly

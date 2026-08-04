@@ -104,20 +104,6 @@ std::string hresultText(const char* operation, HRESULT result)
     return stream.str();
 }
 
-bool isIntelD3D11Device(ID3D11Device* device) noexcept
-{
-    if (!device) {
-        return false;
-    }
-    ComPtr<IDXGIDevice> dxgiDevice;
-    ComPtr<IDXGIAdapter> adapter;
-    DXGI_ADAPTER_DESC description {};
-    return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)))
-        && SUCCEEDED(dxgiDevice->GetAdapter(&adapter))
-        && SUCCEEDED(adapter->GetDesc(&description))
-        && description.VendorId == 0x8086U;
-}
-
 bool sameAdvancedColorInfo(
     const D3D11AdvancedColorInfo& left,
     const D3D11AdvancedColorInfo& right) noexcept
@@ -828,7 +814,6 @@ public:
         , context_(deviceAccess_ ? deviceAccess_->immediateContext()
                                  : BorrowedD3D11DeviceContext {})
         , currentTarget_(std::move(currentTarget))
-        , intelDevice_(isIntelD3D11Device(device_.get()))
     {
         scRgbOutputHook_.stages = PL_HOOK_OUTPUT;
         scRgbOutputHook_.input = PL_HOOK_SIG_COLOR;
@@ -1229,7 +1214,6 @@ public:
             ID3D11Texture2D* sampledTexture = imported->texture();
             UINT sampledArraySlice = imported->arraySlice();
             if (detail::d3d11ShouldCopyDecoderSurface(
-                    intelDevice_,
                     source.hasDolbyVisionMetadata(),
                     rawYuv)) {
                 std::string copyError;
@@ -1257,8 +1241,9 @@ public:
                         std::memory_order_relaxed);
                 } else {
                     // Direct decoder-surface sampling remains the established
-                    // fallback and keeps the synchronous Intel workaround
-                    // below. A failed optional copy must not disable video.
+                    // fallback and keeps the synchronous imported-frame
+                    // workaround below. A failed optional copy must not
+                    // disable video.
                     decoderSurfaceCopy.Reset();
                 }
             }
@@ -1363,7 +1348,6 @@ public:
     D3D11AdvancedColorInfo advancedColorInfo_;
     bool allowSoftwareMappingFallback_ = false;
     bool open_ = false;
-    bool intelDevice_ = false;
 
     pl_log log_ = nullptr;
     pl_d3d11 d3d11_ = nullptr;
@@ -1747,7 +1731,10 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         impl_->context_.get()->ClearRenderTargetView(
             target.view,
             clearColor);
-        pl_render_params renderParams = impl_->intelDevice_
+        const bool useHardwareImportWorkaround =
+            detail::d3d11ShouldUseHardwareImportWorkaround(
+                static_cast<bool>(imported));
+        pl_render_params renderParams = useHardwareImportWorkaround
             ? pl_render_fast_params
             : pl_render_default_params;
         const pl_hook* outputHooks[] { &impl_->scRgbOutputHook_ };
@@ -1762,14 +1749,13 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             &renderParams);
         if (rendered) {
             impl_->context_.get()->End(completion.Get());
-            if (impl_->intelDevice_ && imported) {
-                // Intel's D3D11 UMD can access-violate when libplacebo
-                // pipelines imported D3D11VA NV12/P010 frames, even while
-                // application-owned source and target wrappers remain retained
-                // by event query. Both ordinary HDR10 and Dolby Vision reproduce
-                // the same fault on the affected driver. Copying a decoder array
-                // slice into a private shader-readable texture does not avoid it,
-                // so every Intel hardware-frame submission completes here.
+            if (useHardwareImportWorkaround) {
+                // Intel, AMD, and NVIDIA D3D11 UMDs have all reproduced an
+                // access violation while libplacebo pipelines imported
+                // D3D11VA NV12/P010 frames, even though the application keeps
+                // source and target wrappers alive through an event query.
+                // Complete every imported hardware-frame submission before
+                // any associated decoder resource can be recycled.
                 pl_gpu_finish(impl_->d3d11_->gpu);
             }
             Impl::InFlightRender inFlight;

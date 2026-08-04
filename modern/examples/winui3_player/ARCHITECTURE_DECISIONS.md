@@ -253,5 +253,5 @@ color space, display peak, and system SDR white level.
 The player reported active RGB10/PQ output for ordinary HDR10 `legend.mkv` and
 Dolby Vision Profile 5 `wednesday.mp4` on the same Windows HDR display. The
 user compared the result with MPC-BE and confirmed matching brightness. The
-separate Intel imported-hardware-frame crash and synchronization workaround are
-governed by project decision AD-007 in `modern/DECISIONS.md`.
+separate cross-vendor imported-hardware-frame crash and synchronization
+workaround are governed by project decision AD-007 in `modern/DECISIONS.md`.

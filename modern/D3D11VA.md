@@ -23,8 +23,9 @@ contracts shared by `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`,
   PQ/HLG conversion, tone mapping, gamut mapping, or output encoding.
 - A Dolby Vision RPU belongs to one exact `VideoFrame`; it is never reused by
   timestamp approximation or applied after ordinary YCbCr conversion.
-- Real-time render/context contention is retryable and non-blocking. There is
-  no per-frame completion query, `Flush()`, or `pl_gpu_finish()`.
+- Real-time render/context contention is retryable and non-blocking. AD-007
+  defines a conservative per-frame `pl_gpu_finish()` exception for every
+  successfully imported D3D11VA hardware frame, regardless of adapter vendor.
 
 ## Target and dependency boundaries
 
@@ -157,16 +158,17 @@ FFmpeg decode callbacks and QtAVCore D3D11 rendering share the recursive
 both renderer state and immediate-context ownership; contention declines the
 render so the output can retry instead of blocking its render/UI thread.
 
-The imported frame and libplacebo plane wrappers remain alive until
-`pl_render_image()` has submitted its commands. They are then released without
-waiting for GPU completion. Because decode and render submissions use the same
-serialized immediate context, later decoder-surface reuse is ordered after the
-earlier reads and D3D11 retains queued resource references.
-
-Per-frame `pl_gpu_finish()`, D3D11 event queries, and synchronous flushes are
-forbidden. `pl_gpu_finish()` is used only during renderer teardown before its
-reusable libplacebo resources are destroyed. The high-level output separately
-uses a frame-latency-one flip-model swap chain, redraw coalescing, non-blocking
+The imported frame, libplacebo plane wrappers, and borrowed target remain
+alive in a completion-query queue bounded at three submissions. Because decode
+and render submissions use the same serialized immediate context, later
+decoder-surface reuse remains ordered after earlier reads. In addition, every
+successfully submitted imported D3D11VA frame calls `pl_gpu_finish()` before
+its resources can be recycled. This vendor-neutral AD-007 compatibility path
+uses libplacebo's fast render parameters; Dolby Vision raw NV12/P010 input
+receives an optional same-device GPU copy into a private shader-resource
+texture. Software frames keep the default render parameters and do not take
+the per-frame completion wait. The high-level output separately uses a
+frame-latency-one flip-model swap chain, redraw coalescing, non-blocking
 `Present()`, and bounded compositor backpressure as specified by AD-005.
 
 ## Fallback and failure policy
