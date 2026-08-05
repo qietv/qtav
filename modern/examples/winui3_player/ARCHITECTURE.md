@@ -66,7 +66,7 @@ correct if callback routing changes later.
 | Player audio-output worker | Converts negotiated PCM, writes the WASAPI sink, and samples/publishes the device clock. | Perform UI/log formatting or wait for video presentation. |
 | Player video decode worker | Decodes video packets and feeds the bounded presentation path. | Present directly to the SwapChainPanel. |
 | Player presentation worker | Applies playback timing, drops late video, publishes frame callbacks, and requests rendering. | Submit device audio or synchronously invoke the UI. |
-| D3D11 output render thread | Coalesces redraws, calls `Player::renderVideo()`, performs hardware interop or software fallback, tracks display color, and presents. | Access XAML controls or destroy/detach itself from its callback. |
+| D3D11 output render thread | Coalesces redraws, calls `Player::renderVideoDetailed()`, retries classified transient contention, performs hardware interop or software fallback, tracks display color, and presents. | Access XAML controls or destroy/detach itself from its callback. |
 
 All UI-bound notifications use this pattern:
 
@@ -116,27 +116,33 @@ rather than allowing an arbitrary UI timer to advance playback.
 ```text
 FFmpeg packet -> video decode worker -> bounded presentation queue
               -> presentation worker -> current frame + render request
-              -> D3D11 output render thread -> Player::renderVideo()
+              -> D3D11 output latest-frame mailbox
+              -> render thread -> Player::renderVideoDetailed()
               -> D3D11VA interop or software fallback -> swap-chain Present
 ```
 
 The presentation queue is bounded and late frames may be dropped. Render
-requests are coalesced. The output uses a frame-latency cap and non-blocking
-presentation with bounded swap-chain backpressure on its own thread, so a busy
-compositor does not stall WASAPI or the WinUI dispatcher.
+requests are coalesced. A retryable Player/backend result remains in a
+latest-frame mailbox; a newer sequence supersedes it instead of growing a
+queue. Before each output pass makes its first non-blocking D3D11 context
+attempt, it reserves the render thread ahead of new FFmpeg-side acquisitions.
+An uncontended attempt proceeds immediately; contention enters an at-most-8-ms
+handoff and uses bounded timer backoff only after a timeout. This wait, the
+frame-latency cap, and non-blocking presentation all live on the private output
+thread, so neither context contention nor a busy compositor stalls WASAPI or
+the WinUI dispatcher.
 
 Hardware frames normally remain on the selected D3D11 device. Their raw
 NV12/P010 planes pass through libplacebo color processing and rendering
 without a CPU map. Submitted decoder slices and swap-chain back buffers stay
 retained until GPU completion; output resize drains those submissions before
 replacing the buffers. Every successfully imported D3D11VA frame uses fast
-libplacebo parameters and completes GPU work before its decoder resources can
-be recycled, regardless of adapter vendor. Dolby Vision raw NV12/P010 decoder
-slices are also copied GPU-to-GPU into a three-texture shader-resource pool
-without directly sampling the decoder surface. Software frames remain outside
-this per-frame synchronization path. Unsupported media or devices fall back
-through QtAVCore's software decode/render path rather than an application-side
-decoder.
+libplacebo parameters and remains in the bounded completion-query queue until
+its decoder resources can be recycled, regardless of adapter vendor. Dolby
+Vision raw NV12/P010 imports sample the retained decoder texture-array slice
+directly; there is no intermediate GPU copy. Software frames remain outside
+this imported-frame policy. Unsupported media or devices fall back through
+QtAVCore's software decode/render path rather than an application-side decoder.
 
 ### Seek and progress
 
@@ -178,8 +184,17 @@ resets output counters. Important interpretations are:
 - `decoder-copies` is a retained compatibility counter and remains zero while
   the renderer samples Dolby Vision decoder slices directly;
 - `coalesced` means multiple redraw notifications were intentionally combined;
-- `render-skipped` is retryable Player/backend contention, not necessarily a
-  fatal error;
+- `no-frame/player-busy/renderer-busy` classifies unsuccessful attempts, while
+  `renderer-busy(state/serialize/context/in-flight)` locates backend
+  contention;
+- `context-owner(reservation-aware/unreserved)` identifies an acquisition that
+  still reached the renderer as busy after the proactive handoff, separating
+  FFmpeg/internal owners from ordinary public owners;
+- `handoff(wait/timeout)` records contention caught before the renderer and
+  whether its bounded exchange succeeded, and
+  `retry/superseded/terminal` distinguishes recovered attempts from frames that
+  were actually lost;
+- `render-skipped` is retained for compatibility and mirrors terminal drops;
 - maximum color/interop/buffer/draw times identify the expensive D3D11 stage.
 
 The format is intentionally human-readable and may change with diagnostics.

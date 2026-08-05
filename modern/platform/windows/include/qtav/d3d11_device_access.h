@@ -11,6 +11,7 @@
 
 #include <d3d11.h>
 
+#include <chrono>
 #include <memory>
 
 #include <qtav/platform_windows_export.h>
@@ -56,6 +57,10 @@ public:
     D3D11ContextGuard& operator=(const D3D11ContextGuard&) = delete;
 
     explicit operator bool() const noexcept;
+    // Valid only when the guard is false. Returns true when the failed
+    // non-blocking acquisition was contending with a reservation-aware owner,
+    // such as FFmpeg's D3D11VA decode callback.
+    bool contendedByReservationAwareOwner() const noexcept;
 
 private:
     friend class D3D11DeviceAccess;
@@ -63,7 +68,39 @@ private:
     D3D11ContextGuard(
         std::shared_ptr<void> lifetime,
         void* mutex,
-        bool tryLock);
+        bool tryLock,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds { 0 },
+        bool honorReservations = false);
+
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Move-only reservation that gives its creating thread priority over new
+// FFmpeg decode-side context acquisitions. It does not take the context lock
+// and does not block unrelated public contextGuard() users. This lets a
+// real-time renderer perform its initial bounded handoff or retry without
+// being starved by a decoder that immediately begins its next D3D11 operation.
+// Destroy the reservation as soon as the pass succeeds or is cancelled.
+class QTAV_PLATFORM_WINDOWS_EXPORT D3D11ContextReservation final {
+public:
+    ~D3D11ContextReservation();
+
+    D3D11ContextReservation(D3D11ContextReservation&&) noexcept;
+    D3D11ContextReservation& operator=(
+        D3D11ContextReservation&&) noexcept;
+    D3D11ContextReservation(const D3D11ContextReservation&) = delete;
+    D3D11ContextReservation& operator=(
+        const D3D11ContextReservation&) = delete;
+
+    explicit operator bool() const noexcept;
+
+private:
+    friend class D3D11DeviceAccess;
+
+    D3D11ContextReservation(
+        std::shared_ptr<void> lifetime,
+        void* mutex);
 
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -90,6 +127,14 @@ public:
     // Non-blocking form for real-time render paths. The returned guard converts
     // to false when another thread currently owns the immediate context.
     D3D11ContextGuard tryContextGuard() const;
+    // Bounded-wait form for a private render worker after it has reserved the
+    // context. The returned guard converts to false when the timeout expires.
+    D3D11ContextGuard tryContextGuardFor(
+        std::chrono::milliseconds timeout) const;
+    // Prevents new FFmpeg decode-side acquisitions from overtaking an initial
+    // bounded handoff or retry on the calling thread. The reservation itself
+    // never owns the context.
+    D3D11ContextReservation reserveContext() const;
 
 private:
     friend class detail::D3D11DeviceAccessPrivate;

@@ -97,9 +97,21 @@ it may not substitute the player's newer current frame.
 
 `VideoRenderAPI` defines renderer lifecycle and target geometry without naming
 a graphics API. `Player::setRenderCallback()` requests a redraw, and the
-application calls `renderVideo()` on the thread that owns the native graphics
-context. Multiple renderer instances may be keyed by application opaque
-pointers.
+application calls `renderVideoDetailed()` on the thread that owns the native
+graphics context. Immutable current-frame and renderer-binding snapshots keep
+that hot path independent of the Player control mutex. The detailed result
+carries reason, frame sequence, and presentation generation; generation is
+checked again after the backend call so an invalidated frame is not presented.
+The older `renderVideo()` timestamp/negative-value contract remains as a
+compatibility wrapper. Multiple renderer instances may be keyed by application
+opaque pointers.
+
+The high-level Windows output reserves the shared immediate context before
+each output pass makes its first non-blocking acquisition. An uncontended pass
+continues immediately; contention uses a private-thread, at-most-8-ms handoff
+before the one-frame latest retry mailbox and bounded timer backoff. The
+reservation is honored by FFmpeg/internal D3D11 users, owns no context itself,
+and is released with the render result before statistics or `Present()`.
 
 The renderer owns resources derived from its API device/context. Native window
 and presentation ownership stays in a platform adapter or high-level output:
@@ -293,11 +305,10 @@ are the current production paths. OHOS backend implementation is deferred; its
 planned responsibilities remain separate OHAudio, OHCodec, Vulkan/OpenGL
 interop, and platform-window adapters.
 
-The active next task is the Android example playback-stutter investigation in
-[`PLAN.md`](PLAN.md). It applies to Dolby and non-Dolby media, so diagnosis must
-measure scheduling, queue starvation, interop backpressure, graphics-thread
-waits, and libplacebo render cost independently before changing the color
-pipeline.
+The active next task is the Windows AMD/Intel cadence comparison in
+[`PLAN.md`](PLAN.md). It applies to Dolby and non-Dolby media, so diagnosis
+must measure scheduling, retry/handoff, compositor backpressure, power state,
+and libplacebo render cost independently before changing the color pipeline.
 
 ## Architectural invariants for changes
 

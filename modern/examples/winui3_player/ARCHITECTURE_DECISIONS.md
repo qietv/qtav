@@ -17,6 +17,7 @@ remain with a link to their replacement.
 | [ADR-006](#adr-006-keep-diagnostics-lightweight-and-opt-in) | Keep diagnostics lightweight and opt-in | Accepted |
 | [ADR-007](#adr-007-coalesce-progress-interaction-into-one-asynchronous-seek) | Coalesce progress interaction into one asynchronous seek | Accepted |
 | [ADR-008](#adr-008-use-opaque-rgb10pq-video-presentation) | Use opaque RGB10/PQ video presentation | Accepted |
+| [ADR-009](#adr-009-retry-transient-render-contention-with-bounded-context-handoff) | Retry transient render contention with bounded context handoff | Accepted |
 
 ## ADR-001: Unpackaged, self-contained WinUI 3 application
 
@@ -255,3 +256,66 @@ Dolby Vision Profile 5 `wednesday.mp4` on the same Windows HDR display. The
 user compared the result with MPC-BE and confirmed matching brightness. The
 separate cross-vendor imported-hardware-frame crash and synchronization
 workaround are governed by project decision AD-007 in `modern/DECISIONS.md`.
+
+## ADR-009: Retry transient render contention with bounded context handoff
+
+- **Status:** Accepted
+- **Date:** 2026-08-04
+
+### Context
+
+The original render callback carried no frame identity, and
+`Player::renderVideo()` collapsed no-frame, Player-lock contention, and backend
+contention into one negative value. `D3D11VideoOutput` consumed that request as
+skipped. On the Radeon 880M, momentary collisions therefore became visible
+missing frames even though scheduled cadence, D3D11VA throughput, renderer
+stage times, and `Present()` remained within budget. Making the Player lock
+blocking removed most symptoms but would put playback-control work in the
+native render path. Removing that lock exposed a second issue: FFmpeg's decode
+thread could immediately reacquire the shared D3D11 context before a timer-only
+render retry.
+
+### Decision
+
+Use `Player::renderVideoDetailed()` on the output's private render thread. The
+Player publishes immutable frame and renderer-binding snapshots atomically,
+returns a frame sequence and presentation generation, and rechecks generation
+after rendering. The output retries only classified busy results in a
+latest-frame mailbox; a newer sequence supersedes the older pending frame.
+
+Before every output pass makes its first non-blocking D3D11 context attempt, it
+reserves the render thread ahead of new FFmpeg/internal acquisitions. An
+uncontended attempt proceeds immediately; a contended attempt waits for at most
+8 ms for the current owner to yield. A timeout returns to bounded
+1/2/4/8/16-ms backoff rather than spinning. Ordinary public context users are
+not blocked by the reservation, and every wait stays on the private output
+thread. The context guard is released when rendering returns and is never held
+through statistics collection or swap-chain presentation. Detach, stop, and
+connection-generation changes cancel both pending retry and reservation.
+
+Diagnostics report attempt reason, renderer lock stage, context-owner class,
+handoff wait/timeout, retry wakeup, supersession, and terminal drop separately.
+The legacy `render-skipped` field mirrors terminal drops so recovered retries
+are no longer reported as missing frames.
+
+### Consequences
+
+- UI and playback-control threads remain non-blocking with respect to render
+  contention; the private render worker absorbs the bounded handoff.
+- A transient busy result can be recovered without requiring another decoder
+  callback, while the mailbox remains bounded to one latest frame.
+- Seek, stop, and media replacement cannot present a backend result completed
+  for an obsolete presentation generation.
+- On the recorded Radeon 880M, settled Dolby Vision Profile 5 and HDR10 runs
+  retained D3D11VA, RGB10/PQ, and zero decoder copies with zero terminal render
+  drops. All observed context collisions were reservation-aware FFmpeg-side
+  ownership, and every bounded handoff completed without timeout.
+- A later high-load check reproduced rare supersession while the reservation
+  was still reactive. Moving it ahead of the first context attempt restored
+  zero renderer-busy/superseded/terminal counts with zero handoff timeouts.
+  Separate high draw times after prolonged build/UI-capture load disappeared
+  in a controlled cold rerun, which restored both supplied files to source
+  cadence and zero steady coalescing.
+- The same-build Intel performance regression remains required; this decision
+  corrects generic retry semantics but does not claim cross-device performance
+  equivalence.

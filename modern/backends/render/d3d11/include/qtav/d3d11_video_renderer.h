@@ -51,6 +51,16 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11AdvancedColorInfo {
 struct QTAV_RENDER_D3D11_EXPORT D3D11VideoRendererStatistics {
     // Per-stage maxima accumulated since the previous takeStatistics() call.
     std::uint64_t decoderSurfaceCopies = 0;
+    // Mutually exclusive reasons for render() returning false because a
+    // transient renderer resource was busy.
+    std::uint64_t stateBusyRenderAttempts = 0;
+    std::uint64_t serializationBusyRenderAttempts = 0;
+    std::uint64_t deviceContextBusyRenderAttempts = 0;
+    // These two counters partition deviceContextBusyRenderAttempts by the
+    // current immediate-context owner's acquisition policy.
+    std::uint64_t reservationAwareContextBusyRenderAttempts = 0;
+    std::uint64_t unreservedContextBusyRenderAttempts = 0;
+    std::uint64_t inFlightBusyRenderAttempts = 0;
     std::int64_t maximumColorSetupMicroseconds = 0;
     std::int64_t maximumInteropMicroseconds = 0;
     std::int64_t maximumBufferUpdateMicroseconds = 0;

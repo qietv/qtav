@@ -46,6 +46,10 @@ For configuration-specific project or runtime changes, repeat with
 `bin/x64/<Configuration>/QtAVWinUI3.exe` without relying on QtAVCore/FFmpeg
 DLLs elsewhere in `PATH`.
 
+Debug requires an ABI-compatible Debug dependency package. The current
+release-only Windows FFmpeg artifact does not contain Debug `placebo.lib`; do
+not bypass the resulting `_ITERATOR_DEBUG_LEVEL` mismatch.
+
 ## Manual smoke matrix
 
 Use media for which codec, frame rate, resolution, audio layout, duration, and
@@ -97,8 +101,18 @@ Interpret the main fields together:
   service them; occasional coalescing is expected under pressure.
 - `present-busy` shows non-blocking swap-chain backpressure. Correlate it with
   render gaps rather than treating any nonzero count as a failure.
-- `render-skipped` means a retryable non-blocking Player/backend operation was
-  busy. Persistent growth with low presentation rate needs investigation.
+- `no-frame/player-busy/renderer-busy` classifies unsuccessful render attempts;
+  `renderer-busy(state/serialize/context/in-flight)` identifies the backend
+  lock or capacity involved.
+- `context-owner(reservation-aware/unreserved)` separates FFmpeg/internal
+  immediate-context ownership from ordinary public ownership after a failed
+  proactive handoff. `handoff(wait/timeout)` records contention intercepted
+  before the renderer and should normally show successful bounded exchanges;
+  repeated timeouts indicate an owner that exceeds the handoff budget.
+- `retry/superseded/terminal` separates timer retries, older frames replaced by
+  newer sequences, and frames that could not be recovered. `render-skipped`
+  mirrors `terminal`; transient busy attempts that later render do not count as
+  skipped.
 - `max-stage-ms(color/interop/buffer/draw)` localizes a long render operation.
 - High `>80ms gaps(video/render)` with low CPU can indicate blocking I/O, clock
   starvation, driver waits, or a queue/lifetime bug rather than insufficient

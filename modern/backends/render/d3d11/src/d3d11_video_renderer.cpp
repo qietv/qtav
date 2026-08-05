@@ -1263,6 +1263,13 @@ public:
     std::string lastLogError_;
 
     std::atomic<std::uint64_t> decoderSurfaceCopies_ { 0 };
+    std::atomic<std::uint64_t> stateBusyRenderAttempts_ { 0 };
+    std::atomic<std::uint64_t> serializationBusyRenderAttempts_ { 0 };
+    std::atomic<std::uint64_t> deviceContextBusyRenderAttempts_ { 0 };
+    std::atomic<std::uint64_t>
+        reservationAwareContextBusyRenderAttempts_ { 0 };
+    std::atomic<std::uint64_t> unreservedContextBusyRenderAttempts_ { 0 };
+    std::atomic<std::uint64_t> inFlightBusyRenderAttempts_ { 0 };
     std::atomic<std::int64_t> maximumColorSetupMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumInteropMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumBufferUpdateMicroseconds_ { 0 };
@@ -1430,6 +1437,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             impl_->stateMutex_,
             std::try_to_lock);
         if (!lock.owns_lock()) {
+            impl_->stateBusyRenderAttempts_.fetch_add(
+                1,
+                std::memory_order_relaxed);
             return false;
         }
         if (impl_->open_) {
@@ -1459,10 +1469,21 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         impl_->renderMutex_,
         std::try_to_lock);
     if (!renderLock.owns_lock()) {
+        impl_->serializationBusyRenderAttempts_.fetch_add(
+            1,
+            std::memory_order_relaxed);
         return false;
     }
     auto contextGuard = impl_->deviceAccess_->tryContextGuard();
     if (!contextGuard) {
+        impl_->deviceContextBusyRenderAttempts_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        auto& detailedCounter =
+            contextGuard.contendedByReservationAwareOwner()
+            ? impl_->reservationAwareContextBusyRenderAttempts_
+            : impl_->unreservedContextBusyRenderAttempts_;
+        detailedCounter.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -1488,6 +1509,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     if (error.empty()
         && impl_->inFlightRenders_.size()
             >= impl_->maximumInFlightRenders) {
+        impl_->inFlightBusyRenderAttempts_.fetch_add(
+            1,
+            std::memory_order_relaxed);
         return false;
     }
 
@@ -1848,6 +1872,18 @@ D3D11VideoRenderer::takeStatistics() noexcept
     D3D11VideoRendererStatistics result;
     result.decoderSurfaceCopies =
         impl_->decoderSurfaceCopies_.exchange(0);
+    result.stateBusyRenderAttempts =
+        impl_->stateBusyRenderAttempts_.exchange(0);
+    result.serializationBusyRenderAttempts =
+        impl_->serializationBusyRenderAttempts_.exchange(0);
+    result.deviceContextBusyRenderAttempts =
+        impl_->deviceContextBusyRenderAttempts_.exchange(0);
+    result.reservationAwareContextBusyRenderAttempts =
+        impl_->reservationAwareContextBusyRenderAttempts_.exchange(0);
+    result.unreservedContextBusyRenderAttempts =
+        impl_->unreservedContextBusyRenderAttempts_.exchange(0);
+    result.inFlightBusyRenderAttempts =
+        impl_->inFlightBusyRenderAttempts_.exchange(0);
     result.maximumColorSetupMicroseconds =
         impl_->maximumColorSetupMicroseconds_.exchange(0);
     result.maximumInteropMicroseconds =

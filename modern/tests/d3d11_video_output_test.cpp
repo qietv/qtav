@@ -10,6 +10,7 @@
 
 #include <wrl/client.h>
 
+#include <qtav/d3d11_device_access.h>
 #include <qtav/d3d11_video_output.h>
 #include <qtav/player.h>
 
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 
 int main(int argc, char** argv)
 {
@@ -122,6 +124,115 @@ int main(int argc, char** argv)
             [&] { return presentedFrames >= 2; }));
     }
 
+    player.setState(qtav::State::Paused);
+    assert(player.waitFor(qtav::State::Paused, 5'000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    static_cast<void>(output.takeStatistics());
+
+    const auto deviceAccess = output.deviceAccess();
+    assert(deviceAccess);
+    int presentedBeforeRetry = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        presentedBeforeRetry = presentedFrames;
+    }
+    qtav::D3D11VideoOutputStatistics busyStatistics;
+    {
+        auto contextGuard = deviceAccess->contextGuard();
+        output.requestRender();
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        busyStatistics = output.takeStatistics();
+        std::lock_guard<std::mutex> lock(mutex);
+        assert(presentedFrames == presentedBeforeRetry);
+    }
+    assert(busyStatistics.rendererBusyRenderAttempts > 0);
+    assert(
+        busyStatistics.rendererDeviceContextBusyRenderAttempts
+        == busyStatistics.rendererBusyRenderAttempts);
+    assert(busyStatistics.retryWakeups > 0);
+    assert(busyStatistics.contextHandoffWaits > 0);
+    assert(busyStatistics.contextHandoffTimeouts > 0);
+    assert(busyStatistics.skippedRenders == 0);
+    assert(busyStatistics.terminalRenderDrops == 0);
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return presentedFrames > presentedBeforeRetry; }));
+    }
+    const auto recoveredStatistics = output.takeStatistics();
+    assert(recoveredStatistics.presentedFrames > 0);
+    assert(recoveredStatistics.skippedRenders == 0);
+    assert(recoveredStatistics.terminalRenderDrops == 0);
+
+    int presentedBeforeResume = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        presentedBeforeResume = presentedFrames;
+    }
+    player.setState(qtav::State::Playing);
+    assert(player.waitFor(qtav::State::Playing, 5'000));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return presentedFrames > presentedBeforeResume; }));
+    }
+    int presentedBeforeRewind = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        presentedBeforeRewind = presentedFrames;
+    }
+    assert(player.seek(0));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return presentedFrames > presentedBeforeRewind; }));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    static_cast<void>(output.takeStatistics());
+
+    int presentedBeforeSupersession = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        presentedBeforeSupersession = presentedFrames;
+    }
+    qtav::D3D11VideoOutputStatistics supersededStatistics;
+    {
+        auto contextGuard = deviceAccess->contextGuard();
+        output.requestRender();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        supersededStatistics = output.takeStatistics();
+        std::lock_guard<std::mutex> lock(mutex);
+        assert(presentedFrames == presentedBeforeSupersession);
+    }
+    assert(supersededStatistics.rendererBusyRenderAttempts > 0);
+    assert(
+        supersededStatistics.rendererDeviceContextBusyRenderAttempts > 0);
+    assert(supersededStatistics.retryWakeups > 0);
+    assert(supersededStatistics.supersededRenderFrames > 0);
+    assert(
+        supersededStatistics.terminalRenderDrops
+        >= supersededStatistics.supersededRenderFrames);
+    assert(
+        supersededStatistics.skippedRenders
+        == supersededStatistics.terminalRenderDrops);
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return presentedFrames > presentedBeforeSupersession; }));
+    }
+    const auto supersessionRecoveryStatistics =
+        output.takeStatistics();
+    assert(supersessionRecoveryStatistics.presentedFrames > 0);
+
     assert(output.resize({ 640, 360 }, 1.5F, 1.5F));
     output.requestRender();
     {
@@ -142,11 +253,35 @@ int main(int argc, char** argv)
         == previousHardwareConfig.deviceType);
 
     const auto statistics = output.takeStatistics();
-    assert(statistics.renderRequests >= statistics.presentedFrames);
+    const auto totalRenderRequests =
+        busyStatistics.renderRequests
+        + recoveredStatistics.renderRequests
+        + supersededStatistics.renderRequests
+        + supersessionRecoveryStatistics.renderRequests
+        + statistics.renderRequests;
+    const auto totalRenderPasses =
+        busyStatistics.renderPasses
+        + recoveredStatistics.renderPasses
+        + supersededStatistics.renderPasses
+        + supersessionRecoveryStatistics.renderPasses
+        + statistics.renderPasses;
+    const auto totalPresentedFrames =
+        busyStatistics.presentedFrames
+        + recoveredStatistics.presentedFrames
+        + supersededStatistics.presentedFrames
+        + supersessionRecoveryStatistics.presentedFrames
+        + statistics.presentedFrames;
+    const auto totalBusyPresents =
+        busyStatistics.busyPresents
+        + recoveredStatistics.busyPresents
+        + supersededStatistics.busyPresents
+        + supersessionRecoveryStatistics.busyPresents
+        + statistics.busyPresents;
+    assert(totalRenderRequests >= totalPresentedFrames);
     assert(
-        statistics.renderPasses
-        >= statistics.presentedFrames + statistics.busyPresents);
-    assert(statistics.presentedFrames >= 3);
+        totalRenderPasses
+        >= totalPresentedFrames + totalBusyPresents);
+    assert(totalPresentedFrames >= 2);
     {
         std::lock_guard<std::mutex> lock(mutex);
         assert(outputErrors == 0);

@@ -36,16 +36,16 @@ those identifiers from the active headers.
 | `QVariant` properties | string properties |
 | `VideoRenderer::receive()` | `onVideoFrame()` |
 | Qt paint/update events | normally owned by a high-level output such as `D3D11VideoOutput`; `setRenderCallback()` for external-context integration |
-| renderer paint method | normally owned by a high-level output; `renderVideo()` and `VideoRenderAPI` for external-context integration |
+| renderer paint method | normally owned by a high-level output; reason-aware `renderVideoDetailed()` or compatibility `renderVideo()` plus `VideoRenderAPI` for external-context integration |
 | `AudioOutput` | `onAudioFrame()` and optional `setAudioSink()` |
 | `QThread` playback workers | standard C++ demux, independent audio/video decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
 
 For ordinary Windows composition presentation, `QtAV::OutputD3D11` owns the
 D3D11 device, swap chain, render target, redraw coalescing, render thread,
-`renderVideo()`, `Present()`, and Advanced Color policy. The application
+reason-aware rendering, `Present()`, and Advanced Color policy. The application
 supplies only its hosting HWND, a native surface-binding callback, attaches a
-`Player`, and forwards surface size or composition-scale changes. The default
+   `Player`, and forwards surface size or composition-scale changes. The default
 prefers an FP16 scRGB HDR layer and automatically tracks display moves and the
 Windows HDR setting.
 
@@ -54,7 +54,8 @@ already own a graphics context or require multiple/custom render targets:
 
 1. decoding makes a frame current;
 2. `setRenderCallback()` asks the application to schedule a redraw;
-3. the application calls `renderVideo()` on its native render thread;
+3. the application calls `renderVideoDetailed()` (or the compatibility
+   `renderVideo()`) on its native render thread;
 4. the configured renderer consumes the reference-counted frame.
 
 ## Implemented
@@ -258,9 +259,14 @@ output while Windows HDR is active. `RequireHdr` reports unavailable HDR
 instead of presenting SDR, while `SdrOnly` keeps an explicit BGRA8 path.
 `colorInfo()` exposes the active contract for diagnostics. The player and
 native composition surface must outlive that attachment. Direct
-`D3D11VideoRenderer`, `setRenderCallback()`, and `renderVideo()` use remains
-the advanced path for externally owned graphics contexts, offscreen targets,
-or custom presentation loops.
+`D3D11VideoRenderer`, `setRenderCallback()`, and `renderVideoDetailed()` use
+remains the advanced path for externally owned graphics contexts, offscreen
+targets, or custom presentation loops. The output classifies transient render
+failures, keeps only the latest pending frame, and retries on its private
+thread. For immediate-context contention it reserves priority over new
+FFmpeg-side acquisitions, performs an immediate bounded handoff wait, and only
+then applies bounded backoff; recovered retries are not counted as terminal
+drops.
 
 Opaque video players may additionally select
 `D3D11HdrPresentationMode::HDR10` and `DXGI_ALPHA_MODE_IGNORE` in
@@ -473,10 +479,17 @@ implementation.
 - HTTP(S) inputs default to a 15-second FFmpeg I/O timeout plus bounded
   reconnect attempts; `avformat.rw_timeout`, `avformat.reconnect`, and the
   other FFmpeg protocol properties can override those defaults;
-- `renderVideo()` runs synchronously on its caller and should be called from the
-  thread that owns the native graphics context; it returns a negative value
-  when no frame is ready or a retryable player/backend lock is busy, so native
-  render loops should retry instead of blocking the UI/render thread;
+- `renderVideoDetailed()` runs synchronously on its caller and should be called
+  from the thread that owns the native graphics context. Atomically published
+  immutable frame/binding snapshots keep this hot path off the Player control
+  mutex. Its `VideoRenderResult` distinguishes rendered, no-frame, Player-busy,
+  and renderer-busy outcomes and includes a frame sequence and presentation
+  generation for bounded retry coalescing. A generation change during the
+  backend call rejects that stale completion;
+- compatibility `renderVideo()` returns a negative value for every non-rendered
+  result and therefore cannot distinguish a missing frame from retryable
+  contention. New native render loops should retry only the detailed busy
+  results rather than blocking their UI/render thread;
 - `OpenGLPresentCallback` runs on that same graphics-owner thread after
   framebuffer submission and before hardware-source release; it is intended
   for the adapter's bounded window-present call, not general application work;
@@ -484,9 +497,12 @@ implementation.
   immediate context must serialize through the same
   `D3D11DeviceAccess::contextGuard()` or equivalent external locking; the
   renderer uses non-blocking `tryContextGuard()` and declines a frame on
-  contention;
-- `VideoRenderAPI::render()` runs synchronously inside `renderVideo()` and
-  backend event callbacks may request another player state;
+  contention. A private output worker may pair `reserveContext()` with
+  `tryContextGuardFor()` for a bounded, reservation-aware handoff without
+  blocking an application UI thread;
+- `VideoRenderAPI::render()` runs synchronously inside
+  `renderVideoDetailed()` (and therefore the compatibility `renderVideo()`
+  wrapper), and backend event callbacks may request another player state;
 - audio-sink and video-render backend event callbacks run on the thread chosen
   by the backend and may request another player state;
 - compressed audio packets cross a bounded queue to their decode worker, then

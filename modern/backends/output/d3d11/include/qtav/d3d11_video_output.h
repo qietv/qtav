@@ -125,7 +125,28 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
     std::int64_t maximumRenderMicroseconds = 0;
     std::int64_t maximumPresentMicroseconds = 0;
     std::uint64_t busyPresents = 0;
+    // Compatibility mirror of terminalRenderDrops. Recovered retry attempts
+    // are not skipped renders.
     std::uint64_t skippedRenders = 0;
+    // Detailed outcomes accumulated across render-thread attempts.
+    std::uint64_t noFrameRenderAttempts = 0;
+    std::uint64_t playerBusyRenderAttempts = 0;
+    std::uint64_t rendererBusyRenderAttempts = 0;
+    std::uint64_t retryWakeups = 0;
+    // A superseded frame is also one terminal drop. terminalRenderDrops may
+    // additionally contain non-retryable backend failures.
+    std::uint64_t supersededRenderFrames = 0;
+    std::uint64_t terminalRenderDrops = 0;
+    std::uint64_t rendererStateBusyRenderAttempts = 0;
+    std::uint64_t rendererSerializationBusyRenderAttempts = 0;
+    std::uint64_t rendererDeviceContextBusyRenderAttempts = 0;
+    std::uint64_t rendererReservationAwareContextBusyRenderAttempts = 0;
+    std::uint64_t rendererUnreservedContextBusyRenderAttempts = 0;
+    // Contention intercepted by the proactive bounded acquisition, and the
+    // subset that exhausted its handoff interval before renderer entry.
+    std::uint64_t contextHandoffWaits = 0;
+    std::uint64_t contextHandoffTimeouts = 0;
+    std::uint64_t rendererInFlightBusyRenderAttempts = 0;
     std::uint64_t decoderSurfaceCopies = 0;
     std::int64_t maximumColorSetupMicroseconds = 0;
     std::int64_t maximumInteropMicroseconds = 0;
@@ -136,7 +157,7 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
 // High-level composition-surface output for ordinary Windows playback.
 //
 // The output owns the D3D11 device, composition swap chain, render target,
-// D3D11VA/Video Processor path, redraw-coalescing render thread, Present(),
+// D3D11VA/libplacebo raw-plane path, redraw-coalescing render thread, Present(),
 // resize, HDR/SDR presentation, and teardown. The hosting HWND and surface
 // binding callback are the only ordinary UI-toolkit bridge; for a WinUI
 // SwapChainPanel the callback normally calls

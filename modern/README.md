@@ -36,7 +36,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   mastering-display, and content-light metadata;
 - `prepare`, `seek`, pause/resume/stop, playback rate, A-B range, and loop;
 - media/track information and `avformat.*` property forwarding;
-- decoder-driven `setRenderCallback()` plus render-thread `renderVideo()`;
+- decoder-driven `setRenderCallback()` plus reason-aware render-thread
+  `renderVideoDetailed()` and the compatibility `renderVideo()` wrapper;
 - compile-time `VideoRenderAPI`, `AudioSink`, and hardware-frame interop
   contracts;
 - optional libswscale CPU renderer for application-owned image buffers;
@@ -47,7 +48,7 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   RGB10 HDR10 output;
 - optional high-level Windows D3D11 composition output that owns the device,
   HDR-aware FP16 scRGB or SDR swap chain, render target, display tracking,
-  redraw-coalescing thread, D3D11VA/interop wiring, `renderVideo()`,
+  redraw-coalescing thread, D3D11VA/interop wiring, reason-aware rendering,
   `Present()`, resize, and teardown;
 - optional libswresample converter for negotiated interleaved PCM output;
 - optional RIFF/WAVE PCM diagnostic file sink;
@@ -830,7 +831,13 @@ player
     .setVideoRenderAPI(mainRenderer, mainSurfaceKey)
     .setVideoRenderAPI(previewRenderer, previewSurfaceKey)
     .setRenderCallback([&](void* key) {
-        schedule_on_render_thread([&, key] { player.renderVideo(key); });
+        schedule_on_render_thread([&, key] {
+            const auto result = player.renderVideoDetailed(key);
+            if (result.status == qtav::VideoRenderStatus::PlayerStateBusy
+                || result.status == qtav::VideoRenderStatus::RendererBusy) {
+                schedule_bounded_retry(key);
+            }
+        });
     });
 ```
 
@@ -847,15 +854,21 @@ worker, so a slow application redraw path cannot stall demux, decode, or
 device audio submission. The video presentation queue is bounded;
 when the application falls behind, it preserves the imminent queued frame and
 discards an incoming farther-future frame instead of accumulating unbounded
-latency or repeatedly replacing the next presentable frame. `renderVideo()`
-runs on the caller's thread, so an OpenGL, Vulkan, or D3D integration
-can keep ownership of its native context and surface. It returns the rendered
-timestamp in seconds, or a negative value when no frame is ready or a
-real-time render attempt is temporarily declined; the render scheduler should
-retry on a later redraw rather than block its native/UI thread. A/V startup
-and playing seeks use a bounded video preroll before releasing device audio,
-avoiding an audio-first clock sprint while the first video frames are still
-being decoded.
+latency or repeatedly replacing the next presentable frame.
+`renderVideoDetailed()` runs on the caller's thread, so an OpenGL, Vulkan, or
+D3D integration can keep ownership of its native context and surface. Its
+immutable frame and renderer-binding snapshots are atomically published; the
+hot render path does not take the Player control mutex. The result distinguishes
+`Rendered`, `NoFrame`, `PlayerStateBusy`, and `RendererBusy`, and carries the
+frame sequence plus presentation generation needed to coalesce bounded
+retries. Retry only the two busy results; `NoFrame` waits for the next
+decoder-driven redraw. Player rechecks the generation after the backend call,
+so a seek, stop, or media replacement that overlaps rendering rejects the
+completed stale frame. The compatibility `renderVideo()` returns the rendered
+timestamp in seconds and collapses every other result to a negative value.
+A/V startup and playing seeks use a bounded video preroll before releasing
+device audio, avoiding an audio-first clock sprint while the first video
+frames are still being decoded.
 
 `setVideoFrameScheduler()` is the earlier, opt-in hardware-presentation hook.
 It runs on the video-decode worker inside the bounded video decode window and
@@ -1153,8 +1166,8 @@ provide synchronous diagnostics.
 
 For ordinary Windows presentation, link `QtAV::OutputD3D11` and provide the
 native composition control's swap-chain binding operation. The output owns
-the D3D11 device, HDR-aware flip-model swap chain, target, display tracking,
-render scheduling thread, `renderVideo()`, `Present()`, D3D11VA
+ the D3D11 device, HDR-aware flip-model swap chain, target, display tracking,
+ render scheduling thread, reason-aware rendering, `Present()`, D3D11VA
 configuration, raw-plane libplacebo interop, resize, and teardown:
 
 ```cpp
@@ -1227,12 +1240,24 @@ render thread, HDR policy, or presentation loop in application code.
 The composition output caps DXGI frame latency at one, uses non-blocking
 `Present()` and a bounded waitable-object wait on its private render thread,
 and retries when the compositor is busy. It never waits for presentation
-capacity on the UI thread. `takeStatistics()` returns and resets render
-requests/passes, presented frames, coalesced requests, busy presents, skipped
-renders, the retained decoder-surface-copy diagnostic counter, long gaps,
-render/present maxima, and the renderer's color, interop, buffer-update, and
-draw-stage maxima. The copy counter remains zero under the current direct
-decoder-surface policy.
+capacity on the UI thread. Retryable Player/backend contention enters a
+latest-frame mailbox rather than becoming an immediate drop. A newer frame
+supersedes an older pending frame. Before each output pass makes its first
+non-blocking D3D11 context attempt, it creates a render-thread reservation. An
+uncontended pass proceeds immediately; a contended pass waits for at most 8 ms
+for a decode-side owner to yield. Only a failed handoff enters the one-frame
+retry mailbox and bounded 1/2/4/8/16 ms backoff. There is no busy spin and the
+WinUI thread does not wait for this exchange.
+
+`takeStatistics()` returns and resets render requests/passes, presented frames,
+coalesced requests, busy presents, reason-level no-frame/Player/renderer-busy
+attempts, retry wakeups, superseded and terminal frames, renderer lock-stage
+contention, reservation-aware versus unreserved context ownership, handoff
+waits/timeouts, the retained decoder-surface-copy diagnostic counter, long
+gaps, render/present maxima, and the renderer's color, interop, buffer-update,
+and draw-stage maxima. `skippedRenders` is retained for compatibility and now
+mirrors `terminalRenderDrops`; a recovered retry is not a skipped frame. The
+copy counter remains zero under the current direct decoder-surface policy.
 
 ### D3D11 renderer (advanced external-context path)
 
@@ -1268,8 +1293,14 @@ recursive lock shared by the renderer and D3D11VA/interop backends. Creation
 also fails if the context cannot expose or enable native multithread
 protection. `contextGuard()` waits for ownership; `tryContextGuard()` is its
 non-blocking real-time form and returns a false guard when the context is
-busy. The native guard covers context calls made inside FFmpeg and libplacebo
-before driver dispatch; it does not replace the explicit guard required around
+busy. A false guard reports whether its current owner uses the reservation-aware
+FFmpeg/internal acquisition path. `reserveContext()` gives its creating thread
+priority over new reservation-aware acquisitions without taking the context;
+`tryContextGuardFor()` then performs the bounded acquisition. Ordinary public
+`contextGuard()` calls remain independent of reservations so application
+surface operations do not create a graphics-lock/context-lock cycle. The
+native guard covers context calls made inside FFmpeg and libplacebo before
+driver dispatch; it does not replace the explicit guard required around
 application context calls. The older renderer constructor taking the two
 borrowed wrappers remains a convenience path and creates the same retained
 access internally.
@@ -1292,10 +1323,11 @@ automatically before `ResizeBuffers()`.
 
 The renderer uses `tryContextGuard()` and a non-blocking render lock while
 issuing immediate-context calls. If either is busy, `render()` returns false
-without emitting a backend error; `Player::renderVideo()` therefore returns a
-negative value and the scheduler retries. Applications using that immediate
-context from another thread must acquire `contextGuard()` (or provide
-equivalent external serialization):
+without emitting a backend error. `Player::renderVideoDetailed()` reports this
+as `RendererBusy`, allowing a custom scheduler to retry it without confusing it
+with `NoFrame`; the compatibility `renderVideo()` still returns a negative
+value. Applications using that immediate context from another thread must
+acquire `contextGuard()` (or provide equivalent external serialization):
 
 ```cpp
 {
@@ -1363,12 +1395,15 @@ Successful per-frame submission remains asynchronous: it does not call
 `pl_gpu_finish()`, and Dolby Vision raw NV12/P010 input samples the retained
 decoder array slice directly instead of creating a GPU copy. Software frames
 retain the default render parameters. This vendor-neutral policy is accepted
-on NVIDIA, Intel, and AMD. A separately reported visual 4K cadence issue on an
-AMD integrated GPU remains under performance investigation and is not treated
-as an imported-frame correctness regression without stage-level evidence. The
-performance task also requires a same-build Intel regression; it cannot close
-until both final devices have recorded hardware/driver details and objective
-cadence and stage-timing data.
+on NVIDIA, Intel, and AMD. The reported AMD integrated-GPU 4K cadence loss was
+traced outside renderer throughput: transient render-state and FFmpeg
+immediate-context collisions were collapsed into generic negative results and
+consumed without a retry. Immutable Player render snapshots plus the
+reason-aware output mailbox and bounded context handoff restored sustained
+source cadence on the recorded Radeon 880M while keeping D3D11VA and zero
+decoder-surface copies. The performance task still requires a same-build Intel
+regression and cannot close until both final devices have comparable hardware,
+driver, cadence, and stage-timing records.
 
 Hardware-frame import and decoder fallback are independent policies. The
 renderer does not map a hardware frame by default. Applications may explicitly

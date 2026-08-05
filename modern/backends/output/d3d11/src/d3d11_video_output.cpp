@@ -11,12 +11,14 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <iomanip>
 #include <iterator>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -36,6 +38,18 @@ std::int64_t steadyMicroseconds() noexcept
 }
 
 constexpr DWORD frameLatencyWaitMilliseconds = 20;
+constexpr auto contextHandoffWait = std::chrono::milliseconds { 8 };
+// Each output pass reserves the context before its first nonblocking attempt.
+// A contended pass then enters this bounded handoff wait immediately. Only a
+// failed handoff backs off, so sustained contention cannot become a busy loop.
+constexpr std::array<int, 6> renderRetryBackoffMilliseconds {
+    0,
+    1,
+    2,
+    4,
+    8,
+    16,
+};
 
 void updateMaximum(
     std::atomic<std::int64_t>& destination,
@@ -134,6 +148,8 @@ public:
         std::mutex mutex;
         std::condition_variable changed;
         bool requested = false;
+        bool retryPending = false;
+        Clock::time_point retryDeadline = Clock::now();
         bool stopping = false;
         Player* player = nullptr;
         std::uint64_t generation = 0;
@@ -142,7 +158,24 @@ public:
         std::atomic<std::uint64_t> renderPasses { 0 };
         std::atomic<std::uint64_t> presentedFrames { 0 };
         std::atomic<std::uint64_t> busyPresents { 0 };
-        std::atomic<std::uint64_t> skippedRenders { 0 };
+        std::atomic<std::uint64_t> noFrameRenderAttempts { 0 };
+        std::atomic<std::uint64_t> playerBusyRenderAttempts { 0 };
+        std::atomic<std::uint64_t> rendererBusyRenderAttempts { 0 };
+        std::atomic<std::uint64_t> retryWakeups { 0 };
+        std::atomic<std::uint64_t> supersededRenderFrames { 0 };
+        std::atomic<std::uint64_t> terminalRenderDrops { 0 };
+        std::atomic<std::uint64_t> rendererStateBusyRenderAttempts { 0 };
+        std::atomic<std::uint64_t>
+            rendererSerializationBusyRenderAttempts { 0 };
+        std::atomic<std::uint64_t>
+            rendererDeviceContextBusyRenderAttempts { 0 };
+        std::atomic<std::uint64_t>
+            rendererReservationAwareContextBusyRenderAttempts { 0 };
+        std::atomic<std::uint64_t>
+            rendererUnreservedContextBusyRenderAttempts { 0 };
+        std::atomic<std::uint64_t> contextHandoffWaits { 0 };
+        std::atomic<std::uint64_t> contextHandoffTimeouts { 0 };
+        std::atomic<std::uint64_t> rendererInFlightBusyRenderAttempts { 0 };
         std::atomic<std::uint64_t> decoderSurfaceCopies { 0 };
         std::atomic<std::uint64_t> longRenderGaps { 0 };
         std::atomic<std::int64_t> previousRenderMicroseconds { 0 };
@@ -358,6 +391,8 @@ public:
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->player = &player;
+            state->requested = false;
+            state->retryPending = false;
             ++state->generation;
         }
 
@@ -396,9 +431,13 @@ public:
                 if (renderState_->player == player) {
                     renderState_->player = nullptr;
                     renderState_->requested = false;
+                    renderState_->retryPending = false;
                     ++renderState_->generation;
                 }
             }
+        }
+        if (renderState_) {
+            renderState_->changed.notify_all();
         }
         player->setVideoRenderAPI({});
         if (restoreHardwareConfig) {
@@ -571,8 +610,34 @@ public:
         result.renderPasses = state->renderPasses.exchange(0);
         result.presentedFrames = state->presentedFrames.exchange(0);
         result.busyPresents = state->busyPresents.exchange(0);
-        result.skippedRenders =
-            state->skippedRenders.exchange(0);
+        result.noFrameRenderAttempts =
+            state->noFrameRenderAttempts.exchange(0);
+        result.playerBusyRenderAttempts =
+            state->playerBusyRenderAttempts.exchange(0);
+        result.rendererBusyRenderAttempts =
+            state->rendererBusyRenderAttempts.exchange(0);
+        result.retryWakeups = state->retryWakeups.exchange(0);
+        result.supersededRenderFrames =
+            state->supersededRenderFrames.exchange(0);
+        result.terminalRenderDrops =
+            state->terminalRenderDrops.exchange(0);
+        result.skippedRenders = result.terminalRenderDrops;
+        result.rendererStateBusyRenderAttempts =
+            state->rendererStateBusyRenderAttempts.exchange(0);
+        result.rendererSerializationBusyRenderAttempts =
+            state->rendererSerializationBusyRenderAttempts.exchange(0);
+        result.rendererDeviceContextBusyRenderAttempts =
+            state->rendererDeviceContextBusyRenderAttempts.exchange(0);
+        result.rendererReservationAwareContextBusyRenderAttempts =
+            state->rendererReservationAwareContextBusyRenderAttempts
+                .exchange(0);
+        result.rendererUnreservedContextBusyRenderAttempts =
+            state->rendererUnreservedContextBusyRenderAttempts.exchange(0);
+        result.contextHandoffWaits = state->contextHandoffWaits.exchange(0);
+        result.contextHandoffTimeouts =
+            state->contextHandoffTimeouts.exchange(0);
+        result.rendererInFlightBusyRenderAttempts =
+            state->rendererInFlightBusyRenderAttempts.exchange(0);
         result.decoderSurfaceCopies =
             state->decoderSurfaceCopies.exchange(0);
         result.longRenderGaps = state->longRenderGaps.exchange(0);
@@ -794,24 +859,102 @@ private:
 
     void runRenderThread(std::shared_ptr<RenderState> state)
     {
+        struct PendingBusyRender {
+            bool active = false;
+            std::uint64_t connectionGeneration = 0;
+            std::uint64_t frameSequence = 0;
+            std::uint64_t presentationGeneration = 0;
+            std::size_t backoffIndex = 0;
+        } pendingBusy;
+        std::optional<D3D11ContextReservation> contextReservation;
+
+        const auto recordTerminalDrop = [&] {
+            state->terminalRenderDrops.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        };
+        const auto finishPendingBusy = [&](bool superseded) {
+            if (!pendingBusy.active) {
+                return;
+            }
+            if (superseded) {
+                state->supersededRenderFrames.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
+            recordTerminalDrop();
+            pendingBusy = {};
+        };
+        const auto matchesPendingBusy = [&](const VideoRenderResult& result) {
+            return pendingBusy.active
+                && pendingBusy.presentationGeneration
+                    == result.presentationGeneration
+                && (pendingBusy.frameSequence == 0
+                    || result.frameSequence == 0
+                    || pendingBusy.frameSequence == result.frameSequence);
+        };
+
         bool waitForPresentationCapacity = false;
         while (true) {
             Player* player = nullptr;
             std::uint64_t generation = 0;
+            bool retryWakeup = false;
             {
                 std::unique_lock<std::mutex> lock(state->mutex);
-                state->changed.wait(
-                    lock,
-                    [&] { return state->requested || state->stopping; });
-                if (state->stopping) {
-                    return;
+                while (true) {
+                    if (state->stopping) {
+                        return;
+                    }
+                    if (pendingBusy.active
+                        && state->generation
+                            != pendingBusy.connectionGeneration) {
+                        pendingBusy = {};
+                        contextReservation.reset();
+                    }
+                    if (state->requested) {
+                        state->requested = false;
+                        state->retryPending = false;
+                        break;
+                    }
+                    if (state->retryPending) {
+                        const auto deadline = state->retryDeadline;
+                        const bool changed = state->changed.wait_until(
+                            lock,
+                            deadline,
+                            [&] {
+                                return state->stopping
+                                    || state->requested
+                                    || !state->retryPending;
+                            });
+                        if (!changed) {
+                            state->retryPending = false;
+                            retryWakeup = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    state->changed.wait(
+                        lock,
+                        [&] {
+                            return state->requested
+                                || state->retryPending
+                                || state->stopping;
+                        });
                 }
-                state->requested = false;
                 player = state->player;
                 generation = state->generation;
             }
+            if (retryWakeup) {
+                state->retryWakeups.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
             if (!player) {
                 continue;
+            }
+            if (pendingBusy.active
+                && pendingBusy.connectionGeneration != generation) {
+                pendingBusy = {};
             }
 
             if (frameLatencyWaitableObject_
@@ -840,9 +983,11 @@ private:
                 std::memory_order_relaxed);
 
             const auto renderStarted = steadyMicroseconds();
-            double timestamp = -1.0;
+            VideoRenderResult renderResult;
             HRESULT presentStatus = S_OK;
             bool requiredHdrUnavailable = false;
+            bool rendererReportedRetryableBusy = false;
+            bool rendererDeviceContextBusy = false;
             std::int64_t renderCompleted = renderStarted;
             {
                 std::lock_guard<std::mutex> graphicsLock(graphicsMutex_);
@@ -859,12 +1004,70 @@ private:
                     continue;
                 }
 
-                timestamp = player->renderVideo();
+                if (!contextReservation) {
+                    contextReservation.emplace(
+                        deviceAccess_->reserveContext());
+                }
+                std::optional<D3D11ContextGuard> handoffGuard;
+                handoffGuard.emplace(
+                    deviceAccess_->tryContextGuard());
+                if (!*handoffGuard) {
+                    state->contextHandoffWaits.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    handoffGuard.emplace(
+                        deviceAccess_->tryContextGuardFor(
+                            contextHandoffWait));
+                    if (!*handoffGuard) {
+                        state->contextHandoffTimeouts.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
+                }
+                renderResult = player->renderVideoDetailed();
+                // The renderer has finished using the immediate context. Keep
+                // the reservation, when present, until the result is
+                // classified below, but do not hold the context itself across
+                // statistics collection or swap-chain presentation.
+                handoffGuard.reset();
                 if (renderer_) {
                     const auto rendererStatistics =
                         renderer_->takeStatistics();
+                    rendererReportedRetryableBusy =
+                        rendererStatistics.stateBusyRenderAttempts > 0
+                        || rendererStatistics
+                               .serializationBusyRenderAttempts
+                            > 0
+                        || rendererStatistics
+                               .deviceContextBusyRenderAttempts
+                            > 0
+                        || rendererStatistics.inFlightBusyRenderAttempts > 0;
+                    rendererDeviceContextBusy = rendererStatistics
+                        .deviceContextBusyRenderAttempts > 0;
                     state->decoderSurfaceCopies.fetch_add(
                         rendererStatistics.decoderSurfaceCopies,
+                        std::memory_order_relaxed);
+                    state->rendererStateBusyRenderAttempts.fetch_add(
+                        rendererStatistics.stateBusyRenderAttempts,
+                        std::memory_order_relaxed);
+                    state->rendererSerializationBusyRenderAttempts.fetch_add(
+                        rendererStatistics.serializationBusyRenderAttempts,
+                        std::memory_order_relaxed);
+                    state->rendererDeviceContextBusyRenderAttempts.fetch_add(
+                        rendererStatistics.deviceContextBusyRenderAttempts,
+                        std::memory_order_relaxed);
+                    state->rendererReservationAwareContextBusyRenderAttempts
+                        .fetch_add(
+                            rendererStatistics
+                                .reservationAwareContextBusyRenderAttempts,
+                            std::memory_order_relaxed);
+                    state->rendererUnreservedContextBusyRenderAttempts
+                        .fetch_add(
+                            rendererStatistics
+                                .unreservedContextBusyRenderAttempts,
+                            std::memory_order_relaxed);
+                    state->rendererInFlightBusyRenderAttempts.fetch_add(
+                        rendererStatistics.inFlightBusyRenderAttempts,
                         std::memory_order_relaxed);
                     updateMaximum(
                         state->maximumColorSetupMicroseconds,
@@ -883,12 +1086,110 @@ private:
                         rendererStatistics
                             .maximumDrawMicroseconds);
                 }
-                if (timestamp < 0.0) {
-                    state->skippedRenders.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
+                if (renderResult.status
+                    != VideoRenderStatus::Rendered) {
+                    switch (renderResult.status) {
+                    case VideoRenderStatus::NoFrame:
+                        state->noFrameRenderAttempts.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                        break;
+                    case VideoRenderStatus::PlayerStateBusy:
+                        state->playerBusyRenderAttempts.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                        break;
+                    case VideoRenderStatus::RendererBusy:
+                        state->rendererBusyRenderAttempts.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                        break;
+                    case VideoRenderStatus::Rendered:
+                        break;
+                    }
+
+                    if (renderResult.status == VideoRenderStatus::NoFrame) {
+                        finishPendingBusy(false);
+                        contextReservation.reset();
+                        continue;
+                    }
+
+                    const bool retryable = renderResult.status
+                            == VideoRenderStatus::PlayerStateBusy
+                        || (renderResult.status
+                                == VideoRenderStatus::RendererBusy
+                            && rendererReportedRetryableBusy);
+                    if (!retryable) {
+                        if (pendingBusy.active) {
+                            if (matchesPendingBusy(renderResult)) {
+                                finishPendingBusy(false);
+                            } else {
+                                finishPendingBusy(true);
+                                recordTerminalDrop();
+                            }
+                        } else {
+                            recordTerminalDrop();
+                        }
+                        contextReservation.reset();
+                        continue;
+                    }
+
+                    if (rendererDeviceContextBusy) {
+                        if (!contextReservation && deviceAccess_) {
+                            contextReservation.emplace(
+                                deviceAccess_->reserveContext());
+                        }
+                    } else {
+                        contextReservation.reset();
+                    }
+
+                    if (pendingBusy.active
+                        && !matchesPendingBusy(renderResult)) {
+                        finishPendingBusy(true);
+                    }
+                    if (!pendingBusy.active) {
+                        pendingBusy.active = true;
+                        pendingBusy.connectionGeneration = generation;
+                        pendingBusy.frameSequence =
+                            renderResult.frameSequence;
+                        pendingBusy.presentationGeneration =
+                            renderResult.presentationGeneration;
+                        pendingBusy.backoffIndex = 0;
+                    } else {
+                        pendingBusy.backoffIndex = std::min(
+                            pendingBusy.backoffIndex + 1,
+                            renderRetryBackoffMilliseconds.size() - 1);
+                    }
+
+                    bool scheduled = false;
+                    {
+                        std::lock_guard<std::mutex> stateLock(state->mutex);
+                        if (!state->stopping && state->player == player
+                            && state->generation == generation) {
+                            state->retryPending = true;
+                            state->retryDeadline = Clock::now()
+                                + std::chrono::milliseconds(
+                                    renderRetryBackoffMilliseconds
+                                        [pendingBusy.backoffIndex]);
+                            scheduled = true;
+                        }
+                    }
+                    if (scheduled) {
+                        state->changed.notify_one();
+                    } else {
+                        pendingBusy = {};
+                        contextReservation.reset();
+                    }
                     continue;
                 }
+                if (pendingBusy.active) {
+                    if (matchesPendingBusy(renderResult)) {
+                        pendingBusy = {};
+                    } else {
+                        finishPendingBusy(true);
+                    }
+                }
+                contextReservation.reset();
                 renderCompleted = steadyMicroseconds();
                 if (options_.outputPreference
                         == D3D11OutputPreference::RequireHdr
@@ -977,7 +1278,7 @@ private:
             }
             if (callback) {
                 try {
-                    callback(timestamp);
+                    callback(renderResult.timestamp);
                 } catch (...) {
                     // User callbacks must not terminate the render worker.
                 }
@@ -993,6 +1294,7 @@ private:
                 std::lock_guard<std::mutex> lock(state->mutex);
                 state->stopping = true;
                 state->requested = false;
+                state->retryPending = false;
                 state->player = nullptr;
                 ++state->generation;
             }

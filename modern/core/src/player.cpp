@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -178,6 +179,18 @@ void applyHttpRecoveryDefaults(
 
 class Player::Impl {
 public:
+    struct VideoFrameSnapshot {
+        VideoFrame frame;
+        std::uint64_t sequence = 0;
+        std::uint64_t generation = 0;
+    };
+
+    struct RenderBindingsSnapshot {
+        RenderCallback callback;
+        VideoRenderer legacyRenderer;
+        std::unordered_map<void*, std::shared_ptr<VideoRenderAPI>> renderAPIs;
+    };
+
     Impl()
     {
         audioSinkCallbackBridge_->owner = this;
@@ -195,7 +208,11 @@ public:
     {
         quitting_.store(true, std::memory_order_release);
         interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
-        presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lock(videoFrameSnapshotMutex_);
+            presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
+            clearCurrentVideoFrameSnapshot();
+        }
         // Pair shutdown with each condition variable's wait mutex so a waiter
         // cannot observe the old predicate and go to sleep after notification.
         {
@@ -628,62 +645,95 @@ public:
 
     void setRenderCallback(RenderCallback callback)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        renderCallback_ = std::move(callback);
+        std::lock_guard<std::mutex> lock(renderBindingsMutex_);
+        auto updated = copyRenderBindings();
+        updated->callback = std::move(callback);
+        publishRenderBindings(std::move(updated));
     }
 
     void setVideoRenderer(VideoRenderer renderer)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        videoRenderer_ = std::move(renderer);
+        std::lock_guard<std::mutex> lock(renderBindingsMutex_);
+        auto updated = copyRenderBindings();
+        updated->legacyRenderer = std::move(renderer);
+        publishRenderBindings(std::move(updated));
     }
 
     void setVideoRenderAPI(
         std::shared_ptr<VideoRenderAPI> renderer,
         void* opaque)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(renderBindingsMutex_);
+        auto updated = copyRenderBindings();
         if (renderer) {
-            videoRenderAPIs_[opaque] = std::move(renderer);
+            updated->renderAPIs[opaque] = std::move(renderer);
         } else {
-            videoRenderAPIs_.erase(opaque);
+            updated->renderAPIs.erase(opaque);
         }
+        publishRenderBindings(std::move(updated));
+    }
+
+    VideoRenderResult renderVideoDetailed(void* opaque)
+    {
+        const auto frame = std::atomic_load_explicit(
+            &currentVideoFrameSnapshot_,
+            std::memory_order_acquire);
+        const auto currentGeneration =
+            presentationGeneration_.load(std::memory_order_acquire);
+        if (!frame || frame->generation != currentGeneration) {
+            return {
+                VideoRenderStatus::NoFrame,
+                -1.0,
+                0,
+                currentGeneration,
+            };
+        }
+
+        const auto bindings = std::atomic_load_explicit(
+            &renderBindings_,
+            std::memory_order_acquire);
+        std::shared_ptr<VideoRenderAPI> renderAPI;
+        VideoRenderer legacyRenderer;
+        if (bindings) {
+            const auto found = bindings->renderAPIs.find(opaque);
+            if (found != bindings->renderAPIs.end()) {
+                renderAPI = found->second;
+            }
+            legacyRenderer = bindings->legacyRenderer;
+        }
+
+        bool rendered = true;
+        if (renderAPI) {
+            rendered = renderAPI->render(frame->frame);
+        } else if (legacyRenderer) {
+            legacyRenderer(frame->frame, opaque);
+        }
+
+        const auto completedGeneration =
+            presentationGeneration_.load(std::memory_order_acquire);
+        if (frame->generation != completedGeneration) {
+            return {
+                VideoRenderStatus::NoFrame,
+                -1.0,
+                0,
+                completedGeneration,
+            };
+        }
+        return {
+            rendered ? VideoRenderStatus::Rendered
+                     : VideoRenderStatus::RendererBusy,
+            static_cast<double>(frame->frame.timestamp()) / 1000.0,
+            frame->sequence,
+            frame->generation,
+        };
     }
 
     double renderVideo(void* opaque)
     {
-        VideoFrame frame;
-        VideoRenderer renderer;
-        std::shared_ptr<VideoRenderAPI> renderAPI;
-        {
-            // Rendering is a real-time, retryable operation. A seek or output
-            // transition may briefly own the player state lock; waiting here
-            // would stall the native render thread (and any UI operation
-            // waiting for its surface lock) behind playback control work.
-            std::unique_lock<std::mutex> lock(
-                mutex_,
-                std::try_to_lock);
-            if (!lock.owns_lock()) {
-                return -1.0;
-            }
-            frame = currentVideoFrame_;
-            renderer = videoRenderer_;
-            const auto found = videoRenderAPIs_.find(opaque);
-            if (found != videoRenderAPIs_.end()) {
-                renderAPI = found->second;
-            }
-        }
-        if (!frame) {
-            return -1.0;
-        }
-        if (renderAPI) {
-            if (!renderAPI->render(frame)) {
-                return -1.0;
-            }
-        } else if (renderer) {
-            renderer(frame, opaque);
-        }
-        return static_cast<double>(frame.timestamp()) / 1000.0;
+        const auto result = renderVideoDetailed(opaque);
+        return result.status == VideoRenderStatus::Rendered
+            ? result.timestamp
+            : -1.0;
     }
 
     void setPlaybackRate(float value)
@@ -756,6 +806,45 @@ public:
     }
 
 private:
+    std::shared_ptr<RenderBindingsSnapshot> copyRenderBindings() const
+    {
+        const auto current = std::atomic_load_explicit(
+            &renderBindings_,
+            std::memory_order_acquire);
+        return current
+            ? std::make_shared<RenderBindingsSnapshot>(*current)
+            : std::make_shared<RenderBindingsSnapshot>();
+    }
+
+    void publishRenderBindings(
+        std::shared_ptr<RenderBindingsSnapshot> bindings)
+    {
+        std::shared_ptr<const RenderBindingsSnapshot> immutable =
+            std::move(bindings);
+        std::atomic_store_explicit(
+            &renderBindings_,
+            std::move(immutable),
+            std::memory_order_release);
+    }
+
+    void clearCurrentVideoFrameSnapshot() noexcept
+    {
+        std::atomic_store_explicit(
+            &currentVideoFrameSnapshot_,
+            std::shared_ptr<const VideoFrameSnapshot> {},
+            std::memory_order_release);
+    }
+
+    bool hasCurrentVideoFrame() const noexcept
+    {
+        const auto frame = std::atomic_load_explicit(
+            &currentVideoFrameSnapshot_,
+            std::memory_order_acquire);
+        return frame
+            && frame->generation
+                == presentationGeneration_.load(std::memory_order_acquire);
+    }
+
     static int interruptCallback(void* opaque)
     {
         const auto* context = static_cast<InterruptContext*>(opaque);
@@ -885,7 +974,8 @@ private:
                                     std::memory_order_acquire),
                                 false,
                                 true);
-                        } else if (!currentVideoFrame_ && !audioSinkOpen_) {
+                        } else if (!hasCurrentVideoFrame()
+                                   && !audioSinkOpen_) {
                             primeOutputWaitLocked(
                                 currentPosition_,
                                 presentationGeneration_.load(
@@ -977,7 +1067,6 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             hasOpenMedia_ = false;
             mediaInfo_ = {};
-            currentVideoFrame_ = {};
             currentPosition_ = 0;
             loopsCompleted_ = 0;
         }
@@ -1399,7 +1488,6 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             currentPosition_ = targetMs;
-            currentVideoFrame_ = {};
             resetClockLocked(targetMs);
             waitForData = currentState_ == State::Playing
                 && requestedState_ == State::Playing;
@@ -2547,8 +2635,6 @@ private:
         }
 
         VideoFrameCallback frameCallback;
-        RenderCallback renderCallback;
-        std::vector<void*> renderKeys;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (item.generation
@@ -2557,18 +2643,46 @@ private:
             }
             currentPosition_ =
                 std::max(currentPosition_, item.video.timestamp());
-            currentVideoFrame_ = item.video;
             frameCallback = videoFrameCallback_;
-            renderCallback = renderCallback_;
-            const bool scheduleLegacyRenderer = videoRenderer_
-                && videoRenderAPIs_.find(nullptr) == videoRenderAPIs_.end();
+        }
+
+        auto frameSnapshot = std::make_shared<VideoFrameSnapshot>();
+        frameSnapshot->frame = item.video;
+        frameSnapshot->generation = item.generation;
+        frameSnapshot->sequence =
+            nextVideoFrameSequence_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(videoFrameSnapshotMutex_);
+            if (item.generation
+                != presentationGeneration_.load(std::memory_order_acquire)) {
+                return;
+            }
+            std::shared_ptr<const VideoFrameSnapshot> immutable =
+                std::move(frameSnapshot);
+            std::atomic_store_explicit(
+                &currentVideoFrameSnapshot_,
+                std::move(immutable),
+                std::memory_order_release);
+        }
+
+        const auto bindings = std::atomic_load_explicit(
+            &renderBindings_,
+            std::memory_order_acquire);
+        const auto renderCallback = bindings
+            ? bindings->callback
+            : RenderCallback {};
+        std::vector<void*> renderKeys;
+        if (bindings) {
+            const bool scheduleLegacyRenderer = bindings->legacyRenderer
+                && bindings->renderAPIs.find(nullptr)
+                    == bindings->renderAPIs.end();
             renderKeys.reserve(
-                videoRenderAPIs_.size()
+                bindings->renderAPIs.size()
                 + (scheduleLegacyRenderer ? 1U : 0U));
             if (scheduleLegacyRenderer) {
                 renderKeys.push_back(nullptr);
             }
-            for (const auto& entry : videoRenderAPIs_) {
+            for (const auto& entry : bindings->renderAPIs) {
                 renderKeys.push_back(entry.first);
             }
         }
@@ -2695,7 +2809,11 @@ private:
 
     void invalidatePlaybackQueues()
     {
-        presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lock(videoFrameSnapshotMutex_);
+            presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
+            clearCurrentVideoFrameSnapshot();
+        }
         invalidateAudioClock();
         audioQueueChanged_.notify_all();
         audioQueueSpace_.notify_all();
@@ -2731,7 +2849,6 @@ private:
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            currentVideoFrame_ = {};
             waitingForOutput_ = false;
             outputWaitPrimed_ = false;
             outputWaitGeneration_ = 0;
@@ -3808,6 +3925,8 @@ private:
     }
 
     mutable std::mutex mutex_;
+    mutable std::mutex renderBindingsMutex_;
+    mutable std::mutex videoFrameSnapshotMutex_;
     mutable std::mutex audioSinkCallMutex_;
     mutable std::mutex audioClockMutex_;
     mutable std::mutex audioQueueMutex_;
@@ -3912,11 +4031,10 @@ private:
     bool audioSinkOpenAttempted_ = false;
     bool audioSinkHasClock_ = false;
     bool audioFrameConverterOpen_ = false;
-    RenderCallback renderCallback_;
-    VideoRenderer videoRenderer_;
-    std::unordered_map<void*, std::shared_ptr<VideoRenderAPI>>
-        videoRenderAPIs_;
-    VideoFrame currentVideoFrame_;
+    std::shared_ptr<const RenderBindingsSnapshot> renderBindings_ =
+        std::make_shared<const RenderBindingsSnapshot>();
+    std::shared_ptr<const VideoFrameSnapshot> currentVideoFrameSnapshot_;
+    std::atomic<std::uint64_t> nextVideoFrameSequence_ { 1 };
 };
 
 Player::Player()
@@ -4067,6 +4185,11 @@ Player& Player::setVideoRenderAPI(
 {
     impl_->setVideoRenderAPI(std::move(renderer), opaque);
     return *this;
+}
+
+VideoRenderResult Player::renderVideoDetailed(void* opaque)
+{
+    return impl_->renderVideoDetailed(opaque);
 }
 
 double Player::renderVideo(void* opaque)

@@ -383,10 +383,10 @@ look like a process leak.
 
 ### Decision
 
-1. `Player::renderVideo()` and the D3D11 renderer use non-blocking acquisition
-   for real-time state, render, and immediate-context ownership. Contention is
-   a retryable declined render, not permission to block the native render or UI
-   thread.
+1. Player rendering and the D3D11 renderer do not block the native render or UI
+   thread on control, render, or immediate-context ownership. AD-008 replaces
+   Player's former non-blocking state-lock attempt with immutable snapshots and
+   adds reason-aware results plus bounded output-thread retry/handoff.
 2. When the bounded presentation queue is full, it preserves its contiguous
    near-term frames and rejects a farther-future incoming frame. A decode burst
    after seek must not replace the frame that is about to be displayed.
@@ -403,15 +403,17 @@ look like a process leak.
    texture pool. Per-frame libplacebo wrappers are released after submission;
    libplacebo's renderer owns its bounded reusable shader/render caches and
    teardown performs the only explicit GPU drain.
-6. Retryable skipped renders, compositor-busy presents, and maximum render
-   stage durations are counted without per-frame logging.
+6. Retry attempts, terminal drops, compositor-busy presents, and maximum render
+   stage durations are counted without per-frame logging. AD-008 defines the
+   reason-level counters and compatibility `skippedRenders` semantics.
 
 ### Consequences
 
 - Audio, UI dispatch, and control operations remain responsive when the GPU or
   compositor is temporarily busy.
-- A negative `renderVideo()` result, skipped render, or busy present schedules a
-  later attempt and is not by itself a fatal rendering error.
+- The detailed render result determines whether the high-level output retries.
+  The compatibility `renderVideo()` negative value intentionally loses that
+  distinction; a busy present still schedules a later attempt.
 - Driver working set may rise transiently across seek and queued GPU work, but
   retained application resources are bounded and must not grow linearly per
   frame or per seek.
@@ -709,12 +711,114 @@ adapter/driver details and objective cadence from those final two runs were not
 supplied in this handoff, so that confirmation is a correctness acceptance,
 not a performance benchmark.
 
-The user separately reported that 4K playback on the AMD integrated GPU looks
-slightly frame-droppy by eye. No cadence trace or failing stage accompanied the
-observation. This does not reopen AD-007: `PLAN.md` tracks an AMD integrated-GPU
-performance investigation to distinguish input/decode/clock scheduling,
-libplacebo draw cost, context contention, and compositor backpressure before
-any implementation change is selected. It cannot close until the final AMD and
-Intel test devices both record exact adapter/PCI and driver details, Windows
-and build conditions, and objective source/scheduled/rendered cadence plus
-stage timing from the same current policy and representative 4K workloads.
+The later AMD cadence trace and generic scheduling correction are recorded in
+AD-008. They do not reopen AD-007: native context protection, asynchronous
+submission, direct decoder-slice sampling, and bounded GPU lifetime retention
+remain unchanged.
+
+## AD-008: Windows retries transient rendering with a bounded D3D11 handoff
+
+- Date: 2026-08-04
+- Status: Accepted
+- Scope: Core render snapshots, Windows D3D11 context scheduling, composition
+  output retry semantics, and cadence diagnostics
+
+### Context
+
+On the recorded Radeon 880M, both 4K HDR10 and Dolby Vision Profile 5 scheduled
+at source rate, used D3D11VA with no decoded-source copy or CPU map, stayed
+below their renderer-stage budgets, and reported no `Present()` backpressure.
+They still lost one to nine output frames in representative five-second
+windows. The first failing boundary was between Player's render request and a
+successful backend draw.
+
+The compatibility `Player::renderVideo()` returned one negative value for no
+frame, Player state-lock contention, and a renderer that temporarily declined
+the frame. `D3D11VideoOutput` counted that value as skipped and did not retry.
+A diagnostic blocking Player lock removed nearly all loss but violated the
+non-blocking native-render contract. Atomically publishing Player render state
+removed that collision, then reason-level diagnostics exposed the remaining
+owner: FFmpeg's reservation-aware D3D11VA work could release and immediately
+reacquire the recursive immediate-context lock before a timer-only retry.
+
+### Decision
+
+1. Add `Player::renderVideoDetailed()` and `VideoRenderResult`. Each attempt
+   reports `Rendered`, `NoFrame`, `PlayerStateBusy`, or `RendererBusy` plus a
+   monotonically assigned frame sequence and presentation generation. Keep
+   `renderVideo()` as a source-compatible wrapper that returns a timestamp only
+   for `Rendered`.
+2. Publish immutable current-frame and render-binding snapshots with C++17
+   atomic shared-pointer operations. The render hot path does not acquire the
+   Player control mutex. Recheck presentation generation after the backend
+   call so seek, stop, or media replacement rejects a stale completion.
+3. Let `D3D11VideoOutput` retain only one latest retryable frame. A later frame
+   supersedes the pending sequence; detach, stop, or a connection-generation
+   change cancels it. `NoFrame` is not timer-retried, and a backend failure with
+   no recorded transient lock/capacity reason is terminal.
+4. Preserve recursive immediate-context serialization and the required native
+   `ID3D10Multithread` protection, but make FFmpeg/internal acquisitions honor
+   render-thread reservations. A reservation owns no D3D11 context and does not
+   block ordinary public `contextGuard()` users. Establish it before each
+   output pass makes its first non-blocking context attempt, so a contended
+   pass enters `tryContextGuardFor()` for an at-most-8-ms handoff without first
+   yielding priority back to FFmpeg. Failures return to bounded
+   1/2/4/8/16-ms timer backoff without busy spinning.
+5. Hold the acquired handoff guard only through the renderer call, never
+   through statistics collection or `Present()`. All waits run on the private
+   output thread, not the WinUI dispatcher or a Player worker.
+6. Report attempt reason, renderer state/serialization/context/in-flight
+   contention, reservation-aware versus unreserved context owner, handoff
+   wait/timeout, retry wakeup, supersession, and terminal drop separately.
+   Retain `skippedRenders` as a compatibility mirror of terminal drops; a
+   recovered retry is not a skipped frame.
+
+### Consequences
+
+- Native/UI render integrations can distinguish retryable contention from the
+  absence of a current frame without blocking on Player control work.
+- The high-level Windows output can recover a transient collision without a
+  second decoder callback, but never accumulates an unbounded retry queue.
+- FFmpeg decode cannot overtake a contended output pass or its reserved retry.
+  Unrelated public D3D11 users keep the pre-existing blocking/non-blocking
+  guard behavior, avoiding a reservation-induced graphics/context lock
+  inversion.
+- The new public result and Windows statistics are additive API. Existing code
+  using `renderVideo()` and `skippedRenders` continues to compile, with the
+  clarified terminal-drop meaning for the latter.
+- The Radeon correction does not establish Intel performance equivalence; the
+  same-build Intel workload and full two-device matrix remain open in
+  `PLAN.md`.
+
+### Windows validation
+
+The final shared Release WinUI build ran on the documented Radeon 880M,
+Windows HDR display, and RGB10/PQ output. `wednesday.mp4` sustained about
+23.8-24.1 presented fps for roughly 55 seconds. Every settled window reported
+zero superseded and terminal frames; one to ten context collisions per window
+were all reservation-aware, and every handoff completed without timeout.
+
+The same process replaced the media with `legend.mkv`. The transition reported
+one expected `NoFrame` attempt for the new presentation generation, followed
+by zero superseded and terminal frames. Settled windows recorded four to
+fourteen reservation-aware context collisions, zero handoff timeouts, zero
+Player-busy attempts, zero `Present()` busy results, and zero decoder copies.
+Both files retained D3D11VA hardware decoding and direct decoder-slice
+rendering. Targeted Player-generation, D3D11 device-access fairness/timed-wait,
+and composition-output retry/supersession tests provide deterministic coverage
+for the new contracts.
+
+A later high-load Release check exposed a narrower scheduling window: because
+the reservation was created only after the first failed renderer acquisition,
+`legend.mkv` could still supersede one or two pending frames in a five-second
+window. Establishing the reservation before each output pass's initial
+non-blocking acquisition eliminated renderer-busy, superseded, and terminal
+counts for both supplied files; all intercepted handoffs completed within the
+same 8-ms bound. The composition-output test then passed twenty consecutive
+runs. That observation also recorded a separate, non-accepted throughput state
+with 57-75 ms libplacebo draw maxima and later audio underruns after prolonged
+build/UI-capture load. After an idle interval, a fresh process restored
+`legend.mkv` to 24.9-25.1 fps and `wednesday.mp4` to 23.8-24.1 fps with zero
+steady coalescing, busy, superseded, or terminal counts; warm draw maxima were
+about 35-43 ms. `PLAN.md` therefore records the high-load result as an
+environmental caution and keeps only the Intel performance comparison open.

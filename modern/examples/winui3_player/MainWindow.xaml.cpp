@@ -829,6 +829,34 @@ struct MainWindowPrivate final {
         const auto rendered = outputStatistics.presentedFrames;
         const auto busyPresents = outputStatistics.busyPresents;
         const auto skippedRenders = outputStatistics.skippedRenders;
+        const auto noFrameRenders =
+            outputStatistics.noFrameRenderAttempts;
+        const auto playerBusyRenders =
+            outputStatistics.playerBusyRenderAttempts;
+        const auto rendererBusyRenders =
+            outputStatistics.rendererBusyRenderAttempts;
+        const auto retryWakeups = outputStatistics.retryWakeups;
+        const auto supersededRenderFrames =
+            outputStatistics.supersededRenderFrames;
+        const auto terminalRenderDrops =
+            outputStatistics.terminalRenderDrops;
+        const auto rendererStateBusyRenders =
+            outputStatistics.rendererStateBusyRenderAttempts;
+        const auto rendererSerializationBusyRenders =
+            outputStatistics.rendererSerializationBusyRenderAttempts;
+        const auto rendererContextBusyRenders =
+            outputStatistics.rendererDeviceContextBusyRenderAttempts;
+        const auto rendererReservationAwareContextBusyRenders =
+            outputStatistics
+                .rendererReservationAwareContextBusyRenderAttempts;
+        const auto rendererUnreservedContextBusyRenders =
+            outputStatistics.rendererUnreservedContextBusyRenderAttempts;
+        const auto contextHandoffWaits =
+            outputStatistics.contextHandoffWaits;
+        const auto contextHandoffTimeouts =
+            outputStatistics.contextHandoffTimeouts;
+        const auto rendererInFlightBusyRenders =
+            outputStatistics.rendererInFlightBusyRenderAttempts;
         const auto decoderSurfaceCopies =
             outputStatistics.decoderSurfaceCopies;
         const auto videoLongGaps =
@@ -867,6 +895,21 @@ struct MainWindowPrivate final {
             << L" fps, coalesced=" << coalesced
             << L", present-busy=" << busyPresents
             << L", render-skipped=" << skippedRenders
+            << L" (no-frame/player-busy/renderer-busy="
+            << noFrameRenders << L'/' << playerBusyRenders << L'/'
+            << rendererBusyRenders << L')'
+            << L", retry/superseded/terminal=" << retryWakeups << L'/'
+            << supersededRenderFrames << L'/' << terminalRenderDrops
+            << L", renderer-busy(state/serialize/context/in-flight)="
+            << rendererStateBusyRenders << L'/'
+            << rendererSerializationBusyRenders << L'/'
+            << rendererContextBusyRenders << L'/'
+            << rendererInFlightBusyRenders
+            << L", context-owner(reservation-aware/unreserved)="
+            << rendererReservationAwareContextBusyRenders << L'/'
+            << rendererUnreservedContextBusyRenders
+            << L", handoff(wait/timeout)=" << contextHandoffWaits << L'/'
+            << contextHandoffTimeouts
             << L", decoder-copies=" << decoderSurfaceCopies
             << L", >80ms gaps(video/render)="
             << videoLongGaps << L'/' << renderLongGaps

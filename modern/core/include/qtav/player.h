@@ -30,6 +30,29 @@ struct QTAV_CORE_EXPORT PlaybackStatistics {
     std::uint64_t maximumVideoPresentationStarvationMilliseconds = 0;
 };
 
+enum class VideoRenderStatus {
+    Rendered,
+    // No current frame exists, or its presentation generation was invalidated
+    // before the backend completed. Wait for the next render callback.
+    NoFrame,
+    // Reserved for transient Player-side render-state contention.
+    PlayerStateBusy,
+    // The selected VideoRenderAPI declined this attempt. Backends may expose
+    // more detailed diagnostics to decide whether it is retryable.
+    RendererBusy,
+};
+
+// Detailed result for one render-thread attempt. A frame sequence is
+// monotonically assigned when Player publishes a new current frame. Sequence
+// zero means that no current frame was available. presentationGeneration
+// changes whenever seek, stop, or media replacement invalidates queued video.
+struct QTAV_CORE_EXPORT VideoRenderResult {
+    VideoRenderStatus status = VideoRenderStatus::NoFrame;
+    double timestamp = -1.0;
+    std::uint64_t frameSequence = 0;
+    std::uint64_t presentationGeneration = 0;
+};
+
 class QTAV_CORE_EXPORT Player {
 public:
     using StateCallback = std::function<void(State)>;
@@ -97,9 +120,11 @@ public:
     Player& setVideoRenderAPI(
         std::shared_ptr<VideoRenderAPI> renderer,
         void* opaque = nullptr);
+    // Synchronously renders the atomically published current-frame snapshot on
+    // the caller's thread and preserves reason, sequence, and generation.
+    VideoRenderResult renderVideoDetailed(void* opaque = nullptr);
     // Returns the rendered frame timestamp in seconds. A negative value means
-    // there is no current frame or this retryable render attempt was declined
-    // because player/backend state is temporarily busy.
+    // renderVideoDetailed() did not return VideoRenderStatus::Rendered.
     double renderVideo(void* opaque = nullptr);
 
     void setPlaybackRate(float value);

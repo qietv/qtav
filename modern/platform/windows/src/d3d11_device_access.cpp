@@ -5,7 +5,12 @@
 #include <d3d10_1.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <condition_variable>
+#include <exception>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include "d3d11_device_access_internal.h"
@@ -14,6 +19,130 @@ namespace qtav {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+class ReservedRecursiveMutex {
+public:
+    struct TryLockResult {
+        bool locked = false;
+        bool ownerHonorsReservations = false;
+    };
+
+    void lock(bool honorReservations = false)
+    {
+        const auto thread = std::this_thread::get_id();
+        std::unique_lock<std::mutex> lock(stateMutex_);
+        changed_.wait(
+            lock,
+            [&] {
+                return owner_ == thread
+                    || (depth_ == 0
+                        && (!honorReservations
+                            || reservations_.empty()
+                            || reservations_.find(thread)
+                                != reservations_.end()));
+            });
+        if (owner_ == thread) {
+            ++depth_;
+        } else {
+            owner_ = thread;
+            depth_ = 1;
+            ownerHonorsReservations_ = honorReservations;
+        }
+    }
+
+    TryLockResult tryLock(bool honorReservations = false)
+    {
+        const auto thread = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (owner_ == thread) {
+            ++depth_;
+            return { true, ownerHonorsReservations_ };
+        }
+        if (depth_ != 0
+            || (honorReservations && !reservations_.empty()
+                && reservations_.find(thread) == reservations_.end())) {
+            return { false, depth_ != 0 && ownerHonorsReservations_ };
+        }
+        owner_ = thread;
+        depth_ = 1;
+        ownerHonorsReservations_ = honorReservations;
+        return { true, ownerHonorsReservations_ };
+    }
+
+    TryLockResult tryLockFor(std::chrono::milliseconds timeout)
+    {
+        const auto thread = std::this_thread::get_id();
+        std::unique_lock<std::mutex> lock(stateMutex_);
+        if (owner_ == thread) {
+            ++depth_;
+            return { true, ownerHonorsReservations_ };
+        }
+        if (!changed_.wait_for(
+                lock,
+                timeout,
+                [&] {
+                    return depth_ == 0
+                        && (reservations_.empty()
+                            || reservations_.find(thread)
+                                != reservations_.end());
+                })) {
+            return { false, ownerHonorsReservations_ };
+        }
+        owner_ = thread;
+        depth_ = 1;
+        ownerHonorsReservations_ = false;
+        return { true, false };
+    }
+
+    void unlock() noexcept
+    {
+        bool released = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            if (owner_ != std::this_thread::get_id() || depth_ == 0) {
+                std::terminate();
+            }
+            --depth_;
+            if (depth_ == 0) {
+                owner_ = {};
+                ownerHonorsReservations_ = false;
+                released = true;
+            }
+        }
+        if (released) {
+            changed_.notify_all();
+        }
+    }
+
+    void reserve(std::thread::id thread)
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        ++reservations_[thread];
+    }
+
+    void release(std::thread::id thread) noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            const auto found = reservations_.find(thread);
+            if (found == reservations_.end()) {
+                std::terminate();
+            }
+            if (--found->second == 0) {
+                reservations_.erase(found);
+            }
+        }
+        changed_.notify_all();
+    }
+
+private:
+    std::mutex stateMutex_;
+    std::condition_variable changed_;
+    std::thread::id owner_;
+    std::size_t depth_ = 0;
+    bool ownerHonorsReservations_ = false;
+    std::unordered_map<std::thread::id, std::size_t> reservations_;
+};
 
 bool sameComObject(IUnknown* first, IUnknown* second) noexcept
 {
@@ -75,37 +204,58 @@ public:
 
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> immediateContext_;
-    std::recursive_mutex contextMutex_;
+    ReservedRecursiveMutex contextMutex_;
 };
 
 class D3D11ContextGuard::Impl {
 public:
-    Impl(std::shared_ptr<void> lifetime, void* mutex, bool tryLock)
+    Impl(
+        std::shared_ptr<void> lifetime,
+        void* mutex,
+        bool tryLock,
+        std::chrono::milliseconds timeout,
+        bool honorReservations)
         : lifetime_(std::move(lifetime))
-        , lock_(
-              *static_cast<std::recursive_mutex*>(mutex),
-              std::defer_lock)
+        , mutex_(static_cast<ReservedRecursiveMutex*>(mutex))
     {
         if (tryLock) {
-            const bool locked = lock_.try_lock();
-            (void)locked;
+            const auto result = honorReservations
+                ? mutex_->tryLockFor(timeout)
+                : mutex_->tryLock();
+            locked_ = result.locked;
+            contendedByReservationAwareOwner_ =
+                !result.locked && result.ownerHonorsReservations;
         } else {
-            lock_.lock();
+            mutex_->lock();
+            locked_ = true;
+        }
+    }
+
+    ~Impl()
+    {
+        if (locked_) {
+            mutex_->unlock();
         }
     }
 
     std::shared_ptr<void> lifetime_;
-    std::unique_lock<std::recursive_mutex> lock_;
+    ReservedRecursiveMutex* mutex_ = nullptr;
+    bool locked_ = false;
+    bool contendedByReservationAwareOwner_ = false;
 };
 
 D3D11ContextGuard::D3D11ContextGuard(
     std::shared_ptr<void> lifetime,
     void* mutex,
-    bool tryLock)
+    bool tryLock,
+    std::chrono::milliseconds timeout,
+    bool honorReservations)
     : impl_(std::make_unique<Impl>(
           std::move(lifetime),
           mutex,
-          tryLock))
+          tryLock,
+          timeout,
+          honorReservations))
 {
 }
 
@@ -117,7 +267,52 @@ D3D11ContextGuard& D3D11ContextGuard::operator=(
 
 D3D11ContextGuard::operator bool() const noexcept
 {
-    return impl_ && impl_->lock_.owns_lock();
+    return impl_ && impl_->locked_;
+}
+
+bool D3D11ContextGuard::contendedByReservationAwareOwner() const noexcept
+{
+    return impl_ && impl_->contendedByReservationAwareOwner_;
+}
+
+class D3D11ContextReservation::Impl {
+public:
+    Impl(std::shared_ptr<void> lifetime, void* mutex)
+        : lifetime_(std::move(lifetime))
+        , mutex_(static_cast<ReservedRecursiveMutex*>(mutex))
+        , thread_(std::this_thread::get_id())
+    {
+        mutex_->reserve(thread_);
+    }
+
+    ~Impl()
+    {
+        mutex_->release(thread_);
+    }
+
+    std::shared_ptr<void> lifetime_;
+    ReservedRecursiveMutex* mutex_ = nullptr;
+    std::thread::id thread_;
+};
+
+D3D11ContextReservation::D3D11ContextReservation(
+    std::shared_ptr<void> lifetime,
+    void* mutex)
+    : impl_(std::make_unique<Impl>(
+          std::move(lifetime),
+          mutex))
+{
+}
+
+D3D11ContextReservation::~D3D11ContextReservation() = default;
+D3D11ContextReservation::D3D11ContextReservation(
+    D3D11ContextReservation&&) noexcept = default;
+D3D11ContextReservation& D3D11ContextReservation::operator=(
+    D3D11ContextReservation&&) noexcept = default;
+
+D3D11ContextReservation::operator bool() const noexcept
+{
+    return static_cast<bool>(impl_);
 }
 
 std::shared_ptr<D3D11DeviceAccess> D3D11DeviceAccess::create(
@@ -204,12 +399,30 @@ D3D11ContextGuard D3D11DeviceAccess::tryContextGuard() const
         true);
 }
 
+D3D11ContextGuard D3D11DeviceAccess::tryContextGuardFor(
+    std::chrono::milliseconds timeout) const
+{
+    return D3D11ContextGuard(
+        impl_,
+        &impl_->contextMutex_,
+        true,
+        std::max(timeout, std::chrono::milliseconds { 0 }),
+        true);
+}
+
+D3D11ContextReservation D3D11DeviceAccess::reserveContext() const
+{
+    return D3D11ContextReservation(
+        impl_,
+        &impl_->contextMutex_);
+}
+
 namespace detail {
 
 void D3D11DeviceAccessPrivate::lock(
     D3D11DeviceAccess& access) noexcept
 {
-    access.impl_->contextMutex_.lock();
+    access.impl_->contextMutex_.lock(true);
 }
 
 void D3D11DeviceAccessPrivate::unlock(

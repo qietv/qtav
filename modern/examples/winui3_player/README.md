@@ -58,8 +58,9 @@ HDR10 presentation model commonly used by dedicated video renderers.
 | Shared Windows D3D11 device access | `QtAV::PlatformWindows` |
 
 `qtav::D3D11VideoOutput` owns the D3D11 device, composition swap chain,
-render target, render scheduling thread, `renderVideo()`, `Present()`, resize,
-display/HDR tracking, and teardown. The application supplies only its HWND and
+render target, reason-aware render scheduling thread, bounded retry/handoff,
+`Present()`, resize, display/HDR tracking, and teardown. The application
+supplies only its HWND and
 an `ISwapChainPanelNative::SetSwapChain` binding callback, attaches the
 `qtav::Player`, and forwards panel-size changes.
 
@@ -169,7 +170,10 @@ The Debug window keeps the most recent 1,000 lines and reports:
 - first decoded audio/video frame and first presented video frame;
 - five-second cadence snapshots for scheduled video, decoded audio, render
   requests/passes, presented frames, coalesced redraws, busy presents,
-  retryable skipped renders, gaps over 80 ms, and maximum render-stage times.
+  reason-level no-frame/Player/renderer contention, retry wakeups, superseded
+  and terminal frames, D3D11 context-owner and handoff counts, gaps over 80 ms,
+  and maximum render-stage times. `render-skipped` is the compatibility mirror
+  of terminal drops; a recovered retry is not counted as skipped.
 
 The cadence line helps distinguish decode or network starvation from a slow
 render/driver stage. It is diagnostic evidence, not a stable machine-readable
@@ -182,6 +186,11 @@ log format.
 - There is no adaptive bitrate policy, download cache, or detailed network
   buffering UI.
 - Only Windows x64 Debug and Release project configurations are supplied.
+- Debug also requires ABI-compatible Debug variants of the repository FFmpeg
+  dependencies. The current release-only Windows artifact has no Debug
+  `placebo.lib`; ClangCL correctly rejects mixing its
+  `_ITERATOR_DEBUG_LEVEL=0` library with Debug level 2 objects. Use Release for
+  that artifact rather than forcing an ABI override.
 - Debug logging is in-memory and is not written to disk.
 - Closing the main window performs deterministic synchronous teardown. Active
   FFmpeg I/O is interrupted and workers are joined, so a broken protocol or

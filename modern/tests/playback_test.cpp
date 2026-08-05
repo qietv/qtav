@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+#if defined(NDEBUG)
+#  undef NDEBUG
+#endif
+
 #include <qtav/player.h>
 #include <qtav/video_render_api.h>
 
@@ -49,6 +53,59 @@ private:
     EventCallback callback_;
 };
 
+class BlockingRenderer final : public qtav::VideoRenderAPI {
+public:
+    qtav::VideoRenderCapabilities capabilities() const override
+    {
+        return {};
+    }
+    void setEventCallback(EventCallback callback) override
+    {
+        callback_ = std::move(callback);
+    }
+    bool open(const qtav::VideoRenderConfig&) override { return true; }
+    bool configure(const qtav::VideoRenderConfig&) override { return true; }
+    bool render(const qtav::VideoFrame& frame) override
+    {
+        assert(frame);
+        std::unique_lock<std::mutex> lock(mutex_);
+        entered_ = true;
+        changed_.notify_all();
+        const bool released = changed_.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return released_; });
+        assert(released);
+        return true;
+    }
+    void close() noexcept override {}
+
+    bool waitUntilEntered()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return entered_; });
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        changed_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false;
+    bool released_ = false;
+    EventCallback callback_;
+};
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -72,6 +129,10 @@ int main(int argc, char** argv)
     auto rejectingRenderer = std::make_shared<CountingRenderer>(
         rejectedRenderAttempts,
         false);
+    const auto emptyRender = player.renderVideoDetailed();
+    assert(emptyRender.status == qtav::VideoRenderStatus::NoFrame);
+    assert(emptyRender.frameSequence == 0);
+    assert(player.renderVideo() < 0.0);
 
     player
         .onMediaStatus([&](qtav::MediaStatus, qtav::MediaStatus status) {
@@ -106,24 +167,24 @@ int main(int argc, char** argv)
         .setVideoRenderAPI(rejectingRenderer, &rejectingRenderKey)
         .setRenderCallback([&](void* opaque) {
             const auto rejectedBefore = rejectedRenderAttempts.load();
-            auto timestamp = player.renderVideo(opaque);
-            for (int attempt = 0;
-                 (opaque == &rejectingRenderKey
-                      ? rejectedRenderAttempts.load() == rejectedBefore
-                      : timestamp < 0.0)
-                     && attempt < 1'000;
-                 ++attempt) {
-                std::this_thread::yield();
-                timestamp = player.renderVideo(opaque);
+            if (!opaque) {
+                assert(player.renderVideo() >= 0.0);
+                return;
             }
-            assert(
-                opaque == &rejectingRenderKey
-                    ? timestamp < 0.0
-                    : timestamp >= 0.0);
+
+            const auto result = player.renderVideoDetailed(opaque);
+            assert(result.frameSequence > 0);
+            assert(result.presentationGeneration > 0);
+            assert(result.status != qtav::VideoRenderStatus::PlayerStateBusy);
             if (opaque == &rejectingRenderKey) {
+                assert(
+                    result.status
+                    == qtav::VideoRenderStatus::RendererBusy);
                 assert(
                     rejectedRenderAttempts.load()
                     == rejectedBefore + 1);
+            } else {
+                assert(result.status == qtav::VideoRenderStatus::Rendered);
             }
         });
 
@@ -146,6 +207,61 @@ int main(int argc, char** argv)
     assert(renderedFrames.load() == videoFrames.load() * 3);
     assert(rejectedRenderAttempts.load() == videoFrames.load());
     assert(player.state() == qtav::State::Stopped);
+
+    qtav::Player invalidationPlayer;
+    auto blockingRenderer = std::make_shared<BlockingRenderer>();
+    std::mutex renderRequestMutex;
+    std::condition_variable renderRequestChanged;
+    bool renderRequested = false;
+    bool renderFinished = false;
+    qtav::VideoRenderResult invalidatedRender;
+    invalidationPlayer
+        .setVideoRenderAPI(blockingRenderer)
+        .setRenderCallback([&](void*) {
+            {
+                std::lock_guard<std::mutex> requestLock(
+                    renderRequestMutex);
+                renderRequested = true;
+            }
+            renderRequestChanged.notify_all();
+        });
+    std::thread renderThread([&] {
+        {
+            std::unique_lock<std::mutex> requestLock(
+                renderRequestMutex);
+            const bool requested = renderRequestChanged.wait_for(
+                requestLock,
+                std::chrono::seconds(5),
+                [&] { return renderRequested; });
+            assert(requested);
+        }
+        invalidatedRender = invalidationPlayer.renderVideoDetailed();
+        {
+            std::lock_guard<std::mutex> requestLock(renderRequestMutex);
+            renderFinished = true;
+        }
+        renderRequestChanged.notify_all();
+    });
+    invalidationPlayer.setMedia(argv[1]);
+    invalidationPlayer.setState(qtav::State::Playing);
+    assert(blockingRenderer->waitUntilEntered());
+    assert(invalidationPlayer.seek(0));
+    invalidationPlayer.setVideoRenderAPI({});
+    blockingRenderer->release();
+    {
+        std::unique_lock<std::mutex> requestLock(renderRequestMutex);
+        assert(renderRequestChanged.wait_for(
+            requestLock,
+            std::chrono::seconds(5),
+            [&] { return renderFinished; }));
+    }
+    renderThread.join();
+    assert(
+        invalidatedRender.status
+        == qtav::VideoRenderStatus::NoFrame);
+    assert(invalidatedRender.frameSequence == 0);
+    invalidationPlayer.setState(qtav::State::Stopped);
+    assert(invalidationPlayer.waitFor(qtav::State::Stopped, 5'000));
 
     qtav::Player scheduledPlayer;
     std::mutex scheduledMutex;
