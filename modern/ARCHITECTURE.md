@@ -22,8 +22,14 @@ The active implementation has these non-negotiable boundaries:
 - hardware decode, hardware-frame interop, rendering, audio output, and native
   window ownership remain separate responsibilities;
 - native frames use reference-counted lifetime and explicit synchronization;
-- zero-copy means no decoded-source CPU map, software transfer, CPU staging,
-  or re-upload. Final render-target readback is allowed only for validation.
+- zero-CPU-copy means no decoded-source CPU map, software transfer, CPU
+  staging, or re-upload. It may still include a GPU-only representation
+  normalization pass and an intermediate texture. Final render-target readback
+  is allowed only for validation;
+- strict no-intermediate source zero-copy is a narrower claim: the retained
+  decoded native buffer has an explicit graphics format and plane mapping and
+  is wrapped directly as libplacebo's source, with no normalization draw or
+  intermediate source texture.
 
 ## Repository layers
 
@@ -155,6 +161,13 @@ representation conversion that preserves raw source components. It must not
 apply a color matrix, inverse/forward transfer, gamut conversion, Dolby
 Vision reshape, tone mapping, or output encoding.
 
+Platform interop is limited to native-buffer import, format/plane exposure,
+producer/consumer synchronization, timestamp and generation correlation, and
+reference-counted lifetime through GPU completion. It must not become a second
+color pipeline. This division applies equally to Windows D3D11, Vulkan, and
+OpenGL ES: libplacebo is their sole semantic color, Dolby Vision, tone-map,
+gamut-map, scaling, and output-encoding authority.
+
 This boundary currently allows two mobile normalization passes:
 
 - Vulkan external-format hardware images may be normalized to an explicit raw
@@ -165,20 +178,28 @@ This boundary currently allows two mobile normalization passes:
   libplacebo renders it.
 
 These passes are GPU-to-GPU representation work, not decoded-source copies and
-not alternative color pipelines.
+not alternative color pipelines. They satisfy the zero-CPU-copy definition
+when their source lifetime and synchronization are retained, but they do not
+satisfy strict no-intermediate source zero-copy. A Vulkan native image qualifies
+for the strict claim only when an explicit `VkFormat` and plane mapping let the
+renderer wrap the retained decoded allocation directly for libplacebo.
 
 Windows needs no normalization shader. D3D11VA textures are created with
 `D3D11_BIND_SHADER_RESOURCE`; the interop retains the exact NV12/P010 array
 slice, and libplacebo wraps its luma and chroma plane views directly. A D3D11
 Video Processor RGB conversion is deliberately absent because it would erase
-the raw Profile 5 representation before Dolby Vision reshaping.
+the raw Profile 5 representation before Dolby Vision reshaping. This direct
+plane wrapping meets the strict no-intermediate source zero-copy definition.
 
 ## Dolby Vision and HDR behavior
 
 FFmpeg parses Dolby Vision RPU data into frame side data. libdovi is not
-required or enabled. Android correlates MediaCodec output with the parsed RPU
-by presentation timestamp; Windows retains FFmpeg's RPU on the decoded
-D3D11VA-backed `VideoFrame`.
+required or enabled. QtAVCore passes metadata to libplacebo only for the
+base-layer, residual-disabled case (`disable_residual_flag`); it does not
+reconstruct an enhancement layer. Android correlates MediaCodec output with
+the parsed RPU by presentation timestamp; Windows retains FFmpeg's RPU on the
+decoded D3D11VA-backed `VideoFrame`. Dolby licensing and certification are
+outside the project scope.
 
 Profile 5 has no conventional HDR10-compatible base layer. Its raw base-layer
 components must reach libplacebo before ordinary color conversion:
@@ -272,6 +293,30 @@ Direct-Surface mode is a third, separate path. It has no application-readable
 texture and therefore cannot be described as Vulkan, OpenGL ES, libplacebo, or
 application-side tone mapping.
 
+## OHOS hardware-frame direction
+
+OHCodec direct-surface presentation remains separate from application-rendered
+texture interop. The preferred OHOS texture path is Vulkan: retain the exact
+decoded `OH_AVBuffer`/`OH_NativeBuffer`, import it through the target SDK's
+`VK_OHOS_external_memory` path, preserve its fences and lifetime, and expose
+raw planes to libplacebo. This path may claim strict no-intermediate source
+zero-copy only when the imported buffer has an explicit `VkFormat` and plane
+mapping that libplacebo can wrap directly. An opaque external format that
+requires a GPU normalization texture is zero-CPU-copy, but not strict source
+zero-copy.
+
+The OHOS OpenGL ES fallback target is raw import through
+`GL_EXT_YUV_target`, followed by a crop-aware RGBA16F GPU normalization of raw
+Y/Cb/Cr before libplacebo. That fallback is also zero-CPU-copy but not strict
+source zero-copy. Implicit external-OES YUV-to-RGB conversion is not a target:
+it hides the source representation from libplacebo and cannot preserve the raw
+contract required for Dolby Vision. OHCodec/NativeImage may propagate the codec
+PTS unchanged in microseconds, so the interop compares the observed value and
+its microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
+then stores and correlates the selected value in nanoseconds. Until either
+native-buffer route is implemented and validated, OHOS texture interop remains
+unclaimed.
+
 ## Audio architecture
 
 `AudioSink` is a platform-neutral lifecycle and timing contract. Decoded PCM
@@ -312,12 +357,14 @@ MediaCodec packet-feed and output-retention bounds, but its OHOS SDK types and
 native lifetime remain backend-local. Direct surface output remains separate
 from future native-buffer interop.
 
-The active local next task in [`PLAN.md`](PLAN.md) is the OHCodec
-pause/seek/stop/media-replacement and surface-recreation lifecycle matrix.
-Direct `OHNativeWindow` present/drop scheduling is connected-device validated.
-The transferred Intel Windows cadence
-investigation remains open on its separate administrator-capable machine and
-is not described as closed by local OHOS progress.
+Direct `OHNativeWindow` present/drop scheduling and its lifecycle matrix are
+connected-device validated. The next native-buffer architecture is the
+Vulkan-first, raw-OpenGL-fallback direction above; no OHOS texture-interop
+success is claimed before native import, synchronization, lifetime, and format
+gates are validated. [`PLAN.md`](PLAN.md) remains the source of truth for task
+ordering. The transferred Intel Windows cadence investigation remains open on
+its separate administrator-capable machine and is not described as closed by
+local OHOS progress.
 
 ## Architectural invariants for changes
 
@@ -328,10 +375,12 @@ Before accepting a backend change, verify that:
 2. the graphics-owner thread performs rendering and API-context work;
 3. bounded queues and reference-counted exact-frame lifetime are preserved;
 4. native-buffer release occurs only after GPU completion;
-5. a zero-copy claim keeps decoded-source map/transfer/staging/upload counters
+5. a zero-CPU-copy claim keeps decoded-source map/transfer/staging/upload counters
    at zero;
-6. libplacebo remains the sole semantic color/shader authority for D3D11,
+6. a strict source zero-copy claim additionally proves an explicit native
+   format/plane mapping and no pre-libplacebo normalization texture or draw;
+7. libplacebo remains the sole semantic color/shader authority for D3D11,
    Vulkan, and OpenGL ES;
-7. direct-Surface and application-rendered modes are reported distinctly;
-8. unsupported capabilities fail or fall back explicitly rather than silently
+8. direct-Surface and application-rendered modes are reported distinctly;
+9. unsupported capabilities fail or fall back explicitly rather than silently
    changing color interpretation or copying decoded pixels.

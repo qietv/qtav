@@ -22,6 +22,7 @@
 
 #include <qtav/mobile_video_renderer.h>
 #include <qtav/ohcodec_hardware_decoder.h>
+#include <qtav/ohcodec_opengl_interop.h>
 #include <qtav/ohos_opengl_video_renderer.h>
 #include <qtav/ohaudio_audio_sink.h>
 #include <qtav/player.h>
@@ -44,6 +45,11 @@ constexpr std::uint64_t RequiredH264RecreatedFrames = 12;
 constexpr std::uint64_t RequiredHEVCFrames = 45;
 constexpr std::int64_t OHCodecSeekTargetMilliseconds = 2'000;
 constexpr std::uint64_t RetainedOHCodecOutputLimit = 1;
+constexpr std::uint64_t RequiredOHCodecOpenGLH264Frames = 24;
+constexpr std::uint64_t RequiredOHCodecOpenGLH264AfterSeekFrames = 24;
+constexpr std::uint64_t RequiredOHCodecOpenGLHEVCFrames = 45;
+constexpr std::uint64_t OHCodecOpenGLMaximumPendingFrames = 4;
+constexpr std::size_t OHCodecOpenGLMaximumScheduledFrames = 1;
 
 enum class ValidationPhase {
     InitialFallback,
@@ -51,6 +57,7 @@ enum class ValidationPhase {
     FatalFallback,
     SwitchingToOHCodec,
     OHCodec,
+    OHCodecOpenGL,
     Complete,
 };
 
@@ -77,6 +84,28 @@ enum class OHCodecControlAction {
     RequestBackground,
     ReplaceWithHEVC,
     StopHEVC,
+    SeekOpenGLH264,
+    ReplaceOpenGLWithHEVC,
+    StopOpenGLHEVC,
+    RenderOpenGLFrame,
+    AbortOpenGL,
+};
+
+enum class OHCodecOpenGLPhase {
+    Inactive,
+    H264Warmup,
+    H264SeekPending,
+    H264AfterSeek,
+    H264ReplacementPending,
+    HEVCWarmup,
+    HEVCStopPending,
+    Finalizing,
+    Complete,
+};
+
+struct ScheduledOHCodecOpenGLFrame {
+    std::uint64_t serial = 0;
+    VideoFrame frame;
 };
 
 const char* validationPhaseName(ValidationPhase phase) noexcept
@@ -92,7 +121,35 @@ const char* validationPhaseName(ValidationPhase phase) noexcept
         return "switching-to-ohcodec";
     case ValidationPhase::OHCodec:
         return "ohcodec";
+    case ValidationPhase::OHCodecOpenGL:
+        return "ohcodec-opengl";
     case ValidationPhase::Complete:
+        return "complete";
+    }
+    return "unknown";
+}
+
+const char* ohCodecOpenGLPhaseName(
+    OHCodecOpenGLPhase phase) noexcept
+{
+    switch (phase) {
+    case OHCodecOpenGLPhase::Inactive:
+        return "inactive";
+    case OHCodecOpenGLPhase::H264Warmup:
+        return "h264-warmup";
+    case OHCodecOpenGLPhase::H264SeekPending:
+        return "h264-seek-pending";
+    case OHCodecOpenGLPhase::H264AfterSeek:
+        return "h264-after-seek";
+    case OHCodecOpenGLPhase::H264ReplacementPending:
+        return "h264-replacement-pending";
+    case OHCodecOpenGLPhase::HEVCWarmup:
+        return "hevc-warmup";
+    case OHCodecOpenGLPhase::HEVCStopPending:
+        return "hevc-stop-pending";
+    case OHCodecOpenGLPhase::Finalizing:
+        return "finalizing";
+    case OHCodecOpenGLPhase::Complete:
         return "complete";
     }
     return "unknown";
@@ -348,6 +405,7 @@ public:
             .setVideoFrameScheduler({})
             .setHardwareDecodeConfig({});
         std::lock_guard<std::mutex> lock(pipelineMutex_);
+        teardownOHCodecOpenGLLocked();
         mediaStarted_ = false;
         mediaReady_ = false;
     }
@@ -410,7 +468,17 @@ public:
                     == OHCodecLifecyclePhase::H264BackgroundPending
                 || ohCodecLifecycle
                     == OHCodecLifecyclePhase::H264WaitingForSurface);
+        const bool interruptedOHCodecOpenGL =
+            phase_.load(std::memory_order_acquire)
+                == ValidationPhase::OHCodecOpenGL
+            && ohCodecOpenGLPhase_.load(std::memory_order_acquire)
+                != OHCodecOpenGLPhase::Complete;
         releaseSurfaceLocked();
+        if (interruptedOHCodecOpenGL) {
+            failOHCodecOpenGL(
+                "The XComponent surface was replaced during OHCodec/OpenGL interop validation");
+            return;
+        }
         window_ = window;
         renderConfig_ = {};
         renderConfig_.surfaceSize = {
@@ -431,6 +499,9 @@ public:
             std::memory_order_release);
         ohCodecLifecycle_.store(
             OHCodecLifecyclePhase::Inactive,
+            std::memory_order_release);
+        ohCodecOpenGLPhase_.store(
+            OHCodecOpenGLPhase::Inactive,
             std::memory_order_release);
         initialFallbackFrames_.store(0, std::memory_order_relaxed);
         fatalFallbackFrames_.store(0, std::memory_order_relaxed);
@@ -468,7 +539,7 @@ public:
         OHNativeWindow* window)
     {
         std::lock_guard<std::mutex> lock(pipelineMutex_);
-        if (!selector_ || !window || window != window_) {
+        if (!window || window != window_) {
             return;
         }
         std::uint64_t width = 0;
@@ -480,16 +551,45 @@ public:
                    &width,
                    &height)
                 == OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
+            const VideoSize previousSize = renderConfig_.surfaceSize;
             renderConfig_.surfaceSize = {
                 static_cast<int>(width),
                 static_cast<int>(height),
             };
             renderConfig_.aspectRatio = VideoAspectRatioMode::Fit;
-            selector_->suspendSurface();
-            selector_->configure(renderConfig_);
-            if (!selector_->recreateSurface()) {
-                fail(
-                    "The OHOS mobile selector could not follow the XComponent resize");
+            if (selector_) {
+                selector_->suspendSurface();
+                selector_->configure(renderConfig_);
+                if (!selector_->recreateSurface()) {
+                    fail(
+                        "The OHOS mobile selector could not follow the XComponent resize");
+                }
+            } else if (ohCodecOpenGLRenderer_
+                       && (previousSize.width
+                               != renderConfig_.surfaceSize.width
+                           || previousSize.height
+                               != renderConfig_.surfaceSize.height)) {
+                if (!ohCodecOpenGLRenderer_->setWindow(window_)) {
+                    failOHCodecOpenGL(
+                        "The OHCodec/OpenGL renderer could not recreate its resized XComponent surface");
+                    return;
+                }
+                renderConfig_.surfaceSize =
+                    ohCodecOpenGLRenderer_->surfaceSize();
+                ohCodecOpenGLRendererGeneration_.store(
+                    ohCodecOpenGLRenderer_->surfaceGeneration(),
+                    std::memory_order_release);
+                logMessage(
+                    LOG_INFO,
+                    "QTAV_OHOS_CHECKPOINT OHCODEC_OPENGL_SURFACE_RESIZED width="
+                        + std::to_string(
+                            renderConfig_.surfaceSize.width)
+                        + " height="
+                        + std::to_string(
+                            renderConfig_.surfaceSize.height)
+                        + " rendererGeneration="
+                        + std::to_string(
+                            ohCodecOpenGLRenderer_->surfaceGeneration()));
             }
         }
     }
@@ -526,6 +626,10 @@ public:
                << ohCodecLifecyclePhaseName(
                       ohCodecLifecycle_.load(
                           std::memory_order_acquire))
+               << " ohcodecOpenGLPhase="
+               << ohCodecOpenGLPhaseName(
+                      ohCodecOpenGLPhase_.load(
+                          std::memory_order_acquire))
                << " api="
                << mobileRenderAPIName(
                       lastSelectedAPI_.load(std::memory_order_acquire))
@@ -547,6 +651,24 @@ public:
                << pendingOHCodecOutputs_.load(std::memory_order_relaxed)
                << " ohcodecPendingMax="
                << maximumPendingOHCodecOutputs_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecOpenGLH264="
+               << ohCodecOpenGLH264Rendered_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecOpenGLHEVC="
+               << ohCodecOpenGLHEVCRendered_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecOpenGLDeferred="
+               << ohCodecOpenGLDeferred_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecOpenGLRedraw="
+               << ohCodecOpenGLRedrawCallbacks_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecOpenGLExactMax="
+               << ohCodecOpenGLMaximumScheduledFrames_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecOpenGLSchedulerDrops="
+               << ohCodecOpenGLSchedulerDrops_.load(
                       std::memory_order_relaxed)
                << " delivered=" << playback.deliveredVideoFrames
                << " overflowDrops=" << playback.videoQueueOverflowDrops
@@ -1185,7 +1307,8 @@ private:
 
     void executeOHCodecControlAction(OHCodecControlAction action)
     {
-        if (failed_.load(std::memory_order_acquire)) {
+        if (failed_.load(std::memory_order_acquire)
+            && action != OHCodecControlAction::AbortOpenGL) {
             return;
         }
 
@@ -1306,6 +1429,24 @@ private:
         }
         case OHCodecControlAction::StopHEVC:
             finalizeOHCodecLifecycle();
+            break;
+        case OHCodecControlAction::SeekOpenGLH264:
+            seekOHCodecOpenGLH264();
+            break;
+        case OHCodecControlAction::ReplaceOpenGLWithHEVC:
+            replaceOHCodecOpenGLWithHEVC();
+            break;
+        case OHCodecControlAction::StopOpenGLHEVC:
+            finalizeOHCodecOpenGLLifecycle();
+            break;
+        case OHCodecControlAction::RenderOpenGLFrame:
+            ohCodecOpenGLRenderQueued_.store(
+                false,
+                std::memory_order_release);
+            renderScheduledOHCodecOpenGLFrame();
+            break;
+        case OHCodecControlAction::AbortOpenGL:
+            abortOHCodecOpenGLValidation();
             break;
         }
     }
@@ -1458,6 +1599,14 @@ private:
             .setVideoFrameScheduler({})
             .setHardwareDecodeConfig({});
         {
+            std::lock_guard<std::mutex> lock(retainedOHCodecMutex_);
+            // The retained H.264 frame has completed its stale-generation
+            // assertion. Keeping it alive here would also keep that decoder's
+            // direct XComponent producer connection alive, preventing EGL
+            // from becoming the producer for the following interop phase.
+            staleOHCodecFrame_ = {};
+        }
+        {
             std::lock_guard<std::mutex> lock(pipelineMutex_);
             ohCodecSurface_.reset();
             ohCodecSurfaceGeneration_.store(
@@ -1501,18 +1650,6 @@ private:
         ohCodecLifecycle_.store(
             OHCodecLifecyclePhase::Complete,
             std::memory_order_release);
-        phase_.store(
-            ValidationPhase::Complete,
-            std::memory_order_release);
-        passed_.store(true, std::memory_order_release);
-        bool expected = false;
-        if (!passLogged_.compare_exchange_strong(
-                expected,
-                true,
-                std::memory_order_acq_rel)) {
-            return;
-        }
-
         const std::string ohCodecResult =
             "QTAV_OHOS_OHCODEC_RESULT PASS codecs=h264,hevc"
             " h264Presented="
@@ -1550,6 +1687,850 @@ private:
                 newOHCodecSurfaceGeneration_.load(
                     std::memory_order_relaxed));
         logMessage(LOG_INFO, ohCodecResult);
+        setDetail(
+            "OHCodec direct-surface lifecycle passed; starting OHCodec/OpenGL external-OES validation");
+        startOHCodecOpenGLPhase();
+    }
+
+    static bool isActiveOHCodecOpenGLPhase(
+        OHCodecOpenGLPhase phase) noexcept
+    {
+        return phase == OHCodecOpenGLPhase::H264Warmup
+            || phase == OHCodecOpenGLPhase::H264AfterSeek
+            || phase == OHCodecOpenGLPhase::HEVCWarmup;
+    }
+
+    void startOHCodecOpenGLPhase()
+    {
+        std::lock_guard<std::mutex> lock(pipelineMutex_);
+        if (!surfaceReady_ || !window_) {
+            fail("OHCodec/OpenGL interop has no active XComponent surface");
+            return;
+        }
+
+        OHCodecOpenGLInteropConfig interopConfig;
+        interopConfig.maximumPendingFrames =
+            static_cast<int>(OHCodecOpenGLMaximumPendingFrames);
+        auto interop = std::make_shared<OHCodecOpenGLInterop>(
+            interopConfig);
+
+        auto renderer = std::make_shared<OHOSOpenGLVideoRenderer>(
+            OpenGLOutputPreference::SdrOnly);
+        renderer->setEventCallback(
+            [this](const VideoRenderEvent& event) {
+                handleOHCodecOpenGLRendererEvent(event);
+            });
+        renderer->setHardwareFrameInterop(interop);
+        if (!renderer->setWindow(window_)) {
+            fail(
+                "Could not bind the OHCodec/OpenGL renderer to the XComponent window");
+            return;
+        }
+
+        VideoRenderConfig interopRenderConfig = renderConfig_;
+        interopRenderConfig.surfaceSize = renderer->surfaceSize();
+        interopRenderConfig.aspectRatio = VideoAspectRatioMode::Fit;
+        if (!interopRenderConfig.surfaceSize.isValid()
+            || !renderer->open(interopRenderConfig)) {
+            fail(
+                "Could not open the OHCodec/OpenGL external-OES renderer");
+            return;
+        }
+
+        bool advertisesOHCodec = false;
+        for (const HardwareDeviceType type :
+             renderer->capabilities().hardwareDevices) {
+            if (type == HardwareDeviceType::OHCodec) {
+                advertisesOHCodec = true;
+                break;
+            }
+        }
+        const OHCodecSurface surface = interop->surface();
+        OHCodecHardwareDecodeOptions options;
+        options.allowSoftwareFallback = false;
+        options.extraHardwareFrames = 6;
+        const HardwareDecodeConfig decodeConfig =
+            ohCodecHardwareDecodeConfig(surface, options);
+        if (!*interop || !advertisesOHCodec || !surface
+            || !decodeConfig.device
+            || decodeConfig.deviceType != HardwareDeviceType::OHCodec
+            || decodeConfig.decoderWrapper != "ohcodec"
+            || decodeConfig.surfaceGeneration != surface.generation()) {
+            renderer->setEventCallback({});
+            renderer->close();
+            fail(
+                "OHCodec/OpenGL did not publish a valid OH_NativeImage decode surface");
+            return;
+        }
+
+        ohCodecOpenGLH264Rendered_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLHEVCRendered_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLStageRendered_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLDeferred_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLRedrawCallbacks_.store(
+            0,
+            std::memory_order_relaxed);
+        ohCodecOpenGLSeekCount_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLFlushCount_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLMediaReplacementCount_.store(
+            0,
+            std::memory_order_relaxed);
+        ohCodecOpenGLStopCount_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLH264Statistics_ = {};
+        ohCodecOpenGLAbortQueued_.store(false, std::memory_order_release);
+        ohCodecOpenGLRenderQueued_.store(false, std::memory_order_release);
+        ohCodecOpenGLNextFrameSerial_.store(1, std::memory_order_relaxed);
+        ohCodecOpenGLMaximumScheduledFrames_.store(
+            0,
+            std::memory_order_relaxed);
+        ohCodecOpenGLSchedulerDrops_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLRendererDiscards_.store(
+            0,
+            std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> queueLock(
+                ohCodecOpenGLQueueMutex_);
+            ohCodecOpenGLScheduledFrames_.clear();
+        }
+        ohCodecOpenGLSurfaceGeneration_.store(
+            surface.generation(),
+            std::memory_order_release);
+        ohCodecOpenGLRendererGeneration_.store(
+            renderer->surfaceGeneration(),
+            std::memory_order_release);
+        ohCodecOpenGLInterop_ = interop;
+        ohCodecOpenGLRenderer_ = renderer;
+        renderConfig_ = interopRenderConfig;
+        phase_.store(
+            ValidationPhase::OHCodecOpenGL,
+            std::memory_order_release);
+        ohCodecOpenGLPhase_.store(
+            OHCodecOpenGLPhase::H264Warmup,
+            std::memory_order_release);
+
+        player_
+            .setRenderCallback({})
+            .setVideoRenderAPI({})
+            .setVideoFrameScheduler(
+                [this, interop, surface](
+                    const VideoFrame& frame,
+                    int,
+                    std::int64_t) {
+                    return scheduleOHCodecOpenGLFrame(
+                        frame,
+                        interop,
+                        surface);
+                })
+            .setHardwareDecodeConfig(decodeConfig);
+        mediaOpenCount_.fetch_add(1, std::memory_order_relaxed);
+        player_.setMedia(H264MediaPath);
+        player_.setState(State::Playing);
+
+        const std::string detail =
+            "QTAV_OHOS_CHECKPOINT OHCODEC_OPENGL_PHASE_READY codec=h264 generation="
+            + std::to_string(surface.generation())
+            + " rendererGeneration="
+            + std::to_string(renderer->surfaceGeneration())
+            + " producer=oh_nativeimage texture=external-oes maxPending="
+            + std::to_string(OHCodecOpenGLMaximumPendingFrames)
+            + " exactInFlight="
+            + std::to_string(OHCodecOpenGLMaximumScheduledFrames);
+        setDetail(detail);
+        logMessage(LOG_INFO, detail);
+    }
+
+    void handleOHCodecOpenGLRendererEvent(
+        const VideoRenderEvent& event)
+    {
+        if (event.type == VideoRenderEventType::RedrawRequested) {
+            ohCodecOpenGLRedrawCallbacks_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            // OH_NativeImage invokes this listener on a platform callback
+            // thread. Only publish a control action here; UpdateSurfaceImage,
+            // timestamp queries, and rendering stay on the control worker.
+            requestOHCodecOpenGLRender();
+            return;
+        }
+        if (phase_.load(std::memory_order_acquire)
+            != ValidationPhase::OHCodecOpenGL) {
+            return;
+        }
+        failOHCodecOpenGL(
+            std::string(
+                event.type == VideoRenderEventType::SurfaceLost
+                    ? "OHCodec/OpenGL surface lost: "
+                    : "OHCodec/OpenGL renderer error: ")
+            + (event.detail.empty() ? "no detail" : event.detail));
+    }
+
+    void requestOHCodecOpenGLRender()
+    {
+        if (failed_.load(std::memory_order_acquire)
+            || phase_.load(std::memory_order_acquire)
+                != ValidationPhase::OHCodecOpenGL
+            || !isActiveOHCodecOpenGLPhase(
+                ohCodecOpenGLPhase_.load(
+                    std::memory_order_acquire))) {
+            return;
+        }
+
+        bool expected = false;
+        if (ohCodecOpenGLRenderQueued_.compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel)) {
+            queueOHCodecControlAction(
+                OHCodecControlAction::RenderOpenGLFrame);
+        }
+    }
+
+    bool dropUnscheduledOHCodecOpenGLFrame(
+        const VideoFrame& frame,
+        const OHCodecSurface& surface,
+        const char* reason)
+    {
+        OHCodecFrame output = ohCodecFrame(frame, surface);
+        const bool dropped = output && output.drop();
+        if (!dropped) {
+            failOHCodecOpenGL(
+                std::string("Could not drop an OHCodec/OpenGL ")
+                + reason + " output with its single decision token");
+            return true;
+        }
+        ohCodecOpenGLSchedulerDrops_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        return true;
+    }
+
+    bool scheduleOHCodecOpenGLFrame(
+        const VideoFrame& frame,
+        const std::shared_ptr<OHCodecOpenGLInterop>& interop,
+        const OHCodecSurface& surface)
+    {
+        if (!frame.hasHardwareFrame()) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL scheduler received a software video frame");
+            return true;
+        }
+        if (!interop || !surface) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL scheduler lost its retained interop surface");
+            return true;
+        }
+
+        const auto shouldDrop = [this, &frame, &surface](
+                                    const char* reason) {
+            return dropUnscheduledOHCodecOpenGLFrame(
+                frame,
+                surface,
+                reason);
+        };
+        if (failed_.load(std::memory_order_acquire)
+            || phase_.load(std::memory_order_acquire)
+                != ValidationPhase::OHCodecOpenGL
+            || !isActiveOHCodecOpenGLPhase(
+                ohCodecOpenGLPhase_.load(
+                    std::memory_order_acquire))) {
+            return shouldDrop("inactive-phase");
+        }
+
+        {
+            std::unique_lock<std::mutex> queueLock(
+                ohCodecOpenGLQueueMutex_);
+            if (failed_.load(std::memory_order_acquire)
+                || phase_.load(std::memory_order_acquire)
+                    != ValidationPhase::OHCodecOpenGL
+                || !isActiveOHCodecOpenGLPhase(
+                    ohCodecOpenGLPhase_.load(
+                        std::memory_order_acquire))) {
+                queueLock.unlock();
+                return shouldDrop("phase-transition");
+            }
+            if (ohCodecOpenGLScheduledFrames_.size()
+                >= OHCodecOpenGLMaximumScheduledFrames) {
+                queueLock.unlock();
+                return shouldDrop("queue-full");
+            }
+
+            const std::uint64_t serial =
+                ohCodecOpenGLNextFrameSerial_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            ohCodecOpenGLScheduledFrames_.push_back(
+                { serial, frame });
+            updateMaximum(
+                ohCodecOpenGLMaximumScheduledFrames_,
+                ohCodecOpenGLScheduledFrames_.size());
+
+            std::string detail;
+            if (!interop->queueFrame(frame, detail)) {
+                if (!ohCodecOpenGLScheduledFrames_.empty()
+                    && ohCodecOpenGLScheduledFrames_.back().serial
+                        == serial) {
+                    ohCodecOpenGLScheduledFrames_.pop_back();
+                }
+                queueLock.unlock();
+                failOHCodecOpenGL(
+                    detail.empty()
+                        ? "OHCodec/OpenGL could not queue the exact scheduler frame"
+                        : detail);
+                // queueFrame owns the output decision attempt. Always consume
+                // this callback so the same hardware token cannot enter the
+                // Player current-frame path as a second owner.
+                return true;
+            }
+        }
+
+        // The NativeImage listener normally publishes this action. Also
+        // publish once after queueFrame() so a coalesced callback cannot leave
+        // the retained exact frame idle; a premature attempt simply defers.
+        requestOHCodecOpenGLRender();
+        return true;
+    }
+
+    void renderScheduledOHCodecOpenGLFrame()
+    {
+        if (phase_.load(std::memory_order_acquire)
+                != ValidationPhase::OHCodecOpenGL
+            || failed_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        VideoRenderAttemptResult result;
+        ScheduledOHCodecOpenGLFrame scheduledFrame;
+        bool hasAnotherFrame = false;
+        bool countedPresentation = false;
+        {
+            std::lock_guard<std::mutex> queueLock(
+                ohCodecOpenGLQueueMutex_);
+            if (ohCodecOpenGLScheduledFrames_.empty()) {
+                return;
+            }
+            scheduledFrame = ohCodecOpenGLScheduledFrames_.front();
+        }
+
+        {
+            // Serialize native rendering against surface teardown. The copied
+            // entry retains the same exact frame while the decode worker can
+            // observe the occupied queue and immediately drop newer outputs.
+            std::lock_guard<std::mutex> pipelineLock(pipelineMutex_);
+            if (!ohCodecOpenGLRenderer_) {
+                return;
+            }
+            result = ohCodecOpenGLRenderer_->renderDetailed(
+                scheduledFrame.frame);
+        }
+
+        if (result.status == VideoRenderAttemptStatus::Presented
+            || result.status == VideoRenderAttemptStatus::Discarded) {
+            std::lock_guard<std::mutex> queueLock(
+                ohCodecOpenGLQueueMutex_);
+            if (!ohCodecOpenGLScheduledFrames_.empty()
+                && ohCodecOpenGLScheduledFrames_.front().serial
+                    == scheduledFrame.serial) {
+                if (result.status
+                    == VideoRenderAttemptStatus::Presented) {
+                    const OHCodecOpenGLPhase phase =
+                        ohCodecOpenGLPhase_.load(
+                            std::memory_order_acquire);
+                    if (isActiveOHCodecOpenGLPhase(phase)) {
+                        const std::uint64_t stage =
+                            ohCodecOpenGLStageRendered_.fetch_add(
+                                1,
+                                std::memory_order_relaxed)
+                            + 1;
+                        if (phase == OHCodecOpenGLPhase::HEVCWarmup) {
+                            ohCodecOpenGLHEVCRendered_.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                        } else {
+                            ohCodecOpenGLH264Rendered_.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                        }
+                        maybeAdvanceOHCodecOpenGLLifecycle(
+                            phase,
+                            stage);
+                        countedPresentation = true;
+                    }
+                }
+                if (result.status == VideoRenderAttemptStatus::Presented
+                    || result.status
+                        == VideoRenderAttemptStatus::Discarded) {
+                    ohCodecOpenGLScheduledFrames_.pop_front();
+                }
+                hasAnotherFrame =
+                    !ohCodecOpenGLScheduledFrames_.empty();
+            }
+        }
+
+        switch (result.status) {
+        case VideoRenderAttemptStatus::Presented:
+            if (countedPresentation && hasAnotherFrame) {
+                requestOHCodecOpenGLRender();
+            }
+            break;
+        case VideoRenderAttemptStatus::DeferredUntilRedraw:
+            ohCodecOpenGLDeferred_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            break;
+        case VideoRenderAttemptStatus::Discarded:
+            ohCodecOpenGLRendererDiscards_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            if (hasAnotherFrame) {
+                requestOHCodecOpenGLRender();
+            }
+            break;
+        case VideoRenderAttemptStatus::RetryAfterBackoff:
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL unexpectedly requested timer backoff");
+            break;
+        case VideoRenderAttemptStatus::SurfaceLost:
+        case VideoRenderAttemptStatus::FatalError:
+            failOHCodecOpenGL(
+                result.detail.empty()
+                    ? "OHCodec/OpenGL render attempt failed"
+                    : result.detail);
+            break;
+        }
+    }
+
+    void maybeAdvanceOHCodecOpenGLLifecycle(
+        OHCodecOpenGLPhase phase,
+        std::uint64_t stageRendered)
+    {
+        OHCodecOpenGLPhase next = phase;
+        OHCodecControlAction action {};
+        bool advance = false;
+        switch (phase) {
+        case OHCodecOpenGLPhase::H264Warmup:
+            if (stageRendered >= RequiredOHCodecOpenGLH264Frames) {
+                next = OHCodecOpenGLPhase::H264SeekPending;
+                action = OHCodecControlAction::SeekOpenGLH264;
+                advance = true;
+            }
+            break;
+        case OHCodecOpenGLPhase::H264AfterSeek:
+            if (stageRendered
+                >= RequiredOHCodecOpenGLH264AfterSeekFrames) {
+                next = OHCodecOpenGLPhase::H264ReplacementPending;
+                action = OHCodecControlAction::ReplaceOpenGLWithHEVC;
+                advance = true;
+            }
+            break;
+        case OHCodecOpenGLPhase::HEVCWarmup:
+            if (stageRendered >= RequiredOHCodecOpenGLHEVCFrames) {
+                next = OHCodecOpenGLPhase::HEVCStopPending;
+                action = OHCodecControlAction::StopOpenGLHEVC;
+                advance = true;
+            }
+            break;
+        default:
+            break;
+        }
+        if (!advance) {
+            return;
+        }
+        auto expected = phase;
+        if (ohCodecOpenGLPhase_.compare_exchange_strong(
+                expected,
+                next,
+                std::memory_order_acq_rel)) {
+            queueOHCodecControlAction(action);
+        }
+    }
+
+    std::shared_ptr<OHCodecOpenGLInterop> activeOHCodecOpenGLInterop()
+    {
+        std::lock_guard<std::mutex> lock(pipelineMutex_);
+        return surfaceReady_ ? ohCodecOpenGLInterop_ : nullptr;
+    }
+
+    void clearAndFlushOHCodecOpenGLFrames(
+        const std::shared_ptr<OHCodecOpenGLInterop>& interop)
+    {
+        std::lock_guard<std::mutex> queueLock(
+            ohCodecOpenGLQueueMutex_);
+        // Every queued frame has already made its one present decision in
+        // interop->queueFrame(). Releasing our retained references and then
+        // flushing the interop retires those associations without issuing a
+        // second OHCodec decision. Queue-full outputs are dropped separately
+        // before they ever enter either queue.
+        ohCodecOpenGLScheduledFrames_.clear();
+        if (interop) {
+            interop->flush();
+        }
+        ohCodecOpenGLRenderQueued_.store(
+            false,
+            std::memory_order_release);
+    }
+
+    void seekOHCodecOpenGLH264()
+    {
+        auto interop = activeOHCodecOpenGLInterop();
+        if (!interop) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL H.264 seek has no active interop");
+            return;
+        }
+        player_.setState(State::Paused);
+        if (!player_.waitFor(State::Paused, 3'000)) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL H.264 did not pause before seek");
+            return;
+        }
+        clearAndFlushOHCodecOpenGLFrames(interop);
+        ohCodecOpenGLFlushCount_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+
+        auto completed = std::make_shared<std::atomic<bool>>(false);
+        auto callbackPosition =
+            std::make_shared<std::atomic<std::int64_t>>(-1);
+        if (!player_.seek(
+                OHCodecSeekTargetMilliseconds,
+                SeekFlag::FromStart,
+                [completed, callbackPosition](std::int64_t position) {
+                    callbackPosition->store(
+                        position,
+                        std::memory_order_release);
+                    completed->store(true, std::memory_order_release);
+                })) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL H.264 seek request was rejected");
+            return;
+        }
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds(4);
+        while (!completed->load(std::memory_order_acquire)
+               && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!completed->load(std::memory_order_acquire)
+            || callbackPosition->load(std::memory_order_acquire) < 0) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL H.264 seek did not complete");
+            return;
+        }
+        ohCodecOpenGLStageRendered_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLSeekCount_.fetch_add(1, std::memory_order_relaxed);
+        ohCodecOpenGLPhase_.store(
+            OHCodecOpenGLPhase::H264AfterSeek,
+            std::memory_order_release);
+        player_.setState(State::Playing);
+        logMessage(
+            LOG_INFO,
+            "QTAV_OHOS_CHECKPOINT OHCODEC_OPENGL_SEEK codec=h264 targetMs="
+                + std::to_string(OHCodecSeekTargetMilliseconds)
+                + " callbackMs="
+                + std::to_string(
+                    callbackPosition->load(std::memory_order_acquire))
+                + " flush=1");
+    }
+
+    void replaceOHCodecOpenGLWithHEVC()
+    {
+        auto interop = activeOHCodecOpenGLInterop();
+        if (!interop) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL HEVC replacement has no active interop");
+            return;
+        }
+        player_.setState(State::Paused);
+        if (!player_.waitFor(State::Paused, 3'000)) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL H.264 did not pause before HEVC replacement");
+            return;
+        }
+        const auto statistics = interop->statistics();
+        const std::uint64_t h264Rendered =
+            ohCodecOpenGLH264Rendered_.load(std::memory_order_relaxed);
+        if (statistics.surfaceGeneration == 0
+            || statistics.surfaceGeneration
+                != ohCodecOpenGLSurfaceGeneration_.load(
+                    std::memory_order_acquire)
+            || statistics.codecOutputsQueued < h264Rendered
+            || statistics.surfaceImagesUpdated < h264Rendered
+            || statistics.frameAvailableSignals < h264Rendered
+            || statistics.redrawSignals < h264Rendered
+            || statistics.transformQueries < h264Rendered
+            || statistics.timestampMatches < h264Rendered
+            || statistics.framesReleased < h264Rendered
+            || statistics.maximumPendingFrames == 0
+            || statistics.maximumPendingFrames
+                > OHCodecOpenGLMaximumPendingFrames
+            || statistics.unsupportedFrames != 0
+            || statistics.cpuMapCalls != 0
+            || statistics.softwareTransferCalls != 0
+            || statistics.stagingCopies != 0
+            || statistics.rendererUploads != 0) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL H.264 statistics failed before HEVC replacement");
+            return;
+        }
+        ohCodecOpenGLH264Statistics_ = statistics;
+        clearAndFlushOHCodecOpenGLFrames(interop);
+        ohCodecOpenGLFlushCount_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        ohCodecOpenGLMediaReplacementCount_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        mediaOpenCount_.fetch_add(1, std::memory_order_relaxed);
+        player_.setMedia(HEVCMediaPath);
+        ohCodecOpenGLStageRendered_.store(0, std::memory_order_relaxed);
+        ohCodecOpenGLPhase_.store(
+            OHCodecOpenGLPhase::HEVCWarmup,
+            std::memory_order_release);
+        player_.setState(State::Playing);
+        logMessage(
+            LOG_INFO,
+            "QTAV_OHOS_CHECKPOINT OHCODEC_OPENGL_MEDIA_REPLACED from=h264 to=hevc generation="
+                + std::to_string(statistics.surfaceGeneration)
+                + " flush=1");
+    }
+
+    void finalizeOHCodecOpenGLLifecycle()
+    {
+        auto interop = activeOHCodecOpenGLInterop();
+        std::shared_ptr<OHOSOpenGLVideoRenderer> renderer;
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            renderer = ohCodecOpenGLRenderer_;
+        }
+        if (!interop || !renderer) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL finalization lost its renderer or interop");
+            return;
+        }
+
+        ohCodecOpenGLPhase_.store(
+            OHCodecOpenGLPhase::Finalizing,
+            std::memory_order_release);
+        player_.setState(State::Stopped);
+        if (!player_.waitFor(State::Stopped, 4'000)) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL HEVC explicit stop did not complete");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        const auto stoppedStatistics = interop->statistics();
+        std::this_thread::sleep_for(std::chrono::milliseconds(160));
+        const auto stableStatistics = interop->statistics();
+        if (stableStatistics.codecOutputsQueued
+                != stoppedStatistics.codecOutputsQueued
+            || stableStatistics.surfaceImagesUpdated
+                != stoppedStatistics.surfaceImagesUpdated) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL produced output after HEVC reached Stopped");
+            return;
+        }
+
+        clearAndFlushOHCodecOpenGLFrames(interop);
+        ohCodecOpenGLFlushCount_.fetch_add(
+            1,
+            std::memory_order_relaxed);
+        ohCodecOpenGLStopCount_.fetch_add(1, std::memory_order_relaxed);
+        player_
+            .setRenderCallback({})
+            .setVideoRenderAPI({})
+            .setVideoFrameScheduler({})
+            .setHardwareDecodeConfig({});
+
+        const OHCodecOpenGLInteropStatistics activeStatistics =
+            interop->statistics();
+        const std::uint64_t totalRendered =
+            ohCodecOpenGLH264Rendered_.load(std::memory_order_relaxed)
+            + ohCodecOpenGLHEVCRendered_.load(
+                std::memory_order_relaxed);
+        const std::uint64_t hevcRendered =
+            ohCodecOpenGLHEVCRendered_.load(
+                std::memory_order_relaxed);
+        const std::uint32_t surfaceGeneration =
+            ohCodecOpenGLSurfaceGeneration_.load(
+                std::memory_order_acquire);
+        const bool activeStatisticsPassed =
+            activeStatistics.codecOutputsQueued >= totalRendered
+            && activeStatistics.surfaceImagesUpdated >= totalRendered
+            && activeStatistics.codecOutputsQueued
+                    - ohCodecOpenGLH264Statistics_.codecOutputsQueued
+                >= hevcRendered
+            && activeStatistics.surfaceImagesUpdated
+                    - ohCodecOpenGLH264Statistics_.surfaceImagesUpdated
+                >= hevcRendered
+            && activeStatistics.frameAvailableSignals > 0
+            && activeStatistics.frameAvailableSignals
+                    - ohCodecOpenGLH264Statistics_.frameAvailableSignals
+                >= hevcRendered
+            && activeStatistics.redrawSignals > 0
+            && activeStatistics.redrawSignals
+                    - ohCodecOpenGLH264Statistics_.redrawSignals
+                >= hevcRendered
+            && activeStatistics.transformQueries >= totalRendered
+            && activeStatistics.transformQueries
+                    - ohCodecOpenGLH264Statistics_.transformQueries
+                >= hevcRendered
+            && activeStatistics.timestampMatches >= totalRendered
+            && activeStatistics.timestampMatches
+                    - ohCodecOpenGLH264Statistics_.timestampMatches
+                >= hevcRendered
+            && activeStatistics.rawYcbcrImages >= totalRendered
+            && activeStatistics.implicitRgbImages == 0
+            && activeStatistics.maximumPendingFrames > 0
+            && activeStatistics.maximumPendingFrames
+                <= OHCodecOpenGLMaximumPendingFrames
+            && activeStatistics.contextAttachments > 0
+            && activeStatistics.framesReleased >= totalRendered
+            && activeStatistics.framesReleased
+                    - ohCodecOpenGLH264Statistics_.framesReleased
+                >= hevcRendered
+            && activeStatistics.unsupportedFrames == 0
+            && activeStatistics.lastTimestampNanoseconds > 0
+            && activeStatistics.textureName != 0
+            && activeStatistics.surfaceGeneration == surfaceGeneration
+            && activeStatistics.cpuMapCalls == 0
+            && activeStatistics.softwareTransferCalls == 0
+            && activeStatistics.stagingCopies == 0
+            && activeStatistics.rendererUploads == 0;
+        if (!activeStatisticsPassed) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL active external-OES statistics did not satisfy the zero-CPU contract");
+            return;
+        }
+
+        renderer->setEventCallback({});
+        renderer->close();
+        const OHCodecOpenGLInteropStatistics finalStatistics =
+            interop->statistics();
+        const bool lifecyclePassed =
+            ohCodecOpenGLH264Rendered_.load(std::memory_order_relaxed)
+                >= RequiredOHCodecOpenGLH264Frames
+                    + RequiredOHCodecOpenGLH264AfterSeekFrames
+            && ohCodecOpenGLHEVCRendered_.load(
+                   std::memory_order_relaxed)
+                >= RequiredOHCodecOpenGLHEVCFrames
+            && ohCodecOpenGLRedrawCallbacks_.load(
+                   std::memory_order_relaxed)
+                > 0
+            && ohCodecOpenGLMaximumScheduledFrames_.load(
+                   std::memory_order_relaxed)
+                > 0
+            && ohCodecOpenGLMaximumScheduledFrames_.load(
+                   std::memory_order_relaxed)
+                <= OHCodecOpenGLMaximumScheduledFrames
+            && ohCodecOpenGLSeekCount_.load(std::memory_order_relaxed)
+                == 1
+            && ohCodecOpenGLFlushCount_.load(std::memory_order_relaxed)
+                == 3
+            && ohCodecOpenGLMediaReplacementCount_.load(
+                   std::memory_order_relaxed)
+                == 1
+            && ohCodecOpenGLStopCount_.load(std::memory_order_relaxed)
+                == 1
+            && ohCodecOpenGLRendererGeneration_.load(
+                   std::memory_order_relaxed)
+                > 0
+            && finalStatistics.contextAttachments > 0
+            && finalStatistics.contextDetaches
+                == finalStatistics.contextAttachments
+            && finalStatistics.textureName == 0
+            && finalStatistics.surfaceGeneration == surfaceGeneration
+            && finalStatistics.cpuMapCalls == 0
+            && finalStatistics.softwareTransferCalls == 0
+            && finalStatistics.stagingCopies == 0
+            && finalStatistics.rendererUploads == 0
+            && mediaOpenCount_.load(std::memory_order_relaxed) == 4
+            && player_.state() == State::Stopped;
+        if (!lifecyclePassed) {
+            failOHCodecOpenGL(
+                "OHCodec/OpenGL lifecycle counters did not satisfy the required matrix");
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            ohCodecOpenGLRenderer_.reset();
+            ohCodecOpenGLInterop_.reset();
+        }
+        ohCodecOpenGLPhase_.store(
+            OHCodecOpenGLPhase::Complete,
+            std::memory_order_release);
+        phase_.store(
+            ValidationPhase::Complete,
+            std::memory_order_release);
+        passed_.store(true, std::memory_order_release);
+        bool expected = false;
+        if (!passLogged_.compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel)) {
+            return;
+        }
+
+        const std::string interopResult =
+            "QTAV_OHOS_OHCODEC_OPENGL_RESULT PASS codecs=h264,hevc"
+            " h264Rendered="
+            + std::to_string(
+                ohCodecOpenGLH264Rendered_.load(
+                    std::memory_order_relaxed))
+            + " hevcRendered="
+            + std::to_string(
+                ohCodecOpenGLHEVCRendered_.load(
+                    std::memory_order_relaxed))
+            + " queued="
+            + std::to_string(finalStatistics.codecOutputsQueued)
+            + " updated="
+            + std::to_string(finalStatistics.surfaceImagesUpdated)
+            + " frameAvailable="
+            + std::to_string(finalStatistics.frameAvailableSignals)
+            + " redrawSignals="
+            + std::to_string(finalStatistics.redrawSignals)
+            + " redrawCallbacks="
+            + std::to_string(
+                ohCodecOpenGLRedrawCallbacks_.load(
+                    std::memory_order_relaxed))
+            + " transformQueries="
+            + std::to_string(finalStatistics.transformQueries)
+            + " timestampMatches="
+            + std::to_string(finalStatistics.timestampMatches)
+            + " ptsUsNormalized="
+            + std::to_string(
+                finalStatistics.microsecondTimestampsNormalized)
+            + " rawYcbcr="
+            + std::to_string(finalStatistics.rawYcbcrImages)
+            + " implicitRgb="
+            + std::to_string(finalStatistics.implicitRgbImages)
+            + " attachments="
+            + std::to_string(finalStatistics.contextAttachments)
+            + " detaches="
+            + std::to_string(finalStatistics.contextDetaches)
+            + " released="
+            + std::to_string(finalStatistics.framesReleased)
+            + " stale="
+            + std::to_string(finalStatistics.staleFramesDropped)
+            + " maxPending="
+            + std::to_string(finalStatistics.maximumPendingFrames)
+            + " exactQueueMax="
+            + std::to_string(
+                ohCodecOpenGLMaximumScheduledFrames_.load(
+                    std::memory_order_relaxed))
+            + " schedulerDrops="
+            + std::to_string(
+                ohCodecOpenGLSchedulerDrops_.load(
+                    std::memory_order_relaxed))
+            + " rendererDiscards="
+            + std::to_string(
+                ohCodecOpenGLRendererDiscards_.load(
+                    std::memory_order_relaxed))
+            + " generation="
+            + std::to_string(finalStatistics.surfaceGeneration)
+            + " seek=1 flush=3 mediaReplacement=1 stop=1"
+              " cpuMap=0 transfer=0 staging=0 upload=0";
+        logMessage(LOG_INFO, interopResult);
 
         const std::string message =
             "QTAV_OHOS_RESULT PASS software selector initialGLES="
@@ -1560,7 +2541,7 @@ private:
             + " fatalGLES="
             + std::to_string(
                 fatalFallbackFrames_.load(std::memory_order_relaxed))
-            + " mediaOpen=2 ohcodecWrapper=ohcodec"
+            + " mediaOpen=4 ohcodecWrapper=ohcodec"
             + " ohcodecH264Presented="
             + std::to_string(
                 h264PresentedFrames_.load(std::memory_order_relaxed))
@@ -1570,9 +2551,73 @@ private:
             + " ohcodecDropped="
             + std::to_string(
                 ohCodecDroppedFrames_.load(std::memory_order_relaxed))
-            + " ohcodecLifecycle=pass" + audioResultText();
+            + " ohcodecLifecycle=pass ohcodecOpenGLH264Rendered="
+            + std::to_string(
+                ohCodecOpenGLH264Rendered_.load(
+                    std::memory_order_relaxed))
+            + " ohcodecOpenGLHEVCRendered="
+            + std::to_string(
+                ohCodecOpenGLHEVCRendered_.load(
+                    std::memory_order_relaxed))
+            + " ohcodecOpenGLQueued="
+            + std::to_string(finalStatistics.codecOutputsQueued)
+            + " ohcodecOpenGLUpdated="
+            + std::to_string(finalStatistics.surfaceImagesUpdated)
+            + " ohcodecOpenGLTransform="
+            + std::to_string(finalStatistics.transformQueries)
+            + " ohcodecOpenGLExactQueueMax="
+            + std::to_string(
+                ohCodecOpenGLMaximumScheduledFrames_.load(
+                    std::memory_order_relaxed))
+            + " ohcodecOpenGLSchedulerDrops="
+            + std::to_string(
+                ohCodecOpenGLSchedulerDrops_.load(
+                    std::memory_order_relaxed))
+            + " ohcodecOpenGLGeneration="
+            + std::to_string(finalStatistics.surfaceGeneration)
+            + " ohcodecOpenGLLifecycle=pass" + audioResultText();
         setDetail(message);
         logMessage(LOG_INFO, message);
+    }
+
+    void failOHCodecOpenGL(std::string detail)
+    {
+        fail(std::move(detail));
+        if (phase_.load(std::memory_order_acquire)
+            != ValidationPhase::OHCodecOpenGL) {
+            return;
+        }
+        bool expected = false;
+        if (ohCodecOpenGLAbortQueued_.compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel)) {
+            queueOHCodecControlAction(OHCodecControlAction::AbortOpenGL);
+        }
+    }
+
+    void abortOHCodecOpenGLValidation()
+    {
+        player_.setState(State::Stopped);
+        player_.waitFor(State::Stopped, 4'000);
+        std::lock_guard<std::mutex> lock(pipelineMutex_);
+        teardownOHCodecOpenGLLocked();
+    }
+
+    void teardownOHCodecOpenGLLocked()
+    {
+        player_
+            .setRenderCallback({})
+            .setVideoRenderAPI({})
+            .setVideoFrameScheduler({})
+            .setHardwareDecodeConfig({});
+        auto renderer = std::move(ohCodecOpenGLRenderer_);
+        auto interop = std::move(ohCodecOpenGLInterop_);
+        clearAndFlushOHCodecOpenGLFrames(interop);
+        if (renderer) {
+            renderer->setEventCallback({});
+            renderer->close();
+        }
     }
 
     void startPlayer()
@@ -1661,9 +2706,15 @@ private:
     void releaseSurfaceLocked()
     {
         if (!surfaceReady_ && !selector_ && !vulkanContext_
-            && !ohCodecSurface_) {
+            && !ohCodecSurface_ && !ohCodecOpenGLRenderer_
+            && !ohCodecOpenGLInterop_) {
             return;
         }
+        const bool ohCodecOpenGLActive =
+            phase_.load(std::memory_order_acquire)
+                == ValidationPhase::OHCodecOpenGL
+            && ohCodecOpenGLPhase_.load(std::memory_order_acquire)
+                != OHCodecOpenGLPhase::Complete;
         const auto lifecycle = ohCodecLifecycle_.load(
             std::memory_order_acquire);
         const bool ohCodecSurfaceRecreation =
@@ -1683,6 +2734,9 @@ private:
         player_
             .setVideoFrameScheduler({})
             .setHardwareDecodeConfig({});
+        if (ohCodecOpenGLRenderer_ || ohCodecOpenGLInterop_) {
+            teardownOHCodecOpenGLLocked();
+        }
         if (selector_) {
             selector_->suspendSurface();
             selector_->close();
@@ -1711,6 +2765,9 @@ private:
                         std::memory_order_relaxed));
             setDetail(detail);
             logMessage(LOG_INFO, detail);
+        } else if (ohCodecOpenGLActive) {
+            failOHCodecOpenGL(
+                "The XComponent surface was released during OHCodec/OpenGL interop validation");
         } else {
             setDetail("XComponent surface released; playback paused");
         }
@@ -1790,6 +2847,7 @@ private:
     mutable std::mutex statusMutex_;
     std::mutex controlMutex_;
     std::mutex retainedOHCodecMutex_;
+    std::mutex ohCodecOpenGLQueueMutex_;
     std::condition_variable controlCondition_;
     std::thread controlWorker_;
     Player player_;
@@ -1797,8 +2855,13 @@ private:
     std::unique_ptr<OHCodecSurface> ohCodecSurface_;
     std::unique_ptr<OHCodecFrame> retainedOHCodecOutput_;
     VideoFrame staleOHCodecFrame_;
+    OHCodecOpenGLInteropStatistics ohCodecOpenGLH264Statistics_;
     std::unique_ptr<OHOSVulkanContext> vulkanContext_;
     std::shared_ptr<MobileVideoRendererSelector> selector_;
+    std::shared_ptr<OHCodecOpenGLInterop> ohCodecOpenGLInterop_;
+    std::shared_ptr<OHOSOpenGLVideoRenderer> ohCodecOpenGLRenderer_;
+    std::deque<ScheduledOHCodecOpenGLFrame>
+        ohCodecOpenGLScheduledFrames_;
     OHNativeWindow* window_ = nullptr;
     VideoRenderConfig renderConfig_;
     MediaStatus mediaStatus_ = MediaStatus::NoMedia;
@@ -1836,12 +2899,32 @@ private:
     std::atomic<std::uint32_t> ohCodecSurfaceGeneration_ { 0 };
     std::atomic<std::uint32_t> oldOHCodecSurfaceGeneration_ { 0 };
     std::atomic<std::uint32_t> newOHCodecSurfaceGeneration_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLH264Rendered_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLHEVCRendered_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLStageRendered_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLDeferred_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLRedrawCallbacks_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLSeekCount_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLFlushCount_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLMediaReplacementCount_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLStopCount_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLNextFrameSerial_ { 1 };
+    std::atomic<std::uint64_t> ohCodecOpenGLMaximumScheduledFrames_ {
+        0
+    };
+    std::atomic<std::uint64_t> ohCodecOpenGLSchedulerDrops_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLRendererDiscards_ { 0 };
+    std::atomic<std::uint32_t> ohCodecOpenGLSurfaceGeneration_ { 0 };
+    std::atomic<std::uint64_t> ohCodecOpenGLRendererGeneration_ { 0 };
     std::atomic<std::uint64_t> mediaOpenCount_ { 0 };
     std::atomic<ValidationPhase> phase_ {
         ValidationPhase::InitialFallback
     };
     std::atomic<OHCodecLifecyclePhase> ohCodecLifecycle_ {
         OHCodecLifecyclePhase::Inactive
+    };
+    std::atomic<OHCodecOpenGLPhase> ohCodecOpenGLPhase_ {
+        OHCodecOpenGLPhase::Inactive
     };
     std::atomic<MobileRenderAPI> lastSelectedAPI_ {
         MobileRenderAPI::None
@@ -1854,6 +2937,8 @@ private:
     std::atomic<bool> fatalFallbackObserved_ { false };
     std::atomic<bool> transitionQueued_ { false };
     std::atomic<bool> ohCodecTransitionQueued_ { false };
+    std::atomic<bool> ohCodecOpenGLAbortQueued_ { false };
+    std::atomic<bool> ohCodecOpenGLRenderQueued_ { false };
     std::atomic<bool> audioLifecycleRequested_ { false };
     std::deque<OHCodecControlAction> ohCodecControlActions_;
     bool controlQuit_ = false;

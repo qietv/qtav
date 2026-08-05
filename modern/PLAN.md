@@ -163,7 +163,8 @@ Continuation checkpoint:
   longer used. A shared FFmpeg/libplacebo bridge maps software frames and
   FFmpeg-parsed Dolby Vision RPU metadata; backend-owned shaders are limited
   to unavoidable representation normalization, including crop-aware raw
-  Y/Cb/Cr normalization before libplacebo on Android hardware frames;
+  Y/Cb/Cr normalization before libplacebo on Android and OHOS hardware
+  frames;
 - Windows now follows the same color-authority boundary through libplacebo's
   D3D11 backend. FFmpeg-parsed Dolby Vision metadata, Dolby Vision reshaping,
   transfer handling, gamut conversion, HDR tone mapping, and target encoding
@@ -219,8 +220,10 @@ Current public entry points:
 - `modern/backends/render/mobile/include/qtav/mobile_video_renderer.h`
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
 - `modern/backends/hwaccel/mediacodec/include/qtav/mediacodec_hardware_decoder.h`
+- `modern/backends/hwaccel/ohcodec/include/qtav/ohcodec_hardware_decoder.h`
 - `modern/backends/interop/mediacodec_vulkan/include/qtav/mediacodec_vulkan_interop.h`
 - `modern/backends/interop/mediacodec_opengl/include/qtav/mediacodec_opengl_interop.h`
+- `modern/backends/interop/ohcodec_opengl/include/qtav/ohcodec_opengl_interop.h`
 - `modern/backends/interop/d3d11/include/qtav/d3d11_frame_interop.h`
 - `modern/MOBILE.md`
 
@@ -250,8 +253,10 @@ Current implementation:
 - `modern/backends/render/mobile/src/mobile_video_renderer.cpp`
 - `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
 - `modern/backends/hwaccel/mediacodec/src/mediacodec_hardware_decoder.cpp`
+- `modern/backends/hwaccel/ohcodec/src/ohcodec_hardware_decoder.cpp`
 - `modern/backends/interop/mediacodec_vulkan/src/mediacodec_vulkan_interop.cpp`
 - `modern/backends/interop/mediacodec_opengl/src/mediacodec_opengl_interop.cpp`
+- `modern/backends/interop/ohcodec_opengl/src/ohcodec_opengl_interop.cpp`
 - `modern/backends/interop/d3d11/src/d3d11_frame_interop.cpp`
 - `modern/backends/output/d3d11/src/d3d11_video_output.cpp`
 - `modern/tests/audio_sink_player_test.cpp`
@@ -841,10 +846,15 @@ and is transferred to another Intel machine for administrator-only GPU tracing,
 root-cause confirmation, repair, and cross-vendor regression. The active local
 track is OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
-native OHAudio output, OHCodec decoder selection, and direct `OHNativeWindow`
-H.264/HEVC present/drop scheduling and lifecycle matrix are complete. The next
-slice is OHOS OpenGL ES native hardware-frame interop through
-`OH_NativeImage` and `GL_TEXTURE_EXTERNAL_OES`.
+native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
+lifecycle matrix, and raw-YCbCr `OH_NativeImage`/OpenGL ES/libplacebo
+hardware-frame path are complete. The OpenGL ES path performs no decoded-source
+CPU map, transfer, staging, or upload, but deliberately uses one RGBA16F GPU
+representation-normalization pass per image and is not strict source zero copy.
+The next slice is retained `OH_NativeBuffer` Vulkan import that libplacebo can
+wrap directly. Afterward, FFmpeg-parsed Dolby Vision RPU metadata must be
+correlated to exact OHCodec outputs by normalized PTS and validated with Dolby
+Vision Profile 5 and supported Profile 8.x media.
 
 Active local OHOS execution order:
 
@@ -878,10 +888,28 @@ Active local OHOS execution order:
    installed consumer, and complete connected H.264/HEVC pause/resume, seek,
    media-replacement, stop, background/foreground, surface-recreation,
    stale-generation, retained-output-bound, and shutdown matrix pass.
-9. [ ] Add OHOS OpenGL ES native hardware-frame interop: supply the
+9. [x] Add OHOS OpenGL ES native hardware-frame interop: supply the
    `OHNativeWindow` produced by `OH_NativeImage` to OHCodec surface output,
-   update the native image, and sample its `GL_TEXTURE_EXTERNAL_OES` texture
-   under the selected SDK's token, generation, and image-lifetime rules.
+   update the native image, sample raw Y/Cb/Cr through `GL_EXT_YUV_target`,
+   and pass the RGBA16F representation-normalization result to libplacebo
+   under the selected SDK's token, generation, PTS, and image-lifetime rules.
+   The connected HAP passed with `rawYcbcr=93`, `implicitRgb=0`, and
+   `ptsUsNormalized=91`; decoded-source CPU map, transfer, staging, and upload
+   counters remained zero.
+10. [ ] Expose and retain the exact decoder-owned `OH_NativeBuffer` through GPU
+    completion, import it with `VK_OHOS_external_memory`, and provide an
+    explicit native format/plane contract that `pl_vulkan_wrap` can consume
+    directly. Strict source zero copy requires no `OH_AVBuffer_GetAddr()`,
+    `av_image_copy2()`, CPU map/transfer/staging/upload, or RGBA normalization
+    intermediate. Release the OHCodec output only after GPU completion and
+    report unsupported when direct wrapping cannot be proven.
+11. [ ] Correlate FFmpeg-parsed Dolby Vision RPU side data with the exact
+    retained OHCodec output after timestamp-unit normalization. Validate Dolby
+    Vision Profile 5 and supported Profile 8.x media through the raw OpenGL ES
+    and strict Vulkan libplacebo routes, with libplacebo owning reshaping,
+    color conversion, tone/gamut mapping, and output encoding. Reject unmatched
+    RPU or implicit-RGB input; enhancement-layer residual reconstruction and
+    certification remain out of scope.
 
 The HAP/XComponent Vulkan slice completed on 2026-08-05. It adds the exported
 `QtAV::RenderVulkanOHOS` target, retains the active `OHNativeWindow`, owns the
@@ -970,6 +998,19 @@ and one stale-generation rejection each passed. Retention remained bounded at
 `maxPending=2`; `pendingAtStop=1` drained to `pendingEnd=0`, and `maxQueued=0`.
 This completes Next-task item 8 without completing Milestone 7. The next local
 slice is OHOS OpenGL ES `OH_NativeImage` native hardware-frame interop.
+
+The OHCodec raw OpenGL ES/libplacebo checkpoint completed on 2026-08-05. The
+signed HAP supplied an `OH_NativeImage` producer window to OHCodec, retained the
+exact scheduler frame, normalized the device's microsecond PTS form to
+nanoseconds, and correlated every updated native image before sampling raw Y,
+Cb, and Cr through `GL_EXT_YUV_target`. The connected result passed with 48
+H.264 and 45 HEVC renders, `rawYcbcr=93`, `implicitRgb=0`,
+`timestampMatches=93`, and `ptsUsNormalized=91`. libplacebo remained the sole
+semantic color authority. Decoded-source CPU map, software-transfer, staging,
+and upload counters were zero, while every rendered raw image deliberately used
+one RGBA16F GPU representation-normalization pass. This completes Next-task
+item 9 without claiming strict source zero copy or completing Milestone 7. The
+next local slice is retained-`OH_NativeBuffer` Vulkan direct wrapping.
 
 The portable render-attempt slice completed on 2026-08-05. The public
 `VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
@@ -2251,9 +2292,9 @@ Acceptance:
 Status: complete. Its connected-device results remain the Android regression
 baseline. The Intel matrix continues on the external administrator-capable
 Windows machine; the portable Android/OHOS result contract and OHAudio slice
-are complete. OHCodec decoder selection and its direct-surface lifecycle matrix
-are complete; local work proceeds into OHOS `OH_NativeImage`/OpenGL ES native
-hardware-frame interop.
+are complete. OHCodec decoder selection, its direct-surface lifecycle matrix,
+and its raw-YCbCr `OH_NativeImage`/OpenGL ES/libplacebo path are complete;
+local work proceeds into retained-`OH_NativeBuffer` Vulkan direct wrapping.
 
 ## Active milestone 7 — OHOS production path
 
@@ -2261,9 +2302,11 @@ This is now the active local development milestone. The transferred Intel
 Windows performance issue remains open in parallel and must not be described as
 fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
 toolchain validation, portable render-result contract, Vulkan/OpenGL ES
-selector path, OHAudio sink, and OHCodec H.264/HEVC direct-surface lifecycle
-matrix are complete and connected-device validated. The next local slice is
-OHOS OpenGL ES native hardware-frame interop through `OH_NativeImage`.
+selector path, OHAudio sink, OHCodec H.264/HEVC direct-surface lifecycle matrix,
+and raw-YCbCr OHCodec/OpenGL ES/libplacebo path are complete and connected-
+device validated. The next local slice is retained `OH_NativeBuffer` Vulkan
+direct wrapping with strict source zero copy, followed by exact-PTS Dolby
+Vision RPU attachment and Profile 5/Profile 8.x validation.
 
 Target clarification gate:
 
@@ -2291,9 +2334,9 @@ Target clarification gate:
 - [~] Add QtAVCore OHOS CI execution and production HAP playback/device
   validation. The existing dependency CI remains on its macOS self-hosted
   runner. Local signed-HAP XComponent Vulkan/OpenGL ES presentation and
-  one-way selector fallback, OHAudio output, and the complete H.264/HEVC
-  OHCodec direct-output lifecycle matrix are now validated; CI execution
-  remains pending.
+  one-way selector fallback, OHAudio output, the complete H.264/HEVC OHCodec
+  direct-output lifecycle matrix, and raw-YCbCr OpenGL ES/libplacebo interop
+  are now validated; CI execution remains pending.
 
 Windows toolchain validation on 2026-08-05 rebuilt the complete target
 dependency closure locally from source in 17 minutes and passed
@@ -2352,21 +2395,21 @@ change.
 - [x] Implement direct `OHNativeWindow` presentation first, including
   generation validation and connected-device totals of 48 H.264 presentations
   with 5 drops plus 40 HEVC presentations with 5 drops.
-- [ ] Add the confirmed OHOS OpenGL ES path: supply the `OHNativeWindow`
-  produced by `OH_NativeImage` to OHCodec surface output, update the surface
-  image, and sample its bound `GL_TEXTURE_EXTERNAL_OES` texture while
-  enforcing the selected SDK's token, generation, and image-lifetime rules.
-- [ ] Before claiming OHOS Vulkan zero-CPU-copy interop, add a backend or
-  narrowly scoped FFmpeg bridge that exposes and retains the decoded
-  `OH_AVBuffer`/`OH_NativeBuffer` through GPU completion. The current FFmpeg 8
-  OHCodec buffer branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`
-  and is therefore disallowed; its surface branch exposes only present/drop
-  tokens, not a Vulkan-importable native buffer.
-- [ ] After that bridge exists, add the OHOS Vulkan adapter using the target
-  SDK's native-buffer/external-memory path and release the codec output only
-  after GPU completion. Record exact format, lifetime, protected-content, and
-  fence capabilities on the target device; keep the feature unavailable when
-  any required capability is absent.
+- [x] Add the OHOS OpenGL ES raw-component path through `OH_NativeImage`,
+  `GL_TEXTURE_EXTERNAL_OES`, and `GL_EXT_YUV_target`. The connected HAP passed
+  with `rawYcbcr=93`, `implicitRgb=0`, and `ptsUsNormalized=91`, zero
+  decoded-source CPU copies, and one explicitly reported RGBA16F GPU
+  representation-normalization pass per rendered image.
+- [ ] Expose and retain the decoder-owned `OH_NativeBuffer` without calling
+  `OH_AVBuffer_GetAddr()` or `av_image_copy2()`.
+- [ ] Import that buffer through `VK_OHOS_external_memory`, wrap its explicit
+  format/planes directly for libplacebo, and release it only after GPU
+  completion. Strict source zero copy also forbids a GPU normalization
+  intermediate; unsupported native formats remain unavailable rather than
+  silently copied.
+- [ ] Attach FFmpeg-parsed Dolby Vision RPU metadata to the exact OHCodec output
+  using normalized PTS and validate Profile 5 plus supported Profile 8.x media
+  through libplacebo.
 - [ ] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
   interop for subsequent frames; otherwise follow an explicit direct-surface,
   software-decode, or no-video policy without implicit hardware-frame mapping.
@@ -2384,12 +2427,17 @@ Acceptance:
   without media reopen, and the both-renderers-unavailable error path;
 - OHCodec H.264 and HEVC paths cover pause/resume, seek, media replacement,
   stop, background/foreground transition, surface recreation, and shutdown;
-- on a capable target, H.264 and HEVC native frames render through both Vulkan
-  and OpenGL ES with zero CPU map/transfer/upload calls, correct fence ordering,
-  bounded retained buffers, color/format validation, and lifecycle coverage;
-- the OHOS Vulkan result specifically proves that the active decode path did
-  not call `OH_AVBuffer_GetAddr()` or `av_image_copy2()`; final-render-target
-  readback for pixel validation is permitted;
+- the OHOS OpenGL ES result proves raw-YCbCr sampling, zero implicit-RGB images,
+  exact timestamp correlation, zero decoded-source CPU map, transfer, staging,
+  or upload calls, and separately reports its single RGBA16F GPU normalization
+  pass;
+- the OHOS Vulkan result proves strict source zero copy: the active decode path
+  calls neither `OH_AVBuffer_GetAddr()` nor `av_image_copy2()`, creates no
+  source-normalization intermediate, and presents a directly wrapped retained
+  native buffer; final-render-target readback for pixel validation is permitted;
+- Dolby Vision validation proves exact normalized-PTS RPU/output correlation
+  for Profile 5 and supported Profile 8.x frames, with raw components and RPU
+  metadata reaching libplacebo before reshape and output color processing;
 - unsupported native-buffer import capability is reported explicitly as
   unavailable or skipped, not counted as zero-CPU-copy success;
 - Android/OHOS share renderer engines and deterministic tests without sharing
@@ -2421,12 +2469,18 @@ Acceptance:
 - [ ] Windows HDMI/WASAPI passthrough.
 - [ ] Atmos object-metadata preservation/rendering feasibility.
 - [x] HDR10 metadata propagation.
-- [x] Dolby Vision Profile 5 application-rendered playback: FFmpeg parses RPU
+- [x] Android Dolby Vision Profile 5 application-rendered playback: FFmpeg
+  parses RPU
   metadata, the Vulkan and OpenGL ES backends pass raw base-layer components
   to libplacebo for reshaping, and libplacebo performs target-aware SDR tone
   mapping or native HDR output. Connected-device validation covers both GPU
   backends without decoded-source CPU copies. Enhancement-layer residual
   reconstruction and product certification remain out of scope.
+- [ ] OHOS OHCodec Dolby Vision Profile 5 and supported Profile 8.x
+  application-rendered playback through exact normalized-PTS RPU attachment,
+  raw-component native-buffer interop, and libplacebo reshape/color/tone/output
+  processing. Implicit-RGB input, unmatched RPU, enhancement-layer residual
+  reconstruction, and certification are not accepted as completion.
 - [ ] Licensing and certification review before product claims.
 
 Codec decoding must never be described as Dolby certification or Atmos

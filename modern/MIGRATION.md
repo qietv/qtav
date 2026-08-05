@@ -115,6 +115,12 @@ already own a graphics context or require multiple/custom render targets:
   `QtAV::RenderOpenGLAndroid` EGL/window adaptation for native RGB10_A2 HDR or
   explicit RGBA8/sRGB fallback and OHOS `QtAV::RenderOpenGLOHOS` adaptation
   for a capability-verified RGBA8/sRGB baseline;
+- one GPU semantic pipeline: libplacebo is the sole Windows D3D11, Vulkan, and
+  OpenGL ES authority for color conversion, Dolby Vision, tone/gamut mapping,
+  scaling, and output encoding. Platform interop only imports native buffers,
+  preserves synchronization and lifetime, and exposes raw representation;
+  backend-local shaders may normalize that representation but may not perform
+  semantic color work;
 - optional platform-neutral `QtAV::RenderMobile` policy that keeps one
   `VideoRenderAPI` attached across Vulkan-preferred startup, bounded same-API
   recovery, one-way OpenGL ES fallback, and the no-renderer state, with an
@@ -262,7 +268,10 @@ direct output with 48/40 presentations and 5 drops per codec, pause/resume, a
 2000 ms seek callback, media replacement, stop, background/foreground, surface
 recreation, stale-generation rejection, and bounded retention
 (`maxPending=2`, `pendingEnd=0`, `maxQueued=0`). Native hardware-frame texture
-interop remains separate work, beginning with `OH_NativeImage`/OpenGL ES.
+interop remains separate work. Its preferred target is a retained
+`OH_AVBuffer`/`OH_NativeBuffer` Vulkan import; the OpenGL ES fallback requires
+raw `GL_EXT_YUV_target` sampling and RGBA16F GPU normalization, not implicit
+external-OES YUV-to-RGB conversion.
 
 On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
 `ID3D11Device` and its immediate context. `D3D11VideoRenderer` accepts that
@@ -333,7 +342,9 @@ without a Video Processor RGB pass. The renderer wraps plane-specific D3D11
 views with libplacebo, attaches the exact FFmpeg Dolby Vision RPU before color
 conversion, and renders directly to the selected SDR, FP16 scRGB, or RGB10/PQ
 target. PQ/BT.2020 and Profile 5 hardware frames therefore preserve their raw
-semantic input through the zero-CPU-map path. The renderer reports D3D11
+semantic input through the zero-CPU-map path. Direct plane wrapping uses no
+normalization draw or intermediate source texture and therefore satisfies the
+strict no-intermediate source zero-copy definition. The renderer reports D3D11
 hardware-frame capability and
 offers an explicit, disabled-by-default software mapping fallback through
 `setAllowSoftwareMappingFallback()`. The interop and renderer use the same
@@ -374,8 +385,9 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
-- OHOS native hardware-frame texture interop, beginning with
-  `OH_NativeImage`/OpenGL ES, plus the separately gated Vulkan bridge;
+- OHOS native hardware-frame texture interop, preferring retained
+  `OH_NativeBuffer` Vulkan import, plus a separately gated raw
+  `GL_EXT_YUV_target` OpenGL ES fallback;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;
@@ -393,7 +405,8 @@ Vulkan-to-OpenGL ES fallback without reopening media. It also covers OHAudio
 PCM delivery, device-master timing, pause/resume, seek/flush, and segment-end
 drain, plus the complete OHCodec H.264/HEVC direct-surface lifecycle matrix.
 Android covers the complete Vulkan/OpenGL ES native-buffer interop matrix
-below; OHOS OpenGL ES native hardware-frame interop is the next slice.
+below; OHOS native hardware-frame texture interop remains a separate pending
+slice with Vulkan preferred over the OpenGL ES fallback.
 `MobileVideoRendererSelector` now implements the accepted Android/OHOS policy:
 it prefers application-created Vulkan, performs bounded same-API recreation
 for recoverable surface loss, switches one-way to an application-created
@@ -408,11 +421,13 @@ rejection, background/foreground surface recreation, and shutdown on the
 recorded device. OHOS OHCodec direct-surface H.264/HEVC output now passes the
 same lifecycle classes with bounded retained outputs and final-reference drop.
 The separate Android Vulkan and OpenGL ES native-buffer adapters are now
-implemented and device-validated; the confirmed OHOS `OH_NativeImage`/OpenGL
-ES path is next, while OHOS Vulkan remains separately capability-gated. Their
-zero-CPU-copy contract forbids decoded-pixel mapping, software transfer, CPU
-staging, and re-upload; it requires retained native-buffer lifetime, explicit
-producer/release synchronization, and capability-gated format support. A
+implemented and device-validated. Their zero-CPU-copy contract forbids
+decoded-pixel mapping, software transfer, CPU staging, and re-upload; it
+requires retained native-buffer lifetime, explicit producer/release
+synchronization, and capability-gated format support. This claim permits a
+GPU-only normalization texture. The narrower strict no-intermediate
+source zero-copy claim additionally requires an explicit graphics format and
+plane mapping that libplacebo wraps directly, without a normalization draw. A
 Vulkan-to-OpenGL ES switch attempts compatible GLES native import for
 subsequent frames, then follows the caller's explicit direct-surface,
 software-decode, or no-video policy instead of silently copying a hardware
@@ -434,12 +449,23 @@ late frames from the retired Vulkan surface are discarded without mapping.
 The connected Adreno 830 run injected fatal Vulkan failure after 30 successful
 imports and continued the same H.264 media session with 180 raw EGLImage
 imports and matching release fences; both interop paths reported zero
-decoded-source map/transfer/staging/upload calls. The next OHOS hardware-frame
-slice uses `OH_NativeImage` with an external-OES texture. OHOS Vulkan remains
-conditional on adding a retained
-`OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer
-branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
-zero-CPU-copy source as-is.
+decoded-source map/transfer/staging/upload calls. These are zero-CPU-copy
+results; the RGBA16F normalization path is not strict source zero-copy.
+
+For OHOS, the preferred target is a retained `OH_AVBuffer`/`OH_NativeBuffer`
+bridge imported through `VK_OHOS_external_memory`. It may claim strict source
+zero-copy only when an explicit `VkFormat` and plane mapping allow direct
+libplacebo wrapping; an opaque external format that needs a GPU normalization
+texture retains only the
+zero-CPU-copy claim. The GLES fallback must sample raw components through
+`GL_EXT_YUV_target` into RGBA16F before libplacebo and is therefore also not
+strict source zero-copy. Implicit external-OES conversion is not a target.
+OHCodec/NativeImage may propagate the codec PTS unchanged in microseconds, so
+the interop compares the observed value and its microsecond-to-nanosecond
+candidate against the exact queued-frame PTS set, then stores and correlates
+the selected value in nanoseconds. The current FFmpeg 8 OHCodec buffer branch
+calls `OH_AVBuffer_GetAddr()` and
+`av_image_copy2()`, so it cannot satisfy either native-buffer route as-is.
 The Vulkan renderer now imports the application device through libplacebo.
 `BorrowedVulkanDevice` therefore also requires its `VkInstance` and explicit
 confirmation that Vulkan 1.2 `timelineSemaphore` and `hostQueryReset` were
@@ -474,9 +500,8 @@ YCbCr/external-format sampling, one returned release fence per imported DOVI
 frame, bounded pending images, and zero decoded-source
 map/transfer/staging/upload counters. The DOVI phase retains parsed RPU
 metadata on all 100 output frames and renders 97 through libplacebo. OHOS
-direct-surface lifecycle coverage is complete; its `OH_NativeImage`/OpenGL ES
-texture interop is the next backend slice under the responsibility and
-lifecycle boundaries in
+direct-surface lifecycle coverage is complete; native-buffer texture interop
+remains pending under the responsibility and lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and
@@ -489,8 +514,9 @@ The core is codec-agnostic and uses the decoder registered by FFmpeg. AC-3,
 E-AC-3, and TrueHD software decoding have been exercised through the audio
 frame callback. This is PCM decode support only; IEC 61937/HDMI passthrough,
 and Atmos object rendering remain separate backend/product work. On the
-Vulkan video path, FFmpeg-parsed `AV_FRAME_DATA_DOVI_METADATA` is passed to
-libplacebo for base-layer Dolby Vision reshaping and target-aware tone mapping;
+libplacebo GPU video paths, FFmpeg-parsed `AV_FRAME_DATA_DOVI_METADATA` is
+passed to libplacebo only for residual-disabled base-layer Dolby Vision
+reshaping and target-aware tone mapping;
 the HEVC MediaCodec wrapper obtains that metadata through the same in-tree
 FFmpeg RPU parser. libdovi is not required or enabled. Enhancement-layer
 residual reconstruction, licensing, and certification remain outside this
@@ -592,7 +618,7 @@ implementation.
 ## Recommended next implementation order
 
 1. Keep the resolved Android OpenGL ZeroCopy long-form/reopen regression in
-   the connected-device gate while preserving the zero-copy and libplacebo
+   the connected-device gate while preserving the zero-CPU-copy and libplacebo
    color paths.
 2. Keep the CPU swscale renderer and image-buffer target as the reference
    software path.

@@ -2,6 +2,7 @@
 
 #include <qtav/mobile_video_renderer.h>
 #include <qtav/ohcodec_hardware_decoder.h>
+#include <qtav/ohcodec_opengl_interop.h>
 #include <qtav/ohos_opengl_video_renderer.h>
 #include <qtav/ohos_vulkan_video_renderer.h>
 #include <qtav/ohaudio_audio_sink.h>
@@ -37,6 +38,11 @@ int qtav_ohos_render_install_consumer()
     const qtav::HardwareDecodeConfig ohCodecConfig =
         qtav::ohCodecHardwareDecodeConfig(emptyOHCodecSurface);
     qtav::OHCodecFrame emptyOHCodecFrame;
+    const qtav::OHCodecOpenGLInteropConfig ohCodecOpenGLConfig;
+    qtav::OHCodecOpenGLInterop ohCodecOpenGLInterop(
+        ohCodecOpenGLConfig);
+    const qtav::OHCodecOpenGLInteropStatistics
+        ohCodecOpenGLStatistics = ohCodecOpenGLInterop.statistics();
     return capabilities.customViewport
             && capabilities.rotation
             && capabilities.ownedContext
@@ -61,6 +67,16 @@ int qtav_ohos_render_install_consumer()
             && ohCodecConfig.decoderWrapper == "ohcodec"
             && !emptyOHCodecFrame
             && !emptyOHCodecFrame.drop()
+            && !ohCodecOpenGLInterop.surface()
+            && ohCodecOpenGLStatistics.cpuMapCalls == 0
+            && ohCodecOpenGLStatistics.softwareTransferCalls == 0
+            && ohCodecOpenGLStatistics.stagingCopies == 0
+            && ohCodecOpenGLStatistics.rendererUploads == 0
+            && ohCodecOpenGLStatistics.rawYcbcrImages == 0
+            && ohCodecOpenGLStatistics.implicitRgbImages == 0
+            && ohCodecOpenGLStatistics
+                    .microsecondTimestampsNormalized
+                == 0
             && std::string(
                    qtav::mobileRenderAPIName(
                        qtav::MobileRenderAPI::OpenGLES))

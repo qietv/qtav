@@ -35,6 +35,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - audio and video frame callbacks with reference-counted frame lifetime;
 - structured video range, primaries, transfer, matrix, chroma-location, HDR10
   mastering-display, and content-light metadata;
+- libplacebo as the sole semantic color/shader authority for the Windows
+  D3D11, Vulkan, and OpenGL ES GPU renderers, including color conversion,
+  Dolby Vision reshaping, tone/gamut mapping, scaling, and output encoding;
 - `prepare`, `seek`, pause/resume/stop, playback rate, A-B range, and loop;
 - media/track information and `avformat.*` property forwarding;
 - decoder-driven `setRenderCallback()` plus reason-aware render-thread
@@ -193,7 +196,9 @@ Current backend integration boundary:
 - `QtAV::InteropD3D11` consumes same-device D3D11VA NV12/P010 texture-array
   slices as raw luma/chroma planes for libplacebo without a D3D11 Video
   Processor RGB conversion and without mapping, transferring, staging, or
-  uploading decoded pixels through CPU memory;
+  uploading decoded pixels through CPU memory. Because libplacebo wraps those
+  retained plane views directly, this is strict no-intermediate source
+  zero-copy;
 - `QtAV::OutputD3D11` combines the Windows device, renderer, decoder, and
   interop targets into a composition-surface output for ordinary applications;
   the application supplies a swap-chain binding callback, surface size, and
@@ -241,8 +246,10 @@ Current backend integration boundary:
   output; cross-API fallback never retries or maps the retired native frame;
 - OHOS OHCodec decoder selection, explicit direct-surface presentation tokens,
   and the H.264/HEVC lifecycle matrix are implemented and device-validated.
-  Native hardware-frame texture interop remains pending, beginning with the
-  confirmed `OH_NativeImage`/OpenGL ES path.
+  Native hardware-frame texture interop remains pending. The preferred target
+  is retained `OH_NativeBuffer` import through Vulkan; the OpenGL ES fallback
+  requires raw `GL_EXT_YUV_target` sampling rather than implicit external-OES
+  YUV-to-RGB conversion.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -265,26 +272,43 @@ The accepted design is
 specified in [`MOBILE.md`](MOBILE.md).
 
 The Android Vulkan and OpenGL ES zero-CPU-copy paths are separate backends.
-Vulkan consumes private GPU-sampled
-`AImageReader` images by importing retained `AHardwareBuffer` allocations,
-native YCbCr/external formats, and acquire/release fences. OpenGL ES also owns
-a private GPU-sampled `AImageReader`, imports each retained
-`AHardwareBuffer` as an EGLImage, waits its acquire fence, and returns a
-release fence after submission. `GL_EXT_YUV_target` exposes raw Y, Cb, and Cr;
-a crop-aware GPU normalization pass stores those components in RGBA16F without
-performing color conversion, after which libplacebo applies FFmpeg's Dolby
-Vision metadata and the complete output color pipeline. Imports that cannot
-prove this raw contract are rejected for Dolby Vision rather than sampled
-through an implicitly converted SurfaceTexture. On OHOS, the confirmed GLES
-path uses
-`OH_NativeImage` plus an external-OES texture. OHOS Vulkan additionally needs
-a retained `OH_AVBuffer`/`OH_NativeBuffer` bridge because the current FFmpeg 8
-OHCodec buffer branch performs `OH_AVBuffer_GetAddr()` plus
-`av_image_copy2()` and therefore cannot satisfy this contract as-is. A
-zero-CPU-copy claim requires zero decoded-pixel map, software transfer, CPU
+Their platform interop responsibility stops at native import, format/plane
+exposure, timestamp/generation correlation, synchronization, and retained
+source lifetime; libplacebo owns all semantic processing.
+Vulkan consumes private GPU-sampled `AImageReader` images by importing retained
+`AHardwareBuffer` allocations, native YCbCr/external formats, and
+acquire/release fences. OpenGL ES also owns a private GPU-sampled
+`AImageReader`, imports each retained `AHardwareBuffer` as an EGLImage, waits
+its acquire fence, and returns a release fence after submission.
+`GL_EXT_YUV_target` exposes raw Y, Cb, and Cr; a crop-aware GPU normalization
+pass stores those components in RGBA16F without performing color conversion,
+after which libplacebo applies the complete semantic color pipeline.
+
+Here, zero-CPU-copy means zero decoded-source map, software transfer, CPU
 staging, and re-upload calls plus verified native-buffer lifetime and fence
-ordering. Unsupported imports are reported rather than silently mapped, and a
-Vulkan-to-OpenGL ES renderer switch does not itself authorize a CPU copy.
+ordering. It permits a GPU normalization texture. The narrower strict
+no-intermediate source zero-copy claim is allowed only when an explicit native
+format and plane mapping let libplacebo wrap the retained decoder allocation
+directly, with no normalization draw or intermediate source texture. Android
+OpenGL ES raw RGBA16F normalization and opaque-external-format Vulkan
+normalization are therefore zero-CPU-copy, but not strict source zero-copy.
+
+OHOS must use the same responsibility boundary. The preferred future route
+retains the exact `OH_AVBuffer`/`OH_NativeBuffer` and imports it through
+`VK_OHOS_external_memory`. Only an explicit `VkFormat`/plane mapping can
+qualify that route as strict
+source zero-copy. An opaque external format that needs GPU normalization keeps
+only the zero-CPU-copy claim. The OpenGL ES fallback requires raw
+`GL_EXT_YUV_target` sampling followed by RGBA16F GPU normalization; implicit
+external-OES YUV-to-RGB conversion is not a target. OHCodec/NativeImage may
+propagate the codec PTS unchanged in microseconds, so the interop compares the
+observed value and its microsecond-to-nanosecond candidate against the exact
+queued-frame PTS set, then stores and correlates the selected value in
+nanoseconds. The current FFmpeg 8 OHCodec buffer branch performs
+`OH_AVBuffer_GetAddr()` plus `av_image_copy2()`
+and cannot satisfy either native-buffer route as-is. Unsupported imports are
+reported rather than silently mapped, and a renderer switch does not itself
+authorize a CPU copy.
 
 ## Build
 
@@ -766,8 +790,11 @@ dropped 5. The run passed pause/resume, a 2000 ms target/callback seek, media
 replacement, explicit stop, background and foreground transitions, one
 surface recreation, and one stale-generation rejection. Output retention was
 bounded at `maxPending=2`; `pendingAtStop=1` drained to `pendingEnd=0`, and
-`maxQueued=0`. This completes the direct-surface lifecycle matrix. The next
-hardware-frame slice is `OH_NativeImage`/OpenGL ES interop.
+`maxQueued=0`. This completes the direct-surface lifecycle matrix; it does not
+validate texture interop. The preferred next hardware-frame target is retained
+`OH_NativeBuffer` Vulkan import. A later OpenGL ES fallback must expose raw
+components through `GL_EXT_YUV_target` and must not rely on implicit
+external-OES conversion.
 
 ### MediaCodec direct-surface hardware decode
 
@@ -882,28 +909,29 @@ The config's optional `width` and `height` are only the reader's default
 dimensions; when omitted, the interop uses `1x1`. MediaCodec overrides that
 default with its decoded output size, and every import uses the actual
 `AImage` dimensions and crop, so applications do not need a separate media
-probe before creating the zero-copy path.
+probe before creating the zero-CPU-copy path.
 `queueFrame()` performs a bounded wait for the matching asynchronous image to
 be acquired, serializing producer ownership transfer without waiting for the
 playback deadline or Vulkan submission. Applications should reserve their own
 bounded render slot before calling it, retain the exact `VideoFrame`, and
 render at the scheduler-provided deadline.
-Vulkan uses the
-driver-reported format or external format and suggested YCbCr conversion. The
+Vulkan uses the driver-reported explicit format or opaque external format. The
 renderer also applies the `AImage` crop rectangle, so codec-aligned native
 allocations may be larger than the visible decoded frame.
 
-libplacebo's public Vulkan wrapping API requires a defined `VkFormat`, while
-Android private MediaCodec buffers on tested devices expose only an external
-format. For that case the interop performs one GPU-only sampling pass into an
-FP16 Vulkan texture, applying only an immutable sampler and the visible crop.
-Ordinary frames use the driver's suggested YCbCr conversion. Dolby Vision
-frames instead use an identity conversion that preserves raw Y/Cb/Cr in
-component order, so libplacebo receives the base-layer signals required by
-the FFmpeg RPU metadata. No transfer, gamut mapping, tone mapping, HDR output
-encoding, or RPU processing is implemented in that small normalization pass;
-libplacebo performs those operations from the FP16 texture onward. This does
-not map, transfer, stage, or upload decoded pixels through the CPU.
+When the driver reports an explicit `VkFormat` and plane mapping, the retained
+decoder allocation can be wrapped directly for libplacebo; only that direct
+case qualifies as strict no-intermediate source zero-copy. Android private
+MediaCodec buffers on tested devices instead expose an opaque external format,
+so the interop performs one GPU-only sampling pass into an FP16 Vulkan texture,
+applying only raw representation normalization and the visible crop. Dolby
+Vision requires an identity/raw-component sampling contract so libplacebo
+receives the base-layer signals associated with FFmpeg's RPU metadata. No
+matrix, transfer, gamut mapping, tone mapping, HDR output encoding, or RPU
+processing belongs in this normalization pass; imports that cannot preserve
+raw components must be rejected for this path. The opaque-format path performs
+no decoded-source CPU map, transfer, staging, or upload, but its intermediate
+texture means it is zero-CPU-copy rather than strict source zero-copy.
 
 When an acquire sync fd is present it is imported into a temporary Vulkan
 semaphore. Submission waits on that semaphore and transfers ownership from
@@ -984,6 +1012,8 @@ matrix, transfer, gamut, tone mapping, or output encoding; libplacebo performs
 all of those operations after applying any FFmpeg `AVDOVIMetadata`. A
 configured `width` and `height` only set the AImageReader's initial size;
 MediaCodec output supplies each acquired image's actual dimensions and crop.
+This route is zero-CPU-copy, but the RGBA16F normalization texture means it is
+not strict no-intermediate source zero-copy.
 
 Call `flush()` before seek, loop, decoder/media replacement, explicit stop, or
 an interop-policy switch. Close the renderer while its context can still be
@@ -1144,14 +1174,15 @@ white and preserve brighter values above `1.0`.
 
 Software frames are mapped with libplacebo's FFmpeg bridge. When FFmpeg has
 parsed a Dolby Vision RPU into `AV_FRAME_DATA_DOVI_METADATA`, libplacebo maps
-the metadata, applies base-layer reshaping, and tone maps to the selected
-target. The repository FFmpeg overlay makes the HEVC MediaCodec wrapper run
-FFmpeg's own RPU parser before submitting each access unit, correlates the
-result with the reordered hardware output timestamp, and attaches the same
+only residual-disabled base-layer metadata, applies base-layer reshaping, and
+tone maps to the selected target. The repository FFmpeg overlay makes the HEVC
+MediaCodec wrapper run FFmpeg's own RPU parser before submitting each access
+unit, correlates the result with the reordered hardware output timestamp, and
+attaches the same
 frame side data used by the software decoder. MediaCodec frames then enter the
-same libplacebo DOVI path after zero-copy external-image normalization. This
-does not require libdovi: the optional raw-RPU parser remains disabled. RPUs
-that require a residual enhancement layer are rejected by this
+same libplacebo DOVI path after zero-CPU-copy external-image normalization.
+This does not require libdovi: the optional raw-RPU parser remains disabled.
+RPUs that require a residual enhancement layer are rejected by this
 base-layer-only path; compressed passthrough, Dolby certification, and
 licensing are outside QtAVCore's scope.
 
@@ -1553,12 +1584,12 @@ context must restore their state after `renderVideo()`.
 The software path uploads YUV420P, YUV422P, YUV444P, NV12, NV21, P010,
 RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8 frames. It renders to single-sample
 BGRA8/RGBA8 UNORM, `R16G16B16A16_FLOAT`, or
-`R10G10B10A2_UNORM` 2D targets. The shader applies limited/full-range
-BT.601/BT.709/BT.2020 YUV conversion, PQ or HLG EOTF, linear-light
-BT.2020/Display-P3 to BT.709 conversion, display-aware luminance mapping, and
-the output transfer. It also supports custom viewports, Fit/Fill/Stretch, all
-right-angle rotations, resize, surface recreation, and surface/device-loss
-events.
+`R10G10B10A2_UNORM` 2D targets. libplacebo generates the D3D11 shaders and is
+the sole authority for limited/full-range YUV conversion, transfer functions,
+primaries conversion, Dolby Vision reshaping, display-aware tone/gamut mapping,
+scaling, and output encoding. The renderer supplies custom viewports,
+Fit/Fill/Stretch, all right-angle rotations, resize, surface recreation, and
+surface/device-loss events; it does not maintain a competing semantic shader.
 
 For general-purpose Windows presentation, create a flip-model
 `R16G16B16A16_FLOAT` swap chain. The renderer sets its color space to
@@ -1884,8 +1915,8 @@ imports return release fences with zero CPU map/transfer/staging/upload.
 Independent OpenGL ES phases import 99 H.264 and 180 HEVC
 AHardwareBuffer/EGLImages through the raw-YCbCr path, return a release fence
 for every imported image, survive seek plus EGL surface recreation, and retain
-the same zero-copy counters. A forced Vulkan failure rebinds MediaCodec to a
-new OpenGL AImageReader and presents another 180 raw frames without retrying
+the same zero-CPU-copy counters. A forced Vulkan failure rebinds MediaCodec to
+a new OpenGL AImageReader and presents another 180 raw frames without retrying
 the retired Vulkan image. Manual Profile 5 validation is recorded in
 [`DECISIONS.md`](DECISIONS.md).
 Windows D3D11 tests use the WARP device for deterministic offscreen rendering
@@ -1915,7 +1946,7 @@ exposes no endpoint.
 ## Architecture summary
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the complete ownership, threading,
-libplacebo color-pipeline, Android zero-copy, HDR, and packaging boundaries.
+libplacebo color-pipeline, Android zero-CPU-copy, HDR, and packaging boundaries.
 
 ```text
 Player facade
@@ -1953,7 +1984,7 @@ dependencies to the legacy library.
 See [MIGRATION.md](MIGRATION.md) for the QtAV API mapping, current limitations,
 and threading contract. See [PLAN.md](PLAN.md) for the persistent milestone
 status, next task, and backend implementation order. The accepted Windows
-D3D11VA device, frame-lifetime, and zero-copy interop design is recorded in
+D3D11VA device, frame-lifetime, and zero-CPU-copy interop design is recorded in
 [D3D11VA.md](D3D11VA.md).
 The shared Android/OHOS mobile renderer, native lifecycle, hardware-output,
 audio, and connected-device test boundaries are recorded in

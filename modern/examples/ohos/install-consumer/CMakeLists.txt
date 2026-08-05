@@ -13,6 +13,7 @@ target_link_libraries(
         QtAV::AudioOHAudio
         QtAV::AudioResample
         QtAV::HWOHCodec
+        QtAV::InteropOHCodecOpenGL
         QtAV::RenderMobile
         QtAV::RenderOpenGLOHOS
         QtAV::RenderVulkanOHOS

@@ -9,3 +9,8 @@ qtav_add_optional_backend(
     qtav_interop_mediacodec_opengl
     mediacodec_opengl
 )
+qtav_add_optional_backend(
+    QTAV_INTEROP_OHCODEC_OPENGL
+    qtav_interop_ohcodec_opengl
+    ohcodec_opengl
+)

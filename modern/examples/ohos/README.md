@@ -7,6 +7,14 @@ its native lifecycle publishes `OHNativeWindow` generations to
 surface/context/swapchain resources while the platform-neutral Vulkan and
 OpenGL ES engines render decoded software frames.
 
+For every GPU renderer, libplacebo is the sole semantic authority for color
+conversion, residual-disabled base-layer Dolby Vision reshaping, tone/gamut
+mapping, scaling, and output encoding. Platform adapters and future
+hardware-frame interop may only import native resources, preserve fences and
+lifetime, and normalize a raw representation when direct wrapping is
+impossible; they must not implement a competing color shader. Enhancement-layer
+reconstruction and Dolby certification are not claimed.
+
 The native module receives short packaged H.264/AAC and HEVC/AAC test clips in
 one `start()` call and copies them into app storage. AAC is converted to
 negotiated 48 kHz Float32 PCM through `QtAV::AudioResample` and presented
@@ -27,7 +35,22 @@ XComponent surface. The page reports foreground/background state to native
 code and creates a fresh XComponent without restarting `start()`. The native
 harness then replaces H.264 with HEVC, verifies bounded retained output across
 stop, and emits PASS only after the complete lifecycle succeeds.
-Native-buffer texture interop and native OHOS HDR remain pending.
+Native-buffer texture interop and native OHOS HDR remain pending. The preferred
+interop target retains the exact OHCodec `OH_AVBuffer`/`OH_NativeBuffer` and
+imports it through `VK_OHOS_external_memory`. It can be called strict
+no-intermediate source zero-copy only when the driver exposes an explicit
+`VkFormat` and plane mapping that libplacebo wraps directly. An opaque format
+requiring a GPU
+normalization texture is only zero-CPU-copy. The OpenGL ES fallback likewise
+requires raw `GL_EXT_YUV_target` sampling followed by crop-aware RGBA16F GPU
+normalization before libplacebo; it is zero-CPU-copy but not strict source
+zero-copy. Implicit `OH_NativeImage` external-OES YUV-to-RGB conversion
+is not the target. OHCodec/NativeImage may propagate the codec PTS unchanged in
+microseconds, so the interop compares the observed value and its
+microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
+then stores and correlates the selected value in nanoseconds. This is a
+correlation rule, not an additional device-validation result; no OHOS
+texture-interop PASS is claimed by this harness.
 The generated 440 Hz and 660 Hz tones allow a manual audibility check, while
 automation validates delivery and hardware timing.
 
