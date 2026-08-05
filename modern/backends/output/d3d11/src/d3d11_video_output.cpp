@@ -186,6 +186,25 @@ public:
         std::atomic<std::int64_t> maximumInteropMicroseconds { 0 };
         std::atomic<std::int64_t> maximumBufferUpdateMicroseconds { 0 };
         std::atomic<std::int64_t> maximumDrawMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumRetireCompletedMicroseconds { 0 };
+        std::atomic<std::int64_t>
+            maximumCompletionQueryAcquireMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumClearMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumPlRenderImageMicroseconds { 0 };
+        std::atomic<std::int64_t>
+            maximumCompletionQueryEndMicroseconds { 0 };
+        std::atomic<std::int64_t>
+            maximumInFlightRetentionMicroseconds { 0 };
+        std::atomic<std::int64_t> maximumLibplaceboPassesPerRender { 0 };
+        std::atomic<std::uint64_t> libplaceboPassGraphChanges { 0 };
+        std::atomic<std::int64_t>
+            maximumLibplaceboGpuFrameMicroseconds { 0 };
+        std::atomic<std::int64_t>
+            maximumLibplaceboGpuPassMicroseconds { 0 };
+        std::atomic<std::int64_t>
+            maximumLibplaceboCallbackArrivalMicroseconds { 0 };
+        std::atomic<std::int64_t>
+            maximumLibplaceboPostCallbackMicroseconds { 0 };
     };
 
     ~Impl()
@@ -655,6 +674,30 @@ public:
             state->maximumBufferUpdateMicroseconds.exchange(0);
         result.maximumDrawMicroseconds =
             state->maximumDrawMicroseconds.exchange(0);
+        result.maximumRetireCompletedMicroseconds =
+            state->maximumRetireCompletedMicroseconds.exchange(0);
+        result.maximumCompletionQueryAcquireMicroseconds =
+            state->maximumCompletionQueryAcquireMicroseconds.exchange(0);
+        result.maximumClearMicroseconds =
+            state->maximumClearMicroseconds.exchange(0);
+        result.maximumPlRenderImageMicroseconds =
+            state->maximumPlRenderImageMicroseconds.exchange(0);
+        result.maximumCompletionQueryEndMicroseconds =
+            state->maximumCompletionQueryEndMicroseconds.exchange(0);
+        result.maximumInFlightRetentionMicroseconds =
+            state->maximumInFlightRetentionMicroseconds.exchange(0);
+        result.maximumLibplaceboPassesPerRender =
+            state->maximumLibplaceboPassesPerRender.exchange(0);
+        result.libplaceboPassGraphChanges =
+            state->libplaceboPassGraphChanges.exchange(0);
+        result.maximumLibplaceboGpuFrameMicroseconds =
+            state->maximumLibplaceboGpuFrameMicroseconds.exchange(0);
+        result.maximumLibplaceboGpuPassMicroseconds =
+            state->maximumLibplaceboGpuPassMicroseconds.exchange(0);
+        result.maximumLibplaceboCallbackArrivalMicroseconds =
+            state->maximumLibplaceboCallbackArrivalMicroseconds.exchange(0);
+        result.maximumLibplaceboPostCallbackMicroseconds =
+            state->maximumLibplaceboPostCallbackMicroseconds.exchange(0);
         return result;
     }
 
@@ -1085,6 +1128,52 @@ private:
                         state->maximumDrawMicroseconds,
                         rendererStatistics
                             .maximumDrawMicroseconds);
+                    updateMaximum(
+                        state->maximumRetireCompletedMicroseconds,
+                        rendererStatistics
+                            .maximumRetireCompletedMicroseconds);
+                    updateMaximum(
+                        state->maximumCompletionQueryAcquireMicroseconds,
+                        rendererStatistics
+                            .maximumCompletionQueryAcquireMicroseconds);
+                    updateMaximum(
+                        state->maximumClearMicroseconds,
+                        rendererStatistics.maximumClearMicroseconds);
+                    updateMaximum(
+                        state->maximumPlRenderImageMicroseconds,
+                        rendererStatistics
+                            .maximumPlRenderImageMicroseconds);
+                    updateMaximum(
+                        state->maximumCompletionQueryEndMicroseconds,
+                        rendererStatistics
+                            .maximumCompletionQueryEndMicroseconds);
+                    updateMaximum(
+                        state->maximumInFlightRetentionMicroseconds,
+                        rendererStatistics
+                            .maximumInFlightRetentionMicroseconds);
+                    updateMaximum(
+                        state->maximumLibplaceboPassesPerRender,
+                        rendererStatistics
+                            .maximumLibplaceboPassesPerRender);
+                    state->libplaceboPassGraphChanges.fetch_add(
+                        rendererStatistics.libplaceboPassGraphChanges,
+                        std::memory_order_relaxed);
+                    updateMaximum(
+                        state->maximumLibplaceboGpuFrameMicroseconds,
+                        rendererStatistics
+                            .maximumLibplaceboGpuFrameMicroseconds);
+                    updateMaximum(
+                        state->maximumLibplaceboGpuPassMicroseconds,
+                        rendererStatistics
+                            .maximumLibplaceboGpuPassMicroseconds);
+                    updateMaximum(
+                        state->maximumLibplaceboCallbackArrivalMicroseconds,
+                        rendererStatistics
+                            .maximumLibplaceboCallbackArrivalMicroseconds);
+                    updateMaximum(
+                        state->maximumLibplaceboPostCallbackMicroseconds,
+                        rendererStatistics
+                            .maximumLibplaceboPostCallbackMicroseconds);
                 }
                 if (renderResult.status
                     != VideoRenderStatus::Rendered) {

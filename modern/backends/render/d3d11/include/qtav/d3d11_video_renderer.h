@@ -65,6 +65,26 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11VideoRendererStatistics {
     std::int64_t maximumInteropMicroseconds = 0;
     std::int64_t maximumBufferUpdateMicroseconds = 0;
     std::int64_t maximumDrawMicroseconds = 0;
+    // Detailed CPU wall-clock maxima for work that is otherwise folded into
+    // render() or maximumDrawMicroseconds. These values do not wait for GPU
+    // completion.
+    std::int64_t maximumRetireCompletedMicroseconds = 0;
+    std::int64_t maximumCompletionQueryAcquireMicroseconds = 0;
+    std::int64_t maximumClearMicroseconds = 0;
+    std::int64_t maximumPlRenderImageMicroseconds = 0;
+    std::int64_t maximumCompletionQueryEndMicroseconds = 0;
+    std::int64_t maximumInFlightRetentionMicroseconds = 0;
+    // libplacebo's GPU timings are asynchronous rolling samples. They help
+    // distinguish GPU workload from CPU/driver time inside pl_render_image(),
+    // but do not necessarily describe the same frame as the CPU maximum.
+    std::int64_t maximumLibplaceboPassesPerRender = 0;
+    std::uint64_t libplaceboPassGraphChanges = 0;
+    std::int64_t maximumLibplaceboGpuFrameMicroseconds = 0;
+    std::int64_t maximumLibplaceboGpuPassMicroseconds = 0;
+    // CPU wall time from pl_render_image() entry to the first successful-pass
+    // callback, and from the last callback until pl_render_image() returns.
+    std::int64_t maximumLibplaceboCallbackArrivalMicroseconds = 0;
+    std::int64_t maximumLibplaceboPostCallbackMicroseconds = 0;
 };
 
 // The view and optional swap chain remain application-owned and must stay

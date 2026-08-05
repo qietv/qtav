@@ -33,6 +33,47 @@ if(NOT AVCODEC_VERSION_HEADER MATCHES "#define LIBAVCODEC_VERSION_MAJOR[ \t]+62"
     message(FATAL_ERROR "QtAVCore requires FFmpeg 8 / libavcodec major 62")
 endif()
 
+if(TRIPLET MATCHES "ohos")
+    if(NOT EXISTS "${PREFIX}/include/libavutil/hwcontext_oh.h")
+        message(FATAL_ERROR "OHOS FFmpeg is missing its OHCodec hardware-context header")
+    endif()
+
+    find_program(QTAV_OHOS_LLVM_NM
+        NAMES llvm-nm llvm-nm.exe
+        HINTS "$ENV{OHOS_SDK_ROOT}/native/llvm/bin"
+        NO_DEFAULT_PATH
+    )
+    if(NOT QTAV_OHOS_LLVM_NM)
+        find_program(QTAV_OHOS_LLVM_NM NAMES llvm-nm llvm-nm.exe)
+    endif()
+    if(NOT QTAV_OHOS_LLVM_NM)
+        message(FATAL_ERROR "llvm-nm is required to verify the OHCodec archive")
+    endif()
+
+    execute_process(
+        COMMAND "${QTAV_OHOS_LLVM_NM}" "${PREFIX}/lib/libavcodec.a"
+        RESULT_VARIABLE QTAV_OHOS_NM_RESULT
+        OUTPUT_VARIABLE QTAV_OHOS_AVCODEC_SYMBOLS
+        ERROR_VARIABLE QTAV_OHOS_NM_ERROR
+    )
+    if(NOT QTAV_OHOS_NM_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "Could not inspect the OHOS libavcodec archive: ${QTAV_OHOS_NM_ERROR}"
+        )
+    endif()
+    foreach(QTAV_OHOS_CODEC_SYMBOL IN ITEMS
+        ff_h264_oh_decoder
+        ff_hevc_oh_decoder
+    )
+        if(NOT QTAV_OHOS_AVCODEC_SYMBOLS MATCHES
+           "(^|[\r\n])[^\r\n]*${QTAV_OHOS_CODEC_SYMBOL}([\r\n]|$)")
+            message(FATAL_ERROR
+                "OHOS FFmpeg was built without ${QTAV_OHOS_CODEC_SYMBOL}"
+            )
+        endif()
+    endforeach()
+endif()
+
 file(READ "${PREFIX}/include/libplacebo/config.h" LIBPLACEBO_CONFIG)
 if(NOT LIBPLACEBO_CONFIG MATCHES "#define PL_HAVE_VULKAN 1")
     message(FATAL_ERROR "libplacebo was built without Vulkan support")

@@ -878,6 +878,30 @@ struct MainWindowPrivate final {
             outputStatistics.maximumBufferUpdateMicroseconds;
         const auto maximumDraw =
             outputStatistics.maximumDrawMicroseconds;
+        const auto maximumRetire =
+            outputStatistics.maximumRetireCompletedMicroseconds;
+        const auto maximumQueryAcquire =
+            outputStatistics.maximumCompletionQueryAcquireMicroseconds;
+        const auto maximumClear =
+            outputStatistics.maximumClearMicroseconds;
+        const auto maximumPlRender =
+            outputStatistics.maximumPlRenderImageMicroseconds;
+        const auto maximumQueryEnd =
+            outputStatistics.maximumCompletionQueryEndMicroseconds;
+        const auto maximumRetention =
+            outputStatistics.maximumInFlightRetentionMicroseconds;
+        const auto maximumLibplaceboPasses =
+            outputStatistics.maximumLibplaceboPassesPerRender;
+        const auto libplaceboPassGraphChanges =
+            outputStatistics.libplaceboPassGraphChanges;
+        const auto maximumLibplaceboGpuFrame =
+            outputStatistics.maximumLibplaceboGpuFrameMicroseconds;
+        const auto maximumLibplaceboGpuPass =
+            outputStatistics.maximumLibplaceboGpuPassMicroseconds;
+        const auto maximumLibplaceboCallbackArrival =
+            outputStatistics.maximumLibplaceboCallbackArrivalMicroseconds;
+        const auto maximumLibplaceboPostCallback =
+            outputStatistics.maximumLibplaceboPostCallbackMicroseconds;
         if (video == 0 && audio == 0 && requests == 0
             && passes == 0 && rendered == 0) {
             return;
@@ -928,7 +952,31 @@ struct MainWindowPrivate final {
             << L'/'
             << static_cast<double>(maximumBufferUpdate) / 1'000.0
             << L'/'
-            << static_cast<double>(maximumDraw) / 1'000.0;
+            << static_cast<double>(maximumDraw) / 1'000.0
+            << L", max-render-detail-ms(retire/query/clear/pl-render/end/retain)="
+            << static_cast<double>(maximumRetire) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumQueryAcquire) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumClear) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumPlRender) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumQueryEnd) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumRetention) / 1'000.0
+            << L", libplacebo-pass(max/graph-change)="
+            << maximumLibplaceboPasses
+            << L'/'
+            << libplaceboPassGraphChanges
+            << L", max-libplacebo-gpu-ms(frame/pass)="
+            << static_cast<double>(maximumLibplaceboGpuFrame) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumLibplaceboGpuPass) / 1'000.0
+            << L", max-libplacebo-cpu-ms(to-callback/after-callback)="
+            << static_cast<double>(maximumLibplaceboCallbackArrival) / 1'000.0
+            << L'/'
+            << static_cast<double>(maximumLibplaceboPostCallback) / 1'000.0;
         AppendLog(message.str());
     }
 

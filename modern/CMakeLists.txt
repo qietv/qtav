@@ -23,6 +23,15 @@ if(WIN32)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
+# The supported OHOS package links the repository's PIC static FFmpeg closure
+# into QtAVCore shared libraries. Bind definitions inside each shared object so
+# AArch64 assembler references do not become non-PIC interposable relocations.
+if(CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$" AND BUILD_SHARED_LIBS)
+    add_link_options(
+        "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,SHARED_LIBRARY>:LINKER:-Bsymbolic>"
+    )
+endif()
+
 option(QTAV_CORE_BUILD_EXAMPLES "Build QtAVCore examples" ON)
 option(QTAV_CORE_BUILD_TESTS "Build QtAVCore tests" ON)
 option(QTAV_CORE_INSTALL "Generate install rules" ON)

@@ -802,6 +802,16 @@ public:
         pl_tex targetTexture = nullptr;
     };
 
+    struct RenderPassProbe {
+        std::uint64_t graphHash = 14695981039346656037ULL;
+        std::uint64_t passCount = 0;
+        std::uint64_t gpuFrameNanoseconds = 0;
+        std::uint64_t maximumGpuPassNanoseconds = 0;
+        std::int64_t cpuStartedMicroseconds = 0;
+        std::int64_t firstCallbackMicroseconds = 0;
+        std::int64_t lastCallbackMicroseconds = 0;
+    };
+
     static constexpr std::size_t maximumInFlightRenders = 3;
 
     Impl(
@@ -848,6 +858,34 @@ public:
         auto* self = static_cast<Impl*>(privateData);
         std::lock_guard<std::mutex> lock(self->logMutex_);
         self->lastLogError_ = message;
+    }
+
+    static void renderInfoCallback(
+        void* privateData,
+        const pl_render_info* info) noexcept
+    {
+        if (!privateData || !info || !info->pass) {
+            return;
+        }
+        auto* probe = static_cast<RenderPassProbe*>(privateData);
+        const auto callbackMicroseconds = steadyMicroseconds();
+        if (probe->firstCallbackMicroseconds == 0) {
+            probe->firstCallbackMicroseconds = callbackMicroseconds;
+        }
+        probe->lastCallbackMicroseconds = callbackMicroseconds;
+        const auto mixHash = [&probe](std::uint64_t value) {
+            probe->graphHash ^= value;
+            probe->graphHash *= 1099511628211ULL;
+        };
+        mixHash(info->pass->signature);
+        mixHash(static_cast<std::uint64_t>(info->stage));
+        mixHash(static_cast<std::uint64_t>(info->index));
+        mixHash(static_cast<std::uint64_t>(info->count));
+        ++probe->passCount;
+        probe->gpuFrameNanoseconds += info->pass->last;
+        probe->maximumGpuPassNanoseconds = std::max(
+            probe->maximumGpuPassNanoseconds,
+            info->pass->last);
     }
 
     static pl_hook_res scaleScRgbOutput(
@@ -1274,6 +1312,27 @@ public:
     std::atomic<std::int64_t> maximumInteropMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumBufferUpdateMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumDrawMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumRetireCompletedMicroseconds_ { 0 };
+    std::atomic<std::int64_t>
+        maximumCompletionQueryAcquireMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumClearMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumPlRenderImageMicroseconds_ { 0 };
+    std::atomic<std::int64_t>
+        maximumCompletionQueryEndMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumInFlightRetentionMicroseconds_ { 0 };
+    std::atomic<std::int64_t> maximumLibplaceboPassesPerRender_ { 0 };
+    std::atomic<std::uint64_t> libplaceboPassGraphChanges_ { 0 };
+    std::atomic<std::int64_t>
+        maximumLibplaceboGpuFrameMicroseconds_ { 0 };
+    std::atomic<std::int64_t>
+        maximumLibplaceboGpuPassMicroseconds_ { 0 };
+    std::atomic<std::int64_t>
+        maximumLibplaceboCallbackArrivalMicroseconds_ { 0 };
+    std::atomic<std::int64_t>
+        maximumLibplaceboPostCallbackMicroseconds_ { 0 };
+    std::uint64_t previousLibplaceboPassGraphHash_ = 0;
+    std::uint64_t previousLibplaceboPassCount_ = 0;
+    bool havePreviousLibplaceboPassGraph_ = false;
 };
 
 D3D11VideoRenderer::D3D11VideoRenderer(
@@ -1501,10 +1560,16 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         errorType = VideoRenderEventType::SurfaceLost;
         error = hresultText("The D3D11 device was removed", removedReason);
     }
-    if (error.empty()
-        && !impl_->retireCompletedRenders(error)) {
-        errorType = detail::d3d11FailureEvent(
-            impl_->device_.get()->GetDeviceRemovedReason());
+    if (error.empty()) {
+        const auto retireStarted = steadyMicroseconds();
+        const bool retired = impl_->retireCompletedRenders(error);
+        updateMaximum(
+            impl_->maximumRetireCompletedMicroseconds_,
+            steadyMicroseconds() - retireStarted);
+        if (!retired) {
+            errorType = detail::d3d11FailureEvent(
+                impl_->device_.get()->GetDeviceRemovedReason());
+        }
     }
     if (error.empty()
         && impl_->inFlightRenders_.size()
@@ -1642,19 +1707,30 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         impl_->maximumBufferUpdateMicroseconds_,
         steadyMicroseconds() - sourceStarted);
 
-    if (error.empty()
-        && !impl_->acquireCompletionQuery(completion, error)) {
-        errorType = detail::d3d11FailureEvent(
-            impl_->device_.get()->GetDeviceRemovedReason());
+    if (error.empty()) {
+        const auto queryStarted = steadyMicroseconds();
+        const bool acquired =
+            impl_->acquireCompletionQuery(completion, error);
+        updateMaximum(
+            impl_->maximumCompletionQueryAcquireMicroseconds_,
+            steadyMicroseconds() - queryStarted);
+        if (!acquired) {
+            errorType = detail::d3d11FailureEvent(
+                impl_->device_.get()->GetDeviceRemovedReason());
+        }
     }
 
     if (error.empty()) {
         applyGeometry(image, targetFrame, config);
         const auto drawStarted = steadyMicroseconds();
         constexpr float clearColor[] { 0.0F, 0.0F, 0.0F, 1.0F };
+        const auto clearStarted = steadyMicroseconds();
         impl_->context_.get()->ClearRenderTargetView(
             target.view,
             clearColor);
+        updateMaximum(
+            impl_->maximumClearMicroseconds_,
+            steadyMicroseconds() - clearStarted);
         const bool useHardwareImportFastParams =
             detail::d3d11ShouldUseHardwareImportFastParams(
                 static_cast<bool>(imported));
@@ -1666,13 +1742,61 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             renderParams.hooks = outputHooks;
             renderParams.num_hooks = 1;
         }
+        Impl::RenderPassProbe passProbe;
+        renderParams.info_callback = &Impl::renderInfoCallback;
+        renderParams.info_priv = &passProbe;
+        const auto plRenderStarted = steadyMicroseconds();
+        passProbe.cpuStartedMicroseconds = plRenderStarted;
         rendered = pl_render_image(
             impl_->renderer_,
             &image,
             &targetFrame,
             &renderParams);
+        const auto plRenderFinished = steadyMicroseconds();
+        updateMaximum(
+            impl_->maximumPlRenderImageMicroseconds_,
+            plRenderFinished - plRenderStarted);
         if (rendered) {
+            updateMaximum(
+                impl_->maximumLibplaceboPassesPerRender_,
+                static_cast<std::int64_t>(passProbe.passCount));
+            updateMaximum(
+                impl_->maximumLibplaceboGpuFrameMicroseconds_,
+                static_cast<std::int64_t>(
+                    passProbe.gpuFrameNanoseconds / 1'000));
+            updateMaximum(
+                impl_->maximumLibplaceboGpuPassMicroseconds_,
+                static_cast<std::int64_t>(
+                    passProbe.maximumGpuPassNanoseconds / 1'000));
+            if (passProbe.firstCallbackMicroseconds != 0) {
+                updateMaximum(
+                    impl_->maximumLibplaceboCallbackArrivalMicroseconds_,
+                    passProbe.firstCallbackMicroseconds
+                        - passProbe.cpuStartedMicroseconds);
+                updateMaximum(
+                    impl_->maximumLibplaceboPostCallbackMicroseconds_,
+                    plRenderFinished
+                        - passProbe.lastCallbackMicroseconds);
+            }
+            if (!impl_->havePreviousLibplaceboPassGraph_
+                || impl_->previousLibplaceboPassGraphHash_
+                    != passProbe.graphHash
+                || impl_->previousLibplaceboPassCount_
+                    != passProbe.passCount) {
+                impl_->libplaceboPassGraphChanges_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                impl_->previousLibplaceboPassGraphHash_ =
+                    passProbe.graphHash;
+                impl_->previousLibplaceboPassCount_ = passProbe.passCount;
+                impl_->havePreviousLibplaceboPassGraph_ = true;
+            }
+            const auto completionEndStarted = steadyMicroseconds();
             impl_->context_.get()->End(completion.Get());
+            updateMaximum(
+                impl_->maximumCompletionQueryEndMicroseconds_,
+                steadyMicroseconds() - completionEndStarted);
+            const auto retentionStarted = steadyMicroseconds();
             Impl::InFlightRender inFlight;
             inFlight.completion = std::move(completion);
             inFlight.target = std::move(targetTextureNative);
@@ -1683,6 +1807,9 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             inFlight.targetTexture = targetTexture;
             targetTexture = nullptr;
             impl_->inFlightRenders_.push_back(std::move(inFlight));
+            updateMaximum(
+                impl_->maximumInFlightRetentionMicroseconds_,
+                steadyMicroseconds() - retentionStarted);
         }
         updateMaximum(
             impl_->maximumDrawMicroseconds_,
@@ -1892,6 +2019,30 @@ D3D11VideoRenderer::takeStatistics() noexcept
         impl_->maximumBufferUpdateMicroseconds_.exchange(0);
     result.maximumDrawMicroseconds =
         impl_->maximumDrawMicroseconds_.exchange(0);
+    result.maximumRetireCompletedMicroseconds =
+        impl_->maximumRetireCompletedMicroseconds_.exchange(0);
+    result.maximumCompletionQueryAcquireMicroseconds =
+        impl_->maximumCompletionQueryAcquireMicroseconds_.exchange(0);
+    result.maximumClearMicroseconds =
+        impl_->maximumClearMicroseconds_.exchange(0);
+    result.maximumPlRenderImageMicroseconds =
+        impl_->maximumPlRenderImageMicroseconds_.exchange(0);
+    result.maximumCompletionQueryEndMicroseconds =
+        impl_->maximumCompletionQueryEndMicroseconds_.exchange(0);
+    result.maximumInFlightRetentionMicroseconds =
+        impl_->maximumInFlightRetentionMicroseconds_.exchange(0);
+    result.maximumLibplaceboPassesPerRender =
+        impl_->maximumLibplaceboPassesPerRender_.exchange(0);
+    result.libplaceboPassGraphChanges =
+        impl_->libplaceboPassGraphChanges_.exchange(0);
+    result.maximumLibplaceboGpuFrameMicroseconds =
+        impl_->maximumLibplaceboGpuFrameMicroseconds_.exchange(0);
+    result.maximumLibplaceboGpuPassMicroseconds =
+        impl_->maximumLibplaceboGpuPassMicroseconds_.exchange(0);
+    result.maximumLibplaceboCallbackArrivalMicroseconds =
+        impl_->maximumLibplaceboCallbackArrivalMicroseconds_.exchange(0);
+    result.maximumLibplaceboPostCallbackMicroseconds =
+        impl_->maximumLibplaceboPostCallbackMicroseconds_.exchange(0);
     return result;
 }
 

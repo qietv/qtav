@@ -114,6 +114,12 @@ Interpret the main fields together:
   mirrors `terminal`; transient busy attempts that later render do not count as
   skipped.
 - `max-stage-ms(color/interop/buffer/draw)` localizes a long render operation.
+- `max-render-detail-ms(retire/query/clear/pl-render/end/retain)` splits the
+  D3D11 draw path without adding a GPU wait. The libplacebo pass count/graph
+  change fields detect pipeline changes; its GPU values are asynchronous
+  rolling samples and may describe an earlier completed pass. The CPU
+  to-callback/after-callback split brackets libplacebo pass execution but does
+  not identify the individual D3D11 call inside that pass.
 - High `>80ms gaps(video/render)` with low CPU can indicate blocking I/O, clock
   starvation, driver waits, or a queue/lifetime bug rather than insufficient
   decode throughput.

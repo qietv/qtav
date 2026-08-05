@@ -1255,7 +1255,13 @@ attempts, retry wakeups, superseded and terminal frames, renderer lock-stage
 contention, reservation-aware versus unreserved context ownership, handoff
 waits/timeouts, the retained decoder-surface-copy diagnostic counter, long
 gaps, render/present maxima, and the renderer's color, interop, buffer-update,
-and draw-stage maxima. `skippedRenders` is retained for compatibility and now
+and draw-stage maxima. Detailed D3D11 fields split completion-query retirement
+and acquisition, render-target clear, `pl_render_image()`, completion `End()`,
+and retained-resource insertion. They also expose libplacebo pass count and
+pass-graph changes plus asynchronous rolling GPU pass/frame samples and CPU
+callback boundaries. The GPU samples may describe an earlier completed pass,
+so they correlate CPU and GPU behavior over an interval rather than identifying
+the same maximum frame. `skippedRenders` is retained for compatibility and now
 mirrors `terminalRenderDrops`; a recovered retry is not a skipped frame. The
 copy counter remains zero under the current direct decoder-surface policy.
 

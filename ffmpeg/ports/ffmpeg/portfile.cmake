@@ -99,6 +99,16 @@ if("qtav-player" IN_LIST FEATURES)
     string(APPEND OPTIONS " --enable-lto --enable-small --disable-iamf")
 endif()
 
+# OHCodec is a target capability rather than a generally selectable FFmpeg
+# feature. vcpkg currently models the OHOS triplet through its Linux platform
+# path, so key this policy from the explicit triplet marker instead of enabling
+# OHCodec for every Linux or arm64 build.
+if(VCPKG_TARGET_IS_OHOS)
+    string(APPEND OPTIONS " --enable-ohcodec")
+else()
+    string(APPEND OPTIONS " --disable-ohcodec")
+endif()
+
 if(VCPKG_TARGET_IS_MINGW)
     if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x86")
         string(APPEND OPTIONS " --target-os=mingw32")

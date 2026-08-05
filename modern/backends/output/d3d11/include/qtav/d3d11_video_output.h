@@ -152,6 +152,21 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
     std::int64_t maximumInteropMicroseconds = 0;
     std::int64_t maximumBufferUpdateMicroseconds = 0;
     std::int64_t maximumDrawMicroseconds = 0;
+    // Detailed renderer CPU wall-clock maxima. Completion-query timings cover
+    // submission bookkeeping only and do not wait for GPU completion.
+    std::int64_t maximumRetireCompletedMicroseconds = 0;
+    std::int64_t maximumCompletionQueryAcquireMicroseconds = 0;
+    std::int64_t maximumClearMicroseconds = 0;
+    std::int64_t maximumPlRenderImageMicroseconds = 0;
+    std::int64_t maximumCompletionQueryEndMicroseconds = 0;
+    std::int64_t maximumInFlightRetentionMicroseconds = 0;
+    // Asynchronous rolling libplacebo GPU samples and pass-graph diagnostics.
+    std::int64_t maximumLibplaceboPassesPerRender = 0;
+    std::uint64_t libplaceboPassGraphChanges = 0;
+    std::int64_t maximumLibplaceboGpuFrameMicroseconds = 0;
+    std::int64_t maximumLibplaceboGpuPassMicroseconds = 0;
+    std::int64_t maximumLibplaceboCallbackArrivalMicroseconds = 0;
+    std::int64_t maximumLibplaceboPostCallbackMicroseconds = 0;
 };
 
 // High-level composition-surface output for ordinary Windows playback.
