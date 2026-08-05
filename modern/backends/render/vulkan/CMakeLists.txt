@@ -152,6 +152,8 @@ endif()
 
 if(ANDROID)
     add_subdirectory(android)
+elseif(CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$")
+    add_subdirectory(ohos)
 endif()
 
 if(QTAV_CORE_INSTALL)

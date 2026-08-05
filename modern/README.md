@@ -76,12 +76,17 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional Android Vulkan surface adapter that retains the current
   `ANativeWindow` generation, selects a supported SDR/native-HDR swapchain,
   publishes its output color space, and owns surface/swapchain synchronization;
+- optional OHOS Vulkan surface adapter that retains an ArkUI/XComponent
+  `OHNativeWindow`, owns `VK_OHOS_surface` swapchain synchronization, and
+  delegates software-frame rendering to the same platform-neutral Vulkan
+  engine;
 - optional platform-neutral OpenGL ES 3.x renderer using libplacebo for
   software and hardware-frame color conversion, Dolby Vision RPU reshaping,
-  tone mapping, gamut mapping, and output encoding, plus an
-  Android EGL adapter that owns its display, context, window surface, and
-  surface generation, selects native 10-bit BT.2020/PQ or BT.2020/HLG when
-  available, and preserves an explicit RGBA8/sRGB SDR fallback;
+  tone mapping, gamut mapping, and output encoding, plus separate Android and
+  OHOS EGL adapters. Android selects native 10-bit BT.2020/PQ or BT.2020/HLG
+  when available and preserves an explicit RGBA8/sRGB SDR fallback; the first
+  OHOS adapter slice capability-gates an exact RGBA8/sRGB surface and reports
+  required HDR as unavailable until native HDR validation is complete;
 - optional platform-neutral mobile renderer selector that performs
   Vulkan-preferred startup, bounded same-API recovery, fatal one-way fallback
   to OpenGL ES, and an explicit no-renderer state;
@@ -98,6 +103,11 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   AAudio output, MediaCodec H.264/HEVC direct-surface validation, and
   H.264/HEVC private-AImageReader Vulkan plus AHardwareBuffer/EGLImage OpenGL
   ES texture paths;
+- a minimal OHOS ArkUI/XComponent HAP shell and connected-device harness for
+  generated-media software decode, Vulkan and OpenGL ES presentation, forced
+  initial OpenGL ES selection, and fatal one-way Vulkan-to-OpenGL ES fallback
+  without reopening media through the repository arm64/API 23 dependency
+  package;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -182,6 +192,10 @@ Current backend integration boundary:
   native HDR format/color-space pairs when available, and submits HDR10 static
   metadata when the application enabled `VK_EXT_hdr_metadata`; the application
   owns the Vulkan instance, device, queue, and NativeActivity;
+- `QtAV::RenderVulkanOHOS` owns the OHOS surface, swapchain, image views, and
+  acquire/present resources for a retained XComponent `OHNativeWindow`. The
+  ArkUI application owns the XComponent and borrowed Vulkan instance, device,
+  queue, and their lifetime;
 - `QtAV::RenderOpenGL` uploads the same software YUV420/422/444, NV12/NV21,
   P010, RGB/BGR/RGBA/BGRA/ARGB, and Gray8 families into OpenGL ES textures,
   maps their structured metadata through the shared FFmpeg/libplacebo bridge,
@@ -195,6 +209,11 @@ Current backend integration boundary:
   prefers an exact RGB10_A2 BT.2020/PQ surface, considers BT.2020/HLG, and
   falls back explicitly to RGBA8/sRGB while keeping Android and EGL types
   outside core public headers;
+- `QtAV::RenderOpenGLOHOS` retains the current XComponent `OHNativeWindow`
+  generation, owns its EGL display, OpenGL ES 3.x context, window surface, and
+  swap, and verifies an exact RGBA8/sRGB native-window contract. Native OHOS
+  HDR EGL selection remains capability-gated and is not claimed by this first
+  adapter slice;
 - `QtAV::RenderMobile` owns no graphics or platform resources. Applications
   supply Vulkan and OpenGL ES renderer factories for the current native-window
   generation; the selector keeps one stable `VideoRenderAPI` attached to
@@ -202,9 +221,9 @@ Current backend integration boundary:
   hardware-frame fallback callback selects OpenGL ES native interop,
   direct-surface presentation, software decode, or no video for subsequent
   output; cross-API fallback never retries or maps the retired native frame;
-- no OHOS hardware decoder or platform adapter has been implemented yet;
-  Android is the completed reference for the shared mobile
-  renderer/hardware-interop fallback policy.
+- no OHOS audio sink, hardware decoder, or native-buffer decode interop has
+  been implemented yet; Android remains the completed reference for those
+  later shared mobile responsibilities.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -282,6 +301,19 @@ output layout, SDK discovery, space-free SDK junction, shared-link policy, and
 HAP/signing boundary are documented in
 [`OHOS_WINDOWS.md`](OHOS_WINDOWS.md).
 
+To build the OHOS XComponent example and stage it into an existing signed
+DevEco project, use:
+
+```powershell
+./modern/examples/ohos/build-ohos-hap.ps1 `
+  -ProjectRoot C:/path/to/signed-project
+```
+
+With one HDC target connected, `run-connected-device.ps1` installs the signed
+HAP, starts its `EntryAbility`, and collects the native PASS/FAIL result. See
+[`examples/ohos/README.md`](examples/ohos/README.md) for the bundle-name and
+generated-media options.
+
 Backend switches are cache strings with `AUTO`, `ON`, and `OFF` values. `AUTO`
 enables a backend when its implementation and host requirements are available,
 `OFF` always disables it, and `ON` requires it or stops configuration with a
@@ -300,10 +332,13 @@ clear error. Current switches are:
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
 `QTAV_RENDER_MOBILE=AUTO` builds the dependency-free mobile renderer selector,
 `QTAV_RENDER_OPENGL=AUTO` builds the OpenGL ES renderer when GLES 3 headers
-and libraries are available and adds the Android EGL adapter on Android,
+and libraries are available and adds the native EGL adapter on Android
+(`QtAV::RenderOpenGLAndroid`) or OHOS (`QtAV::RenderOpenGLOHOS`),
 `QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader,
-libplacebo 7.351.0 or newer, and (on Android) `glslc` are available. The
-Android harness requires this backend explicitly,
+libplacebo 7.351.0 or newer, and (on Android) `glslc` are available. It adds
+the native surface adapter target on Android (`QtAV::RenderVulkanAndroid`) or
+OHOS (`QtAV::RenderVulkanOHOS`). The Android and OHOS harnesses require this
+backend explicitly,
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
@@ -1053,7 +1088,7 @@ submits frame-derived mastering-display and content-light metadata before
 presentation. `surfaceFormat()` and `hdrOutputActive()` expose the selected
 contract for diagnostics and tests.
 
-### OpenGL ES renderer and Android EGL adapter
+### OpenGL ES renderer and native EGL adapters
 
 Link `QtAV::RenderOpenGLAndroid` for the Android OpenGL ES fallback. The
 adapter owns its EGL display, OpenGL ES 3.x context, window surface, and swap
@@ -1096,6 +1131,16 @@ the EGL surface and refreshes the renderer target size.
 `eglSwapBuffers()`, and then releases it from the calling thread. The adapter
 does not create or select Vulkan and is not itself the Vulkan-to-OpenGL ES
 policy layer.
+
+On OHOS, link `QtAV::RenderOpenGLOHOS` and pass the current XComponent window
+to `OHOSOpenGLVideoRenderer::setWindow()`. The adapter takes an OHOS native-
+object reference, selects and verifies an exact RGBA8 EGLConfig and native
+window format, requests and verifies the sRGB color contract, and owns EGL
+surface/context recreation for that window generation. `SdrOnly` and
+`PreferHdr` currently produce SDR sRGB; `RequireHdr` fails explicitly because
+an OHOS native HDR format, EGL colorspace, and compositor contract has not yet
+passed the device capability gate. This keeps HDR-to-SDR tone mapping truthful
+while the broader OHOS HDR matrix remains pending.
 
 `QtAV::RenderOpenGL` is the reusable engine for applications or future
 platform adapters that already own an OpenGL ES 3.x context. Its

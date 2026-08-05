@@ -1,3 +1,12 @@
+if(CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$")
+    if(TARGET qtav_render_vulkan_ohos
+       AND TARGET qtav_render_opengl_ohos
+       AND TARGET qtav_render_mobile)
+        add_subdirectory(ohos)
+    endif()
+    return()
+endif()
+
 add_executable(qtav_core_console console_player.cpp)
 target_compile_features(qtav_core_console PRIVATE cxx_std_17)
 target_link_libraries(qtav_core_console PRIVATE QtAV::Core)

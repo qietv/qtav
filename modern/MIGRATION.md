@@ -100,11 +100,15 @@ already own a graphics context or require multiple/custom render targets:
   application-owned Vulkan context objects and NativeActivity lifecycle;
   libplacebo now owns Vulkan color conversion, scaling, tone mapping, output
   encoding, and FFmpeg-parsed Dolby Vision RPU reshaping;
+- optional OHOS `QtAV::RenderVulkanOHOS` surface/swapchain adaptation using
+  an ArkUI/XComponent `OHNativeWindow` and application-owned Vulkan context,
+  plus a minimal signed-HAP integration harness for software-frame playback;
 - optional platform-neutral `QtAV::RenderOpenGL` OpenGL ES 3.x rendering with
   libplacebo color conversion, scaling, tone mapping, output encoding, and
   FFmpeg-parsed Dolby Vision RPU reshaping, plus Android
   `QtAV::RenderOpenGLAndroid` EGL/window adaptation for native RGB10_A2 HDR or
-  explicit RGBA8/sRGB fallback;
+  explicit RGBA8/sRGB fallback and OHOS `QtAV::RenderOpenGLOHOS` adaptation
+  for a capability-verified RGBA8/sRGB baseline;
 - optional platform-neutral `QtAV::RenderMobile` policy that keeps one
   `VideoRenderAPI` attached across Vulkan-preferred startup, bounded same-API
   recovery, one-way OpenGL ES fallback, and the no-renderer state, with an
@@ -332,7 +336,7 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - the OHAudio device implementation;
-- the OHOS EGL adapter and Vulkan device validation;
+- broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
 - OHCodec hardware decode plus OHOS GPU zero-CPU-copy interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
@@ -342,9 +346,13 @@ or pace playback. Decoded planar audio therefore normally uses
   enhancement-layer residual reconstruction, display tunnelling, licensing,
   and certification.
 
-The Android harness is currently an integration checkpoint rather than a
-legacy QtAV API replacement. It proves the NDK, packaging, signing,
-connected-device logging, software decode, and Vulkan/OpenGL ES presentation.
+The Android and OHOS harnesses are integration checkpoints rather than a
+legacy QtAV API replacement. They prove cross-compilation, packaging, signing,
+connected-device logging, software decode, and platform presentation. The
+OHOS checkpoint now covers software-frame Vulkan, OpenGL ES, forced initial
+OpenGL ES selection, recoverable native-window recreation, and fatal one-way
+Vulkan-to-OpenGL ES fallback without reopening media. Android covers the
+complete Vulkan/OpenGL ES, audio, and hardware-decode matrix below.
 `MobileVideoRendererSelector` now implements the accepted Android/OHOS policy:
 it prefers application-created Vulkan, performs bounded same-API recreation
 for recoverable surface loss, switches one-way to an application-created

@@ -107,11 +107,27 @@ libsmb2, OpenSSL, dav1d, and the OHCodec system libraries to the final link.
 
 ## Packaging and signing
 
-These scripts produce native libraries and CMake package metadata; they do not
-create or sign a HAP. Add the installed libraries to the application's
-`libs/arm64-v8a/` directory and configure the application certificate/signing
-in DevEco Studio. Device installation and authorization remain application
-integration steps.
+The SDK scripts above produce native libraries and CMake package metadata.
+The XComponent example adds a thin HAP staging and connected-device layer:
+
+```powershell
+./modern/examples/ohos/build-ohos-hap.ps1 `
+  -ProjectRoot C:/path/to/signed-project
+./modern/examples/ohos/run-connected-device.ps1 `
+  -ProjectRoot C:/path/to/signed-project `
+  -BundleName com.example.qtav
+```
+
+The repository template intentionally contains no signing identity. Passing
+an existing DevEco project preserves its signing configuration, copies only
+the example page/type declarations and arm64 libraries, packages generated
+test media, and lets Hvigor produce its signed HAP. The device script installs
+once, launches `EntryAbility`, and collects the native PASS/FAIL marker. The
+current marker requires generated-media software decode through forced initial
+OpenGL ES selection, a fresh Vulkan session, and injected fatal one-way
+fallback to OpenGL ES without a media reopen. If
+installation pauses for device-side approval, approve it manually before
+retrying; the script does not bypass that authorization.
 
 When diagnosing a manual CMake invocation, prefer the supported script. A
 compiler test that links Windows system libraries means the OHOS chainload

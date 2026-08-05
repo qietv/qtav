@@ -120,6 +120,14 @@ sets and verifies the corresponding Android buffer dataspace. Android device
 checks cover all advertised upload families, viewport, rotation,
 target-generation replacement, P010/PQ-to-SDR readback, PQ/HLG output numeric
 encoding, real RGB10_A2/PQ presentation, and compositor HDR-layer recognition.
+`QtAV::RenderOpenGLOHOS` separately retains the XComponent
+`OHNativeWindow`, owns its EGL display, OpenGL ES 3.x context, surface, swap,
+and generation, and verifies exact RGBA8 plus sRGB native-window/EGL state.
+The first OHOS slice exposes `SdrOnly` and SDR fallback for `PreferHdr`, while
+`RequireHdr` fails explicitly until an OHOS HDR format, EGL colorspace, and
+compositor path passes the device capability gate. The connected OHOS harness
+proves initial GLES selection, Vulkan and GLES resize recreation, and fatal
+one-way Vulkan-to-GLES fallback on one media open.
 The application/platform selector is implemented separately as
 `QtAV::RenderMobile`.
 
@@ -165,13 +173,13 @@ performs the configured bounded number of complete same-API recreations,
 whereas `Error` is fatal. Fatal or repeatedly unrecoverable Vulkan is retired
 for the session before OpenGL ES is created and the retained frame is retried.
 OpenGL ES context/display/surface loss is classified as recoverable by the
-Android adapter and uses the same bounded recreation path; fatal OpenGL ES or
-failed recovery enters the explicit no-renderer state. Selection notifications
-record selected, recovered, fallback, and unavailable transitions with their
-reasons.
+Android and OHOS adapters and uses the same bounded recreation path; fatal
+OpenGL ES or failed recovery enters the explicit no-renderer state. Selection
+notifications record selected, recovered, fallback, and unavailable
+transitions with their reasons.
 
 The portable `VideoRenderAttemptResult` is the synchronous decision boundary
-used by both mobile APIs and future OHOS adapters. `Presented` completes the
+used by both mobile APIs and their native adapters. `Presented` completes the
 frame, `DeferredUntilRedraw` retains that exact frame until an asynchronous
 producer/GPU callback raises `RedrawRequested`, `RetryAfterBackoff` asks the
 application for a bounded timer retry, and `Discarded` terminally consumes a

@@ -211,8 +211,10 @@ Current public entry points:
 - `modern/backends/output/d3d11/include/qtav/d3d11_video_output.h`
 - `modern/backends/render/vulkan/include/qtav/vulkan_video_renderer.h`
 - `modern/backends/render/vulkan/android/include/qtav/android_vulkan_video_renderer.h`
+- `modern/backends/render/vulkan/ohos/include/qtav/ohos_vulkan_video_renderer.h`
 - `modern/backends/render/opengl/include/qtav/opengl_video_renderer.h`
 - `modern/backends/render/opengl/android/include/qtav/android_opengl_video_renderer.h`
+- `modern/backends/render/opengl/ohos/include/qtav/ohos_opengl_video_renderer.h`
 - `modern/backends/render/mobile/include/qtav/mobile_video_renderer.h`
 - `modern/backends/hwaccel/d3d11va/include/qtav/d3d11va_hardware_decoder.h`
 - `modern/backends/hwaccel/mediacodec/include/qtav/mediacodec_hardware_decoder.h`
@@ -239,8 +241,10 @@ Current implementation:
 - `modern/backends/render/vulkan/src/vulkan_video_renderer.cpp`
 - `modern/backends/render/libplacebo/src/libplacebo_ffmpeg_bridge.c`
 - `modern/backends/render/vulkan/android/src/android_vulkan_video_renderer.cpp`
+- `modern/backends/render/vulkan/ohos/src/ohos_vulkan_video_renderer.cpp`
 - `modern/backends/render/opengl/src/opengl_video_renderer.cpp`
 - `modern/backends/render/opengl/android/src/android_opengl_video_renderer.cpp`
+- `modern/backends/render/opengl/ohos/src/ohos_opengl_video_renderer.cpp`
 - `modern/backends/render/mobile/src/mobile_video_renderer.cpp`
 - `modern/backends/hwaccel/d3d11va/src/d3d11va_hardware_decoder.cpp`
 - `modern/backends/hwaccel/mediacodec/src/mediacodec_hardware_decoder.cpp`
@@ -834,8 +838,8 @@ There are now two explicit work tracks. The Intel Windows track remains open
 and is transferred to another Intel machine for administrator-only GPU tracing,
 root-cause confirmation, repair, and cross-vendor regression. The active local
 track is OHOS: its Milestone 7 target/toolchain gate and portable Android/OHOS
-render-result contract are complete, so the next slice starts the HAP and
-native-window adapter.
+render-result contract, HAP shell, and Vulkan/OpenGL ES software-rendering
+fallback path are complete, so the next slice starts native OHAudio output.
 
 Active local OHOS execution order:
 
@@ -850,9 +854,42 @@ Active local OHOS execution order:
    generation contract, but do not port D3D11 context reservation or the
    Windows latest-frame mailbox. Distinguish presented, deferred until redraw,
    retry after backoff, stale/discarded, surface lost, and fatal outcomes.
-4. [ ] Add the minimal ArkUI/XComponent HAP shell and the first OHOS native
+4. [x] Add the minimal ArkUI/XComponent HAP shell and the first OHOS native
    window adapter, beginning with software-frame Vulkan presentation through
    the shared renderer engine and the result contract above.
+5. [x] Add the OHOS EGL/OpenGL ES window adapter, then connect the shared
+   mobile selector so Vulkan-unavailable and fatal-failure sessions have the
+   accepted one-way OpenGL ES fallback without reopening media.
+6. [ ] Add the OHOS OHAudio sink with negotiated PCM, bounded callback-safe
+   buffering, playback clock/latency, lifecycle control, and device recovery.
+
+The HAP/XComponent Vulkan slice completed on 2026-08-05. It adds the exported
+`QtAV::RenderVulkanOHOS` target, retains the active `OHNativeWindow`, owns the
+OHOS Vulkan surface/swapchain synchronization, and delegates color and geometry
+work to `QtAV::RenderVulkan`. A minimal ArkUI/N-API shell, signed-project
+staging script, and HDC result collector build generated MPEG-4 media through
+the repository arm64/API 23 FFmpeg package. On the connected Mate 60 Pro, a
+fresh build installed and ran as `com.qtav.feasibility`, selected Maleoon 910
+and a 1260x2375 SDR swapchain, and software-decoded/presented the required 30
+frames twice. Shared and static QtAVCore variants compile the adapter and HAP
+native entry, the install exports `QtAV::RenderVulkanOHOS`, and a separate
+OHOS CMake consumer links that installed target.
+
+The OHOS EGL/OpenGL ES and selector slice completed on 2026-08-05. It adds the
+exported `QtAV::RenderOpenGLOHOS` target, retains the active XComponent
+`OHNativeWindow`, owns EGL display/context/surface/swap lifecycle, and verifies
+an exact RGBA8/sRGB native-window contract. Required native HDR fails
+explicitly until its format/colorspace/compositor gate is validated. The HAP
+now forces initial OpenGL ES selection for 20 frames, starts a fresh selector
+session on Vulkan, injects a fatal Vulkan result after 12 frames, and presents
+30 further frames through one-way OpenGL ES fallback while keeping exactly one
+Player media open. The connected Mate 60 Pro produced the exact marker
+`QTAV_OHOS_RESULT PASS software selector initialGLES=20 fatalVulkan=12
+fatalGLES=30 mediaOpen=1`; both adapters also recreated their surface for new
+native-window generations. Shared and static arm64/API 23 builds install and
+export the new target, and separate installed-package consumers link it with
+`QtAV::RenderMobile` and `QtAV::RenderVulkanOHOS`. The next local slice is
+OHAudio output.
 
 The portable render-attempt slice completed on 2026-08-05. The public
 `VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
@@ -1953,10 +1990,10 @@ Following platform slice:
 1. [~] External Windows machine: complete the Intel administrator trace,
    evidence-backed correction, and same-commit matrix described in `Next task`;
    AMD repair and NVIDIA verification are complete.
-2. [~] This machine: the portable Android/OHOS render-result contract and
-   Milestone 7 target/toolchain gate are complete; continue with the minimal
-   HAP/XComponent shell and OHOS native-window adapters without waiting for the
-   external Intel trace.
+2. [~] This machine: the portable render-result contract, target/toolchain
+   gate, HAP/XComponent Vulkan and OpenGL ES adapters, and shared-selector
+   fallback are complete; continue with the OHOS OHAudio sink without waiting
+   for the external Intel trace.
 
 Platform implementation order after the contracts are stable:
 
@@ -2133,7 +2170,7 @@ Acceptance:
 Status: complete. Its connected-device results remain the Android regression
 baseline. The Intel matrix continues on the external administrator-capable
 Windows machine; the portable Android/OHOS result contract is complete and
-local work proceeds into the OHOS HAP/XComponent adapter slice.
+local work proceeds into the OHOS OHAudio slice.
 
 ## Active milestone 7 — OHOS production path
 
@@ -2141,8 +2178,9 @@ This is now the active local development milestone. The transferred Intel
 Windows performance issue remains open in parallel and must not be described as
 fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
 toolchain validation, and the portable render-result contract are complete.
-The next local slice is the minimal HAP/XComponent shell and OHOS native-window
-adapter.
+The first HAP/XComponent Vulkan slice is complete. The next local slice is the
+OHOS OHAudio sink; the EGL/OpenGL ES adapter and shared-selector fallback are
+also complete and connected-device validated.
 
 Target clarification gate:
 
@@ -2167,10 +2205,11 @@ Target clarification gate:
   shared SDKs. The shared build applies `-Wl,-Bsymbolic`; FFmpeg pkg-config
   metadata carries libsmb2, OpenSSL, dav1d, and OHCodec system libraries into
   the first clean configure.
-- [ ] Add QtAVCore OHOS CI execution and production HAP playback/device
+- [~] Add QtAVCore OHOS CI execution and production HAP playback/device
   validation. The existing dependency CI remains on its macOS self-hosted
-  runner; the Windows local build does not by itself validate XComponent,
-  graphics presentation, OHAudio output, or OHCodec playback.
+  runner. Local signed-HAP XComponent Vulkan/OpenGL ES presentation and
+  one-way selector fallback are now validated; CI execution, OHAudio output,
+  and OHCodec playback remain pending.
 
 Windows toolchain validation on 2026-08-05 rebuilt the complete target
 dependency closure locally from source in 17 minutes and passed
@@ -2187,27 +2226,33 @@ change.
 - [~] Add the `modern/platform/ohos/` root; small shared helpers are still
   pending, and media, graphics, and audio implementations remain in their
   responsibility-specific backend targets.
-- [ ] Minimal HAP/native application shell using ArkUI/XComponent only at the
+- [x] Minimal HAP/native application shell using ArkUI/XComponent only at the
   integration boundary.
-- [ ] Connected-device deployment, signing, logging, generated-media playback,
+- [x] Connected-device deployment, signing, logging, generated-media playback,
   and automated result collection through thin OHOS-specific adapters to the
   shared mobile test scenarios.
 
 ### Vulkan and OpenGL ES rendering
 
-- [ ] Reuse the Android-proven platform-neutral Vulkan renderer engine,
+- [x] Reuse the Android-proven platform-neutral Vulkan renderer engine,
   shaders, color conversion, geometry, synchronization rules, golden vectors,
   and renderer contract tests.
-- [ ] Add the OHOS `OHNativeWindow`/XComponent Vulkan surface and swapchain
+- [x] Add the OHOS `OHNativeWindow`/XComponent Vulkan surface and swapchain
   adapter as a separate target or platform helper.
-- [ ] Reuse OpenGL ES renderer internals where compatible, with a separate OHOS
+- [x] Reuse OpenGL ES renderer internals where compatible, with a separate OHOS
   EGL/window adapter and explicit capability checks.
-- [ ] Reuse the Android-proven renderer selector and one-way Vulkan-to-OpenGL
+- [x] Reuse the Android-proven renderer selector and one-way Vulkan-to-OpenGL
   ES policy while keeping OHOS window, EGL, and error classification in its
   own adapter.
-- [ ] Validate software YUV/NV12/P010/RGB upload, viewport, aspect ratio,
+- [~] Validate software YUV/NV12/P010/RGB upload, viewport, aspect ratio,
   rotation, resize, redraw, surface loss/recreation, SDR, and supported HDR
-  output behavior on a real device.
+  output behavior on a real device. The shared renderer retains its existing
+  deterministic coverage; OHOS device validation currently proves generated
+  YUV420 software decode, fit scaling, redraw, SDR Vulkan and OpenGL ES
+  presentation, native-window recreation in both adapters, forced initial
+  OpenGL ES selection, and fatal one-way Vulkan-to-OpenGL ES fallback on one
+  media open. The remaining upload families, rotation, surface-loss injection,
+  and native HDR behavior remain pending.
 
 ### Audio and hardware decode
 
