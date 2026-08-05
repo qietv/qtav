@@ -293,17 +293,18 @@ Direct-Surface mode is a third, separate path. It has no application-readable
 texture and therefore cannot be described as Vulkan, OpenGL ES, libplacebo, or
 application-side tone mapping.
 
-## OHOS hardware-frame direction
+## OHOS hardware-frame interop
 
 OHCodec direct-surface presentation remains separate from application-rendered
-texture interop. The preferred OHOS texture path is Vulkan: retain the exact
-decoded `OH_AVBuffer`/`OH_NativeBuffer`, import it through the target SDK's
-`VK_OHOS_external_memory` path, preserve its fences and lifetime, and expose
-raw planes to libplacebo. This path may claim strict no-intermediate source
-zero-copy only when the imported buffer has an explicit `VkFormat` and plane
-mapping that libplacebo can wrap directly. An opaque external format that
-requires a GPU normalization texture is zero-CPU-copy, but not strict source
-zero-copy.
+texture interop. `QtAV::InteropOHCodecVulkan` implements the preferred strict
+Vulkan route. It owns a private `OH_ConsumerSurface`, presents exactly one
+retained OHCodec output into that surface, acquires the corresponding
+`OHNativeWindowBuffer`, retains its `OH_NativeBuffer`, imports the acquire sync
+fd and memory through `VK_OHOS_external_memory`, and releases the consumer
+buffer only after renderer GPU completion. This path accepts only an explicit
+sampled two- or three-plane `VkFormat` that libplacebo can wrap directly. An
+opaque external format is rejected rather than normalized, so the target does
+not claim a weaker result than strict no-intermediate source zero-copy.
 
 The OHOS OpenGL ES fallback target is raw import through
 `GL_EXT_YUV_target`, followed by a crop-aware RGBA16F GPU normalization of raw
@@ -313,9 +314,12 @@ it hides the source representation from libplacebo and cannot preserve the raw
 contract required for Dolby Vision. OHCodec/NativeImage may propagate the codec
 PTS unchanged in microseconds, so the interop compares the observed value and
 its microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
-then stores and correlates the selected value in nanoseconds. Until either
-native-buffer route is implemented and validated, OHOS texture interop remains
-unclaimed.
+then stores and correlates the selected value in nanoseconds. The connected
+Mate 60 Pro exposes only `VK_FORMAT_UNDEFINED` plus an opaque external-format
+ID for real H.264 and HEVC outputs. Its strict `UNSUPPORTED` result validates
+the fail-closed gate; a texture-interop success remains unclaimed until an
+explicit multi-plane format is imported, sampled, and released after GPU
+completion on suitable hardware.
 
 ## Audio architecture
 
@@ -355,13 +359,14 @@ H.264/HEVC decoder selection plus single-decision present/drop/timed surface
 output on a retained window generation. The surface-output decoder shares the
 MediaCodec packet-feed and output-retention bounds, but its OHOS SDK types and
 native lifetime remain backend-local. Direct surface output remains separate
-from future native-buffer interop.
+from the optional native-buffer interop targets.
 
 Direct `OHNativeWindow` present/drop scheduling and its lifecycle matrix are
-connected-device validated. The next native-buffer architecture is the
-Vulkan-first, raw-OpenGL-fallback direction above; no OHOS texture-interop
-success is claimed before native import, synchronization, lifetime, and format
-gates are validated. [`PLAN.md`](PLAN.md) remains the source of truth for task
+connected-device validated. The Vulkan-first interop code, shared/static
+package consumption, exact consumer-buffer acquisition, and opaque-format
+rejection are also validated. The current device cannot exercise the final
+direct-plane import/sampling/GPU-release gate, so no OHOS Vulkan texture PASS
+is claimed yet. [`PLAN.md`](PLAN.md) remains the source of truth for task
 ordering. The transferred Intel Windows cadence investigation remains open on
 its separate administrator-capable machine and is not described as closed by
 local OHOS progress.

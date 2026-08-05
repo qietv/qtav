@@ -49,6 +49,9 @@ void OHOSVulkanContext::reset() noexcept
     queue_ = VK_NULL_HANDLE;
     queueFamilyIndex_ = 0;
     hdrMetadataEnabled_ = false;
+    nativeBufferExternalMemoryEnabled_ = false;
+    foreignQueueFamilyEnabled_ = false;
+    syncFdSemaphoreEnabled_ = false;
     deviceName_.clear();
 }
 
@@ -237,6 +240,28 @@ bool OHOSVulkanContext::create(
     std::vector<const char*> enabledDeviceExtensions {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
+    const bool nativeBufferExternalMemoryAvailable = hasExtension(
+        deviceExtensions,
+        VK_OHOS_EXTERNAL_MEMORY_EXTENSION_NAME);
+    const bool foreignQueueFamilyAvailable = hasExtension(
+        deviceExtensions,
+        VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+    const bool syncFdSemaphoreAvailable = hasExtension(
+        deviceExtensions,
+        VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+    if (nativeBufferExternalMemoryAvailable
+        && foreignQueueFamilyAvailable
+        && syncFdSemaphoreAvailable) {
+        enabledDeviceExtensions.push_back(
+            VK_OHOS_EXTERNAL_MEMORY_EXTENSION_NAME);
+        enabledDeviceExtensions.push_back(
+            VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+        enabledDeviceExtensions.push_back(
+            VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+        nativeBufferExternalMemoryEnabled_ = true;
+        foreignQueueFamilyEnabled_ = true;
+        syncFdSemaphoreEnabled_ = true;
+    }
     if (hasExtension(
             deviceExtensions,
             VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
@@ -307,9 +332,32 @@ BorrowedOHOSVulkanContext OHOSVulkanContext::borrowed() const noexcept
     };
 }
 
+bool OHOSVulkanContext::nativeBufferExternalMemoryEnabled() const noexcept
+{
+    return nativeBufferExternalMemoryEnabled_;
+}
+
+bool OHOSVulkanContext::foreignQueueFamilyEnabled() const noexcept
+{
+    return foreignQueueFamilyEnabled_;
+}
+
+bool OHOSVulkanContext::syncFdSemaphoreEnabled() const noexcept
+{
+    return syncFdSemaphoreEnabled_;
+}
+
 std::string OHOSVulkanContext::description() const
 {
-    return deviceName_.empty() ? "Vulkan" : "Vulkan / " + deviceName_;
+    std::string result = deviceName_.empty()
+        ? "Vulkan"
+        : "Vulkan / " + deviceName_;
+    if (nativeBufferExternalMemoryEnabled_
+        && foreignQueueFamilyEnabled_
+        && syncFdSemaphoreEnabled_) {
+        result += " / OH_NativeBuffer external memory";
+    }
+    return result;
 }
 
 } // namespace qtav::ohos_example

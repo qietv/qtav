@@ -407,6 +407,9 @@ both available.
 `QTAV_INTEROP_MEDIACODEC_OPENGL=AUTO` builds the private-AImageReader
 AHardwareBuffer/EGLImage interop on Android API 28 or newer when the
 MediaCodec and OpenGL ES targets are both available.
+`QTAV_INTEROP_OHCODEC_VULKAN=AUTO` builds the strict OHCodec/ConsumerSurface
+Vulkan interop on OHOS when the OHCodec and Vulkan targets plus
+`libnative_buffer`, `libnative_image`, and `libnative_window` are available.
 Backend implementations not otherwise described remain disabled under
 `AUTO`, and explicitly requesting one with `ON` is an error.
 
@@ -790,11 +793,63 @@ dropped 5. The run passed pause/resume, a 2000 ms target/callback seek, media
 replacement, explicit stop, background and foreground transitions, one
 surface recreation, and one stale-generation rejection. Output retention was
 bounded at `maxPending=2`; `pendingAtStop=1` drained to `pendingEnd=0`, and
-`maxQueued=0`. This completes the direct-surface lifecycle matrix; it does not
-validate texture interop. The preferred next hardware-frame target is retained
-`OH_NativeBuffer` Vulkan import. A later OpenGL ES fallback must expose raw
-components through `GL_EXT_YUV_target` and must not rely on implicit
-external-OES conversion.
+`maxQueued=0`. This completes the direct-surface lifecycle matrix. The
+separate `QtAV::InteropOHCodecVulkan` target now implements strict retained
+`OH_NativeBuffer` import, while `QtAV::InteropOHCodecOpenGL` provides the
+raw-component OpenGL ES route. The latter exposes raw components through
+`GL_EXT_YUV_target` and does not rely on implicit external-OES conversion.
+
+### OHCodec Vulkan strict native-buffer interop
+
+Link `QtAV::HWOHCodec`, `QtAV::RenderVulkanOHOS`, and
+`QtAV::InteropOHCodecVulkan`. The application-created Vulkan device must
+enable `VK_OHOS_external_memory`, `VK_EXT_queue_family_foreign`, and
+`VK_KHR_external_semaphore_fd`, then declare those facts in the interop
+configuration:
+
+```cpp
+#include <qtav/ohcodec_vulkan_interop.h>
+
+qtav::OHCodecVulkanInteropConfig interopConfig;
+interopConfig.width = 1920;
+interopConfig.height = 1080;
+interopConfig.ohosExternalMemoryEnabled = true;
+interopConfig.foreignQueueFamilyEnabled = true;
+interopConfig.syncFdSemaphoreEnabled = true;
+
+auto interop = std::make_shared<qtav::OHCodecVulkanInterop>(
+    borrowedVulkanDevice,
+    interopConfig);
+renderer->setHardwareFrameInterop(interop);
+player.setHardwareDecodeConfig(
+    qtav::ohCodecHardwareDecodeConfig(
+        interop->surface(),
+        { false, 8 }));
+```
+
+The interop owns a private `OH_ConsumerSurface`. Surface-mode OHCodec outputs
+do not expose native memory through their `OH_AVBuffer`; the interop therefore
+presents exactly one retained output into that surface, waits for its frame
+callback, acquires and retains the corresponding `OHNativeWindowBuffer`, and
+converts it to `OH_NativeBuffer`. An acquire sync fd is imported into a Vulkan
+semaphore. The consumer buffer remains retained until the renderer's GPU
+completion timeline retires the texture.
+
+Only explicit sampled NV12/P010-compatible two- or three-plane `VkFormat`
+values are passed directly to `pl_vulkan_wrap`. `VK_FORMAT_UNDEFINED` plus an
+opaque external-format ID is reported as unsupported; this strict path never
+maps the decoded source, performs a software transfer, stages or uploads its
+pixels, or creates an RGBA normalization intermediate.
+
+The connected Mate 60 Pro probe on 2026-08-06 exercised real H.264 and HEVC
+outputs. Both reported `NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP` but only
+`VkFormat=VK_FORMAT_UNDEFINED` with external format `1000156003`, so the HAP
+correctly emitted `QTAV_OHOS_OHCODEC_VULKAN_RESULT UNSUPPORTED` with two
+buffers acquired, zero imported/direct-plane buffers, two opaque rejections,
+and all CPU/transfer/staging/upload/normalization counters at zero. This proves
+the fail-closed capability path; strict direct sampling and GPU-completion
+release still require a device that exposes an explicit multi-plane Vulkan
+format.
 
 ### MediaCodec direct-surface hardware decode
 

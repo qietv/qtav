@@ -3,6 +3,7 @@
 #include <qtav/mobile_video_renderer.h>
 #include <qtav/ohcodec_hardware_decoder.h>
 #include <qtav/ohcodec_opengl_interop.h>
+#include <qtav/ohcodec_vulkan_interop.h>
 #include <qtav/ohos_opengl_video_renderer.h>
 #include <qtav/ohos_vulkan_video_renderer.h>
 #include <qtav/ohaudio_audio_sink.h>
@@ -43,6 +44,12 @@ int qtav_ohos_render_install_consumer()
         ohCodecOpenGLConfig);
     const qtav::OHCodecOpenGLInteropStatistics
         ohCodecOpenGLStatistics = ohCodecOpenGLInterop.statistics();
+    qtav::OHCodecVulkanInteropConfig ohCodecVulkanConfig;
+    qtav::OHCodecVulkanInterop ohCodecVulkanInterop(
+        {},
+        ohCodecVulkanConfig);
+    const qtav::OHCodecVulkanInteropStatistics
+        ohCodecVulkanStatistics = ohCodecVulkanInterop.statistics();
     return capabilities.customViewport
             && capabilities.rotation
             && capabilities.ownedContext
@@ -77,6 +84,12 @@ int qtav_ohos_render_install_consumer()
             && ohCodecOpenGLStatistics
                     .microsecondTimestampsNormalized
                 == 0
+            && !ohCodecVulkanInterop
+            && ohCodecVulkanStatistics.cpuMapCalls == 0
+            && ohCodecVulkanStatistics.softwareTransferCalls == 0
+            && ohCodecVulkanStatistics.stagingCopies == 0
+            && ohCodecVulkanStatistics.rendererUploads == 0
+            && ohCodecVulkanStatistics.normalizationPasses == 0
             && std::string(
                    qtav::mobileRenderAPIName(
                        qtav::MobileRenderAPI::OpenGLES))

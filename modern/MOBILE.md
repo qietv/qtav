@@ -429,15 +429,22 @@ cannot prove raw component sampling are rejected for the semantic/Dolby Vision
 path; implicit `SurfaceTexture` or external-OES YUV-to-RGB conversion is not a
 substitute.
 
-The preferred OHOS hardware-frame interop target is Vulkan. A backend or
-narrow FFmpeg bridge must expose and retain the exact decoded
-`OH_AVBuffer`/`OH_NativeBuffer` until GPU completion, import it through the
-target SDK's `VK_OHOS_external_memory` path, carry producer/release
-synchronization, and release the codec output only after consumption. It may
-claim strict source zero-copy only when the driver provides an explicit
-`VkFormat` and plane mapping that libplacebo wraps directly. If the format is
-opaque and a
-raw GPU normalization texture is required, the claim is zero-CPU-copy only.
+The preferred OHOS hardware-frame interop target is implemented by the
+independent `QtAV::InteropOHCodecVulkan` target. Its application-owned interop
+object creates a private `OH_ConsumerSurface` and supplies that surface's
+producer window to `QtAV::HWOHCodec`. Surface-mode callback `OH_AVBuffer`
+objects do not expose usable native memory, so the adapter presents exactly one
+retained codec output into the private surface, acquires the corresponding
+`OHNativeWindowBuffer`, retains its `OH_NativeBuffer`, and imports it through
+`VK_OHOS_external_memory`. An acquire sync fd becomes a Vulkan semaphore. The
+consumer buffer stays retained until the renderer GPU timeline destroys the
+imported image and memory, then it is returned to the consumer surface.
+
+The target accepts only explicit sampled two- or three-plane 4:2:0 8/10-bit
+`VkFormat` values that libplacebo wraps directly. It therefore claims strict
+source zero-copy only after that route succeeds. `VK_FORMAT_UNDEFINED` with an
+opaque external-format ID is rejected; this target deliberately does not add a
+raw GPU normalization texture that would weaken the claim to zero-CPU-copy.
 
 The OHOS OpenGL ES fallback is a separate, lower-priority target. It must prove
 raw `GL_EXT_YUV_target` sampling and normalize crop-aware Y/Cb/Cr into RGBA16F
@@ -447,12 +454,17 @@ because it hides the raw source representation and cannot support the required
 libplacebo/Dolby Vision ordering. OHCodec/NativeImage may propagate the codec
 PTS unchanged in microseconds, so the interop compares the observed value and
 its microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
-then stores and correlates the selected value in nanoseconds. The current
-FFmpeg 8 OHCodec buffer-output branch calls `OH_AVBuffer_GetAddr()` and
-`av_image_copy2()`, so it cannot
-satisfy either native-buffer route as-is. Exact format, protected-content,
-lifetime, and fence support remain target-SDK/device gates; no OHOS texture
-interop PASS is claimed before those gates are exercised.
+then stores and correlates the selected value in nanoseconds. The private
+consumer-surface bridge avoids FFmpeg's software-copying OHCodec buffer-output
+branch and keeps the SDK types in the optional backend. Exact format,
+protected-content, lifetime, and fence support remain target-SDK/device gates.
+On 2026-08-06 the connected Mate 60 Pro acquired one real H.264 and one real
+HEVC buffer, both reported `NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP`, but Vulkan
+returned only `VK_FORMAT_UNDEFINED` with external format `1000156003`. The HAP
+therefore reported the expected strict `UNSUPPORTED` result with two opaque
+rejections and zero map/transfer/staging/upload/normalization counters. No OHOS
+texture-interop PASS is claimed until explicit-plane import, sampling, and
+post-GPU release execute on suitable hardware.
 
 When the active renderer changes from Vulkan to OpenGL ES, the implemented
 selector callback first permits the platform layer to reconfigure newly
@@ -530,15 +542,18 @@ Shared generated media and lifecycle scenarios cover:
   pause/resume, 2000 ms seek, media replacement, stop, background/foreground,
   surface recreation, stale-generation rejection, bounded retained outputs,
   final-reference drop, and clean shutdown;
+- OHCodec H.264/HEVC private-ConsumerSurface native-buffer acquisition,
+  exact one-frame queueing, strict explicit-plane Vulkan gating, opaque-format
+  rejection, and zero CPU map/transfer/staging/upload/normalization counters;
 - MediaCodec H.264/HEVC private-AImageReader Vulkan import with timestamp
   correlation, native/external-format validation, aligned-allocation crop,
   bounded images, release-fence return, and zero decoded-source CPU
   map/transfer/staging/upload counters;
 - capability-gated MediaCodec native-buffer import through Vulkan and OpenGL
   ES with zero CPU map/transfer calls, retained lifetime, fence ordering,
-  format/color validation, and explicit unsupported-path results; future
-  OHCodec texture tests must meet the same gate without being counted as pass
-  before a native buffer is actually imported;
+  format/color validation, and explicit unsupported-path results; the OHCodec
+  Vulkan test applies the same rule and reports `UNSUPPORTED`, not PASS, when
+  a real native buffer lacks an explicit multi-plane Vulkan format;
 - pause/resume and monotonic position;
 - seek and loop flush;
 - media replacement and explicit stop;

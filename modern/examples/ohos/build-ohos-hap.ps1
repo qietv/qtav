@@ -100,6 +100,11 @@ $NativeOutputs = @(
         'libqtav_interop_ohcodec_opengl.so.2'
     ),
     @(
+        (Join-Path $BuildDirectory `
+            'backends/interop/ohcodec_vulkan/libqtav_interop_ohcodec_vulkan.so.2.0.0'),
+        'libqtav_interop_ohcodec_vulkan.so.2'
+    ),
+    @(
         (Join-Path $BuildDirectory 'examples/ohos/libentry.so'),
         'libentry.so'
     )

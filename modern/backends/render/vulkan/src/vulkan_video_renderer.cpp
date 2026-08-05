@@ -1641,11 +1641,11 @@ public:
         wrapParams.height = sourceHeight;
         wrapParams.format = sourceFormat;
         wrapParams.usage = sourceUsage;
-        wrapParams.debug_tag = "QtAVCore MediaCodec source";
+        wrapParams.debug_tag = "QtAVCore hardware-decoder source";
         texture = pl_vulkan_wrap(vulkan_->gpu, &wrapParams);
         if (!texture) {
             error = takeLogError(
-                "libplacebo cannot wrap the imported MediaCodec image");
+                "libplacebo cannot wrap the imported hardware-decoder image");
             return false;
         }
         pl_vulkan_release_params release {};
@@ -1677,7 +1677,7 @@ public:
             initializePlane(frame.planes[2], texture->planes[2], 1, 2);
         } else {
             error =
-                "The imported MediaCodec Vulkan format has no libplacebo YUV plane mapping";
+                "The imported Vulkan hardware format has no libplacebo YUV plane mapping";
             return false;
         }
         const bool tenBit = sourceFormat
@@ -1774,7 +1774,7 @@ public:
         hold.semaphore.value = holdValue;
         if (!pl_vulkan_hold_ex(vulkan_->gpu, &hold)) {
             error = takeLogError(
-                "libplacebo could not release the MediaCodec image");
+                "libplacebo could not release the hardware-decoder image");
             return 0;
         }
         if (externalNormalized) {
@@ -2081,10 +2081,10 @@ VideoRenderAttemptResult VulkanVideoRenderer::renderDetailed(
                 : std::move(importedResult.detail);
         } else {
             imported = std::move(importedResult.texture);
-            if (imported->width() != frame.width()
-                || imported->height() != frame.height()) {
+            if (imported->width() < frame.width()
+                || imported->height() < frame.height()) {
                 error =
-                    "The imported Vulkan image dimensions do not match the decoded frame";
+                    "The imported Vulkan image is smaller than the decoded frame";
             } else {
                 impl_->wrapHardwareSource(
                     frame,

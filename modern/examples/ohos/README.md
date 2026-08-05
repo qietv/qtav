@@ -34,14 +34,16 @@ sends HOME once and relaunches the ability after the page destroys its
 XComponent surface. The page reports foreground/background state to native
 code and creates a fresh XComponent without restarting `start()`. The native
 harness then replaces H.264 with HEVC, verifies bounded retained output across
-stop, and emits PASS only after the complete lifecycle succeeds.
-Native-buffer texture interop and native OHOS HDR remain pending. The preferred
-interop target retains the exact OHCodec `OH_AVBuffer`/`OH_NativeBuffer` and
-imports it through `VK_OHOS_external_memory`. It can be called strict
-no-intermediate source zero-copy only when the driver exposes an explicit
-`VkFormat` and plane mapping that libplacebo wraps directly. An opaque format
-requiring a GPU
-normalization texture is only zero-CPU-copy. The OpenGL ES fallback likewise
+stop, and emits PASS only after the complete lifecycle succeeds. It then opens
+H.264 and HEVC through `QtAV::InteropOHCodecVulkan`, presents exactly one
+output from each codec into the interop's private `OH_ConsumerSurface`, and
+exercises the native-buffer capability gate.
+Native OHOS HDR remains pending. The Vulkan interop retains the exact acquired
+`OHNativeWindowBuffer`/`OH_NativeBuffer`, imports it through
+`VK_OHOS_external_memory`, and can be called strict no-intermediate source
+zero-copy only when the driver exposes an explicit `VkFormat` and plane mapping
+that libplacebo wraps directly. An opaque format is rejected rather than
+normalized. The OpenGL ES fallback likewise
 requires raw `GL_EXT_YUV_target` sampling followed by crop-aware RGBA16F GPU
 normalization before libplacebo; it is zero-CPU-copy but not strict source
 zero-copy. Implicit `OH_NativeImage` external-OES YUV-to-RGB conversion
@@ -49,8 +51,18 @@ is not the target. OHCodec/NativeImage may propagate the codec PTS unchanged in
 microseconds, so the interop compares the observed value and its
 microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
 then stores and correlates the selected value in nanoseconds. This is a
-correlation rule, not an additional device-validation result; no OHOS
-texture-interop PASS is claimed by this harness.
+correlation rule, not an additional device-validation result.
+
+The 2026-08-06 Mate 60 Pro run acquired real H.264 and HEVC consumer buffers,
+but Vulkan exposed only `VK_FORMAT_UNDEFINED` with opaque external format
+`1000156003`. The harness therefore emits
+`QTAV_OHOS_OHCODEC_VULKAN_RESULT UNSUPPORTED`, requires exactly two acquired
+buffers and two opaque rejections, and verifies zero native imports, direct
+planes, CPU maps, transfers, staging copies, uploads, and normalization passes.
+The overall HAP result treats this as a validated capability rejection, not as
+a texture-interoperability PASS. A device with an explicit multi-plane Vulkan
+format is still required to validate direct sampling and release after GPU
+completion.
 The generated 440 Hz and 660 Hz tones allow a manual audibility check, while
 automation validates delivery and hardware timing.
 

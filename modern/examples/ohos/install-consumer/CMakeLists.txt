@@ -14,6 +14,7 @@ target_link_libraries(
         QtAV::AudioResample
         QtAV::HWOHCodec
         QtAV::InteropOHCodecOpenGL
+        QtAV::InteropOHCodecVulkan
         QtAV::RenderMobile
         QtAV::RenderOpenGLOHOS
         QtAV::RenderVulkanOHOS

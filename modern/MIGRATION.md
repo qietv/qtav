@@ -93,6 +93,10 @@ already own a graphics context or require multiple/custom render targets:
 - optional OHOS H.264/HEVC OHCodec decoder selection through
   `QtAV::HWOHCodec`, using a retained, versioned application-supplied
   `OHNativeWindow` and move-only direct-surface present/drop/timed tokens;
+- optional OHOS OHCodec/Vulkan texture interop through
+  `QtAV::InteropOHCodecVulkan`, using a private `OH_ConsumerSurface`, retained
+  `OHNativeWindowBuffer`/`OH_NativeBuffer` import, and strict rejection unless
+  Vulkan exposes an explicit sampled multi-plane format;
 - optional Android MediaCodec/Vulkan texture interop through
   `QtAV::InteropMediaCodecVulkan`, using a private GPU-sampled `AImageReader`,
   retained `AHardwareBuffer` external-format import, and acquire/release
@@ -268,9 +272,20 @@ direct output with 48/40 presentations and 5 drops per codec, pause/resume, a
 2000 ms seek callback, media replacement, stop, background/foreground, surface
 recreation, stale-generation rejection, and bounded retention
 (`maxPending=2`, `pendingEnd=0`, `maxQueued=0`). Native hardware-frame texture
-interop remains separate work. Its preferred target is a retained
-`OH_AVBuffer`/`OH_NativeBuffer` Vulkan import; the OpenGL ES fallback requires
-raw `GL_EXT_YUV_target` sampling and RGBA16F GPU normalization, not implicit
+interop remains separate from that direct-surface path. The independent
+`QtAV::InteropOHCodecVulkan` target now owns a private `OH_ConsumerSurface`,
+presents exactly one retained OHCodec output into it, acquires and retains the
+corresponding `OHNativeWindowBuffer`/`OH_NativeBuffer`, imports its acquire
+sync fd, and keeps the buffer alive until the GPU completion timeline retires
+the texture. It passes only explicit sampled multi-plane `VkFormat` values to
+libplacebo and rejects opaque external formats without mapping, transfer,
+staging, upload, or GPU normalization. The 2026-08-06 connected Mate 60 Pro
+probe acquired real H.264 and HEVC buffers, but its driver exposed only
+`VK_FORMAT_UNDEFINED` plus external format `1000156003`; the harness therefore
+reported the expected strict `UNSUPPORTED` result. Direct sampling and
+GPU-completion release remain to be validated on a device that exposes an
+explicit multi-plane Vulkan format. The OpenGL ES fallback requires raw
+`GL_EXT_YUV_target` sampling and RGBA16F GPU normalization, not implicit
 external-OES YUV-to-RGB conversion.
 
 On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
@@ -385,9 +400,9 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
-- OHOS native hardware-frame texture interop, preferring retained
-  `OH_NativeBuffer` Vulkan import, plus a separately gated raw
-  `GL_EXT_YUV_target` OpenGL ES fallback;
+- OHOS explicit-multi-plane Vulkan device validation for the implemented
+  retained `OH_NativeBuffer` path, plus broader raw `GL_EXT_YUV_target`
+  OpenGL ES device coverage;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;
@@ -405,8 +420,10 @@ Vulkan-to-OpenGL ES fallback without reopening media. It also covers OHAudio
 PCM delivery, device-master timing, pause/resume, seek/flush, and segment-end
 drain, plus the complete OHCodec H.264/HEVC direct-surface lifecycle matrix.
 Android covers the complete Vulkan/OpenGL ES native-buffer interop matrix
-below; OHOS native hardware-frame texture interop remains a separate pending
-slice with Vulkan preferred over the OpenGL ES fallback.
+below. OHOS additionally covers the strict Vulkan native-buffer capability
+gate with real H.264/HEVC outputs: the current device exposes only an opaque
+external format, so the expected `UNSUPPORTED` result is accepted while a
+direct-plane PASS remains pending on suitable hardware.
 `MobileVideoRendererSelector` now implements the accepted Android/OHOS policy:
 it prefers application-created Vulkan, performs bounded same-API recreation
 for recoverable surface loss, switches one-way to an application-created
@@ -452,20 +469,24 @@ imports and matching release fences; both interop paths reported zero
 decoded-source map/transfer/staging/upload calls. These are zero-CPU-copy
 results; the RGBA16F normalization path is not strict source zero-copy.
 
-For OHOS, the preferred target is a retained `OH_AVBuffer`/`OH_NativeBuffer`
-bridge imported through `VK_OHOS_external_memory`. It may claim strict source
-zero-copy only when an explicit `VkFormat` and plane mapping allow direct
-libplacebo wrapping; an opaque external format that needs a GPU normalization
-texture retains only the
-zero-CPU-copy claim. The GLES fallback must sample raw components through
+For OHOS, `QtAV::InteropOHCodecVulkan` implements the preferred retained
+native-buffer path through `VK_OHOS_external_memory`. Surface-mode OHCodec
+outputs do not expose usable native memory through their callback
+`OH_AVBuffer`, so the interop presents the output into its private
+`OH_ConsumerSurface` and acquires the corresponding retained
+`OHNativeWindowBuffer`/`OH_NativeBuffer` from the consumer queue. It may claim
+strict source zero-copy only when an explicit `VkFormat` and plane mapping
+allow direct libplacebo wrapping. This strict target rejects an opaque external
+format rather than adding a GPU normalization texture. The GLES fallback must
+sample raw components through
 `GL_EXT_YUV_target` into RGBA16F before libplacebo and is therefore also not
 strict source zero-copy. Implicit external-OES conversion is not a target.
 OHCodec/NativeImage may propagate the codec PTS unchanged in microseconds, so
 the interop compares the observed value and its microsecond-to-nanosecond
 candidate against the exact queued-frame PTS set, then stores and correlates
-the selected value in nanoseconds. The current FFmpeg 8 OHCodec buffer branch
-calls `OH_AVBuffer_GetAddr()` and
-`av_image_copy2()`, so it cannot satisfy either native-buffer route as-is.
+the selected value in nanoseconds. The consumer-surface bridge avoids the
+software-copying FFmpeg OHCodec buffer-output branch and leaves the generic
+core API free of OHOS types.
 The Vulkan renderer now imports the application device through libplacebo.
 `BorrowedVulkanDevice` therefore also requires its `VkInstance` and explicit
 confirmation that Vulkan 1.2 `timelineSemaphore` and `hostQueryReset` were
@@ -500,9 +521,10 @@ YCbCr/external-format sampling, one returned release fence per imported DOVI
 frame, bounded pending images, and zero decoded-source
 map/transfer/staging/upload counters. The DOVI phase retains parsed RPU
 metadata on all 100 output frames and renders 97 through libplacebo. OHOS
-direct-surface lifecycle coverage is complete; native-buffer texture interop
-remains pending under the responsibility and lifecycle boundaries in
-[`MOBILE.md`](MOBILE.md).
+direct-surface lifecycle coverage is complete. Its strict Vulkan native-buffer
+target is implemented and the fail-closed opaque-format path is connected-
+device validated; direct multi-plane sampling remains pending under the
+responsibility and lifecycle boundaries in [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and
 reference-counted planes. A platform audio sink should convert/resample only
@@ -628,8 +650,9 @@ implementation.
    contracts as the native desktop reference.
 5. Use the completed Android renderer, audio, MediaCodec, and interop paths as
    the mobile reference.
-6. Resume the OHOS production path using the shared mobile contracts only when
-   its deferred milestone is explicitly reactivated.
+6. Continue the OHOS native-buffer milestone on hardware that exposes an
+   explicit sampled multi-plane Vulkan format, then broaden OpenGL ES/HDR
+   coverage using the same shared mobile contracts.
 7. Add subtitle and multi-track switching.
 8. Add live-stream buffering and recovery policies.
 

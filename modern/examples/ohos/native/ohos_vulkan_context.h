@@ -23,6 +23,9 @@ public:
     void reset() noexcept;
 
     BorrowedOHOSVulkanContext borrowed() const noexcept;
+    bool nativeBufferExternalMemoryEnabled() const noexcept;
+    bool foreignQueueFamilyEnabled() const noexcept;
+    bool syncFdSemaphoreEnabled() const noexcept;
     std::string description() const;
 
 private:
@@ -32,6 +35,9 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queueFamilyIndex_ = 0;
     bool hdrMetadataEnabled_ = false;
+    bool nativeBufferExternalMemoryEnabled_ = false;
+    bool foreignQueueFamilyEnabled_ = false;
+    bool syncFdSemaphoreEnabled_ = false;
     std::string deviceName_;
 };
 

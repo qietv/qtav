@@ -28,6 +28,7 @@ target_link_libraries(qtav_ohos_xcomponent_example
         QtAV::AudioResample
         QtAV::HWOHCodec
         QtAV::InteropOHCodecOpenGL
+        QtAV::InteropOHCodecVulkan
         QtAV::RenderMobile
         QtAV::RenderOpenGLOHOS
         QtAV::RenderVulkanOHOS
