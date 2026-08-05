@@ -57,8 +57,10 @@ ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/
 
 The FFmpeg overlay requires `--enable-ohcodec` on this triplet. The final
 verifier uses the SDK's `llvm-nm` to require both `ff_h264_oh_decoder` and
-`ff_hevc_oh_decoder` in `libavcodec.a`; a configure-time fallback to an
-OHCodec-disabled package is therefore an error.
+`ff_hevc_oh_decoder` plus the explicit surface release/timed-render symbols in
+`libavcodec.a`, and requires the installed `ohcodec_surface.h`; a configure-
+time fallback to an OHCodec-disabled or implicit-release-only package is
+therefore an error.
 
 ## Build and install QtAVCore
 
@@ -79,7 +81,7 @@ database without invoking vcpkg again:
 
 This skips compilation, not validation: `verify-install.cmake` still rejects
 an older dependency package that does not contain the required OHCodec decoder
-symbols.
+and explicit surface-output API symbols.
 
 Build a static SDK with:
 

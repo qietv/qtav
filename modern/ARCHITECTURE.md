@@ -305,13 +305,19 @@ Static and shared installs are validated with external `find_package` consumers.
 
 Windows D3D11/D3D11VA/WASAPI and Android Vulkan/OpenGL ES/MediaCodec/AAudio
 are the completed production paths. OHOS now has Vulkan and OpenGL ES software
-presentation, shared selector fallback, and OHAudio output; its remaining
-responsibilities stay separated into OHCodec decode and native-buffer interop.
+presentation, shared selector fallback, OHAudio output, and explicit OHCodec
+H.264/HEVC decoder selection plus single-decision present/drop/timed surface
+output on a retained window generation. The surface-output decoder shares the
+MediaCodec packet-feed and output-retention bounds, but its OHOS SDK types and
+native lifetime remain backend-local. Direct surface output remains separate
+from future native-buffer interop.
 
-The active local next task in [`PLAN.md`](PLAN.md) is OHCodec direct-surface
-hardware decode. The transferred Intel Windows cadence investigation remains
-open on its separate administrator-capable machine and is not described as
-closed by local OHOS progress.
+The active local next task in [`PLAN.md`](PLAN.md) is the OHCodec
+pause/seek/stop/media-replacement and surface-recreation lifecycle matrix.
+Direct `OHNativeWindow` present/drop scheduling is connected-device validated.
+The transferred Intel Windows cadence
+investigation remains open on its separate administrator-capable machine and
+is not described as closed by local OHOS progress.
 
 ## Architectural invariants for changes
 

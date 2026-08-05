@@ -59,6 +59,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional OHOS OHAudio device sink with negotiated Float32 PCM,
   callback-safe bounded buffering, hardware presentation timing, lifecycle
   control, and non-callback route/error recovery;
+- optional OHOS OHCodec H.264/HEVC direct-surface hardware decoding through a
+  retained, versioned application-supplied `OHNativeWindow`, with move-only
+  present/drop/timed-presentation tokens;
 - optional D3D11VA hardware decoding on an application-selected retained
   D3D11 device, with reference-counted shader-readable NV12/P010 decoder
   texture-array slices and explicit software fallback;
@@ -109,8 +112,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - a minimal OHOS ArkUI/XComponent HAP shell and connected-device harness for
   generated-media software decode, Vulkan and OpenGL ES presentation, forced
   initial OpenGL ES selection, and fatal one-way Vulkan-to-OpenGL ES fallback
-  without reopening media, plus OHAudio output and device-master timing,
-  through the repository arm64/API 23 dependency package;
+  without reopening media, plus OHAudio output/device-master timing and a
+  required H.264 OHCodec timed-presentation and drop checkpoint, through the
+  repository arm64/API 23 dependency package;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -154,6 +158,10 @@ Current backend integration boundary:
   `QtAV::HWMediaCodec` explicitly selects FFmpeg's MediaCodec wrapper decoder,
   binds it to a versioned application `ANativeWindow`, and turns each decoded
   output into a single-decision direct-surface present/drop token;
+- `QtAV::HWOHCodec` retains and versions an application-supplied
+  `OHNativeWindow`, creates FFmpeg's `AV_HWDEVICE_TYPE_OHCODEC` device, and
+  explicitly selects the H.264/HEVC `*_ohcodec` wrapper decoder. Each surface
+  output becomes a single-decision present/drop/timed-presentation token;
 - `QtAV::InteropMediaCodecVulkan` owns a private GPU-sampled `AImageReader`,
   supplies its surface to `QtAV::HWMediaCodec`, correlates codec and image
   timestamps, imports retained `AHardwareBuffer` images and fences into the
@@ -230,9 +238,10 @@ Current backend integration boundary:
   hardware-frame fallback callback selects OpenGL ES native interop,
   direct-surface presentation, software decode, or no video for subsequent
   output; cross-API fallback never retries or maps the retired native frame;
-- no OHOS hardware decoder or native-buffer decode interop has been
-  implemented yet; Android remains the completed reference for those later
-  shared mobile responsibilities.
+- OHOS OHCodec decoder selection and surface lifetime are implemented and
+  device-validated; its explicit presentation-token contract and native-buffer
+  interop remain pending. Android remains the completed reference for those
+  later shared mobile responsibilities.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -332,7 +341,8 @@ clear error. Current switches are:
   `QTAV_RENDER_VULKAN`, and `QTAV_RENDER_D3D11`;
 - audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_AAUDIO`,
   `QTAV_AUDIO_OHAUDIO`, `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
-- hardware decode: `QTAV_HW_D3D11VA` and `QTAV_HW_MEDIACODEC`;
+- hardware decode: `QTAV_HW_D3D11VA`, `QTAV_HW_MEDIACODEC`, and
+  `QTAV_HW_OHCODEC`;
 - interop: `QTAV_INTEROP_D3D11`,
   `QTAV_INTEROP_MEDIACODEC_VULKAN`, and
   `QTAV_INTEROP_MEDIACODEC_OPENGL`;
@@ -364,6 +374,8 @@ sink for OHOS/OpenHarmony targets when `libohaudio` is available.
 `QTAV_HW_MEDIACODEC=AUTO` builds the Android
 MediaCodec direct-surface backend when the NDK Media APIs and FFmpeg's
 MediaCodec hardware context are available.
+`QTAV_HW_OHCODEC=AUTO` builds the OHOS decoder-selection backend when
+`libnative_window` and FFmpeg's OHCodec hardware context are available.
 `QTAV_INTEROP_MEDIACODEC_VULKAN=AUTO` builds the private-AImageReader Vulkan
 interop on Android API 26 or newer when the MediaCodec and Vulkan targets are
 both available.
@@ -695,6 +707,60 @@ device-master clock samples, non-negative combined latency, pause/resume,
 seek/flush, loop-boundary drain, and clean continuation through the existing
 Vulkan/OpenGL ES fallback scenario. Automated counters establish delivery and
 hardware timing; subjective audibility still requires a human listening check.
+
+### OHCodec direct-surface hardware decode
+
+Link `QtAV::HWOHCodec` in an OHOS application. Create a new
+`OHCodecSurface` for every ArkUI-published `OHNativeWindow` generation, set
+the returned configuration before opening H.264 or HEVC media, and consume
+each surface output from the decode-worker scheduler:
+
+```cpp
+#include <qtav/ohcodec_hardware_decoder.h>
+
+qtav::OHCodecSurface surface(nativeWindow);
+qtav::OHCodecHardwareDecodeOptions options;
+options.allowSoftwareFallback = false;
+
+player
+    .setHardwareDecodeConfig(
+        qtav::ohCodecHardwareDecodeConfig(surface, options))
+    .setVideoFrameScheduler(
+        [&surface](
+            const qtav::VideoFrame& frame,
+            int,
+            std::int64_t monotonicNanoseconds) {
+            auto output = qtav::ohCodecFrame(frame, surface);
+            return output
+                && output.presentAt(monotonicNanoseconds);
+        });
+player.setMedia(path);
+player.setState(qtav::State::Playing);
+```
+
+The backend retains the native window independently of ArkUI, creates an
+FFmpeg `AV_HWDEVICE_TYPE_OHCODEC` device for it, selects the explicit
+`*_ohcodec` wrapper, and tags decoded hardware frames with the exact surface
+generation. `OHCodecFrame` is a move-only, single-decision token. `present()`
+releases immediately to the configured window, `presentAt()` uses a
+`CLOCK_MONOTONIC` nanosecond timestamp, and `drop()` releases without display.
+Destroying an undecided token drops it. `ohCodecFrame()` rejects stale or
+foreign window generations.
+
+The repository FFmpeg overlay supplies the narrow opaque release API required
+to make that decision without copying FFmpeg's private decoder state. It is a
+surface-output API only: it does not expose an `OH_AVBuffer` or establish
+Vulkan/OpenGL ES native-buffer interop. The Player applies the same bounded
+packet-feed and no-deep-output-queue scheduling policy used by Android
+MediaCodec. On surface loss, pause playback, clear the scheduler and hardware
+configuration, let retained tokens finish or drop, publish a new
+`OHCodecSurface`, and resume with the replacement configuration.
+
+The connected Mate 60 Pro HAP has exercised 30 required timed H.264
+presentations and three explicit drops with software fallback disabled after
+the existing software-renderer and OHAudio regression scenario. H.264/HEVC
+pause, seek, stop, media-replacement, background/foreground, and surface-
+recreation coverage remains part of the next lifecycle slice.
 
 ### MediaCodec direct-surface hardware decode
 

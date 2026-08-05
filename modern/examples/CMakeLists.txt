@@ -3,7 +3,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$")
        AND TARGET qtav_render_opengl_ohos
        AND TARGET qtav_render_mobile
        AND TARGET qtav_audio_resample
-       AND TARGET qtav_audio_ohaudio)
+       AND TARGET qtav_audio_ohaudio
+       AND TARGET qtav_hw_ohcodec)
         add_subdirectory(ohos)
     endif()
     return()

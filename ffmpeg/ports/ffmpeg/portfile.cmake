@@ -23,6 +23,7 @@ vcpkg_from_github(
         0052-allow-clang-cl-lld-link-lto.patch
         0053-mediacodec-dovi-metadata.patch
         0054-fix-clang-cl-mlp-lto-labels.patch
+        0055-ohcodec-explicit-surface-release.patch
 )
 
 file(COPY

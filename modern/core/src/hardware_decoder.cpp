@@ -21,6 +21,8 @@ HardwareDeviceType hardwareDeviceType(AVHWDeviceType type) noexcept
         return HardwareDeviceType::D3D11;
     case AV_HWDEVICE_TYPE_MEDIACODEC:
         return HardwareDeviceType::MediaCodec;
+    case AV_HWDEVICE_TYPE_OHCODEC:
+        return HardwareDeviceType::OHCodec;
     case AV_HWDEVICE_TYPE_VULKAN:
         return HardwareDeviceType::Vulkan;
     default:

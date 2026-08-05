@@ -160,8 +160,11 @@ project-specific behavior:
   HEVC MediaCodec wrapper and PTS-correlates parsed Dolby Vision metadata with
   hardware output frames before QtAVCore receives them.
 - the OHOS FFmpeg overlay requires the native H.264 and HEVC OHCodec wrappers;
-  configure failure is fatal and the verifier checks both decoder symbols in
-  the installed `libavcodec.a` archive.
+  configure failure is fatal. It also exposes a narrow opaque OHCodec surface
+  output token with explicit render, timed-render, and drop decisions. The
+  verifier checks both decoder symbols, the public header, and both release
+  symbols in the installed `libavcodec.a` archive. The compatibility boundary
+  is governed by [FD-004](DECISIONS.md).
 - libsmb2 supplies the missing private Winsock link metadata required by a
   static Windows consumer.
 
@@ -196,7 +199,8 @@ Every entry script runs `cmake/verify-install.cmake` after vcpkg installation.
 The verifier checks:
 
 - required FFmpeg 8/libavcodec 62 headers and metadata;
-- H.264 and HEVC OHCodec decoder symbols in the OHOS archive;
+- H.264/HEVC OHCodec decoder symbols plus the explicit surface-output header
+  and release symbols in the OHOS archive;
 - OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES/Dolby Vision
   reshaping, dav1d, and Vulkan, plus libplacebo D3D11/SPIRV-Cross on Windows;
 - the required FFmpeg feature records;

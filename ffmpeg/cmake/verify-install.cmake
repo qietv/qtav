@@ -37,6 +37,9 @@ if(TRIPLET MATCHES "ohos")
     if(NOT EXISTS "${PREFIX}/include/libavutil/hwcontext_oh.h")
         message(FATAL_ERROR "OHOS FFmpeg is missing its OHCodec hardware-context header")
     endif()
+    if(NOT EXISTS "${PREFIX}/include/libavcodec/ohcodec_surface.h")
+        message(FATAL_ERROR "OHOS FFmpeg is missing its explicit OHCodec surface-output API")
+    endif()
 
     find_program(QTAV_OHOS_LLVM_NM
         NAMES llvm-nm llvm-nm.exe
@@ -62,6 +65,8 @@ if(TRIPLET MATCHES "ohos")
         )
     endif()
     foreach(QTAV_OHOS_CODEC_SYMBOL IN ITEMS
+        av_ohcodec_release_buffer
+        av_ohcodec_render_buffer_at_time
         ff_h264_oh_decoder
         ff_hevc_oh_decoder
     )

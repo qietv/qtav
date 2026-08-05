@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <qtav/mobile_video_renderer.h>
+#include <qtav/ohcodec_hardware_decoder.h>
 #include <qtav/ohos_opengl_video_renderer.h>
 #include <qtav/ohos_vulkan_video_renderer.h>
 #include <qtav/ohaudio_audio_sink.h>
@@ -32,6 +33,10 @@ int qtav_ohos_render_install_consumer()
     const qtav::AudioSinkCapabilities audioCapabilities =
         audioSink.capabilities();
     const qtav::BorrowedOHOSVulkanContext emptyVulkanContext;
+    const qtav::OHCodecSurface emptyOHCodecSurface;
+    const qtav::HardwareDecodeConfig ohCodecConfig =
+        qtav::ohCodecHardwareDecodeConfig(emptyOHCodecSurface);
+    qtav::OHCodecFrame emptyOHCodecFrame;
     return capabilities.customViewport
             && capabilities.rotation
             && capabilities.ownedContext
@@ -49,6 +54,13 @@ int qtav_ohos_render_install_consumer()
                 { 48'000, 2, qtav::SampleFormat::Float, "stereo" })
                 .success
             && !emptyVulkanContext.isValid()
+            && ohCodecConfig.deviceType
+                == qtav::HardwareDeviceType::OHCodec
+            && !ohCodecConfig.device
+            && ohCodecConfig.requireSuppliedDevice
+            && ohCodecConfig.decoderWrapper == "ohcodec"
+            && !emptyOHCodecFrame
+            && !emptyOHCodecFrame.drop()
             && std::string(
                    qtav::mobileRenderAPIName(
                        qtav::MobileRenderAPI::OpenGLES))

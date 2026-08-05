@@ -90,6 +90,9 @@ already own a graphics context or require multiple/custom render targets:
 - optional Android H.264/HEVC MediaCodec hardware decode through
   `QtAV::HWMediaCodec`, using an application-supplied versioned
   `ANativeWindow` and move-only direct-surface present/drop tokens;
+- optional OHOS H.264/HEVC OHCodec decoder selection through
+  `QtAV::HWOHCodec`, using a retained, versioned application-supplied
+  `OHNativeWindow` and move-only direct-surface present/drop/timed tokens;
 - optional Android MediaCodec/Vulkan texture interop through
   `QtAV::InteropMediaCodecVulkan`, using a private GPU-sampled `AImageReader`,
   retained `AHardwareBuffer` external-format import, and acquire/release
@@ -241,6 +244,22 @@ remain in the OHOS backend. The connected HAP validates native PCM delivery,
 clock/latency, pause/resume, seek/flush, and loop-boundary drain; subjective
 audibility remains a manual listening check.
 
+OHOS applications can now create a backend-specific `OHCodecSurface` and pass
+`ohCodecHardwareDecodeConfig()` before opening H.264 or HEVC media. The
+backend retains the exact `OHNativeWindow` generation, creates FFmpeg's
+`AV_HWDEVICE_TYPE_OHCODEC` device, and requests the explicit `*_ohcodec`
+wrapper with an independent software-fallback policy. Generic hardware frames
+identify `HardwareDeviceType::OHCodec` and carry the source surface identity
+and generation without exposing OHOS or FFmpeg types through core headers.
+`ohCodecFrame()` validates that identity and returns a move-only
+`OHCodecFrame`; exactly one of `present()`, `presentAt()`, or `drop()` may be
+used, and an undecided token drops on destruction. Player applies the shared
+surface-output packet-feed and output-retention bounds before invoking the
+decode-worker scheduler. The connected HAP validates 30 timed H.264
+presentations plus three explicit drops with fallback disabled. The remaining
+OHCodec lifecycle matrix and native-buffer texture interop are separate,
+still-pending work.
+
 On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
 `ID3D11Device` and its immediate context. `D3D11VideoRenderer` accepts that
 shared access (or creates one from its compatibility constructor), borrows the
@@ -351,7 +370,8 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
-- OHCodec hardware decode plus OHOS GPU zero-CPU-copy interop;
+- OHCodec explicit direct-surface presentation plus OHOS GPU zero-CPU-copy
+  interop;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;

@@ -46,14 +46,14 @@ using Milliseconds = std::chrono::milliseconds;
 
 constexpr std::int64_t kMaximumQueuedAudioMilliseconds = 500;
 constexpr std::int64_t kMaximumVideoDecodeLeadMilliseconds = 250;
-// Encoded MediaCodec packets need enough lead for deep HEVC reordering, while
-// a decoded Surface frame owns a finite decoder output buffer until the
+// Encoded surface-decoder packets need enough lead for deep HEVC reordering,
+// while a decoded Surface frame owns a finite decoder output buffer until the
 // application presents or drops it. Keep those two windows independent: feed
 // the decoder ahead, but never retain a deep queue of Surface output tokens.
 // This follows legacy QtAV's packet-DTS pacing before decode without moving
 // the wait behind hardware-frame acquisition.
-constexpr std::int64_t kMaximumMediaCodecPacketDecodeLeadMilliseconds = 250;
-constexpr std::int64_t kMaximumMediaCodecOutputLeadMilliseconds = 80;
+constexpr std::int64_t kMaximumSurfacePacketDecodeLeadMilliseconds = 250;
+constexpr std::int64_t kMaximumSurfaceOutputLeadMilliseconds = 80;
 constexpr std::int64_t kMaximumVideoPrerollWaitMilliseconds = 500;
 constexpr std::size_t kMinimumVideoPrerollFrames = 6;
 constexpr std::size_t kMaximumQueuedSoftwareVideoFrames = 8;
@@ -113,6 +113,8 @@ AVHWDeviceType ffmpegHardwareDeviceType(HardwareDeviceType type) noexcept
         return AV_HWDEVICE_TYPE_D3D11VA;
     case HardwareDeviceType::MediaCodec:
         return AV_HWDEVICE_TYPE_MEDIACODEC;
+    case HardwareDeviceType::OHCodec:
+        return AV_HWDEVICE_TYPE_OHCODEC;
     case HardwareDeviceType::Vulkan:
         return AV_HWDEVICE_TYPE_VULKAN;
     case HardwareDeviceType::Unknown:
@@ -120,6 +122,12 @@ AVHWDeviceType ffmpegHardwareDeviceType(HardwareDeviceType type) noexcept
         return AV_HWDEVICE_TYPE_NONE;
     }
     return AV_HWDEVICE_TYPE_NONE;
+}
+
+bool isSurfaceOutputHardwareDevice(HardwareDeviceType type) noexcept
+{
+    return type == HardwareDeviceType::MediaCodec
+        || type == HardwareDeviceType::OHCodec;
 }
 
 const AVCodec* decoderForWrapper(
@@ -1953,10 +1961,10 @@ private:
                     flushDecoder(media_.video, queued.generation);
                 } else if (queued.packet) {
                     const bool paceBeforeDecode =
-                        media_.video.hardwareDeviceType
-                            == HardwareDeviceType::MediaCodec;
+                        isSurfaceOutputHardwareDevice(
+                            media_.video.hardwareDeviceType);
                     if (!paceBeforeDecode
-                        || waitForMediaCodecPacketDecodeWindow(
+                        || waitForSurfacePacketDecodeWindow(
                             media_.video,
                             queued.packet.get(),
                             queued.generation)) {
@@ -2131,15 +2139,15 @@ private:
                 }
             }
             decodedVideoFrames_.fetch_add(1, std::memory_order_relaxed);
-            const bool scheduledMediaCodecOutput = scheduler
-                && decoder.hardwareDeviceType
-                    == HardwareDeviceType::MediaCodec;
-            if (!scheduledMediaCodecOutput
+            const bool scheduledSurfaceOutput = scheduler
+                && isSurfaceOutputHardwareDevice(
+                    decoder.hardwareDeviceType);
+            if (!scheduledSurfaceOutput
                 && !waitForVideoDecodeWindow(
                     timestampMs,
                     generation,
-                    decoder.hardwareDeviceType
-                        == HardwareDeviceType::MediaCodec)) {
+                    isSurfaceOutputHardwareDevice(
+                        decoder.hardwareDeviceType))) {
                 return false;
             }
             const auto hardwareDeviceType =
@@ -2319,7 +2327,7 @@ private:
     bool waitForVideoDecodeWindow(
         std::int64_t timestampMs,
         std::uint64_t generation,
-        bool ownsMediaCodecOutput)
+        bool ownsSurfaceOutput)
     {
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
@@ -2345,8 +2353,8 @@ private:
                 audioPosition ? clampPositionLocked(*audioPosition)
                               : clockPositionLocked();
             const auto lead = timestampMs - current;
-            const auto maximumLead = ownsMediaCodecOutput
-                ? kMaximumMediaCodecOutputLeadMilliseconds
+            const auto maximumLead = ownsSurfaceOutput
+                ? kMaximumSurfaceOutputLeadMilliseconds
                 : kMaximumVideoDecodeLeadMilliseconds;
             if (lead <= maximumLead) {
                 return true;
@@ -2360,7 +2368,7 @@ private:
         }
     }
 
-    bool waitForMediaCodecPacketDecodeWindow(
+    bool waitForSurfacePacketDecodeWindow(
         const Decoder& decoder,
         const AVPacket* packet,
         std::uint64_t generation)
@@ -2406,14 +2414,14 @@ private:
                               : clockPositionLocked();
             const auto lead = timestampMs - current;
             if (lead
-                <= kMaximumMediaCodecPacketDecodeLeadMilliseconds) {
+                <= kMaximumSurfacePacketDecodeLeadMilliseconds) {
                 return true;
             }
             controlChanged_.wait_for(
                 lock,
                 Milliseconds(std::clamp<std::int64_t>(
                     lead
-                        - kMaximumMediaCodecPacketDecodeLeadMilliseconds,
+                        - kMaximumSurfacePacketDecodeLeadMilliseconds,
                     1,
                     20)));
         }

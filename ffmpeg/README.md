@@ -37,7 +37,8 @@ The FFmpeg overlay applies this policy:
   imported from the reference `avbuild2` tree;
 - `--enable-vulkan --enable-libplacebo --enable-libass --enable-libdav1d`;
 - `--enable-ohcodec` for the OHOS triplet, with H.264 and HEVC wrapper
-  decoders required by installed-package verification;
+  decoders plus the opaque explicit surface-output decision API required by
+  installed-package verification;
 - FFmpeg's native VVC/H.266 decoder remains enabled because the build never
   disables the native decoder set; no external VVC encoder is included;
 - `--enable-lto --enable-small --disable-avdevice --disable-iamf`;
@@ -66,6 +67,12 @@ The mobile/OHOS libass overlay disables automatic system-font discovery and
 does not pull fontconfig. Applications must supply an explicit default font or
 subtitle fonts; this avoids treating OHOS as a Linux desktop solely because of
 vcpkg's current platform model.
+
+The OHOS FFmpeg overlay installs `libavcodec/ohcodec_surface.h`. Its opaque
+token permits exactly one immediate render, monotonic timed render, or drop of
+an OHCodec surface output without exposing FFmpeg's private decoder structure.
+It does not expose `OH_AVBuffer`/`OH_NativeBuffer` texture interop. The API and
+retirement criteria are recorded in [FD-004](DECISIONS.md).
 
 The resulting FFmpeg binaries are GPLv3. Review the complete notices under
 each installed triplet's `share/` directory before distribution.

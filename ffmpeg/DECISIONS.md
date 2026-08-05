@@ -195,3 +195,67 @@ runtime alignment failure.
 Remove the patch only after an upstream allocator fix with an equivalent
 Windows x64 guarantee is present in the pinned libplacebo version and the full
 D3D11 runtime validation passes with the local patch absent.
+
+## FD-004: Expose an opaque explicit OHCodec surface-output decision
+
+- Date: 2026-08-05
+- Status: Accepted
+- Scope: OHOS arm64 FFmpeg OHCodec surface output
+
+### Context
+
+FFmpeg 8.1.2's OHCodec surface decoder owns the output index and decoder
+reference in a private structure. Its public frame exposes an `OH_AVBuffer`
+pointer, while the last frame release implicitly renders unless the buffer is
+marked discard. QtAVCore therefore cannot implement deterministic present,
+timed-present, and drop decisions without copying private FFmpeg state or
+depending on destructor timing.
+
+The OHCodec buffer-output branch is not an alternative: it maps the native
+buffer and copies pixels through `av_image_copy2()`, violating the project's
+direct-surface and future zero-CPU-copy boundaries.
+
+### Decision
+
+Patch the OHCodec surface path to expose an opaque `AVOHCodecBuffer` through
+installed `libavcodec/ohcodec_surface.h`. The public functions
+`av_ohcodec_release_buffer()` and `av_ohcodec_render_buffer_at_time()` make one
+native render/drop decision. An atomic flag guarantees that the native output
+is decided at most once; the existing final-frame fallback applies only when
+no explicit decision was made. The opaque token retains FFmpeg's decoder
+reference until the frame buffer is released.
+
+The policy is implemented by
+[`0055-ohcodec-explicit-surface-release.patch`](ports/ffmpeg/0055-ohcodec-explicit-surface-release.patch).
+The installed-package verifier requires the header and both symbols.
+
+### Rejected alternatives
+
+- Reconstructing FFmpeg's private OHCodec structure in QtAVCore would couple
+  the backend to an unstable layout and violate the library boundary.
+- Calling OHCodec directly from the exposed `OH_AVBuffer` is insufficient
+  because the output index and retained decoder are not public.
+- Relying on last-frame destruction leaves presentation timing implicit and
+  cannot express a deterministic drop.
+- Using the FFmpeg buffer-output branch would introduce a decoded-pixel CPU
+  map and copy and still would not provide native-buffer GPU ownership.
+
+### Consequences and validation
+
+The OHOS package carries a small public overlay ABI that must stay paired with
+the QtAVCore OHCodec backend. This API controls direct surface output only and
+makes no native-buffer interop or zero-copy texture claim. Android and Windows
+packages are unchanged.
+
+Validation requires `scripts/build-ohos.ps1`, `cmake/verify-install.cmake`,
+QtAVCore OHOS shared/static target compilation, an installed
+`QtAV::HWOHCodec` consumer, and connected-device HAP coverage that observes
+successful timed presentations and explicit drops. The 2026-08-05 Mate 60 Pro
+run completed 30 timed H.264 presentations and three explicit drops.
+
+### Retirement condition
+
+Remove the patch when the pinned upstream FFmpeg OHCodec decoder exposes an
+equivalent retained, single-decision surface-output API. Re-run the dependency
+build and verifier, QtAVCore shared/static consumption, and the connected
+present/drop lifecycle matrix before adopting that replacement.

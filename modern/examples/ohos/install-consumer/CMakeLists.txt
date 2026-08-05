@@ -12,6 +12,7 @@ target_link_libraries(
     PRIVATE
         QtAV::AudioOHAudio
         QtAV::AudioResample
+        QtAV::HWOHCodec
         QtAV::RenderMobile
         QtAV::RenderOpenGLOHOS
         QtAV::RenderVulkanOHOS
