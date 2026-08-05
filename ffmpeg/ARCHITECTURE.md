@@ -161,8 +161,9 @@ project-specific behavior:
   hardware output frames before QtAVCore receives them.
 - the OHOS FFmpeg overlay requires the native H.264 and HEVC OHCodec wrappers;
   configure failure is fatal. It also exposes a narrow opaque OHCodec surface
-  output token with explicit render, timed-render, and drop decisions. The
-  verifier checks both decoder symbols, the public header, and both release
+  output token with explicit render, timed-render, and drop decisions. An
+  undecided final frame release is always a drop, never an implicit present.
+  The verifier checks both decoder symbols, the public header, and both release
   symbols in the installed `libavcodec.a` archive. The compatibility boundary
   is governed by [FD-004](DECISIONS.md).
 - libsmb2 supplies the missing private Winsock link metadata required by a

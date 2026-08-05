@@ -71,6 +71,8 @@ vcpkg's current platform model.
 The OHOS FFmpeg overlay installs `libavcodec/ohcodec_surface.h`. Its opaque
 token permits exactly one immediate render, monotonic timed render, or drop of
 an OHCodec surface output without exposing FFmpeg's private decoder structure.
+Releasing the last frame reference without an explicit decision unconditionally
+drops the output; it never implicitly renders an abandoned output.
 It does not expose `OH_AVBuffer`/`OH_NativeBuffer` texture interop. The API and
 retirement criteria are recorded in [FD-004](DECISIONS.md).
 

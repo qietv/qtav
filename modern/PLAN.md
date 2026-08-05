@@ -842,8 +842,9 @@ root-cause confirmation, repair, and cross-vendor regression. The active local
 track is OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, and direct `OHNativeWindow`
-present/drop scheduling are complete. The next slice completes the OHCodec
-pause/seek/stop/media-replacement and surface-recreation lifecycle matrix.
+H.264/HEVC present/drop scheduling and lifecycle matrix are complete. The next
+slice is OHOS OpenGL ES native hardware-frame interop through
+`OH_NativeImage` and `GL_TEXTURE_EXTERNAL_OES`.
 
 Active local OHOS execution order:
 
@@ -871,12 +872,16 @@ Active local OHOS execution order:
    explicitly select the H.264/HEVC `*_ohcodec` wrapper. Validate required
    hardware frames with software fallback disabled before claiming the later
    direct-output decision contract.
-8. [~] Reuse the shared surface-output packet-feed and output-retention bounds,
+8. [x] Reuse the shared surface-output packet-feed and output-retention bounds,
    expose an OHCodec move-only single-decision present/drop/timed token, and
    validate direct `OHNativeWindow` presentation. The API, FFmpeg bridge,
-   installed consumer, and connected H.264 timed-present/drop run are complete;
-   pause/resume, seek, media replacement, stop, background/foreground, surface
-   recreation, retained-output bounds, and HEVC coverage remain.
+   installed consumer, and complete connected H.264/HEVC pause/resume, seek,
+   media-replacement, stop, background/foreground, surface-recreation,
+   stale-generation, retained-output-bound, and shutdown matrix pass.
+9. [ ] Add OHOS OpenGL ES native hardware-frame interop: supply the
+   `OHNativeWindow` produced by `OH_NativeImage` to OHCodec surface output,
+   update the native image, and sample its `GL_TEXTURE_EXTERNAL_OES` texture
+   under the selected SDK's token, generation, and image-lifetime rules.
 
 The HAP/XComponent Vulkan slice completed on 2026-08-05. It adds the exported
 `QtAV::RenderVulkanOHOS` target, retains the active `OHNativeWindow`, owns the
@@ -939,21 +944,32 @@ OHCodec output. It was the prerequisite for the explicit output slice below.
 
 The OHCodec direct-surface slice completed on 2026-08-05. The repository
 FFmpeg overlay now installs an opaque `AVOHCodecBuffer` API with atomic
-single-decision immediate render, monotonic timed render, or drop; its
-destructor fallback runs only for undecided outputs. `QtAV::HWOHCodec` exposes
-that lifetime as move-only `OHCodecFrame`, validates the exact retained window
-generation, and drops undecided tokens. Player applies the shared MediaCodec/
+single-decision immediate render, monotonic timed render, or drop; an undecided
+final-reference fallback unconditionally drops/frees the output instead of
+implicitly rendering it. `QtAV::HWOHCodec` exposes that lifetime as move-only
+`OHCodecFrame`, validates the exact retained window generation, and drops
+undecided tokens. Player applies the shared MediaCodec/
 OHCodec packet-feed and no-deep-output-queue scheduling policy. The dependency
 script and verifier passed, including the installed header and both release
 symbols; the shared arm64/API 23 build, installed external consumer, HAP
-packaging, and Windows platform-neutral 11/11 CTest passed. Static `qtav_core`,
-`qtav_hw_ohcodec`, the HAP native entry, and three core tests linked; the
-unrelated remaining static test-executable links were stopped after a 12-way
-DevEco LLVM 15 out-of-memory condition and are not claimed as a complete
-static test build. The final signed `com.qtav.feasibility` run produced
+packaging, and Windows platform-neutral 11/11 CTest passed. A later
+`-Parallel 4` static arm64/API 23 rebuild completed all 67 compile/link actions,
+including every cross-built test executable and the HAP native entry, and
+installed the complete static package. The initial signed
+`com.qtav.feasibility` run produced
 `QTAV_OHOS_RESULT PASS ... ohcodecPresented=30 ohcodecDropped=3
 ohcodecGeneration=1` on the connected Mate 60 Pro. Direct `OHNativeWindow`
-presentation is complete; the full H.264/HEVC lifecycle matrix is next.
+presentation was therefore ready for the lifecycle checkpoint.
+
+The OHCodec lifecycle checkpoint completed on 2026-08-05 with the entire HAP
+passing on the Mate 60 Pro (`ALN-AL80`), HarmonyOS 6.1.0.135 / OpenHarmony
+6.1.1.120 API 24. H.264 presented 48 outputs and dropped 5; HEVC presented 40
+and dropped 5. Pause/resume, a 2000 ms target/callback seek, media replacement,
+explicit stop, background and foreground transitions, one surface recreation,
+and one stale-generation rejection each passed. Retention remained bounded at
+`maxPending=2`; `pendingAtStop=1` drained to `pendingEnd=0`, and `maxQueued=0`.
+This completes Next-task item 8 without completing Milestone 7. The next local
+slice is OHOS OpenGL ES `OH_NativeImage` native hardware-frame interop.
 
 The portable render-attempt slice completed on 2026-08-05. The public
 `VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
@@ -2055,9 +2071,10 @@ Following platform slice:
    evidence-backed correction, and same-commit matrix described in `Next task`;
    AMD repair and NVIDIA verification are complete.
 2. [~] This machine: the portable render-result contract, target/toolchain
-   gate, HAP/XComponent Vulkan and OpenGL ES adapters, and shared-selector
-   fallback and OHAudio output are complete; continue with OHCodec direct-
-   surface hardware decode without waiting for the external Intel trace.
+   gate, HAP/XComponent Vulkan and OpenGL ES adapters, shared-selector fallback,
+   OHAudio output, and OHCodec direct-surface lifecycle matrix are complete;
+   continue with OHOS `OH_NativeImage`/OpenGL ES native hardware-frame interop
+   without waiting for the external Intel trace.
 
 Platform implementation order after the contracts are stable:
 
@@ -2234,8 +2251,9 @@ Acceptance:
 Status: complete. Its connected-device results remain the Android regression
 baseline. The Intel matrix continues on the external administrator-capable
 Windows machine; the portable Android/OHOS result contract and OHAudio slice
-are complete. OHCodec decoder selection is now complete and local work proceeds
-into its explicit direct-surface presentation contract.
+are complete. OHCodec decoder selection and its direct-surface lifecycle matrix
+are complete; local work proceeds into OHOS `OH_NativeImage`/OpenGL ES native
+hardware-frame interop.
 
 ## Active milestone 7 — OHOS production path
 
@@ -2243,9 +2261,9 @@ This is now the active local development milestone. The transferred Intel
 Windows performance issue remains open in parallel and must not be described as
 fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
 toolchain validation, portable render-result contract, Vulkan/OpenGL ES
-selector path, OHAudio sink, and OHCodec H.264 direct-surface presentation are
-complete and connected-device validated. The next local slice completes the
-OHCodec lifecycle matrix before native-buffer texture interop.
+selector path, OHAudio sink, and OHCodec H.264/HEVC direct-surface lifecycle
+matrix are complete and connected-device validated. The next local slice is
+OHOS OpenGL ES native hardware-frame interop through `OH_NativeImage`.
 
 Target clarification gate:
 
@@ -2273,9 +2291,9 @@ Target clarification gate:
 - [~] Add QtAVCore OHOS CI execution and production HAP playback/device
   validation. The existing dependency CI remains on its macOS self-hosted
   runner. Local signed-HAP XComponent Vulkan/OpenGL ES presentation and
-  one-way selector fallback, OHAudio output, and required H.264 OHCodec timed
-  presentation/drop are now validated; CI execution and the complete
-  direct-output lifecycle matrix remain pending.
+  one-way selector fallback, OHAudio output, and the complete H.264/HEVC
+  OHCodec direct-output lifecycle matrix are now validated; CI execution
+  remains pending.
 
 Windows toolchain validation on 2026-08-05 rebuilt the complete target
 dependency closure locally from source in 17 minutes and passed
@@ -2327,13 +2345,13 @@ change.
   disconnect behavior.
 - [x] Add an OHOS OHCodec hardware-decode target using FFmpeg 8
   `AV_HWDEVICE_TYPE_OHCODEC` and explicit H.264/HEVC wrapper-decoder selection.
-- [~] Reuse the shared surface-backed presentation contract for playback-clock
+- [x] Reuse the shared surface-backed presentation contract for playback-clock
   scheduling, present/drop, outstanding-buffer bounds, flush, stop, and surface
-  recreation. Packet-feed/output-retention bounds and present/drop scheduling
-  are complete; the remaining lifecycle cases are pending.
+  recreation. Packet-feed/output-retention bounds and the complete H.264/HEVC
+  lifecycle matrix pass with `maxPending=2`, `pendingEnd=0`, and `maxQueued=0`.
 - [x] Implement direct `OHNativeWindow` presentation first, including
-  generation validation, 30 timed H.264 presentations, and three explicit
-  drops on the connected device.
+  generation validation and connected-device totals of 48 H.264 presentations
+  with 5 drops plus 40 HEVC presentations with 5 drops.
 - [ ] Add the confirmed OHOS OpenGL ES path: supply the `OHNativeWindow`
   produced by `OH_NativeImage` to OHCodec surface output, update the surface
   image, and sample its bound `GL_TEXTURE_EXTERNAL_OES` texture while

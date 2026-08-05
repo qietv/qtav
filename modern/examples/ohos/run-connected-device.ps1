@@ -3,7 +3,7 @@ param(
     [string]$ProjectRoot,
     [string]$BuildDirectory,
     [string]$BundleName = 'com.qtav.core.ohos',
-    [int]$TimeoutSeconds = 45,
+    [int]$TimeoutSeconds = 90,
     [switch]$SkipBuild
 )
 
@@ -67,21 +67,66 @@ if ($LASTEXITCODE -ne 0) {
 
 $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 $RelevantLog = ''
+$LifecycleOrchestrated = $false
 do {
     Start-Sleep -Seconds 1
     $RelevantLog = (& $Hdc shell hilog -x 2>&1 | Out-String)
     if ($RelevantLog -match 'QTAV_OHOS_RESULT FAIL') {
         $Lines = $RelevantLog -split "`r?`n" |
-            Where-Object { $_ -match 'QtAVCoreOHOS|QTAV_OHOS_RESULT' }
+            Where-Object {
+                $_ -match 'QtAVCoreOHOS|QTAV_OHOS_RESULT|QTAV_OHOS_LIFECYCLE'
+            }
         $Lines | ForEach-Object { Write-Host $_ }
         throw 'Connected OHOS QtAVCore validation reported FAIL'
+    }
+    if (-not $LifecycleOrchestrated -and
+        $RelevantLog -match 'QTAV_OHOS_LIFECYCLE BACKGROUND_REQUEST') {
+        $LifecycleOrchestrated = $true
+        Write-Host 'QtAVCore requested a real background/foreground cycle'
+        & $Hdc shell uitest uiInput keyEvent Home
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not send the HOME key to background the OHOS app'
+        }
+        $MinimumBackgroundUntil = [DateTime]::UtcNow.AddSeconds(1)
+        $ReadyToForeground = $false
+        do {
+            Start-Sleep -Milliseconds 250
+            $RelevantLog = (& $Hdc shell hilog -x 2>&1 | Out-String)
+            if ($RelevantLog -match 'QTAV_OHOS_RESULT FAIL') {
+                $Lines = $RelevantLog -split "`r?`n" |
+                    Where-Object {
+                        $_ -match 'QtAVCoreOHOS|QTAV_OHOS_RESULT|QTAV_OHOS_LIFECYCLE'
+                    }
+                $Lines | ForEach-Object { Write-Host $_ }
+                throw 'Connected OHOS QtAVCore validation reported FAIL'
+            }
+            $BackgroundObserved = $RelevantLog -match `
+                'QTAV_OHOS_LIFECYCLE BACKGROUND_OBSERVED'
+            $SurfaceRemoved = $RelevantLog -match `
+                'QTAV_OHOS_CHECKPOINT OHCODEC_SURFACE_REMOVED'
+            $ReadyToForeground = $BackgroundObserved -and
+                $SurfaceRemoved -and
+                [DateTime]::UtcNow -ge $MinimumBackgroundUntil
+        } while (-not $ReadyToForeground -and
+                 [DateTime]::UtcNow -lt $Deadline)
+        if (-not $ReadyToForeground) {
+            throw ('OHOS background transition did not report both ' +
+                'BACKGROUND_OBSERVED and OHCODEC_SURFACE_REMOVED before ' +
+                'the validation deadline')
+        }
+        & $Hdc shell aa start -a EntryAbility -b $BundleName
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not return $BundleName/EntryAbility to the foreground"
+        }
     }
 } while (
     $RelevantLog -notmatch 'QTAV_OHOS_RESULT PASS' -and
     [DateTime]::UtcNow -lt $Deadline)
 
 $Lines = $RelevantLog -split "`r?`n" |
-    Where-Object { $_ -match 'QtAVCoreOHOS|QTAV_OHOS_RESULT' }
+    Where-Object {
+        $_ -match 'QtAVCoreOHOS|QTAV_OHOS_RESULT|QTAV_OHOS_LIFECYCLE'
+    }
 $Lines | ForEach-Object { Write-Host $_ }
 if ($RelevantLog -notmatch 'QTAV_OHOS_RESULT PASS') {
     throw "Connected OHOS validation timed out after $TimeoutSeconds seconds"

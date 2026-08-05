@@ -221,9 +221,10 @@ Patch the OHCodec surface path to expose an opaque `AVOHCodecBuffer` through
 installed `libavcodec/ohcodec_surface.h`. The public functions
 `av_ohcodec_release_buffer()` and `av_ohcodec_render_buffer_at_time()` make one
 native render/drop decision. An atomic flag guarantees that the native output
-is decided at most once; the existing final-frame fallback applies only when
-no explicit decision was made. The opaque token retains FFmpeg's decoder
-reference until the frame buffer is released.
+is decided at most once. If the last frame reference is released without an
+explicit decision, the fallback unconditionally frees/drops the output rather
+than rendering it. The opaque token retains FFmpeg's decoder reference until
+the frame buffer is released.
 
 The policy is implemented by
 [`0055-ohcodec-explicit-surface-release.patch`](ports/ffmpeg/0055-ohcodec-explicit-surface-release.patch).
@@ -235,8 +236,8 @@ The installed-package verifier requires the header and both symbols.
   the backend to an unstable layout and violate the library boundary.
 - Calling OHCodec directly from the exposed `OH_AVBuffer` is insufficient
   because the output index and retained decoder are not public.
-- Relying on last-frame destruction leaves presentation timing implicit and
-  cannot express a deterministic drop.
+- Relying on upstream last-frame destruction leaves presentation timing
+  implicit and cannot express a deterministic drop.
 - Using the FFmpeg buffer-output branch would introduce a decoded-pixel CPU
   map and copy and still would not provide native-buffer GPU ownership.
 

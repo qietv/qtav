@@ -1,9 +1,8 @@
 # Android and OHOS mobile design
 
-This document fixes the shared design boundary for the Android and OHOS
-production paths before either platform hardware decoder is added. The two
-platforms reuse portable rendering and test logic, but they do not share a
-native application, window-system, audio, or codec ABI.
+This document records the shared design boundary for the Android and OHOS
+production paths. The two platforms reuse portable rendering and test logic,
+but they do not share a native application, window-system, audio, or codec ABI.
 
 ## Responsibility and target boundaries
 
@@ -23,8 +22,8 @@ The reusable pieces are compile-time C++ targets in this repository:
 - OHOS EGL context and surface integration belongs under
   `backends/render/opengl/ohos/`;
 - `qtav_audio_aaudio` and `qtav_audio_ohaudio` are separate audio backends;
-- `qtav_hw_mediacodec` and a future OHCodec target are separate hardware
-  decoder backends;
+- `qtav_hw_mediacodec` and `qtav_hw_ohcodec` are separate hardware-decoder
+  backends;
 - Vulkan and OpenGL ES native-buffer import are separate, optional interop
   targets; texture import remains separate from decoding and final rendering.
 
@@ -279,16 +278,20 @@ backends:
    software-decode fallback policy.
 3. A decoded output carries its media timestamp, surface generation, and a
    single pending decision: present at a requested monotonic time or drop.
-4. The scheduler bounds outstanding undecided outputs. When the bound is
+4. Releasing an undecided token, or the last retained FFmpeg frame reference
+   when no token decision was made, is abandonment. It unconditionally
+   drops/frees the codec output and never infers presentation from native
+   buffer attributes.
+5. The scheduler bounds outstanding undecided outputs. When the bound is
    reached it applies the documented late-frame drop policy instead of
    blocking an unbounded decoder queue.
-5. Seek, loop, stop, and media replacement invalidate the scheduling
+6. Seek, loop, stop, and media replacement invalidate the scheduling
    generation, drop pending outputs, flush the native codec, and reject late
    callbacks from an older generation.
-6. Surface loss stops release-for-presentation immediately. Recreating the
+7. Surface loss stops release-for-presentation immediately. Recreating the
    surface either rebinds the codec when supported or reopens it explicitly;
    the application remains responsible for the native surface lifetime.
-7. A copied generic hardware frame retains only resources whose native API
+8. A copied generic hardware frame retains only resources whose native API
    permits post-callback retention. Direct-surface output that cannot be
    retained is represented as a presentation token, not a fake texture
    handle.
@@ -313,6 +316,17 @@ interop checkpoint provides shader-readable `AImageReader`/`AHardwareBuffer`
 frames; the
 direct-surface path itself still makes no texture-interoperability claim.
 Decoder fallback and renderer/interop fallback remain independent.
+
+The OHOS direct-surface checkpoint is implemented in `QtAV::HWOHCodec` using
+FFmpeg's explicit OHCodec wrapper and opaque single-decision release token. The
+2026-08-05 signed HAP passed on a Mate 60 Pro (`ALN-AL80`), HarmonyOS
+6.1.0.135 / OpenHarmony 6.1.1.120 API 24. H.264 presented 48 outputs and
+dropped 5; HEVC presented 40 and dropped 5. One pause/resume, one 2000 ms
+target/callback seek, media replacement, explicit stop, background/foreground,
+surface recreation, and stale-generation rejection all passed. The run reached
+`maxPending=2`, observed `pendingAtStop=1`, drained to `pendingEnd=0`, and kept
+`maxQueued=0`. This completes the OHCodec direct-surface lifecycle prerequisite
+without making a texture-interoperability claim.
 
 ## Zero-CPU-copy texture interop
 
@@ -396,12 +410,13 @@ capabilities are present. Neither route reads decoded pixels through CPU
 memory. P010, HDR, and formats that cannot be sampled with the required color
 control remain capability-gated rather than silently converted on the CPU.
 
-The confirmed OHOS OpenGL ES design supplies the `OHNativeWindow` produced by
-`OH_NativeImage` to OHCodec surface output, updates the surface image, and
-samples its bound `GL_TEXTURE_EXTERNAL_OES` texture. The adapter retains the
-corresponding codec presentation token and native-image generation until the
-consumer/release rules of the selected SDK permit reuse. This is a separate
-OHOS implementation; it does not reuse Android handles or ABI assumptions.
+The next OHOS native hardware-frame interop slice is the confirmed OpenGL ES
+design: supply the `OHNativeWindow` produced by `OH_NativeImage` to OHCodec
+surface output, update the surface image, and sample its bound
+`GL_TEXTURE_EXTERNAL_OES` texture. The adapter retains the corresponding codec
+presentation token and native-image generation until the consumer/release
+rules of the selected SDK permit reuse. This is a separate OHOS implementation;
+it does not reuse Android handles or ABI assumptions.
 
 OHOS Vulkan is conditionally feasible, not yet a direct consequence of the
 current FFmpeg 8 OHCodec wrapper. OHOS exposes native-buffer Vulkan external
@@ -489,6 +504,10 @@ Shared generated media and lifecycle scenarios cover:
   seek/flush, media replacement, stop, background/foreground surface
   recreation, stale-generation rejection, bounded retained outputs, and clean
   shutdown;
+- OHCodec H.264/HEVC direct-surface output with timed present/drop,
+  pause/resume, 2000 ms seek, media replacement, stop, background/foreground,
+  surface recreation, stale-generation rejection, bounded retained outputs,
+  final-reference drop, and clean shutdown;
 - MediaCodec H.264/HEVC private-AImageReader Vulkan import with timestamp
   correlation, native/external-format validation, aligned-allocation crop,
   bounded images, release-fence return, and zero decoded-source CPU

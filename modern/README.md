@@ -113,8 +113,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   generated-media software decode, Vulkan and OpenGL ES presentation, forced
   initial OpenGL ES selection, and fatal one-way Vulkan-to-OpenGL ES fallback
   without reopening media, plus OHAudio output/device-master timing and a
-  required H.264 OHCodec timed-presentation and drop checkpoint, through the
-  repository arm64/API 23 dependency package;
+  complete H.264/HEVC OHCodec direct-surface lifecycle matrix with bounded
+  output retention and stale-generation rejection, through the repository
+  arm64/API 23 dependency package;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -238,10 +239,10 @@ Current backend integration boundary:
   hardware-frame fallback callback selects OpenGL ES native interop,
   direct-surface presentation, software decode, or no video for subsequent
   output; cross-API fallback never retries or maps the retired native frame;
-- OHOS OHCodec decoder selection and surface lifetime are implemented and
-  device-validated; its explicit presentation-token contract and native-buffer
-  interop remain pending. Android remains the completed reference for those
-  later shared mobile responsibilities.
+- OHOS OHCodec decoder selection, explicit direct-surface presentation tokens,
+  and the H.264/HEVC lifecycle matrix are implemented and device-validated.
+  Native hardware-frame texture interop remains pending, beginning with the
+  confirmed `OH_NativeImage`/OpenGL ES path.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -744,8 +745,10 @@ FFmpeg `AV_HWDEVICE_TYPE_OHCODEC` device for it, selects the explicit
 generation. `OHCodecFrame` is a move-only, single-decision token. `present()`
 releases immediately to the configured window, `presentAt()` uses a
 `CLOCK_MONOTONIC` nanosecond timestamp, and `drop()` releases without display.
-Destroying an undecided token drops it. `ohCodecFrame()` rejects stale or
-foreign window generations.
+Destroying an undecided token drops it. If an output instead reaches its final
+retained frame release without an explicit token decision, the FFmpeg overlay
+also unconditionally drops/frees it; abandonment never implies presentation.
+`ohCodecFrame()` rejects stale or foreign window generations.
 
 The repository FFmpeg overlay supplies the narrow opaque release API required
 to make that decision without copying FFmpeg's private decoder state. It is a
@@ -756,11 +759,15 @@ MediaCodec. On surface loss, pause playback, clear the scheduler and hardware
 configuration, let retained tokens finish or drop, publish a new
 `OHCodecSurface`, and resume with the replacement configuration.
 
-The connected Mate 60 Pro HAP has exercised 30 required timed H.264
-presentations and three explicit drops with software fallback disabled after
-the existing software-renderer and OHAudio regression scenario. H.264/HEVC
-pause, seek, stop, media-replacement, background/foreground, and surface-
-recreation coverage remains part of the next lifecycle slice.
+The complete signed HAP passed on 2026-08-05 on a Mate 60 Pro (`ALN-AL80`),
+HarmonyOS 6.1.0.135 / OpenHarmony 6.1.1.120 API 24. With software fallback
+disabled, H.264 presented 48 outputs and dropped 5; HEVC presented 40 and
+dropped 5. The run passed pause/resume, a 2000 ms target/callback seek, media
+replacement, explicit stop, background and foreground transitions, one
+surface recreation, and one stale-generation rejection. Output retention was
+bounded at `maxPending=2`; `pendingAtStop=1` drained to `pendingEnd=0`, and
+`maxQueued=0`. This completes the direct-surface lifecycle matrix. The next
+hardware-frame slice is `OH_NativeImage`/OpenGL ES interop.
 
 ### MediaCodec direct-surface hardware decode
 
@@ -1856,10 +1863,14 @@ The connected OHOS HAP additionally verifies 48 kHz Float32 negotiation,
 real-time OHAudio presentation, device-master clock samples, combined latency,
 pause/resume, seek/flush, loop-boundary drain, and clean close while preserving
 the software Vulkan/OpenGL ES selector result.
-The same connected harness verifies MediaCodec H.264/HEVC direct-surface
-outputs with explicit present/drop, seek/flush, media replacement, stop,
-surface-generation replacement, stale-token rejection, decoder/output
-lifetime, and NativeActivity shutdown.
+The OHOS HAP then verifies OHCodec H.264/HEVC direct-surface outputs with
+explicit timed present/drop, seek/flush, media replacement, stop, real
+background/foreground surface-generation replacement, stale-token rejection,
+bounded retained output, and decoder/output lifetime through shutdown.
+The connected Android harness separately verifies MediaCodec H.264/HEVC
+direct-surface outputs with explicit present/drop, seek/flush, media
+replacement, stop, surface-generation replacement, stale-token rejection,
+decoder/output lifetime, and NativeActivity shutdown.
 It then decodes H.264 and HEVC into separate private GPU-sampled
 `AImageReader` surfaces, imports external-format `AHardwareBuffer` images into
 Vulkan, samples aligned native allocations using their visible crop, and

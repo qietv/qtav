@@ -253,12 +253,16 @@ identify `HardwareDeviceType::OHCodec` and carry the source surface identity
 and generation without exposing OHOS or FFmpeg types through core headers.
 `ohCodecFrame()` validates that identity and returns a move-only
 `OHCodecFrame`; exactly one of `present()`, `presentAt()`, or `drop()` may be
-used, and an undecided token drops on destruction. Player applies the shared
+used, and an undecided token drops on destruction. A final retained frame
+release without an explicit decision also unconditionally drops/frees the
+FFmpeg output instead of implicitly rendering it. Player applies the shared
 surface-output packet-feed and output-retention bounds before invoking the
-decode-worker scheduler. The connected HAP validates 30 timed H.264
-presentations plus three explicit drops with fallback disabled. The remaining
-OHCodec lifecycle matrix and native-buffer texture interop are separate,
-still-pending work.
+decode-worker scheduler. The complete connected HAP now passes H.264 and HEVC
+direct output with 48/40 presentations and 5 drops per codec, pause/resume, a
+2000 ms seek callback, media replacement, stop, background/foreground, surface
+recreation, stale-generation rejection, and bounded retention
+(`maxPending=2`, `pendingEnd=0`, `maxQueued=0`). Native hardware-frame texture
+interop remains separate work, beginning with `OH_NativeImage`/OpenGL ES.
 
 On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
 `ID3D11Device` and its immediate context. `D3D11VideoRenderer` accepts that
@@ -370,8 +374,8 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
-- OHCodec explicit direct-surface presentation plus OHOS GPU zero-CPU-copy
-  interop;
+- OHOS native hardware-frame texture interop, beginning with
+  `OH_NativeImage`/OpenGL ES, plus the separately gated Vulkan bridge;
 - subtitle decoding and libass rendering;
 - active track switching after load;
 - buffering policy for live/network streams;
@@ -387,8 +391,9 @@ OHOS checkpoint now covers software-frame Vulkan, OpenGL ES, forced initial
 OpenGL ES selection, recoverable native-window recreation, and fatal one-way
 Vulkan-to-OpenGL ES fallback without reopening media. It also covers OHAudio
 PCM delivery, device-master timing, pause/resume, seek/flush, and segment-end
-drain. Android covers the complete Vulkan/OpenGL ES, audio, and hardware-
-decode matrix below.
+drain, plus the complete OHCodec H.264/HEVC direct-surface lifecycle matrix.
+Android covers the complete Vulkan/OpenGL ES native-buffer interop matrix
+below; OHOS OpenGL ES native hardware-frame interop is the next slice.
 `MobileVideoRendererSelector` now implements the accepted Android/OHOS policy:
 it prefers application-created Vulkan, performs bounded same-API recreation
 for recoverable surface loss, switches one-way to an application-created
@@ -400,9 +405,11 @@ independent.
 Android MediaCodec direct-surface H.264/HEVC output is now stable, including
 explicit present/drop, seek/flush, media replacement, stop, stale-surface
 rejection, background/foreground surface recreation, and shutdown on the
-recorded device. The separate Android Vulkan and OpenGL ES native-buffer
-adapters are now implemented and device-validated; both OHOS
-native-buffer adapters remain planned. Their
+recorded device. OHOS OHCodec direct-surface H.264/HEVC output now passes the
+same lifecycle classes with bounded retained outputs and final-reference drop.
+The separate Android Vulkan and OpenGL ES native-buffer adapters are now
+implemented and device-validated; the confirmed OHOS `OH_NativeImage`/OpenGL
+ES path is next, while OHOS Vulkan remains separately capability-gated. Their
 zero-CPU-copy contract forbids decoded-pixel mapping, software transfer, CPU
 staging, and re-upload; it requires retained native-buffer lifetime, explicit
 producer/release synchronization, and capability-gated format support. A
@@ -427,9 +434,9 @@ late frames from the retired Vulkan surface are discarded without mapping.
 The connected Adreno 830 run injected fatal Vulkan failure after 30 successful
 imports and continued the same H.264 media session with 180 raw EGLImage
 imports and matching release fences; both interop paths reported zero
-decoded-source map/transfer/staging/upload calls. OHOS GLES uses
-`OH_NativeImage` with an external-OES texture. OHOS Vulkan remains conditional
-on adding a retained
+decoded-source map/transfer/staging/upload calls. The next OHOS hardware-frame
+slice uses `OH_NativeImage` with an external-OES texture. OHOS Vulkan remains
+conditional on adding a retained
 `OH_AVBuffer`/`OH_NativeBuffer` bridge: the current FFmpeg 8 OHCodec buffer
 branch calls `OH_AVBuffer_GetAddr()` and `av_image_copy2()`, so it is not a
 zero-CPU-copy source as-is.
@@ -467,7 +474,8 @@ YCbCr/external-format sampling, one returned release fence per imported DOVI
 frame, bounded pending images, and zero decoded-source
 map/transfer/staging/upload counters. The DOVI phase retains parsed RPU
 metadata on all 100 output frames and renders 97 through libplacebo. OHOS
-texture interop remains separate backend work under the responsibility and
+direct-surface lifecycle coverage is complete; its `OH_NativeImage`/OpenGL ES
+texture interop is the next backend slice under the responsibility and
 lifecycle boundaries in
 [`MOBILE.md`](MOBILE.md).
 

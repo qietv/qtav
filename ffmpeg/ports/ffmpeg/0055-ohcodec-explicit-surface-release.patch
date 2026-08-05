@@ -42,8 +42,8 @@ index 0000000000..ec0ced37cc
 +#include <stdint.h>
 +
 +/**
-+ * Opaque OHCodec surface output stored in AVFrame.data[3] when the frame's
-+ * format is AV_PIX_FMT_OHCODEC.
++ * Opaque OHCodec surface output stored in AVFrame.data[3]. Releasing the last
++ * AVFrame reference without an explicit decision drops it; it never renders.
 + */
 +typedef struct AVOHCodecBuffer AVOHCodecBuffer;
 +
@@ -146,17 +146,20 @@ index 7f24d9a943..fb66163e52 100644
  
 -    if (buffer->buffer) {
 -        OH_AVCodec *dec = *buffer->dec_ref;
-+    if (buffer->buffer && !atomic_load(&buffer->released)) {
-         OH_AVCodecBufferAttr attr;
-         OH_AVErrCode err = OH_AVBuffer_GetBufferAttr(buffer->buffer, &attr);
+-        OH_AVCodecBufferAttr attr;
+-        OH_AVErrCode err = OH_AVBuffer_GetBufferAttr(buffer->buffer, &attr);
 -        if (err == AV_ERR_OK && !(attr.flags & AVCODEC_BUFFER_FLAGS_DISCARD))
 -            OH_VideoDecoder_RenderOutputBuffer(dec, buffer->index);
 -        else
 -            OH_VideoDecoder_FreeOutputBuffer(dec, buffer->index);
-+        const int render = err == AV_ERR_OK
-+            && !(attr.flags & AVCODEC_BUFFER_FLAGS_DISCARD);
-+        av_ohcodec_release_buffer(buffer, render);
-     }
+-    }
++    /*
++     * Releasing the last frame reference abandons this output, so always
++     * drop/free it rather than inheriting OHCodec's implicit-render default.
++     * This helper preserves the atomic exactly-once rule if an explicit
++     * decision raced with the destructor fallback.
++     */
++    av_ohcodec_release_buffer(buffer, 0);
  
 +    (void)data;
      av_refstruct_unref(&buffer->dec_ref);

@@ -1,5 +1,6 @@
 declare const qtavOHOS: {
-  start(media: Uint8Array): boolean;
+  start(h264Media: Uint8Array, hevcMedia: Uint8Array): boolean;
+  setForeground(foreground: boolean): void;
   stop(): void;
   status(): string;
 };

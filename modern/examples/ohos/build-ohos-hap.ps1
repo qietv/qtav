@@ -3,6 +3,8 @@ param(
     [string]$ProjectRoot,
     [string]$BuildDirectory,
     [string]$MediaSource,
+    [string]$H264MediaSource,
+    [string]$HEVCMediaSource,
     [int]$Parallel = [Environment]::ProcessorCount,
     [switch]$SkipQtAVBuild,
     [switch]$NoPackage
@@ -26,6 +28,13 @@ $BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory)
 
 if (-not (Test-Path (Join-Path $ProjectRoot 'build-profile.json5'))) {
     throw "The HAP project is incomplete: $ProjectRoot"
+}
+
+if ($MediaSource) {
+    if ($H264MediaSource) {
+        throw '-MediaSource and -H264MediaSource cannot be used together'
+    }
+    $H264MediaSource = $MediaSource
 }
 
 if (-not $SkipQtAVBuild) {
@@ -123,39 +132,90 @@ foreach ($output in $NativeOutputs) {
 $RawFileDirectory = Join-Path `
     $ProjectRoot 'entry/src/main/resources/rawfile'
 New-Item -ItemType Directory -Force -Path $RawFileDirectory | Out-Null
-$PackagedMedia = Join-Path $RawFileDirectory 'qtav-ohos-test.mp4'
-if ($MediaSource) {
-    $MediaSource = [IO.Path]::GetFullPath($MediaSource)
-    if (-not (Test-Path -LiteralPath $MediaSource)) {
-        throw "The requested test media does not exist: $MediaSource"
-    }
-    Copy-Item -Force -LiteralPath $MediaSource -Destination $PackagedMedia
-} else {
+$PackagedH264Media = Join-Path `
+    $RawFileDirectory 'qtav-ohos-test-h264.mp4'
+$PackagedHEVCMedia = Join-Path `
+    $RawFileDirectory 'qtav-ohos-test-hevc.mp4'
+
+$Ffmpeg = $null
+if (-not $H264MediaSource -or -not $HEVCMediaSource) {
     $Ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
     if (-not $Ffmpeg) {
         throw 'A host ffmpeg executable is required to generate HAP test media'
     }
-    & $Ffmpeg.Source `
-        -hide_banner `
-        -loglevel error `
-        -y `
-        -f lavfi `
-        -i 'testsrc2=size=320x180:rate=30' `
-        -f lavfi `
-        -i 'sine=frequency=440:sample_rate=48000' `
-        -t 1 `
-        -c:v libx264 `
-        -preset veryfast `
-        -crf 18 `
-        -pix_fmt yuv420p `
-        -c:a aac `
-        -b:a 96k `
-        -shortest `
-        $PackagedMedia
+}
+
+function Stage-QtAVOhosMedia {
+    param(
+        [string]$Source,
+        [Parameter(Mandatory)]
+        [string]$Destination,
+        [Parameter(Mandatory)]
+        [ValidateSet('H264', 'HEVC')]
+        [string]$Codec
+    )
+
+    if ($Source) {
+        $Source = [IO.Path]::GetFullPath($Source)
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+            throw "The requested $Codec test media does not exist: $Source"
+        }
+        Copy-Item -Force -LiteralPath $Source -Destination $Destination
+        return
+    }
+
+    $VideoArguments = if ($Codec -eq 'H264') {
+        @(
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '18',
+            '-g', '30',
+            '-keyint_min', '30',
+            '-sc_threshold', '0'
+        )
+    } else {
+        @(
+            '-c:v', 'libx265',
+            '-preset', 'fast',
+            '-crf', '22',
+            '-tag:v', 'hvc1',
+            '-x265-params',
+            'pools=1:frame-threads=1:wpp=0:log-level=error:keyint=30:min-keyint=30:scenecut=0'
+        )
+    }
+    $ToneFrequency = if ($Codec -eq 'H264') { 440 } else { 660 }
+    $FfmpegArguments = @(
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-y',
+        '-f', 'lavfi',
+        '-i', 'testsrc2=size=320x180:rate=30',
+        '-f', 'lavfi',
+        '-i', "sine=frequency=${ToneFrequency}:sample_rate=48000",
+        '-t', '6',
+        '-threads', '1'
+    ) + $VideoArguments + @(
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '96k',
+        '-movflags', '+faststart',
+        '-shortest',
+        $Destination
+    )
+    & $Ffmpeg.Source @FfmpegArguments
     if ($LASTEXITCODE -ne 0) {
-        throw 'Host FFmpeg could not generate the HAP test media'
+        throw "Host FFmpeg could not generate the $Codec HAP test media"
     }
 }
+
+Stage-QtAVOhosMedia `
+    -Source $H264MediaSource `
+    -Destination $PackagedH264Media `
+    -Codec H264
+Stage-QtAVOhosMedia `
+    -Source $HEVCMediaSource `
+    -Destination $PackagedHEVCMedia `
+    -Codec HEVC
 
 if ($NoPackage) {
     return
