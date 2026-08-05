@@ -194,20 +194,64 @@ int main(int argc, char** argv)
             std::chrono::seconds(5),
             [&] { return presentedFrames > presentedBeforeRewind; }));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     static_cast<void>(output.takeStatistics());
 
     int presentedBeforeSupersession = 0;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        presentedBeforeSupersession = presentedFrames;
-    }
     qtav::D3D11VideoOutputStatistics supersededStatistics;
+    const auto accumulateSupersessionStatistics =
+        [&](const qtav::D3D11VideoOutputStatistics& statistics) {
+            supersededStatistics.renderRequests +=
+                statistics.renderRequests;
+            supersededStatistics.renderPasses +=
+                statistics.renderPasses;
+            supersededStatistics.presentedFrames +=
+                statistics.presentedFrames;
+            supersededStatistics.busyPresents +=
+                statistics.busyPresents;
+            supersededStatistics.skippedRenders +=
+                statistics.skippedRenders;
+            supersededStatistics.rendererBusyRenderAttempts +=
+                statistics.rendererBusyRenderAttempts;
+            supersededStatistics.retryWakeups +=
+                statistics.retryWakeups;
+            supersededStatistics.supersededRenderFrames +=
+                statistics.supersededRenderFrames;
+            supersededStatistics.terminalRenderDrops +=
+                statistics.terminalRenderDrops;
+            supersededStatistics.rendererDeviceContextBusyRenderAttempts +=
+                statistics.rendererDeviceContextBusyRenderAttempts;
+        };
     {
         auto contextGuard = deviceAccess->contextGuard();
         output.requestRender();
+
+        const auto busyDeadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds(5);
+        while (
+            supersededStatistics
+                    .rendererDeviceContextBusyRenderAttempts
+                == 0
+            && std::chrono::steady_clock::now() < busyDeadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            accumulateSupersessionStatistics(
+                output.takeStatistics());
+        }
+        assert(
+            supersededStatistics
+                    .rendererDeviceContextBusyRenderAttempts
+                > 0);
+
+        // Observing the failed context attempt is the barrier: the serial
+        // render worker has completed any prior Present/callback before it can
+        // start this blocked attempt. A baseline sampled before that attempt
+        // can race an already-rendered frame finishing presentation after the
+        // test acquires the immediate-context guard.
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            presentedBeforeSupersession = presentedFrames;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        supersededStatistics = output.takeStatistics();
+        accumulateSupersessionStatistics(output.takeStatistics());
         std::lock_guard<std::mutex> lock(mutex);
         assert(presentedFrames == presentedBeforeSupersession);
     }

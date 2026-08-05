@@ -26,9 +26,10 @@ proactive bounded D3D11 context handoff, without changing AD-007's
 imported-frame policy. A controlled cold rerun restored both supplied files to
 source cadence with zero terminal context drops; the intervening stressed
 draw-throughput shortfall was a transient prolonged-build/UI-capture load
-state rather than a retained regression. Cross-vendor closure now requires
-the same commit and objective cadence/lifecycle matrix on NVIDIA and Intel.
-After those Windows checks, the final active item evaluates and implements
+state rather than a retained regression. The same commit and objective
+cadence/lifecycle matrix now also pass on NVIDIA; Intel is the remaining
+Windows confirmation. After that Windows check, the final active item evaluates
+and implements
 the portable result semantics needed by Android and future OHOS Vulkan/OpenGL
 paths without copying the Windows-only D3D11 reservation mechanism.
 
@@ -352,8 +353,8 @@ Current verification:
   confirmations did not include exact adapter/driver and objective cadence
   data, so they are not performance baselines. A subjective report of 4K
   dropped frames on an AMD integrated GPU is tracked separately in `Next
-  task`; that AMD repair is now complete, with NVIDIA and Intel same-commit
-  performance confirmation remaining;
+  task`; that AMD repair and the NVIDIA same-commit performance confirmation
+  are now complete, with Intel remaining;
 - `legend.mkv` confirms that the brightness report is not Dolby-Vision-only:
   its decoded metadata is BT.2020/PQ and the current sample reports active
   RGB10/PQ output with 240-nit system SDR white and a 1405-nit display peak.
@@ -737,7 +738,7 @@ Completed file-output checkpoint:
 ## Android manual final-test player gate
 
 This user-requested Android player gate is complete. Its results remain the
-Android regression baseline while NVIDIA and Intel validate the Windows fix;
+Android regression baseline while Intel completes the remaining Windows check;
 the separate Android/OHOS render-result follow-up is the final active item,
 and the Milestone 7 OHOS production gate remains sequenced after it:
 
@@ -826,8 +827,9 @@ AD-007 is complete: the current protected, asynchronous imported-frame policy
 is accepted on NVIDIA, Intel, and AMD. The AMD WinUI 3/D3D11 counted loss is
 traced to generic render retry/context-handoff semantics, corrected by
 proactive bounded handoff, and fully verified on the Radeon 880M with both
-supplied 4K files. The active Windows task now consists only of same-commit
-NVIDIA and Intel confirmation. Earlier correctness observations used older
+supplied 4K files. The same-commit NVIDIA cadence and lifecycle matrix is also
+complete; the active Windows task now consists only of the Intel confirmation.
+Earlier correctness observations used older
 workaround combinations and do not satisfy this performance baseline. Do not
 treat a vendor-specific performance difference as an AD-007 correctness
 regression unless new synchronization or driver-failure evidence appears.
@@ -845,30 +847,33 @@ regression unless new synchronization or driver-failure evidence appears.
    coalesced redraws, `present-busy`, `render-skipped`, gaps over 80 ms, and
    color/interop/buffer/draw stage maxima. Confirm D3D11VA and zero
    decoded-source CPU map.
-3. [ ] Run the NVIDIA and Intel confirmations from the same commit and Release
+3. [~] Run the NVIDIA and Intel confirmations from the same commit and Release
    configuration, using the same source scenes, duration, output resolution,
    color mode, window state, and cadence/stage counters. Match display refresh,
    HDR, and power conditions where practical and record every unavoidable
    difference. Capture at least two settled windows and one 60-120 second run
-   on each device; a subjective "looks smooth" result is not a baseline.
+   on each device; a subjective "looks smooth" result is not a baseline. The
+   NVIDIA confirmation is complete; Intel remains.
 4. [x] Locate the first AMD stage that misses the frame budget. Separate input,
    decode, audio-clock, and Player scheduling loss from renderer/context loss
    and swap-chain/compositor backpressure. Compare vendors only after
    accounting for source frame rate, display refresh, output mode, and power;
    a visual comparison or raw cross-device fps alone is not a diagnosis.
-5. [ ] Run the common matrix on the remaining NVIDIA and Intel devices:
+5. [~] Run the common matrix on the remaining NVIDIA and Intel devices:
    generated 1080p H.264/NV12 control, 4K SDR when available, HDR10/P010
    `legend.mkv`, and Dolby Vision Profile 5 `wednesday.mp4`. Include cold
    start, sustained playback, seek, media replacement, and close while
    playing, while preserving the accepted AD-007 synchronization policy. The
-   AMD supplied-file repair and lifecycle validation are complete.
+   AMD supplied-file repair and lifecycle validation are complete. NVIDIA is
+   complete for the generated H.264 control and both supplied HDR files; no
+   separate 4K SDR control was available. Intel remains.
 6. [~] Run controlled diagnostic A/Bs only after the failing stage is known.
    Candidate renderer-side isolates are native-size versus reduced-size output,
    HDR RGB10/PQ versus SDR BGRA8, and windowed versus display-sized
    presentation. Record AMD GPU decode/3D/copy utilization, clocks, power, and
    memory pressure alongside cadence. Do not disable native D3D11 multithread
    protection or infer a fix from lower image quality.
-7. [ ] Compare the same scenes with a trusted player on each device under the
+7. [~] Compare the same scenes with a trusted player on each device under the
    recorded display and power conditions, with interpolation and
    post-processing differences recorded. If QtAVCore is slower, identify the
    responsible backend stage and implement only an evidence-backed optimization
@@ -1044,11 +1049,120 @@ AMD proactive-handoff refinement on 2026-08-04:
 
 AMD repair and verification are complete: the loss is located in generic
 retry/context handoff, the proactive bounded correction is validated, and the
-cold source-rate baseline is restored. Do not close the Windows cross-vendor
-task until both NVIDIA and Intel have exact adapter/PCI and driver details,
-Windows/build and test conditions, objective source/scheduled/rendered cadence,
-gap/drop/backpressure counters, frame-budget stage maxima, D3D11VA/zero-map
-confirmation, lifecycle coverage, and any remaining device or workload limits.
+cold source-rate baseline is restored. NVIDIA now has the required adapter,
+driver, build, objective cadence, stage, zero-map, and lifecycle evidence. Do
+not close the Windows cross-vendor task until Intel records the same evidence
+and any remaining device or workload limits.
+
+Completed NVIDIA checkpoint on 2026-08-05; items 3 and 5 now remain open only
+for Intel:
+
+- commit `dc23a099302f1bb19df8209259560c1aedd8f2e1`, shared Release
+  QtAVCore built with the Visual Studio 2026 ClangCL/lld configuration and the
+  Release WinUI 3 player. The system ran Windows 11 Enterprise build
+  `26200.8246`, an Intel Core i5-14500 with 31.7 GiB RAM, balanced power plan,
+  and no battery. The display-driving NVIDIA GeForce RTX 3050 reported
+  `PCI\\VEN_10DE&DEV_2584&SUBSYS_184610DE`, driver `32.0.15.9186` (591.86),
+  with an Intel UHD Graphics 770 also present but not exercised. The player was
+  windowed with a 1708x814 composition surface on a 3840x2160/59 Hz HDR
+  display; output reported RGB10/PQ, 240-nit SDR white, and a 1405-nit display
+  peak. This refresh and display peak do not exactly match the earlier AMD
+  system and are recorded as comparison limits.
+- the initial WinUI/Core/backend rebuild completed. The initial shared Release
+  CTest result was 34/36. One D3D11VA lifecycle run fast-failed
+  in `ucrtbase.dll`, while five immediate isolated repetitions passed. The
+  initial D3D11 composition access violation was not a valid backend result:
+  the WinUI-target build had refreshed the August 5 shared DLLs but had left an
+  August 4 test executable in place. Commit `dc23a09` enlarged the public,
+  by-value `D3D11VideoOutputStatistics` result from 120 to 232 bytes. The stale
+  caller supplied the old return buffer while the new DLL wrote the new layout,
+  overwriting 112 bytes of caller stack; the later
+  `boundSwapChain = swapChain` failure was a consequence, not the cause.
+  Rebuilding `qtav_output_d3d11_test` removed the access violation. This is a
+  build-consistency failure and also concrete evidence that an unrecompiled
+  shared-library consumer is unsafe across this public ABI change; CTest must
+  follow a complete build, and a released ABI would require versioning or an
+  extensible statistics boundary.
+- the rebuilt composition test exposed a separate timing-sensitive test
+  assumption rather than a graphics failure. With a complete generated media
+  file, the unchanged test passed 19/20 runs; its one failure asserted that no
+  frame could be presented while the test held the immediate-context guard.
+  The output deliberately releases that guard before statistics and Present,
+  so an already-rendered frame can complete its Present/callback after the test
+  samples the counter. Merely weakening that equality moved 3/50 failures to
+  the corresponding recovery-counter assertion. A diagnostic-only experiment
+  instead acquired the guard, allowed the pre-existing Present/callback to
+  drain, then sampled the baseline; all strict busy, retry, supersession,
+  terminal, and recovery assertions passed 50/50. The experiment was removed.
+  The test fixture needs this synchronization correction before treating an
+  isolated assertion abort as a backend or driver regression. The cached media
+  fixture also referenced a removed FFmpeg 8.1.2 executable; the test media was
+  regenerated successfully with the installed host FFmpeg 9.0.
+- the composition test now makes that ordering deterministic. While it owns the
+  context guard, it waits until the serial render worker reports the expected
+  context-busy attempt; that attempt proves the earlier render/Present callback
+  has drained before the test samples its presentation baseline. The strict
+  busy, retry, supersession, terminal, and recovery assertions then passed 50
+  consecutive direct runs. After updating the cached media-generator path, a
+  clean full shared Release rebuild completed, all 36 CTest tests passed, and
+  the composition test passed another 20 consecutive CTest runs. The Release
+  WinUI player rebuilt separately with zero warnings and zero errors.
+- `legend.mkv` retained 3840x2160 D3D11VA HEVC Main 10, BT.2020/PQ input and
+  HDR RGB10/PQ output. After the cold window scheduled/rendered 24.6/24.4 fps,
+  more than two minutes of settled windows normally scheduled and rendered
+  24.8-25.1 fps with zero coalescing, Present busy, render skips, terminal
+  drops, or decoder-surface copies. Warm draw maxima were normally about
+  11-16 ms. One isolated settled window recorded a 90.2-ms render gap and a
+  36.2-ms color-stage maximum without losing a counted frame. A seek to 22:48
+  buffered for about 46 ms; its first window rendered 24.0 fps with four
+  coalesced requests, and the next returned to 25.0 fps. That next window
+  intercepted one context-busy attempt, used one retry and one bounded handoff
+  timeout, and still kept `terminal=0`, directly exercising successful recovery
+  from the transient contention fixed by the proactive handoff work.
+- `wednesday.mp4` retained 3840x2160 D3D11VA HEVC Main 10 Dolby Vision Profile
+  5 input and HDR RGB10/PQ output; the container track reports unknown static
+  color fields as expected for this workload. Cold loading completed in about
+  112 ms and the first frame was presented about 192 ms later. Over more than
+  60 seconds, settled windows scheduled 23.8-24.2 fps and rendered 23.9-24.1
+  fps with zero coalescing, Present busy, render skips, terminal drops, and
+  decoder-surface copies. Warm draw maxima were normally about 13-16 ms. A seek
+  to 29:39 buffered for about 14 ms; the seek window rendered 22.2 fps with one
+  coalesced request and the expected roughly 460-ms discontinuity, then the
+  next window returned to 24.0 fps with every loss/backpressure counter zero.
+- the same first process replaced `legend.mkv` with `wednesday.mp4` and played
+  the replacement for almost six minutes before closing while playing. Both
+  that process and the dedicated Dolby Vision process exited normally, and no
+  `QtAVWinUI3` Application Error event was recorded. Twelve-second process GPU
+  samples averaged about 11.9/0.09/0.01% video-decode/3D/copy for
+  `legend.mkv` and 11.3/0.13/0.00% for `wednesday.mp4`; working set remained
+  about 287 MiB. D3D11VA, `decoder-copies=0`, and the absence of any reported
+  software fallback or decoded-source map remained intact throughout.
+- the generated `C:\\test\\qtav-h264-nv12-control-1080p.mp4` is a 120-second
+  H.264 High/yuv420p limited-range BT.709 control at 1920x1080 and 30000/1001
+  fps with 48-kHz stereo AAC-LC. The player selected D3D11VA/NV12 with HDR
+  RGB10/PQ composition output. Loading completed in about 13 ms and the first
+  frame was presented about 141 ms after open. More than 80 seconds of settled
+  windows scheduled/rendered 29.9-30.1 fps with zero coalescing, Present busy,
+  render skips, renderer busy, retry/superseded/terminal results, decoder
+  copies, or greater-than-80-ms warm gaps; warm draw maxima were about 13-16
+  ms. A twelve-second sample averaged about 8.07% video-decode, 0.09% 3D, and
+  0.00% copy utilization with about 181 MiB working set.
+- a seek to 00:59 buffered for about 19 ms. Its transition window had five
+  coalesced requests and the expected roughly 344-ms discontinuity but zero
+  terminal result or decoder copy; the next windows returned to 29.9-30.1 fps
+  with all loss/backpressure counters zero. In the same process, the control
+  reached end of media and was replaced by `legend.mkv`; the replacement loaded
+  as 3840x2160 D3D11VA HEVC Main 10 BT.2020/PQ, presented HDR RGB10/PQ with zero
+  decoder copies, and continued playing. Closing at about 00:50 left no
+  `QtAVWinUI3` process and no Application Error or Windows Error Reporting event.
+- the NVIDIA matrix is complete for the generated H.264/NV12 control,
+  `legend.mkv`, and `wednesday.mp4`, including cold start, sustained playback,
+  seek, media replacement, and close while playing. A separate 4K SDR control
+  was not available and is recorded as an optional matrix limit rather than a
+  failure. The user already compared the current NVIDIA output with MPC-BE and
+  accepted that trusted-player check. NVIDIA regression is therefore closed;
+  exact trusted-player settings and the entire Intel matrix still keep items 1,
+  3, 5, and 7 partially open.
 
 The prior Android task is retained below as completed history, not as the
 active next step.
@@ -1071,8 +1185,8 @@ The Android example playback-stutter task is complete:
    for both representative files.
 
 The existing Android playback-stutter correction remains complete. Preserve
-this OpenGL reopen/long-form run as the Android regression gate while NVIDIA
-and Intel validate the Windows correction. The distinct cross-platform
+this OpenGL reopen/long-form run as the Android regression gate while Intel
+validates the remaining Windows correction. The distinct cross-platform
 render-attempt evaluation and implementation is queued as item 8 above; OHOS
 production work remains sequenced after the Windows vendor matrix and its
 target-clarification gate.
@@ -1645,8 +1759,8 @@ libplacebo own plane sampling, Dolby Vision/HDR processing, and final output.
 
 Following platform slice:
 
-1. [~] Complete the NVIDIA and Intel same-commit matrix described in `Next
-   task`; AMD repair and verification are complete. Then execute the final
+1. [~] Complete the Intel side of the same-commit matrix described in `Next
+   task`; AMD repair and NVIDIA verification are complete. Then execute the final
    Android/OHOS render-result item before resuming the deferred OHOS production
    slice.
 
@@ -1729,9 +1843,9 @@ Acceptance:
 - [x] No Windows type leaks into core public headers.
 
 Status: complete; Milestone 6 is also complete. AD-007 is accepted across
-NVIDIA, Intel, and AMD; the AMD integrated-GPU cadence correction is fully
-validated, the NVIDIA/Intel same-commit matrix remains active, and Milestone 7
-is deferred.
+NVIDIA, Intel, and AMD; the AMD integrated-GPU cadence correction and NVIDIA
+same-commit matrix are fully validated, the Intel matrix remains active, and
+Milestone 7 is deferred.
 
 ## Milestone 6 — Android production path
 
@@ -1821,7 +1935,7 @@ Acceptance:
   as unavailable or skipped, not counted as zero-CPU-copy success;
 - Android SDK types remain outside core public headers.
 
-Status: complete. Finish the active NVIDIA/Intel same-commit matrix and the
+Status: complete. Finish the active Intel same-commit matrix and the
 final Android/OHOS render-result item first; Milestone 7 remains deferred until
 its target-clarification gate is entered.
 
@@ -1829,7 +1943,7 @@ its target-clarification gate is entered.
 
 This milestone remains in the supported roadmap, but it is not the active next
 task. Do not begin its target-clarification or production implementation until
-the NVIDIA/Intel same-commit matrix closes and the final cross-platform
+the Intel same-commit matrix closes and the final cross-platform
 render-result item records the portable contract that the OHOS adapters will
 implement.
 
