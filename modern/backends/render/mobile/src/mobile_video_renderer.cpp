@@ -250,6 +250,14 @@ public:
         VideoRenderEvent& failure)
     {
         if (!renderer_) {
+            lastAttempt_ = {
+                suspended_ ? VideoRenderAttemptStatus::SurfaceLost
+                           : VideoRenderAttemptStatus::FatalError,
+                0,
+                suspended_
+                    ? "The mobile renderer surface is suspended"
+                    : "Mobile video presentation is unavailable",
+            };
             failure = {
                 suspended_ ? VideoRenderEventType::SurfaceLost
                            : VideoRenderEventType::Error,
@@ -260,15 +268,27 @@ public:
             return false;
         }
         clearPendingEvent();
-        if (renderer_->render(frame)) {
+        lastAttempt_ = renderer_->renderDetailed(frame);
+        if (lastAttempt_.frameConsumed()) {
             clearPendingEvent();
             return true;
         }
         if (!hasPendingEvent_) {
+            VideoRenderEventType failureType =
+                VideoRenderEventType::RedrawRequested;
+            if (lastAttempt_.status
+                == VideoRenderAttemptStatus::SurfaceLost) {
+                failureType = VideoRenderEventType::SurfaceLost;
+            } else if (lastAttempt_.status
+                       == VideoRenderAttemptStatus::FatalError) {
+                failureType = VideoRenderEventType::Error;
+            }
             failure = {
-                VideoRenderEventType::RedrawRequested,
-                apiLabel(selectedAPI_)
-                    + " renderer deferred this retryable render attempt",
+                failureType,
+                lastAttempt_.detail.empty()
+                    ? apiLabel(selectedAPI_)
+                        + " renderer deferred this retryable render attempt"
+                    : lastAttempt_.detail,
             };
             return false;
         }
@@ -404,6 +424,11 @@ public:
                     "failure; subsequent decoder output must use the "
                     "new native interop surface",
                     routeDetail));
+            lastAttempt_ = {
+                VideoRenderAttemptStatus::Discarded,
+                0,
+                "Discarded the frame from the retired Vulkan interop surface",
+            };
             return true;
         }
 
@@ -430,6 +455,11 @@ public:
                     "failure; subsequent decoder output must be "
                     "software frames",
                     routeDetail));
+            lastAttempt_ = {
+                VideoRenderAttemptStatus::Discarded,
+                0,
+                "Discarded the retired hardware frame while switching to software decode",
+            };
             return true;
         }
 
@@ -449,6 +479,11 @@ public:
                     "Handed hardware video presentation to the "
                     "application's direct surface",
                     routeDetail));
+            lastAttempt_ = {
+                VideoRenderAttemptStatus::Discarded,
+                0,
+                "Handed subsequent hardware presentation to the direct surface",
+            };
             return true;
         }
 
@@ -468,6 +503,11 @@ public:
                 previous,
                 MobileRenderAPI::None,
                 lastError_);
+            lastAttempt_ = {
+                VideoRenderAttemptStatus::Discarded,
+                0,
+                lastError_,
+            };
             return true;
         }
 
@@ -498,6 +538,11 @@ public:
             VideoRenderEventType::Error,
             lastError_,
         });
+        lastAttempt_ = {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            lastError_,
+        };
         return false;
     }
 
@@ -666,28 +711,42 @@ public:
         return processFailure(api, std::move(failure), nullptr);
     }
 
-    bool render(const VideoFrame& frame)
+    VideoRenderAttemptResult renderDetailed(const VideoFrame& frame)
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (!sessionConfigured_ || suspended_) {
-            return false;
+            lastAttempt_ = {
+                suspended_ ? VideoRenderAttemptStatus::SurfaceLost
+                           : VideoRenderAttemptStatus::FatalError,
+                0,
+                suspended_
+                    ? "The mobile renderer surface is suspended"
+                    : "The mobile renderer session is not configured",
+            };
+            return lastAttempt_;
         }
         if (hardwareFallbackRoute_
                 == MobileHardwareFrameFallbackRoute::DirectSurface
             || hardwareFallbackRoute_
                 == MobileHardwareFrameFallbackRoute::NoVideo
             || isRetiredHardwareFrame(frame)) {
-            return true;
+            lastAttempt_ = {
+                VideoRenderAttemptStatus::Discarded,
+                0,
+                "The frame belongs to a retired or application-owned presentation route",
+            };
+            return lastAttempt_;
         }
         const MobileRenderAPI api = selectedAPI_;
         VideoRenderEvent failure;
         if (renderOnce(frame, failure)) {
-            return true;
+            return lastAttempt_;
         }
         if (api == MobileRenderAPI::None) {
-            return false;
+            return lastAttempt_;
         }
-        return processFailure(api, std::move(failure), &frame);
+        processFailure(api, std::move(failure), &frame);
+        return lastAttempt_;
     }
 
     void close() noexcept
@@ -760,6 +819,7 @@ public:
         HardwareDeviceType::Unknown;
     NativeHandle retiredHardwareSurface_;
     std::string lastError_;
+    VideoRenderAttemptResult lastAttempt_;
 };
 
 MobileVideoRendererSelector::MobileVideoRendererSelector(
@@ -812,7 +872,21 @@ bool MobileVideoRendererSelector::configure(
 bool MobileVideoRendererSelector::render(
     const VideoFrame& frame)
 {
-    return impl_ && impl_->render(frame);
+    return renderDetailed(frame).frameConsumed();
+}
+
+VideoRenderAttemptResult
+MobileVideoRendererSelector::renderDetailed(
+    const VideoFrame& frame)
+{
+    if (!impl_) {
+        return {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            "The mobile renderer selector is unavailable",
+        };
+    }
+    return impl_->renderDetailed(frame);
 }
 
 void MobileVideoRendererSelector::close() noexcept

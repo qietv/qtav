@@ -482,14 +482,17 @@ implementation.
 - `renderVideoDetailed()` runs synchronously on its caller and should be called
   from the thread that owns the native graphics context. Atomically published
   immutable frame/binding snapshots keep this hot path off the Player control
-  mutex. Its `VideoRenderResult` distinguishes rendered, no-frame, Player-busy,
-  and renderer-busy outcomes and includes a frame sequence and presentation
-  generation for bounded retry coalescing. A generation change during the
-  backend call rejects that stale completion;
+  mutex. `VideoRenderAPI::renderDetailed()` classifies a backend attempt as
+  presented, deferred until a backend redraw, timer-backoff retry, terminally
+  discarded, surface-lost, or fatal. `VideoRenderResult` maps those outcomes
+  to Player-facing statuses and includes frame sequence, presentation
+  generation, optional retry delay, and detail. A generation change during the
+  backend call returns a terminal `FrameDiscarded` completion;
 - compatibility `renderVideo()` returns a negative value for every non-rendered
   result and therefore cannot distinguish a missing frame from retryable
-  contention. New native render loops should retry only the detailed busy
-  results rather than blocking their UI/render thread;
+  contention. New native render loops retain the exact frame for
+  `RendererDeferred`, retry `RendererBusy` after bounded backoff, recreate the
+  platform surface for `SurfaceLost`, and do not retry `FrameDiscarded`;
 - `OpenGLPresentCallback` runs on that same graphics-owner thread after
   framebuffer submission and before hardware-source release; it is intended
   for the adapter's bounded window-present call, not general application work;
@@ -500,9 +503,10 @@ implementation.
   contention. A private output worker may pair `reserveContext()` with
   `tryContextGuardFor()` for a bounded, reservation-aware handoff without
   blocking an application UI thread;
-- `VideoRenderAPI::render()` runs synchronously inside
+- `VideoRenderAPI::renderDetailed()` runs synchronously inside Player's
   `renderVideoDetailed()` (and therefore the compatibility `renderVideo()`
-  wrapper), and backend event callbacks may request another player state;
+  wrapper). Its default implementation calls the legacy boolean `render()`;
+  backend event callbacks may request another player state;
 - audio-sink and video-render backend event callbacks run on the thread chosen
   by the backend and may request another player state;
 - compressed audio packets cross a bounded queue to their decode worker, then

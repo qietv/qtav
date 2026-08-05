@@ -20,7 +20,8 @@ QtAVCore is maintained for Windows, Android, and OHOS targets only. The former
 macOS and iOS backends, tests, and integration notes were moved to
 [`../archived_apple/`](../archived_apple/) and are no longer maintained,
 built, tested, packaged, or installed. A macOS machine may still be used as a
-cross-compilation host for Android/OHOS; that does not make macOS a supported
+cross-compilation host for Android/OHOS, and 64-bit Windows may cross-compile
+OHOS with the DevEco native SDK; neither host role adds another supported
 QtAVCore target. Linux is not part of the active target matrix or roadmap.
 
 ## Current scope
@@ -264,6 +265,22 @@ cmake -S modern -B build/modern -DQTAV_CORE_BUILD_TESTS=ON
 cmake --build build/modern
 ctest --test-dir build/modern --output-on-failure
 ```
+
+### OHOS arm64/API 23 on Windows
+
+On 64-bit Windows with DevEco Studio and the OpenHarmony native SDK installed,
+the supported PowerShell entry point builds the repository FFmpeg dependency
+closure locally, then builds and installs a shared Release QtAVCore SDK:
+
+```powershell
+./modern/scripts/build-ohos.ps1
+```
+
+Use `-SkipDependencies` after the local dependency package has already been
+verified, or `-LibraryType Static` for static QtAVCore archives. The scripts,
+output layout, SDK discovery, space-free SDK junction, shared-link policy, and
+HAP/signing boundary are documented in
+[`OHOS_WINDOWS.md`](OHOS_WINDOWS.md).
 
 Backend switches are cache strings with `AUTO`, `ON`, and `OFF` values. `AUTO`
 enables a backend when its implementation and host requirements are available,
@@ -833,9 +850,17 @@ player
     .setRenderCallback([&](void* key) {
         schedule_on_render_thread([&, key] {
             const auto result = player.renderVideoDetailed(key);
-            if (result.status == qtav::VideoRenderStatus::PlayerStateBusy
-                || result.status == qtav::VideoRenderStatus::RendererBusy) {
-                schedule_bounded_retry(key);
+            if (result.status
+                == qtav::VideoRenderStatus::RendererBusy) {
+                schedule_bounded_retry(
+                    key,
+                    result.retryAfterMilliseconds);
+            } else if (result.status
+                       == qtav::VideoRenderStatus::RendererDeferred) {
+                // Retain the exact frame; the backend will request redraw.
+            } else if (result.status
+                       == qtav::VideoRenderStatus::SurfaceLost) {
+                recreate_native_surface(key);
             }
         });
     });
@@ -858,14 +883,24 @@ latency or repeatedly replacing the next presentable frame.
 `renderVideoDetailed()` runs on the caller's thread, so an OpenGL, Vulkan, or
 D3D integration can keep ownership of its native context and surface. Its
 immutable frame and renderer-binding snapshots are atomically published; the
-hot render path does not take the Player control mutex. The result distinguishes
-`Rendered`, `NoFrame`, `PlayerStateBusy`, and `RendererBusy`, and carries the
-frame sequence plus presentation generation needed to coalesce bounded
-retries. Retry only the two busy results; `NoFrame` waits for the next
-decoder-driven redraw. Player rechecks the generation after the backend call,
-so a seek, stop, or media replacement that overlaps rendering rejects the
-completed stale frame. The compatibility `renderVideo()` returns the rendered
-timestamp in seconds and collapses every other result to a negative value.
+hot render path does not take the Player control mutex. The backend-level
+`VideoRenderAttemptResult` distinguishes `Presented`,
+`DeferredUntilRedraw`, `RetryAfterBackoff`, `Discarded`, `SurfaceLost`, and
+`FatalError`. `renderVideoDetailed()` maps those to `Rendered`,
+`RendererDeferred`, `RendererBusy`, `FrameDiscarded`, `SurfaceLost`, and
+`RendererError`, while retaining `NoFrame` and the reserved
+`PlayerStateBusy`. It also carries the frame sequence, presentation generation,
+optional retry delay, and diagnostic detail. Retain and retry the exact frame
+only for `RendererDeferred` (after the backend raises `RedrawRequested`) or
+`RendererBusy` (after bounded timer backoff); terminal discarded/no-frame
+results wait for a newly published frame. Player rechecks the generation after
+the backend call, so a seek, stop, or media replacement that overlaps rendering
+returns `FrameDiscarded` for that stale completion. The compatibility
+`renderVideo()` returns the rendered timestamp in seconds and collapses every
+other result to a negative value. Existing boolean-only `VideoRenderAPI`
+implementations remain source-compatible: their `false` result maps to a
+one-millisecond `RetryAfterBackoff` attempt until they override
+`renderDetailed()`.
 A/V startup and playing seeks use a bounded video preroll before releasing
 device audio, avoiding an audio-first clock sprint while the first video
 frames are still being decoded.

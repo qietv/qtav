@@ -9,6 +9,7 @@ It builds FFmpeg 8.1.2 and the player dependency closure for these targets:
 | --- | --- | --- |
 | macOS | Android arm64-v8a, API 28 | `arm64-android-28-static` |
 | macOS | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
+| 64-bit Windows | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows | Windows x64, Visual Studio ABI | `x64-windows-static-md` |
 
 macOS is a cross-compilation host only. Do not add macOS or iOS outputs. Do
@@ -43,8 +44,9 @@ toolchains, overlay ports, verification rules, or output layout.
 - Keep `vcpkg.json`, `vcpkg-configuration.json`, overlay ports, and the
   verifier synchronized when dependencies or features change.
 - Keep source and text files UTF-8 without BOM and use LF line endings.
-- Preserve `scripts/build-android.sh` and `scripts/build-ohos.sh` as stable,
-  directly callable local entry points. CI must call the same scripts.
+- Preserve `scripts/build-android.sh`, `scripts/build-ohos.sh`, and
+  `scripts/build-ohos.ps1` as stable, directly callable local entry points.
+  CI must use one of the supported target entry points.
 - Preserve the default package layout under
   `build/<triplet>/vcpkg_installed/<triplet>/`.
 
@@ -77,11 +79,13 @@ On Windows, run from PowerShell on a machine with Visual Studio C++ and C++
 Clang tools installed:
 
 ```powershell
+./ffmpeg/scripts/build-ohos.ps1
 ./ffmpeg/scripts/build-windows.ps1
 ```
 
-Use `QTAV_FFMPEG_INSTALL_ROOT` on macOS or `-InstallRoot` on Windows only when
-an alternate package location is required.
+The first command cross-compiles OHOS with the DevEco native SDK; the second
+builds the Windows x64 package. Use `QTAV_FFMPEG_INSTALL_ROOT` on macOS or
+`-InstallRoot` on Windows only when an alternate package location is required.
 
 ## Toolchain invariants
 

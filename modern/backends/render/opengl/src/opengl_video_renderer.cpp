@@ -1177,10 +1177,15 @@ bool OpenGLVideoRenderer::configure(const VideoRenderConfig& config)
     return configured;
 }
 
-bool OpenGLVideoRenderer::render(const VideoFrame& frame)
+VideoRenderAttemptResult OpenGLVideoRenderer::renderDetailed(
+    const VideoFrame& frame)
 {
     if (!impl_ || !frame) {
-        return false;
+        return {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            "The OpenGL ES renderer received an invalid frame",
+        };
     }
     std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
     VideoRenderConfig config;
@@ -1197,26 +1202,27 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
         }
     }
     if (!config.surfaceSize.isValid()) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The OpenGL ES renderer is not open");
-        return false;
+        const std::string detail = "The OpenGL ES renderer is not open";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
     const OpenGLRenderTarget nativeTarget = currentTarget
         ? currentTarget()
         : OpenGLRenderTarget {};
     if (!nativeTarget.isValid()) {
+        const std::string detail =
+            "The current OpenGL ES target is unavailable";
         impl_->notify(
             VideoRenderEventType::SurfaceLost,
-            "The current OpenGL ES target is unavailable");
-        return false;
+            detail);
+        return { VideoRenderAttemptStatus::SurfaceLost, 0, detail };
     }
     if (nativeTarget.size.width != config.surfaceSize.width
         || nativeTarget.size.height != config.surfaceSize.height) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The current OpenGL ES target size does not match the configured surface");
-        return false;
+        const std::string detail =
+            "The current OpenGL ES target size does not match the configured surface";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
 
     std::string error;
@@ -1228,11 +1234,20 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
                 impl_->prepareHardwareFrame(frame, error);
             if (status == OpenGLHardwareImportStatus::Pending
                 || status == OpenGLHardwareImportStatus::Stale) {
-                return false;
+                return {
+                    status == OpenGLHardwareImportStatus::Pending
+                        ? VideoRenderAttemptStatus::DeferredUntilRedraw
+                        : VideoRenderAttemptStatus::Discarded,
+                    0,
+                    error,
+                };
             }
             if (status != OpenGLHardwareImportStatus::Ready) {
-                impl_->notify(VideoRenderEventType::Error, std::move(error));
-                return false;
+                const std::string detail = error.empty()
+                    ? "The OpenGL ES hardware frame preparation failed"
+                    : error;
+                impl_->notify(VideoRenderEventType::Error, detail);
+                return { VideoRenderAttemptStatus::FatalError, 0, detail };
             }
         }
         external = impl_->preparedHardware_;
@@ -1254,8 +1269,8 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
                 error = std::move(releaseError);
             }
         }
-        impl_->notify(VideoRenderEventType::Error, std::move(error));
-        return false;
+        impl_->notify(VideoRenderEventType::Error, error);
+        return { VideoRenderAttemptStatus::FatalError, 0, error };
     }
 
     struct pl_frame image {};
@@ -1330,14 +1345,18 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
         impl_->preparedKey_ = {};
     }
     if (!rendered || !submitted || !presented || !error.empty()) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            error.empty()
-                ? "libplacebo OpenGL rendering failed"
-                : std::move(error));
-        return false;
+        const std::string detail = error.empty()
+            ? "libplacebo OpenGL rendering failed"
+            : error;
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
-    return true;
+    return { VideoRenderAttemptStatus::Presented, 0, {} };
+}
+
+bool OpenGLVideoRenderer::render(const VideoFrame& frame)
+{
+    return renderDetailed(frame).frameConsumed();
 }
 
 void OpenGLVideoRenderer::close() noexcept

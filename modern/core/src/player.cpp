@@ -686,6 +686,8 @@ public:
                 -1.0,
                 0,
                 currentGeneration,
+                0,
+                {},
             };
         }
 
@@ -702,9 +704,13 @@ public:
             legacyRenderer = bindings->legacyRenderer;
         }
 
-        bool rendered = true;
+        VideoRenderAttemptResult attempt {
+            VideoRenderAttemptStatus::Presented,
+            0,
+            {},
+        };
         if (renderAPI) {
-            rendered = renderAPI->render(frame->frame);
+            attempt = renderAPI->renderDetailed(frame->frame);
         } else if (legacyRenderer) {
             legacyRenderer(frame->frame, opaque);
         }
@@ -713,18 +719,43 @@ public:
             presentationGeneration_.load(std::memory_order_acquire);
         if (frame->generation != completedGeneration) {
             return {
-                VideoRenderStatus::NoFrame,
-                -1.0,
-                0,
+                VideoRenderStatus::FrameDiscarded,
+                static_cast<double>(frame->frame.timestamp()) / 1000.0,
+                frame->sequence,
                 completedGeneration,
+                0,
+                "The presentation generation changed during the render attempt",
             };
         }
+
+        VideoRenderStatus status = VideoRenderStatus::RendererError;
+        switch (attempt.status) {
+        case VideoRenderAttemptStatus::Presented:
+            status = VideoRenderStatus::Rendered;
+            break;
+        case VideoRenderAttemptStatus::DeferredUntilRedraw:
+            status = VideoRenderStatus::RendererDeferred;
+            break;
+        case VideoRenderAttemptStatus::RetryAfterBackoff:
+            status = VideoRenderStatus::RendererBusy;
+            break;
+        case VideoRenderAttemptStatus::Discarded:
+            status = VideoRenderStatus::FrameDiscarded;
+            break;
+        case VideoRenderAttemptStatus::SurfaceLost:
+            status = VideoRenderStatus::SurfaceLost;
+            break;
+        case VideoRenderAttemptStatus::FatalError:
+            status = VideoRenderStatus::RendererError;
+            break;
+        }
         return {
-            rendered ? VideoRenderStatus::Rendered
-                     : VideoRenderStatus::RendererBusy,
+            status,
             static_cast<double>(frame->frame.timestamp()) / 1000.0,
             frame->sequence,
             frame->generation,
+            attempt.retryAfterMilliseconds,
+            std::move(attempt.detail),
         };
     }
 

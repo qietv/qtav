@@ -725,16 +725,22 @@ bool AndroidOpenGLVideoRenderer::configure(
     return configured;
 }
 
-bool AndroidOpenGLVideoRenderer::render(
+VideoRenderAttemptResult AndroidOpenGLVideoRenderer::renderDetailed(
     const VideoFrame& frame)
 {
     if (!impl_) {
-        return false;
+        return {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            "The Android OpenGL ES renderer is unavailable",
+        };
     }
     std::string error;
-    bool rendered = false;
-    bool retryPending = false;
-    bool staleFrame = false;
+    VideoRenderAttemptResult attempt {
+        VideoRenderAttemptStatus::FatalError,
+        0,
+        {},
+    };
     EGLint eglCode = EGL_SUCCESS;
     {
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
@@ -752,14 +758,22 @@ bool AndroidOpenGLVideoRenderer::render(
                     impl_->renderer_.prepareHardwareFrame(
                         frame,
                         &error);
-                retryPending =
-                    hardwareStatus
-                    == OpenGLHardwareImportStatus::Pending;
-                staleFrame =
-                    hardwareStatus
-                    == OpenGLHardwareImportStatus::Stale;
             }
-            if (retryPending || staleFrame) {
+            if (hardwareStatus
+                == OpenGLHardwareImportStatus::Pending) {
+                attempt = {
+                    VideoRenderAttemptStatus::DeferredUntilRedraw,
+                    0,
+                    error,
+                };
+                error.clear();
+            } else if (hardwareStatus
+                       == OpenGLHardwareImportStatus::Stale) {
+                attempt = {
+                    VideoRenderAttemptStatus::Discarded,
+                    0,
+                    error,
+                };
                 error.clear();
             } else if (hardwareStatus
                            != OpenGLHardwareImportStatus::Ready) {
@@ -767,32 +781,57 @@ bool AndroidOpenGLVideoRenderer::render(
                     error =
                         "The Android OpenGL ES hardware-frame preparation failed";
                 }
-            } else if (!impl_->renderer_.render(frame)) {
-                error = impl_->lastEngineError_.empty()
-                    ? "The OpenGL ES engine could not render the frame"
-                    : impl_->lastEngineError_;
             } else {
-                rendered = true;
+                attempt = impl_->renderer_.renderDetailed(frame);
+                if (attempt.status
+                        == VideoRenderAttemptStatus::FatalError
+                    || attempt.status
+                        == VideoRenderAttemptStatus::SurfaceLost) {
+                    error = attempt.detail.empty()
+                        ? impl_->lastEngineError_
+                        : attempt.detail;
+                }
             }
-            if (!rendered
+            if (!attempt.presented()
                 && impl_->lastPresentEglError_ != EGL_SUCCESS) {
                 eglCode = impl_->lastPresentEglError_;
             }
         }
         impl_->doneCurrent();
     }
-    if (retryPending || staleFrame) {
-        return false;
+    if (attempt.status == VideoRenderAttemptStatus::DeferredUntilRedraw
+        || attempt.status == VideoRenderAttemptStatus::RetryAfterBackoff
+        || attempt.status == VideoRenderAttemptStatus::Discarded) {
+        return attempt;
     }
-    if (!rendered) {
-        const VideoRenderEventType type =
-            eglLifecycleLoss(eglCode)
-                || error.find("surface") != std::string::npos
-            ? VideoRenderEventType::SurfaceLost
-            : VideoRenderEventType::Error;
-        impl_->notify(type, std::move(error));
+    if (attempt.presented()) {
+        return attempt;
     }
-    return rendered;
+    const bool surfaceLost =
+        attempt.status == VideoRenderAttemptStatus::SurfaceLost
+        || eglLifecycleLoss(eglCode)
+        || error.find("surface") != std::string::npos;
+    const VideoRenderEventType eventType = surfaceLost
+        ? VideoRenderEventType::SurfaceLost
+        : VideoRenderEventType::Error;
+    if (error.empty()) {
+        error = surfaceLost
+            ? "The Android OpenGL ES surface is unavailable"
+            : "The Android OpenGL ES renderer could not render the frame";
+    }
+    impl_->notify(eventType, error);
+    return {
+        surfaceLost ? VideoRenderAttemptStatus::SurfaceLost
+                    : VideoRenderAttemptStatus::FatalError,
+        0,
+        error,
+    };
+}
+
+bool AndroidOpenGLVideoRenderer::render(
+    const VideoFrame& frame)
+{
+    return renderDetailed(frame).frameConsumed();
 }
 
 void AndroidOpenGLVideoRenderer::close() noexcept

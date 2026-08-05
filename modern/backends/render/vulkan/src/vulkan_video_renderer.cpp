@@ -1960,10 +1960,15 @@ bool VulkanVideoRenderer::configure(const VideoRenderConfig& config)
     return configured;
 }
 
-bool VulkanVideoRenderer::render(const VideoFrame& frame)
+VideoRenderAttemptResult VulkanVideoRenderer::renderDetailed(
+    const VideoFrame& frame)
 {
     if (!impl_ || !frame) {
-        return false;
+        return {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            "The Vulkan renderer received an invalid frame",
+        };
     }
     std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
     VideoRenderConfig config;
@@ -1978,8 +1983,9 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         }
     }
     if (!config.surfaceSize.isValid()) {
-        impl_->notify(VideoRenderEventType::Error, "The Vulkan renderer is not open");
-        return false;
+        const std::string detail = "The Vulkan renderer is not open";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
     impl_->retireCompletedHardwareFrames();
 
@@ -1991,39 +1997,53 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
             impl_->notify(
                 VideoRenderEventType::Error,
                 "The Vulkan renderer has no compatible interop for this hardware frame");
-            return false;
+            return {
+                VideoRenderAttemptStatus::FatalError,
+                0,
+                "The Vulkan renderer has no compatible interop for this hardware frame",
+            };
         }
         const VulkanHardwareImportStatus status =
             hardwareInterop->prepareFrame(frame, error);
         if (status == VulkanHardwareImportStatus::Pending) {
-            return false;
+            return {
+                VideoRenderAttemptStatus::DeferredUntilRedraw,
+                0,
+                error,
+            };
         }
         if (status != VulkanHardwareImportStatus::Ready) {
-            impl_->notify(
-                VideoRenderEventType::Error,
-                error.empty()
-                    ? "The Vulkan hardware frame preparation failed"
-                    : std::move(error));
-            return false;
+            const VideoRenderAttemptStatus attemptStatus =
+                status == VulkanHardwareImportStatus::Stale
+                ? VideoRenderAttemptStatus::Discarded
+                : VideoRenderAttemptStatus::FatalError;
+            const std::string detail = error.empty()
+                ? "The Vulkan hardware frame preparation failed"
+                : error;
+            if (attemptStatus == VideoRenderAttemptStatus::FatalError) {
+                impl_->notify(VideoRenderEventType::Error, detail);
+            }
+            return { attemptStatus, 0, detail };
         }
     }
 
     const VulkanRenderTarget nativeTarget =
         currentTarget ? currentTarget() : VulkanRenderTarget {};
     if (!nativeTarget.isValid()) {
+        const std::string detail = "The current Vulkan target is unavailable";
         impl_->notify(
             VideoRenderEventType::SurfaceLost,
-            "The current Vulkan target is unavailable");
-        return false;
+            detail);
+        return { VideoRenderAttemptStatus::SurfaceLost, 0, detail };
     }
     if (nativeTarget.extent.width
             != static_cast<std::uint32_t>(config.surfaceSize.width)
         || nativeTarget.extent.height
             != static_cast<std::uint32_t>(config.surfaceSize.height)) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The current Vulkan target extent does not match the configured surface");
-        return false;
+        const std::string detail =
+            "The current Vulkan target extent does not match the configured surface";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
 
     pl_tex targetTexture = nullptr;
@@ -2032,8 +2052,8 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         if (targetTexture) {
             pl_tex_destroy(impl_->vulkan_->gpu, &targetTexture);
         }
-        impl_->notify(VideoRenderEventType::Error, std::move(error));
-        return false;
+        impl_->notify(VideoRenderEventType::Error, error);
+        return { VideoRenderAttemptStatus::FatalError, 0, error };
     }
 
     pl_frame image {};
@@ -2042,10 +2062,20 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
     pl_dovi_metadata dovi {};
     bool externalNormalized = false;
     bool mappedSoftware = false;
+    VideoRenderAttemptStatus failureStatus =
+        VideoRenderAttemptStatus::FatalError;
     if (frame.hasHardwareFrame()) {
         VulkanHardwareImportResult importedResult =
             hardwareInterop->importFrame(frame);
         if (!importedResult) {
+            if (importedResult.status
+                == VulkanHardwareImportStatus::Pending) {
+                failureStatus =
+                    VideoRenderAttemptStatus::DeferredUntilRedraw;
+            } else if (importedResult.status
+                       == VulkanHardwareImportStatus::Stale) {
+                failureStatus = VideoRenderAttemptStatus::Discarded;
+            }
             error = importedResult.detail.empty()
                 ? "The prepared Vulkan hardware frame import failed"
                 : std::move(importedResult.detail);
@@ -2136,14 +2166,23 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         impl_->retireCompletedHardwareFrames();
     }
     if (!rendered || !targetFinished) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            error.empty()
-                ? "libplacebo rendering failed"
-                : std::move(error));
-        return false;
+        if (!targetFinished) {
+            failureStatus = VideoRenderAttemptStatus::FatalError;
+        }
+        const std::string detail = error.empty()
+            ? "libplacebo rendering failed"
+            : error;
+        if (failureStatus == VideoRenderAttemptStatus::FatalError) {
+            impl_->notify(VideoRenderEventType::Error, detail);
+        }
+        return { failureStatus, 0, detail };
     }
-    return true;
+    return { VideoRenderAttemptStatus::Presented, 0, {} };
+}
+
+bool VulkanVideoRenderer::render(const VideoFrame& frame)
+{
+    return renderDetailed(frame).frameConsumed();
 }
 
 void VulkanVideoRenderer::close() noexcept

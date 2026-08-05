@@ -170,6 +170,17 @@ failed recovery enters the explicit no-renderer state. Selection notifications
 record selected, recovered, fallback, and unavailable transitions with their
 reasons.
 
+The portable `VideoRenderAttemptResult` is the synchronous decision boundary
+used by both mobile APIs and future OHOS adapters. `Presented` completes the
+frame, `DeferredUntilRedraw` retains that exact frame until an asynchronous
+producer/GPU callback raises `RedrawRequested`, `RetryAfterBackoff` asks the
+application for a bounded timer retry, and `Discarded` terminally consumes a
+stale or retired-generation frame. `SurfaceLost` starts bounded same-API
+recreation; `FatalError` starts the one-way Vulkan-to-OpenGL ES policy. These
+outcomes no longer depend on guessing from a boolean return plus a synchronous
+event side channel. Legacy boolean renderers remain supported through the
+default retry-after-backoff mapping.
+
 The platform calls `suspendSurface()` before releasing a native-window
 generation, updates the application state captured by the factories, and calls
 `recreateSurface()` after publishing the replacement. The selector object
@@ -201,10 +212,9 @@ without mapping. OpenGL ES interop requires the prepared candidate to
 advertise the source hardware device; no callback or a `None` decision makes
 presentation explicitly unavailable.
 
-An asynchronous interop attempt may return `false` before its producer image
-is ready without emitting `SurfaceLost` or `Error`. The selector treats this
-as retryable and preserves the active API. Only an emitted lifecycle or fatal
-event starts recovery or fallback.
+An asynchronous interop attempt returns `DeferredUntilRedraw` before its
+producer image is ready. The selector preserves the active API and exact frame;
+only `SurfaceLost` or `FatalError` starts recovery or fallback.
 
 ## Platform surface adapters
 

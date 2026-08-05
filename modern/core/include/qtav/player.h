@@ -38,8 +38,16 @@ enum class VideoRenderStatus {
     // Reserved for transient Player-side render-state contention.
     PlayerStateBusy,
     // The selected VideoRenderAPI declined this attempt. Backends may expose
-    // more detailed diagnostics to decide whether it is retryable.
+    // a retry delay; retry this same frame after bounded timer backoff.
     RendererBusy,
+    // Retain this exact frame until the backend emits RedrawRequested.
+    RendererDeferred,
+    // The frame is terminally stale, superseded, or intentionally consumed.
+    FrameDiscarded,
+    // The native presentation surface generation must be recreated.
+    SurfaceLost,
+    // The active renderer cannot continue without replacement or fallback.
+    RendererError,
 };
 
 // Detailed result for one render-thread attempt. A frame sequence is
@@ -51,6 +59,8 @@ struct QTAV_CORE_EXPORT VideoRenderResult {
     double timestamp = -1.0;
     std::uint64_t frameSequence = 0;
     std::uint64_t presentationGeneration = 0;
+    std::uint32_t retryAfterMilliseconds = 0;
+    std::string detail;
 };
 
 class QTAV_CORE_EXPORT Player {

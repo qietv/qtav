@@ -700,13 +700,22 @@ bool AndroidVulkanVideoRenderer::configure(
     return impl_->renderer_.configure(impl_->config_);
 }
 
-bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
+VideoRenderAttemptResult AndroidVulkanVideoRenderer::renderDetailed(
+    const VideoFrame& frame)
 {
     if (!impl_) {
-        return false;
+        return {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            "The Android Vulkan renderer is unavailable",
+        };
     }
     std::string error;
-    bool rendered = false;
+    VideoRenderAttemptResult attempt {
+        VideoRenderAttemptStatus::FatalError,
+        0,
+        {},
+    };
     {
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
         if (!impl_->open_) {
@@ -717,6 +726,18 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
                     frame,
                     &error);
             if (status == VulkanHardwareImportStatus::Pending) {
+                attempt = {
+                    VideoRenderAttemptStatus::DeferredUntilRedraw,
+                    0,
+                    error,
+                };
+                error.clear();
+            } else if (status == VulkanHardwareImportStatus::Stale) {
+                attempt = {
+                    VideoRenderAttemptStatus::Discarded,
+                    0,
+                    error,
+                };
                 error.clear();
             } else if (status
                        != VulkanHardwareImportStatus::Ready
@@ -725,12 +746,13 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
                     "The Android Vulkan hardware-frame preparation failed";
             }
             if (status != VulkanHardwareImportStatus::Ready) {
-                rendered = false;
+                // Pending and stale are fully classified above. Unsupported
+                // or failed imports retain the default fatal result.
             } else if (!impl_->acquire(error)) {
-                rendered = false;
             } else {
                 impl_->applyHdrMetadata(frame);
-                if (!impl_->renderer_.render(frame)) {
+                attempt = impl_->renderer_.renderDetailed(frame);
+                if (!attempt.presented()) {
                     impl_->renderer_.close();
                     impl_->engineOpen_ = false;
                     vkDeviceWaitIdle(
@@ -748,17 +770,29 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
                     }
                     impl_->acquired_ = false;
                     impl_->activeTarget_ = {};
-                    error =
-                        "The Vulkan engine could not render the imported Android image";
+                    if (attempt.status
+                            == VideoRenderAttemptStatus::FatalError
+                        || attempt.status
+                            == VideoRenderAttemptStatus::SurfaceLost) {
+                        error = attempt.detail.empty()
+                            ? "The Vulkan engine could not render the imported Android image"
+                            : attempt.detail;
+                    }
                 } else {
-                    rendered = impl_->present(error);
+                    if (!impl_->present(error)) {
+                        attempt = {
+                            VideoRenderAttemptStatus::FatalError,
+                            0,
+                            error,
+                        };
+                    }
                 }
             }
         } else if (!impl_->acquire(error)) {
-            rendered = false;
         } else {
             impl_->applyHdrMetadata(frame);
-            if (!impl_->renderer_.render(frame)) {
+            attempt = impl_->renderer_.renderDetailed(frame);
+            if (!attempt.presented()) {
                 // No submission consumed imageAvailable_. Retire this
                 // generation and its signaled semaphore before permitting
                 // another acquire.
@@ -776,22 +810,57 @@ bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
                 }
                 impl_->acquired_ = false;
                 impl_->activeTarget_ = {};
-                error =
-                    "The Vulkan engine could not render the acquired Android image";
+                if (attempt.status
+                        == VideoRenderAttemptStatus::FatalError
+                    || attempt.status
+                        == VideoRenderAttemptStatus::SurfaceLost) {
+                    error = attempt.detail.empty()
+                        ? "The Vulkan engine could not render the acquired Android image"
+                        : attempt.detail;
+                }
             } else {
-                rendered = impl_->present(error);
+                if (!impl_->present(error)) {
+                    attempt = {
+                        VideoRenderAttemptStatus::FatalError,
+                        0,
+                        error,
+                    };
+                }
             }
         }
     }
-    if (!rendered && !error.empty()) {
-        const VideoRenderEventType type =
-            error.find("SURFACE_LOST") != std::string::npos
-            || error.find("native window") != std::string::npos
-            ? VideoRenderEventType::SurfaceLost
-            : VideoRenderEventType::Error;
-        impl_->notify(type, std::move(error));
+    if (attempt.status == VideoRenderAttemptStatus::DeferredUntilRedraw
+        || attempt.status == VideoRenderAttemptStatus::RetryAfterBackoff
+        || attempt.status == VideoRenderAttemptStatus::Discarded) {
+        return attempt;
     }
-    return rendered;
+    if (attempt.presented() && error.empty()) {
+        return attempt;
+    }
+    const bool surfaceLost =
+        attempt.status == VideoRenderAttemptStatus::SurfaceLost
+        || error.find("SURFACE_LOST") != std::string::npos
+        || error.find("native window") != std::string::npos;
+    if (error.empty()) {
+        error = surfaceLost
+            ? "The Android Vulkan surface is unavailable"
+            : "The Android Vulkan renderer could not render the frame";
+    }
+    const VideoRenderEventType type = surfaceLost
+        ? VideoRenderEventType::SurfaceLost
+        : VideoRenderEventType::Error;
+    impl_->notify(type, error);
+    return {
+        surfaceLost ? VideoRenderAttemptStatus::SurfaceLost
+                    : VideoRenderAttemptStatus::FatalError,
+        0,
+        error,
+    };
+}
+
+bool AndroidVulkanVideoRenderer::render(const VideoFrame& frame)
+{
+    return renderDetailed(frame).frameConsumed();
 }
 
 void AndroidVulkanVideoRenderer::close() noexcept

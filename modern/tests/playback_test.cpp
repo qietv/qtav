@@ -106,6 +106,45 @@ private:
     EventCallback callback_;
 };
 
+class DetailedRenderer final : public qtav::VideoRenderAPI {
+public:
+    DetailedRenderer(
+        qtav::VideoRenderAttemptStatus status,
+        std::atomic<int>& count,
+        std::uint32_t retryAfterMilliseconds = 0)
+        : status_(status)
+        , count_(count)
+        , retryAfterMilliseconds_(retryAfterMilliseconds)
+    {
+    }
+
+    qtav::VideoRenderCapabilities capabilities() const override { return {}; }
+    void setEventCallback(EventCallback) override {}
+    bool open(const qtav::VideoRenderConfig&) override { return true; }
+    bool configure(const qtav::VideoRenderConfig&) override { return true; }
+    qtav::VideoRenderAttemptResult renderDetailed(
+        const qtav::VideoFrame& frame) override
+    {
+        assert(frame);
+        ++count_;
+        return {
+            status_,
+            retryAfterMilliseconds_,
+            "scripted detailed renderer result",
+        };
+    }
+    bool render(const qtav::VideoFrame& frame) override
+    {
+        return renderDetailed(frame).frameConsumed();
+    }
+    void close() noexcept override {}
+
+private:
+    qtav::VideoRenderAttemptStatus status_;
+    std::atomic<int>& count_;
+    std::uint32_t retryAfterMilliseconds_ = 0;
+};
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -121,14 +160,34 @@ int main(int argc, char** argv)
     std::atomic<int> audioFrames { 0 };
     std::atomic<int> renderedFrames { 0 };
     std::atomic<int> rejectedRenderAttempts { 0 };
+    std::atomic<int> deferredRenderAttempts { 0 };
+    std::atomic<int> discardedRenderAttempts { 0 };
+    std::atomic<int> surfaceLostRenderAttempts { 0 };
+    std::atomic<int> fatalRenderAttempts { 0 };
     int firstRenderKey = 1;
     int secondRenderKey = 2;
     int rejectingRenderKey = 3;
+    int deferredRenderKey = 4;
+    int discardedRenderKey = 5;
+    int surfaceLostRenderKey = 6;
+    int fatalRenderKey = 7;
     auto firstRenderer = std::make_shared<CountingRenderer>(renderedFrames);
     auto secondRenderer = std::make_shared<CountingRenderer>(renderedFrames);
     auto rejectingRenderer = std::make_shared<CountingRenderer>(
         rejectedRenderAttempts,
         false);
+    auto deferredRenderer = std::make_shared<DetailedRenderer>(
+        qtav::VideoRenderAttemptStatus::DeferredUntilRedraw,
+        deferredRenderAttempts);
+    auto discardedRenderer = std::make_shared<DetailedRenderer>(
+        qtav::VideoRenderAttemptStatus::Discarded,
+        discardedRenderAttempts);
+    auto surfaceLostRenderer = std::make_shared<DetailedRenderer>(
+        qtav::VideoRenderAttemptStatus::SurfaceLost,
+        surfaceLostRenderAttempts);
+    auto fatalRenderer = std::make_shared<DetailedRenderer>(
+        qtav::VideoRenderAttemptStatus::FatalError,
+        fatalRenderAttempts);
     const auto emptyRender = player.renderVideoDetailed();
     assert(emptyRender.status == qtav::VideoRenderStatus::NoFrame);
     assert(emptyRender.frameSequence == 0);
@@ -165,6 +224,10 @@ int main(int argc, char** argv)
         .setVideoRenderAPI(firstRenderer, &firstRenderKey)
         .setVideoRenderAPI(secondRenderer, &secondRenderKey)
         .setVideoRenderAPI(rejectingRenderer, &rejectingRenderKey)
+        .setVideoRenderAPI(deferredRenderer, &deferredRenderKey)
+        .setVideoRenderAPI(discardedRenderer, &discardedRenderKey)
+        .setVideoRenderAPI(surfaceLostRenderer, &surfaceLostRenderKey)
+        .setVideoRenderAPI(fatalRenderer, &fatalRenderKey)
         .setRenderCallback([&](void* opaque) {
             const auto rejectedBefore = rejectedRenderAttempts.load();
             if (!opaque) {
@@ -180,9 +243,27 @@ int main(int argc, char** argv)
                 assert(
                     result.status
                     == qtav::VideoRenderStatus::RendererBusy);
+                assert(result.retryAfterMilliseconds == 1);
+                assert(!result.detail.empty());
                 assert(
                     rejectedRenderAttempts.load()
                     == rejectedBefore + 1);
+            } else if (opaque == &deferredRenderKey) {
+                assert(
+                    result.status
+                    == qtav::VideoRenderStatus::RendererDeferred);
+            } else if (opaque == &discardedRenderKey) {
+                assert(
+                    result.status
+                    == qtav::VideoRenderStatus::FrameDiscarded);
+            } else if (opaque == &surfaceLostRenderKey) {
+                assert(
+                    result.status
+                    == qtav::VideoRenderStatus::SurfaceLost);
+            } else if (opaque == &fatalRenderKey) {
+                assert(
+                    result.status
+                    == qtav::VideoRenderStatus::RendererError);
             } else {
                 assert(result.status == qtav::VideoRenderStatus::Rendered);
             }
@@ -206,6 +287,10 @@ int main(int argc, char** argv)
     assert(audioFrames.load() > 0);
     assert(renderedFrames.load() == videoFrames.load() * 3);
     assert(rejectedRenderAttempts.load() == videoFrames.load());
+    assert(deferredRenderAttempts.load() == videoFrames.load());
+    assert(discardedRenderAttempts.load() == videoFrames.load());
+    assert(surfaceLostRenderAttempts.load() == videoFrames.load());
+    assert(fatalRenderAttempts.load() == videoFrames.load());
     assert(player.state() == qtav::State::Stopped);
 
     qtav::Player invalidationPlayer;
@@ -258,8 +343,9 @@ int main(int argc, char** argv)
     renderThread.join();
     assert(
         invalidatedRender.status
-        == qtav::VideoRenderStatus::NoFrame);
-    assert(invalidatedRender.frameSequence == 0);
+        == qtav::VideoRenderStatus::FrameDiscarded);
+    assert(invalidatedRender.frameSequence > 0);
+    assert(!invalidatedRender.detail.empty());
     invalidationPlayer.setState(qtav::State::Stopped);
     assert(invalidationPlayer.waitFor(qtav::State::Stopped, 5'000));
 

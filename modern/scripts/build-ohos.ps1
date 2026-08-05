@@ -53,6 +53,15 @@ $EffectiveSdkRoot = Use-QtavOhosSdkWithoutSpaces `
 $Tools = Enable-QtavOhosWindowsBuildTools -SdkRoot $EffectiveSdkRoot
 $env:OHOS_SDK_ROOT = $EffectiveSdkRoot
 
+$VerifyArguments = @(
+    "-DINSTALL_ROOT=$DependencyInstallRoot"
+    "-DTRIPLET=$Triplet"
+    '-P'
+    (Join-Path $FfmpegRoot 'cmake/verify-install.cmake')
+)
+& $Tools.CMake @VerifyArguments
+if ($LASTEXITCODE -ne 0) { throw 'OHOS dependency verification failed' }
+
 $DependencyPrefix = Join-Path $DependencyInstallRoot $Triplet
 if (-not (Test-Path (Join-Path $DependencyPrefix 'include/libavcodec/avcodec.h'))) {
     throw "The OHOS dependency package is incomplete: $DependencyPrefix"
@@ -74,6 +83,8 @@ $BuildTestsValue = if ($BuildTests) { 'ON' } else { 'OFF' }
 $BuildExamplesValue = if ($BuildExamples) { 'ON' } else { 'OFF' }
 $VcpkgToolchain = Join-Path $FfmpegRoot `
     'vcpkg/scripts/buildsystems/vcpkg.cmake'
+$OhosChainloadToolchain = Join-Path $FfmpegRoot `
+    'triplets/toolchains/ohos-native-sdk.cmake'
 
 Write-Host "OHOS SDK:     $EffectiveSdkRoot"
 Write-Host "Dependencies: $DependencyPrefix"
@@ -92,8 +103,8 @@ $ConfigureArguments = @(
     "-DCMAKE_INSTALL_PREFIX=$InstallPrefix"
     "-DCMAKE_MAKE_PROGRAM=$($Tools.Ninja)"
     "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
+    "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=$OhosChainloadToolchain"
     "-DVCPKG_TARGET_TRIPLET=$Triplet"
-    "-DVCPKG_OVERLAY_TRIPLETS=$FfmpegRoot/triplets"
     "-DVCPKG_INSTALLED_DIR=$DependencyInstallRoot"
     '-DOHOS_ARCH=arm64-v8a'
     '-DOHOS_SDK_NATIVE_PLATFORM=ohos-23'

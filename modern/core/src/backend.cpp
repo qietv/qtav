@@ -14,6 +14,19 @@ HardwareFrameMapping::~HardwareFrameMapping() = default;
 HardwareFrameData::~HardwareFrameData() = default;
 HardwareFrameInterop::~HardwareFrameInterop() = default;
 VideoRenderAPI::~VideoRenderAPI() = default;
+
+VideoRenderAttemptResult VideoRenderAPI::renderDetailed(
+    const VideoFrame& frame)
+{
+    if (render(frame)) {
+        return { VideoRenderAttemptStatus::Presented, 0, {} };
+    }
+    return {
+        VideoRenderAttemptStatus::RetryAfterBackoff,
+        1,
+        "Legacy boolean renderer deferred the frame",
+    };
+}
 AudioSink::~AudioSink() = default;
 
 bool AudioSink::drain()

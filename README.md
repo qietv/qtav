@@ -81,13 +81,20 @@ gh run download $runId `
   --repo qietv/qtav `
   --name qtav-ffmpeg-x64-windows-static-md `
   --dir ffmpeg/build/x64-windows-static-md/vcpkg_installed
+
+# When Windows is the OHOS cross-compilation host instead:
+gh run download $runId `
+  --repo qietv/qtav `
+  --name qtav-ffmpeg-arm64-ohos-23-static `
+  --dir ffmpeg/build/arm64-ohos-23-static/vcpkg_installed
 ```
 
 The platform build scripts remain the source of those artifacts. If both local
 lookup and artifact download fail, run `ffmpeg/scripts/build-android.sh` or
-`ffmpeg/scripts/build-ohos.sh` on macOS, or
-`ffmpeg/scripts/build-windows.ps1` on Windows. Run the corresponding script
-unconditionally when the current change modifies `ffmpeg/**`.
+`ffmpeg/scripts/build-ohos.sh` on macOS, `ffmpeg/scripts/build-ohos.ps1` for an
+OHOS cross-build on Windows, or `ffmpeg/scripts/build-windows.ps1` for the
+Windows x64 target. Run the corresponding script unconditionally when the
+current change modifies `ffmpeg/**`.
 
 The same artifacts can be downloaded manually from the
 [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml).

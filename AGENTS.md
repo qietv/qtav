@@ -76,8 +76,9 @@ download commands and the complete consumption contract.
 Regardless of the resolution order above, any task that modifies `ffmpeg/**`
 must run the directly affected native build script locally and pass
 `cmake/verify-install.cmake`. Use `ffmpeg/scripts/build-android.sh` or
-`ffmpeg/scripts/build-ohos.sh` on macOS and
-`ffmpeg/scripts/build-windows.ps1` on Windows.
+`ffmpeg/scripts/build-ohos.sh` on macOS,
+`ffmpeg/scripts/build-ohos.ps1` for an OHOS cross-build on Windows, and
+`ffmpeg/scripts/build-windows.ps1` for the Windows x64 target.
 
 ## Non-negotiable architecture rules
 

@@ -28,6 +28,10 @@ struct RenderResult {
         qtav::VideoRenderEventType::RedrawRequested;
     std::string detail;
     bool emitEvent = true;
+    qtav::VideoRenderAttemptStatus detailedStatus =
+        qtav::VideoRenderAttemptStatus::RetryAfterBackoff;
+    bool useDetailedStatus = false;
+    std::uint32_t retryAfterMilliseconds = 0;
 };
 
 struct RendererBehavior {
@@ -86,7 +90,8 @@ public:
         return behavior_->configureSucceeded;
     }
 
-    bool render(const qtav::VideoFrame&) override
+    qtav::VideoRenderAttemptResult renderDetailed(
+        const qtav::VideoFrame&) override
     {
         ++behavior_->renderCount;
         RenderResult result;
@@ -97,7 +102,25 @@ public:
         if (!result.succeeded && result.emitEvent && callback_) {
             callback_({ result.eventType, std::move(result.detail) });
         }
-        return result.succeeded;
+        if (result.useDetailedStatus) {
+            return {
+                result.detailedStatus,
+                result.retryAfterMilliseconds,
+                std::move(result.detail),
+            };
+        }
+        return {
+            result.succeeded
+                ? qtav::VideoRenderAttemptStatus::Presented
+                : qtav::VideoRenderAttemptStatus::RetryAfterBackoff,
+            result.succeeded ? 0U : 1U,
+            std::move(result.detail),
+        };
+    }
+
+    bool render(const qtav::VideoFrame& frame) override
+    {
+        return renderDetailed(frame).frameConsumed();
     }
 
     void close() noexcept override
@@ -135,6 +158,22 @@ std::shared_ptr<RendererBehavior> behavior(
 {
     auto result = std::make_shared<RendererBehavior>();
     result->renderResults.assign(results.begin(), results.end());
+    return result;
+}
+
+RenderResult detailedAttempt(
+    qtav::VideoRenderAttemptStatus status,
+    std::string detail = {},
+    std::uint32_t retryAfterMilliseconds = 0)
+{
+    RenderResult result;
+    result.succeeded =
+        status == qtav::VideoRenderAttemptStatus::Presented;
+    result.detail = std::move(detail);
+    result.emitEvent = false;
+    result.detailedStatus = status;
+    result.useDetailedStatus = true;
+    result.retryAfterMilliseconds = retryAfterMilliseconds;
     return result;
 }
 
@@ -288,11 +327,9 @@ void testRecoverableVulkanRecreation()
     auto openGLES = std::make_shared<FactoryScript>();
     vulkan->behaviors.push_back(
         behavior({
-            {
-                false,
-                qtav::VideoRenderEventType::SurfaceLost,
-                "scripted recoverable surface loss",
-            },
+            detailedAttempt(
+                qtav::VideoRenderAttemptStatus::SurfaceLost,
+                "scripted recoverable surface loss"),
         }));
     vulkan->behaviors.push_back(behavior());
 
@@ -325,11 +362,9 @@ void testFatalOneWayFallback()
     auto openGLES = std::make_shared<FactoryScript>();
     vulkan->behaviors.push_back(
         behavior({
-            {
-                false,
-                qtav::VideoRenderEventType::Error,
-                "VK_ERROR_DEVICE_LOST",
-            },
+            detailedAttempt(
+                qtav::VideoRenderAttemptStatus::FatalError,
+                "VK_ERROR_DEVICE_LOST"),
         }));
     openGLES->behaviors.push_back(behavior());
     openGLES->behaviors.push_back(behavior());
@@ -392,6 +427,57 @@ void testRetryableRenderDoesNotChangeAPI()
         selector.presentationAvailable(),
         "A retryable render attempt retired the renderer");
     expect(openGLES->calls == 0, "Retryable render probed OpenGL ES");
+}
+
+void testDetailedRenderAttemptContract()
+{
+    auto vulkan = std::make_shared<FactoryScript>();
+    auto openGLES = std::make_shared<FactoryScript>();
+    vulkan->behaviors.push_back(
+        behavior({
+            detailedAttempt(
+                qtav::VideoRenderAttemptStatus::DeferredUntilRedraw,
+                "waiting for a producer image"),
+            detailedAttempt(
+                qtav::VideoRenderAttemptStatus::RetryAfterBackoff,
+                "in-flight ring is busy",
+                7),
+            detailedAttempt(
+                qtav::VideoRenderAttemptStatus::Discarded,
+                "stale native-image generation"),
+            detailedAttempt(
+                qtav::VideoRenderAttemptStatus::Presented),
+        }));
+
+    qtav::MobileVideoRendererSelector selector(
+        selectorConfig(vulkan, openGLES));
+    expect(selector.open(renderConfig()), "Vulkan startup failed");
+
+    const auto deferred = selector.renderDetailed(qtav::VideoFrame {});
+    expect(
+        deferred.status
+            == qtav::VideoRenderAttemptStatus::DeferredUntilRedraw,
+        "Deferred-until-redraw status was not preserved");
+    const auto retry = selector.renderDetailed(qtav::VideoFrame {});
+    expect(
+        retry.status
+                == qtav::VideoRenderAttemptStatus::RetryAfterBackoff
+            && retry.retryAfterMilliseconds == 7,
+        "Retry-after-backoff status or delay was not preserved");
+    const auto discarded = selector.renderDetailed(qtav::VideoFrame {});
+    expect(
+        discarded.status == qtav::VideoRenderAttemptStatus::Discarded
+            && discarded.frameConsumed(),
+        "Terminal discarded status was not preserved");
+    const auto presented = selector.renderDetailed(qtav::VideoFrame {});
+    expect(
+        presented.status == qtav::VideoRenderAttemptStatus::Presented,
+        "Presented status was not preserved");
+    expect(
+        selector.selectedAPI() == qtav::MobileRenderAPI::Vulkan
+            && selector.presentationAvailable()
+            && openGLES->calls == 0,
+        "A nonfatal detailed status changed renderer selection");
 }
 
 void testHardwareFrameFallbackRoutes()
@@ -720,6 +806,7 @@ int main()
     testRecoverableVulkanRecreation();
     testFatalOneWayFallback();
     testRetryableRenderDoesNotChangeAPI();
+    testDetailedRenderAttemptContract();
     testHardwareFrameFallbackRoutes();
     testHardwareFrameFallbackRequiresExplicitPolicy();
     testRepeatedRecoveryFailureFallsBack();

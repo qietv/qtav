@@ -15,7 +15,8 @@ macOS/iOS implementation, tests, and historical notes are preserved under
 [`../archived_apple/`](../archived_apple/) and are no longer maintained,
 built, tested, packaged, or installed. Linux is not part of the active target
 matrix or roadmap. A macOS development machine may still act only as a
-cross-compilation host for Android/OHOS.
+cross-compilation host for Android/OHOS; 64-bit Windows is also a supported
+OHOS cross-compilation host through the DevEco native SDK.
 
 OHOS is now the active local development target. AD-007 is closed after the
 current vendor-neutral D3D11VA/libplacebo policy was accepted on NVIDIA, Intel,
@@ -172,8 +173,9 @@ Continuation checkpoint:
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
-  Android arm64/API 28 and OHOS arm64/API 23 cross-builds on macOS plus native
-  Windows x64/Visual Studio builds. Its FFmpeg 8.1.2 policy enables OpenSSL,
+  Android arm64/API 28 cross-builds on macOS, OHOS arm64/API 23 cross-builds
+  on macOS or Windows, and native Windows x64/Visual Studio builds. Its FFmpeg
+  8.1.2 policy enables OHCodec on OHOS plus OpenSSL,
   libsmb2, Vulkan, libass, libplacebo with OpenGL/OpenGL ES and built-in Dolby
   Vision reshaping, dav1d and native VVC decode while avoiding the unrelated
   desktop dependencies pulled by `ffmpeg[all]`; the
@@ -831,23 +833,42 @@ Android/OHOS render-result follow-up and Milestone 7 OHOS work are now active:
 There are now two explicit work tracks. The Intel Windows track remains open
 and is transferred to another Intel machine for administrator-only GPU tracing,
 root-cause confirmation, repair, and cross-vendor regression. The active local
-track is OHOS: start at the Milestone 7 target-clarification/toolchain gate and
-complete the portable Android/OHOS render-result contract before an OHOS adapter
-depends on it.
+track is OHOS: its Milestone 7 target/toolchain gate and portable Android/OHOS
+render-result contract are complete, so the next slice starts the HAP and
+native-window adapter.
 
 Active local OHOS execution order:
 
-1. [ ] Complete the Milestone 7 target-clarification gate: record HarmonyOS
+1. [x] Complete the Milestone 7 target-clarification gate: record HarmonyOS
    NEXT versus OpenHarmony target, SDK/API version, signing, device, and
    connected deployment workflow.
-2. [~] Audit and validate the existing uncommitted OHOS/FFmpeg toolchain work
+2. [x] Audit and validate the existing uncommitted OHOS/FFmpeg toolchain work
    without discarding it, using the repository arm64/OHOS dependency contract.
-3. [ ] Evaluate and implement portable detailed render-attempt semantics for
+3. [x] Evaluate and implement portable detailed render-attempt semantics for
    Android and OHOS Vulkan/OpenGL before an OHOS adapter depends on the result.
    Keep the common Player immutable snapshot, sequence, and presentation-
    generation contract, but do not port D3D11 context reservation or the
    Windows latest-frame mailbox. Distinguish presented, deferred until redraw,
    retry after backoff, stale/discarded, surface lost, and fatal outcomes.
+4. [ ] Add the minimal ArkUI/XComponent HAP shell and the first OHOS native
+   window adapter, beginning with software-frame Vulkan presentation through
+   the shared renderer engine and the result contract above.
+
+The portable render-attempt slice completed on 2026-08-05. The public
+`VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
+`RetryAfterBackoff`, `Discarded`, `SurfaceLost`, and `FatalError`; Player maps
+those outcomes to reason-aware `VideoRenderResult` statuses with frame
+sequence, presentation generation, retry delay, and detail. Vulkan, OpenGL ES,
+their Android surface adapters, and `MobileVideoRendererSelector` implement the
+contract directly. Deterministic selector and playback tests cover every
+status, stale-generation rejection, same-API recovery, and fatal one-way
+fallback. Windows all-backends-disabled CTest passed 12/12, and a clean OHOS
+arm64/API 23 shared build resolved the standard repository dependency prefix
+and compiled/linked all 63 core, Vulkan, OpenGL ES, mobile-selector, and test
+steps. Both Android native adapters passed an NDK r28c/API 28 syntax
+cross-check, and the Windows Release `qtav_output_d3d11` target compiled with
+the expanded Player status set. No Windows D3D11 reservation or mailbox policy
+was copied into the portable layer.
 
 Transferred Intel Windows checklist (not the next local task):
 
@@ -1358,8 +1379,8 @@ The Android example playback-stutter task is complete:
 The existing Android playback-stutter correction remains complete. Preserve
 this OpenGL reopen/long-form run as the Android regression gate. Intel validates
 the remaining Windows correction on the transferred administrator-capable
-machine, while the distinct cross-platform render-attempt evaluation and OHOS
-target-clarification gate proceed locally.
+machine, while local work proceeds from the completed render-attempt and OHOS
+target/toolchain gates into the HAP/XComponent integration slice.
 
 Completed platform prerequisites:
 
@@ -1932,9 +1953,10 @@ Following platform slice:
 1. [~] External Windows machine: complete the Intel administrator trace,
    evidence-backed correction, and same-commit matrix described in `Next task`;
    AMD repair and NVIDIA verification are complete.
-2. [ ] This machine: complete the portable Android/OHOS render-result contract,
-   enter the Milestone 7 target-clarification/toolchain gate, and continue the
-   OHOS production slice without waiting for the external Intel trace.
+2. [~] This machine: the portable Android/OHOS render-result contract and
+   Milestone 7 target/toolchain gate are complete; continue with the minimal
+   HAP/XComponent shell and OHOS native-window adapters without waiting for the
+   external Intel trace.
 
 Platform implementation order after the contracts are stable:
 
@@ -2110,30 +2132,58 @@ Acceptance:
 
 Status: complete. Its connected-device results remain the Android regression
 baseline. The Intel matrix continues on the external administrator-capable
-Windows machine; local work proceeds into the Android/OHOS result contract and
-Milestone 7.
+Windows machine; the portable Android/OHOS result contract is complete and
+local work proceeds into the OHOS HAP/XComponent adapter slice.
 
 ## Active milestone 7 — OHOS production path
 
 This is now the active local development milestone. The transferred Intel
 Windows performance issue remains open in parallel and must not be described as
-fixed or closed. Begin with target clarification, validate the existing OHOS
-arm64/API 23 dependency/toolchain work, and record the portable cross-platform
-render-result contract before platform adapters depend on it.
+fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
+toolchain validation, and the portable render-result contract are complete.
+The next local slice is the minimal HAP/XComponent shell and OHOS native-window
+adapter.
 
 Target clarification gate:
 
-- [ ] Record whether the initial target is a HarmonyOS NEXT commercial device
-  application, a specific OpenHarmony distribution/device, or both; record the
-  SDK/API version, signing requirements, available system capabilities, and
-  connected-device workflow before fixing backend availability rules.
+- [x] The initial connected target is a commercial HUAWEI Mate 60 Pro
+  (`ALN-AL80`) running HarmonyOS 6.1.0.135 / OpenHarmony 6.1.1.120, API 24,
+  arm64-v8a. The build baseline uses DevEco Studio 6.1, OpenHarmony SDK
+  6.1.1.125/API 24, and an arm64/API 23 minimum target. DevEco debug signing is
+  configured; HDC 3.2 installs and launches a signed HAP. The device exposes
+  H.264/HEVC OHCodec decoders, OHAudio construction, `OH_NativeBuffer`, and
+  `VK_OHOS_external_memory`. A generic OpenHarmony distribution remains a
+  secondary compatibility target without a recorded device validation.
 
 ### Toolchain and application shell
 
-- [~] A reproducible OHOS arm64/API 23 FFmpeg 8+ dependency cross-build is
-  implemented and locally verified under `../ffmpeg/`; the QtAVCore target
-  build, CI execution on an SDK-equipped runner, and device validation remain
-  pending.
+- [x] The reproducible OHOS arm64/API 23 FFmpeg 8.1.2 dependency cross-build
+  under `../ffmpeg/` supports both macOS and 64-bit Windows hosts. The Windows
+  entry handles the DevEco `Program Files` path through a stable junction,
+  enables `--enable-ohcodec`, and verifies the installed H.264/HEVC OHCodec
+  decoder symbols.
+- [x] The Windows-hosted QtAVCore OHOS script configures the repository vcpkg
+  and OHOS chainload toolchains, then builds and installs Release static and
+  shared SDKs. The shared build applies `-Wl,-Bsymbolic`; FFmpeg pkg-config
+  metadata carries libsmb2, OpenSSL, dav1d, and OHCodec system libraries into
+  the first clean configure.
+- [ ] Add QtAVCore OHOS CI execution and production HAP playback/device
+  validation. The existing dependency CI remains on its macOS self-hosted
+  runner; the Windows local build does not by itself validate XComponent,
+  graphics presentation, OHAudio output, or OHCodec playback.
+
+Windows toolchain validation on 2026-08-05 rebuilt the complete target
+dependency closure locally from source in 17 minutes and passed
+`verify-install.cmake`. A clean shared QtAVCore build linked 26/26 steps and a
+clean static build linked 19/19 steps; both installed successfully. A separate
+external project then consumed all installed QtAVCore targets with
+`find_package(QtAVCore)` and produced an AArch64 shared object. The installed
+core ELF records `libnative_media_vdec`, `libnative_media_venc`,
+`libnative_media_codecbase`, `libnative_media_core`, and `libnative_window` as
+runtime dependencies and carries the `SYMBOLIC` flag. A fresh Windows x64
+ClangCL shared build also passed after the cross-target pkg-config discovery
+change.
+
 - [~] Add the `modern/platform/ohos/` root; small shared helpers are still
   pending, and media, graphics, and audio implementations remain in their
   responsibility-specific backend targets.

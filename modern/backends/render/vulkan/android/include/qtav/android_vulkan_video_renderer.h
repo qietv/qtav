@@ -49,6 +49,8 @@ public:
     void setEventCallback(EventCallback callback) override;
     bool open(const VideoRenderConfig& config) override;
     bool configure(const VideoRenderConfig& config) override;
+    VideoRenderAttemptResult renderDetailed(
+        const VideoFrame& frame) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
 
