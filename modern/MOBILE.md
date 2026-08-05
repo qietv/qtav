@@ -22,8 +22,7 @@ The reusable pieces are compile-time C++ targets in this repository:
   `platform/ohos/`;
 - OHOS EGL context and surface integration belongs under
   `backends/render/opengl/ohos/`;
-- `qtav_audio_aaudio` and a future OHOS OHAudio target are separate audio
-  backends;
+- `qtav_audio_aaudio` and `qtav_audio_ohaudio` are separate audio backends;
 - `qtav_hw_mediacodec` and a future OHCodec target are separate hardware
   decoder backends;
 - Vulkan and OpenGL ES native-buffer import are separate, optional interop
@@ -460,6 +459,17 @@ A separate management worker observes transparent route-ID changes and handles
 AAudio disconnect callbacks by closing and rebuilding the default-route stream
 with the same negotiated format. The API 28 device baseline passes without an
 OpenSL ES fallback.
+
+The OHOS implementation now lives in `QtAV::AudioOHAudio`. It requests 48 kHz
+mono/stereo Float32 PCM in fast mode with normal-mode construction fallback,
+and uses the same portable allocation-free SPSC queue implementation without
+sharing any OHAudio ABI with Android. Its native write callback has the same
+bounded no-allocation/no-lock responsibilities, while
+`OH_AudioRenderer_GetAudioTimestampInfo()` supplies hardware-committed frame
+timing. Route changes, forced interruptions, errors, and stream reconstruction
+run on an OHOS-only management worker. The API 24 Mate 60 Pro baseline proves
+PCM delivery, clock/latency, pause/resume, seek/flush, and loop-boundary drain;
+the recorded run did not induce a physical route change.
 
 ## Connected-device validation
 

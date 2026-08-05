@@ -10,6 +10,8 @@ target_compile_features(
 target_link_libraries(
     qtav_ohos_render_install_consumer
     PRIVATE
+        QtAV::AudioOHAudio
+        QtAV::AudioResample
         QtAV::RenderMobile
         QtAV::RenderOpenGLOHOS
         QtAV::RenderVulkanOHOS

@@ -207,6 +207,7 @@ Current public entry points:
 - `modern/backends/audio/file/include/qtav/wav_audio_sink.h`
 - `modern/backends/audio/wasapi/include/qtav/wasapi_audio_sink.h`
 - `modern/backends/audio/aaudio/include/qtav/aaudio_audio_sink.h`
+- `modern/backends/audio/ohaudio/include/qtav/ohaudio_audio_sink.h`
 - `modern/backends/render/d3d11/include/qtav/d3d11_video_renderer.h`
 - `modern/backends/output/d3d11/include/qtav/d3d11_video_output.h`
 - `modern/backends/render/vulkan/include/qtav/vulkan_video_renderer.h`
@@ -237,6 +238,7 @@ Current implementation:
 - `modern/backends/audio/file/src/wav_audio_sink.cpp`
 - `modern/backends/audio/wasapi/src/wasapi_audio_sink.cpp`
 - `modern/backends/audio/aaudio/src/aaudio_audio_sink.cpp`
+- `modern/backends/audio/ohaudio/src/ohaudio_audio_sink.cpp`
 - `modern/backends/render/d3d11/src/d3d11_video_renderer.cpp`
 - `modern/backends/render/vulkan/src/vulkan_video_renderer.cpp`
 - `modern/backends/render/libplacebo/src/libplacebo_ffmpeg_bridge.c`
@@ -837,9 +839,10 @@ Android/OHOS render-result follow-up and Milestone 7 OHOS work are now active:
 There are now two explicit work tracks. The Intel Windows track remains open
 and is transferred to another Intel machine for administrator-only GPU tracing,
 root-cause confirmation, repair, and cross-vendor regression. The active local
-track is OHOS: its Milestone 7 target/toolchain gate and portable Android/OHOS
-render-result contract, HAP shell, and Vulkan/OpenGL ES software-rendering
-fallback path are complete, so the next slice starts native OHAudio output.
+track is OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
+render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
+and native OHAudio output are complete, so the next slice starts OHCodec
+hardware decode with direct `OHNativeWindow` presentation first.
 
 Active local OHOS execution order:
 
@@ -860,7 +863,7 @@ Active local OHOS execution order:
 5. [x] Add the OHOS EGL/OpenGL ES window adapter, then connect the shared
    mobile selector so Vulkan-unavailable and fatal-failure sessions have the
    accepted one-way OpenGL ES fallback without reopening media.
-6. [ ] Add the OHOS OHAudio sink with negotiated PCM, bounded callback-safe
+6. [x] Add the OHOS OHAudio sink with negotiated PCM, bounded callback-safe
    buffering, playback clock/latency, lifecycle control, and device recovery.
 
 The HAP/XComponent Vulkan slice completed on 2026-08-05. It adds the exported
@@ -888,8 +891,25 @@ Player media open. The connected Mate 60 Pro produced the exact marker
 fatalGLES=30 mediaOpen=1`; both adapters also recreated their surface for new
 native-window generations. Shared and static arm64/API 23 builds install and
 export the new target, and separate installed-package consumers link it with
-`QtAV::RenderMobile` and `QtAV::RenderVulkanOHOS`. The next local slice is
-OHAudio output.
+`QtAV::RenderMobile` and `QtAV::RenderVulkanOHOS`.
+
+The OHOS OHAudio slice completed on 2026-08-05. It adds the optional exported
+`QtAV::AudioOHAudio` target and `OHAudioAudioSink`, which negotiates 48 kHz
+mono/stereo Float32 PCM, shares the Android-proven allocation-free SPSC queue,
+uses hardware-committed frame timestamps for the playback-master clock, and
+reports combined native/backend latency. The real-time write callback performs
+only bounded copies, silence fill, and atomic updates; route changes, forced
+interruptions, errors, event delivery, and stream reconstruction stay on a
+backend worker. The signed `com.qtav.feasibility` HAP now packages a one-second
+MPEG-4/AAC clip, pauses/resumes, seeks/flushes, and loops through segment-end
+drain while preserving the renderer-selector scenario. The connected Mate 60
+Pro produced `audioDecoded=40 audioRendered=191904 audioClock=85
+audioLatencyMs=507 audioStarts=4 audioFlushes=3 audioDrains=3
+audioRestarts=0` in the final PASS marker. This proves native PCM delivery and
+hardware timing; subjective audibility remains a manual listening check, and
+no physical route change occurred in that run. Shared arm64/API 23, HAP, and
+installed-target builds link `libohaudio`; the next local slice is OHCodec
+hardware decode and direct `OHNativeWindow` presentation.
 
 The portable render-attempt slice completed on 2026-08-05. The public
 `VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
@@ -1992,8 +2012,8 @@ Following platform slice:
    AMD repair and NVIDIA verification are complete.
 2. [~] This machine: the portable render-result contract, target/toolchain
    gate, HAP/XComponent Vulkan and OpenGL ES adapters, and shared-selector
-   fallback are complete; continue with the OHOS OHAudio sink without waiting
-   for the external Intel trace.
+   fallback and OHAudio output are complete; continue with OHCodec direct-
+   surface hardware decode without waiting for the external Intel trace.
 
 Platform implementation order after the contracts are stable:
 
@@ -2169,18 +2189,18 @@ Acceptance:
 
 Status: complete. Its connected-device results remain the Android regression
 baseline. The Intel matrix continues on the external administrator-capable
-Windows machine; the portable Android/OHOS result contract is complete and
-local work proceeds into the OHOS OHAudio slice.
+Windows machine; the portable Android/OHOS result contract and OHAudio slice
+are complete and local work proceeds into OHCodec hardware decode.
 
 ## Active milestone 7 — OHOS production path
 
 This is now the active local development milestone. The transferred Intel
 Windows performance issue remains open in parallel and must not be described as
 fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
-toolchain validation, and the portable render-result contract are complete.
-The first HAP/XComponent Vulkan slice is complete. The next local slice is the
-OHOS OHAudio sink; the EGL/OpenGL ES adapter and shared-selector fallback are
-also complete and connected-device validated.
+toolchain validation, portable render-result contract, Vulkan/OpenGL ES
+selector path, and OHAudio sink are complete and connected-device validated.
+The next local slice is OHCodec hardware decode with direct
+`OHNativeWindow` presentation first.
 
 Target clarification gate:
 
@@ -2208,7 +2228,7 @@ Target clarification gate:
 - [~] Add QtAVCore OHOS CI execution and production HAP playback/device
   validation. The existing dependency CI remains on its macOS self-hosted
   runner. Local signed-HAP XComponent Vulkan/OpenGL ES presentation and
-  one-way selector fallback are now validated; CI execution, OHAudio output,
+  one-way selector fallback plus OHAudio output are now validated; CI execution
   and OHCodec playback remain pending.
 
 Windows toolchain validation on 2026-08-05 rebuilt the complete target
@@ -2256,7 +2276,7 @@ change.
 
 ### Audio and hardware decode
 
-- [ ] Add an OHOS OHAudio sink target with negotiated PCM, bounded callback-safe
+- [x] Add an OHOS OHAudio sink target with negotiated PCM, bounded callback-safe
   buffering, device clock/latency, pause, flush, drain, route change, and
   disconnect behavior.
 - [ ] Add an OHOS OHCodec hardware-decode target using FFmpeg 8

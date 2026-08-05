@@ -38,7 +38,7 @@ modern/
 │   │   ├── vulkan/               libplacebo Vulkan renderer
 │   │   ├── opengl/               libplacebo OpenGL ES renderer
 │   │   └── mobile/               Vulkan/OpenGL selection and recovery
-│   ├── audio/                    resample, file, WASAPI, and AAudio
+│   ├── audio/                    resample, file, WASAPI, AAudio, and OHAudio
 │   ├── hwaccel/                  D3D11VA and MediaCodec decoder adapters
 │   ├── interop/                  D3D11 and MediaCodec GPU-frame bridges
 │   └── output/d3d11/             high-level Windows composition output
@@ -281,6 +281,9 @@ different format, `QtAV::AudioResample` performs conversion before submission.
 - `QtAV::AudioWASAPI` owns Windows shared-mode device output and clocking;
 - `QtAV::AudioAAudio` feeds Android's realtime callback from a bounded SPSC
   queue and rebuilds disconnected streams outside the callback;
+- `QtAV::AudioOHAudio` feeds OHOS's realtime callback from the shared portable
+  SPSC queue, publishes hardware-committed timing, and rebuilds route-changed
+  or failed streams on its backend worker;
 - `QtAV::AudioFile` is a diagnostic RIFF/WAVE sink and never becomes a device
   clock.
 
@@ -301,14 +304,14 @@ Static and shared installs are validated with external `find_package` consumers.
 ## Platform status and next work
 
 Windows D3D11/D3D11VA/WASAPI and Android Vulkan/OpenGL ES/MediaCodec/AAudio
-are the current production paths. OHOS backend implementation is deferred; its
-planned responsibilities remain separate OHAudio, OHCodec, Vulkan/OpenGL
-interop, and platform-window adapters.
+are the completed production paths. OHOS now has Vulkan and OpenGL ES software
+presentation, shared selector fallback, and OHAudio output; its remaining
+responsibilities stay separated into OHCodec decode and native-buffer interop.
 
-The active next task is the Windows AMD/Intel cadence comparison in
-[`PLAN.md`](PLAN.md). It applies to Dolby and non-Dolby media, so diagnosis
-must measure scheduling, retry/handoff, compositor backpressure, power state,
-and libplacebo render cost independently before changing the color pipeline.
+The active local next task in [`PLAN.md`](PLAN.md) is OHCodec direct-surface
+hardware decode. The transferred Intel Windows cadence investigation remains
+open on its separate administrator-capable machine and is not described as
+closed by local OHOS progress.
 
 ## Architectural invariants for changes
 

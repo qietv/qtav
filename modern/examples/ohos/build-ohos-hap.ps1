@@ -71,6 +71,16 @@ $NativeOutputs = @(
         'libqtav_render_mobile.so.2'
     ),
     @(
+        (Join-Path $BuildDirectory `
+            'backends/audio/resample/libqtav_audio_resample.so.2.0.0'),
+        'libqtav_audio_resample.so.2'
+    ),
+    @(
+        (Join-Path $BuildDirectory `
+            'backends/audio/ohaudio/libqtav_audio_ohaudio.so.2.0.0'),
+        'libqtav_audio_ohaudio.so.2'
+    ),
+    @(
         (Join-Path $BuildDirectory 'examples/ohos/libentry.so'),
         'libentry.so'
     )
@@ -126,11 +136,15 @@ if ($MediaSource) {
         -y `
         -f lavfi `
         -i 'testsrc2=size=320x180:rate=30' `
-        -t 4 `
-        -an `
+        -f lavfi `
+        -i 'sine=frequency=440:sample_rate=48000' `
+        -t 1 `
         -c:v mpeg4 `
         -q:v 3 `
         -pix_fmt yuv420p `
+        -c:a aac `
+        -b:a 96k `
+        -shortest `
         $PackagedMedia
     if ($LASTEXITCODE -ne 0) {
         throw 'Host FFmpeg could not generate the HAP test media'

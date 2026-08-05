@@ -24,6 +24,8 @@ target_link_libraries(qtav_ohos_xcomponent_example
         ace_ndk.z
         native_window
         QtAV::Core
+        QtAV::AudioOHAudio
+        QtAV::AudioResample
         QtAV::RenderMobile
         QtAV::RenderOpenGLOHOS
         QtAV::RenderVulkanOHOS

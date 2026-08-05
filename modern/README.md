@@ -56,6 +56,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional Windows WASAPI shared-mode device sink with native playback timing;
 - optional Android AAudio device sink with callback-safe bounded buffering,
   device timing, latency reporting, and disconnect recovery;
+- optional OHOS OHAudio device sink with negotiated Float32 PCM,
+  callback-safe bounded buffering, hardware presentation timing, lifecycle
+  control, and non-callback route/error recovery;
 - optional D3D11VA hardware decoding on an application-selected retained
   D3D11 device, with reference-counted shader-readable NV12/P010 decoder
   texture-array slices and explicit software fallback;
@@ -106,14 +109,15 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - a minimal OHOS ArkUI/XComponent HAP shell and connected-device harness for
   generated-media software decode, Vulkan and OpenGL ES presentation, forced
   initial OpenGL ES selection, and fatal one-way Vulkan-to-OpenGL ES fallback
-  without reopening media through the repository arm64/API 23 dependency
-  package;
+  without reopening media, plus OHAudio output and device-master timing,
+  through the repository arm64/API 23 dependency package;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
 keep consuming decoded frames through `onAudioFrame()` and can optionally bind
-an `AudioSink`; the Windows WASAPI and Android AAudio implementations remain
-separate backend targets so the core acquires no Qt or platform dependency.
+an `AudioSink`; the Windows WASAPI, Android AAudio, and OHOS OHAudio
+implementations remain separate backend targets so the core acquires no Qt or
+platform dependency.
 
 Current backend integration boundary:
 
@@ -138,6 +142,11 @@ Current backend integration boundary:
   Android output route, feeds AAudio's real-time callback from a bounded
   lock-free queue, maps AAudio presentation timestamps to the media timeline,
   and rebuilds a disconnected default-route stream on a non-callback thread;
+- `QtAV::AudioOHAudio` negotiates 48 kHz Float32 mono/stereo PCM against the
+  current OHOS output route, feeds OHAudio's real-time callback from the same
+  portable bounded SPSC queue, maps hardware-committed frame timestamps to the
+  media timeline, and rebuilds route-changed or failed streams on a dedicated
+  backend worker;
 - `HardwareDecodeConfig` selects an optional hardware device for video decode;
   its optional reference-counted `HardwareDecodeDevice` lets an in-tree
   backend supply a pre-created native device without exposing FFmpeg or
@@ -221,9 +230,9 @@ Current backend integration boundary:
   hardware-frame fallback callback selects OpenGL ES native interop,
   direct-surface presentation, software decode, or no video for subsequent
   output; cross-API fallback never retries or maps the retired native frame;
-- no OHOS audio sink, hardware decoder, or native-buffer decode interop has
-  been implemented yet; Android remains the completed reference for those
-  later shared mobile responsibilities.
+- no OHOS hardware decoder or native-buffer decode interop has been
+  implemented yet; Android remains the completed reference for those later
+  shared mobile responsibilities.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -322,7 +331,7 @@ clear error. Current switches are:
 - render: `QTAV_RENDER_CPU`, `QTAV_RENDER_MOBILE`, `QTAV_RENDER_OPENGL`,
   `QTAV_RENDER_VULKAN`, and `QTAV_RENDER_D3D11`;
 - audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_AAUDIO`,
-  `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
+  `QTAV_AUDIO_OHAUDIO`, `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
 - hardware decode: `QTAV_HW_D3D11VA` and `QTAV_HW_MEDIACODEC`;
 - interop: `QTAV_INTEROP_D3D11`,
   `QTAV_INTEROP_MEDIACODEC_VULKAN`, and
@@ -350,7 +359,9 @@ decoder targets are available. `QTAV_OUTPUT_D3D11=AUTO` builds the high-level Wi
 composition output when the D3D11 renderer, D3D11VA decoder, and interop
 targets are available. `QTAV_AUDIO_AAUDIO=AUTO` builds the AAudio sink on
 Android API 26 or newer; the current Android harness targets API 28 and does
-not require OpenSL ES fallback. `QTAV_HW_MEDIACODEC=AUTO` builds the Android
+not require OpenSL ES fallback. `QTAV_AUDIO_OHAUDIO=AUTO` builds the OHAudio
+sink for OHOS/OpenHarmony targets when `libohaudio` is available.
+`QTAV_HW_MEDIACODEC=AUTO` builds the Android
 MediaCodec direct-surface backend when the NDK Media APIs and FFmpeg's
 MediaCodec hardware context are available.
 `QTAV_INTEROP_MEDIACODEC_VULKAN=AUTO` builds the private-AImageReader Vulkan
@@ -643,6 +654,47 @@ restart emits `DeviceLost`.
 xrun count, transparent route-change count, and disconnect-restart count for
 diagnostics. The backend requires no OpenSL ES fallback at the current API 28
 baseline.
+
+### OHAudio device sink
+
+Link `QtAV::AudioOHAudio` and `QtAV::AudioResample` in an OHOS application
+whose minimum native platform is API 23 or newer:
+
+```cpp
+#include <qtav/ohaudio_audio_sink.h>
+#include <qtav/swresample_audio_converter.h>
+
+player
+    .setAudioFrameConverter(
+        std::make_shared<qtav::SwresampleAudioConverter>())
+    .setAudioSink(
+        std::make_shared<qtav::OHAudioAudioSink>());
+```
+
+The default configuration requests the current route in fast mode and
+negotiates 48 kHz mono/stereo interleaved Float32 PCM, falling back to normal
+latency mode if fast renderer construction is unavailable. Accepted PCM enters
+the same preallocated SPSC implementation used by the Android backend. The
+OHAudio write callback performs only bounded copies, silence fill, and atomic
+updates; stream construction, teardown, route recovery, and event delivery
+remain on non-callback threads.
+
+`clock()` maps `OH_AudioRenderer_GetAudioTimestampInfo()` hardware-committed
+frame positions to media timestamps. Its latency combines frames submitted to
+OHAudio but not yet committed with backend-queued PCM. Pause, flush, natural-
+end drain, underrun re-anchoring, forced audio interruptions, and teardown
+follow the generic `AudioSink` lifecycle. Output-device changes and native
+errors rebuild the negotiated stream on the backend worker, discard the old
+queued generation, and emit `Underrun` after successful recovery or
+`DeviceLost` if reconstruction fails.
+
+`OHAudioStreamInfo` exposes callback size, native frames/underflows, accepted
+PCM, lifecycle counters, route changes, and stream restarts for diagnostics.
+The connected Mate 60 Pro harness has validated native 440 Hz AAC output,
+device-master clock samples, non-negative combined latency, pause/resume,
+seek/flush, loop-boundary drain, and clean continuation through the existing
+Vulkan/OpenGL ES fallback scenario. Automated counters establish delivery and
+hardware timing; subjective audibility still requires a human listening check.
 
 ### MediaCodec direct-surface hardware decode
 
@@ -1636,6 +1688,15 @@ submitted to the native stream. Pause, flush, drain, xrun detection, transparent
 route observation, and disconnect-triggered stream reconstruction remain
 inside the Android target.
 
+`QtAV::AudioOHAudio` implements `OHAudioAudioSink` on OHOS API 23 or newer.
+Its backend header exposes only QtAVCore value types and diagnostics; OHAudio
+declarations remain private to the implementation. It negotiates interleaved
+Float32 mono/stereo PCM, shares the allocation-free SPSC queue implementation
+with AAudio, anchors playback to hardware-committed native frame timestamps,
+and reports live queued/native latency. Pause, flush, drain, interruption,
+underrun, route-change rebuilding, and error recovery stay inside the OHOS
+target.
+
 `QtAV::PlatformWindows` owns the Windows-only `D3D11DeviceAccess` helper and
 strong non-owning wrappers for `ID3D11Device` and `ID3D11DeviceContext`; no
 Windows SDK type reaches the core headers. `QtAV::RenderD3D11` retains that
@@ -1718,12 +1779,17 @@ and verify channel data, drain timing, sample counts, and seek reset behavior.
 Audio-file tests verify RIFF/WAVE headers and little-endian samples, then run
 the player and converter to produce an exact 64,000-byte 16 kHz stereo S16
 payload from deterministic 8 kHz mono input.
-AAudio's portable SPSC queue test covers capacity, wraparound, timestamp
-continuity, rejection, and reset without an Android device. The connected
+The portable SPSC queue shared by AAudio and OHAudio is tested for capacity,
+wraparound, timestamp continuity, rejection, reset, and concurrent
+single-producer/single-consumer access without a device. The connected
 Android harness additionally verifies Float32 negotiation, real-time
 presentation, monotonic device-clock samples, non-negative combined latency,
 pause/resume, background/foreground recovery, drain, and clean close on an
 AAudio-capable device.
+The connected OHOS HAP additionally verifies 48 kHz Float32 negotiation,
+real-time OHAudio presentation, device-master clock samples, combined latency,
+pause/resume, seek/flush, loop-boundary drain, and clean close while preserving
+the software Vulkan/OpenGL ES selector result.
 The same connected harness verifies MediaCodec H.264/HEVC direct-surface
 outputs with explicit present/drop, seek/flush, media replacement, stop,
 surface-generation replacement, stale-token rejection, decoder/output

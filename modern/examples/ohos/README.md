@@ -7,13 +7,20 @@ its native lifecycle publishes `OHNativeWindow` generations to
 surface/context/swapchain resources while the platform-neutral Vulkan and
 OpenGL ES engines render decoded software frames.
 
-The native module copies a small packaged MPEG-4 test clip into app storage and
-opens it once through `qtav::Player`. Its first selector session deliberately
+The native module copies a small packaged MPEG-4/AAC test clip into app storage
+and opens it once through `qtav::Player`. AAC is converted to negotiated 48 kHz
+Float32 PCM through `QtAV::AudioResample` and presented through
+`QtAV::AudioOHAudio`. Its first selector session deliberately
 makes Vulkan unavailable and requires 20 OpenGL ES presentations. A new
 renderer session then selects Vulkan, injects a fatal result after 12 presented
 frames, and requires 30 more frames through the selector's one-way OpenGL ES
-fallback. The final marker also requires exactly one media open. The harness
-does not use OHCodec, OHAudio, native-buffer interop, or native OHOS HDR yet.
+fallback. Between the two renderer sessions the harness pauses playback, seeks,
+and resumes. The one-second clip loops so the final marker can additionally
+require OHAudio callback delivery, a valid hardware presentation clock,
+non-negative latency, successful flush, and segment-end drain while retaining
+exactly one media open. The harness does not use OHCodec, native-buffer
+interop, or native OHOS HDR yet. The generated 440 Hz tone allows a manual
+audibility check, while automation validates delivery and hardware timing.
 
 Build the QtAVCore shared libraries, native N-API module, and unsigned template
 HAP with:

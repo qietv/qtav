@@ -77,6 +77,9 @@ already own a graphics context or require multiple/custom render targets:
 - optional Android `AAudioAudioSink` output through `QtAV::AudioAAudio`, with
   bounded callback-safe PCM buffering, presentation timestamps, latency, and
   disconnect recovery;
+- optional OHOS `OHAudioAudioSink` output through `QtAV::AudioOHAudio`, with
+  negotiated Float32 PCM, the shared callback-safe SPSC buffer, hardware
+  presentation timestamps, lifecycle control, and route/error recovery;
 - optional high-level Windows composition presentation through
   `QtAV::OutputD3D11`, including owned D3D11 resources, render scheduling,
   D3D11VA configuration, zero-CPU-map interop, HDR/SDR output selection,
@@ -226,6 +229,18 @@ reported latency includes both the native pipeline and backend queue. A
 non-callback worker observes route changes and rebuilds disconnected
 default-route streams using the same negotiated format.
 
+On OHOS API 23 or newer, `OHAudioAudioSink` requests the current output route
+in fast mode, falls back to normal mode when required, and negotiates 48 kHz
+interleaved Float32 mono/stereo PCM. It reuses the portable AAudio-proven SPSC
+queue implementation, so the OHAudio write callback only copies or clears
+preallocated memory and updates atomics. Hardware-committed frame timestamps
+anchor the device-master clock; reported latency includes both submitted
+native frames and backend-queued PCM. Pause, flush, natural-end drain,
+interrupt handling, route-change reconstruction, and native error recovery
+remain in the OHOS backend. The connected HAP validates native PCM delivery,
+clock/latency, pause/resume, seek/flush, and loop-boundary drain; subjective
+audibility remains a manual listening check.
+
 On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
 `ID3D11Device` and its immediate context. `D3D11VideoRenderer` accepts that
 shared access (or creates one from its compatibility constructor), borrows the
@@ -335,7 +350,6 @@ or pace playback. Decoded planar audio therefore normally uses
 
 ## Deliberately deferred
 
-- the OHAudio device implementation;
 - broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
 - OHCodec hardware decode plus OHOS GPU zero-CPU-copy interop;
 - subtitle decoding and libass rendering;
@@ -351,8 +365,10 @@ legacy QtAV API replacement. They prove cross-compilation, packaging, signing,
 connected-device logging, software decode, and platform presentation. The
 OHOS checkpoint now covers software-frame Vulkan, OpenGL ES, forced initial
 OpenGL ES selection, recoverable native-window recreation, and fatal one-way
-Vulkan-to-OpenGL ES fallback without reopening media. Android covers the
-complete Vulkan/OpenGL ES, audio, and hardware-decode matrix below.
+Vulkan-to-OpenGL ES fallback without reopening media. It also covers OHAudio
+PCM delivery, device-master timing, pause/resume, seek/flush, and segment-end
+drain. Android covers the complete Vulkan/OpenGL ES, audio, and hardware-
+decode matrix below.
 `MobileVideoRendererSelector` now implements the accepted Android/OHOS policy:
 it prefers application-created Vulkan, performs bounded same-API recreation
 for recoverable surface loss, switches one-way to an application-created

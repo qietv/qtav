@@ -7,6 +7,7 @@
 #include <node_api.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -20,7 +21,9 @@
 
 #include <qtav/mobile_video_renderer.h>
 #include <qtav/ohos_opengl_video_renderer.h>
+#include <qtav/ohaudio_audio_sink.h>
 #include <qtav/player.h>
+#include <qtav/swresample_audio_converter.h>
 
 namespace qtav::ohos_example {
 namespace {
@@ -166,7 +169,11 @@ class AppSession final {
 public:
     AppSession()
     {
+        audioSink_ = std::make_shared<OHAudioAudioSink>();
         player_
+            .setAudioFrameConverter(
+                std::make_shared<SwresampleAudioConverter>())
+            .setAudioSink(audioSink_)
             .onMediaStatus(
                 [this](MediaStatus, MediaStatus status) {
                     {
@@ -193,6 +200,11 @@ public:
             })
             .onVideoFrame([this](const VideoFrame&, int) {
                 decodedFrames_.fetch_add(1, std::memory_order_relaxed);
+            })
+            .onAudioFrame([this](const AudioFrame&, int) {
+                decodedAudioFrames_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
             });
         player_.setLoop(-1);
         controlWorker_ = std::thread([this] { controlLoop(); });
@@ -210,7 +222,13 @@ public:
         }
         stop();
         releaseSurface();
-        player_.onMediaStatus({}).onEvent({}).onVideoFrame({});
+        player_
+            .onMediaStatus({})
+            .onEvent({})
+            .onVideoFrame({})
+            .onAudioFrame({})
+            .setAudioSink({})
+            .setAudioFrameConverter({});
     }
 
     bool startMedia(const std::uint8_t* data, std::size_t size)
@@ -389,6 +407,21 @@ public:
                << " delivered=" << playback.deliveredVideoFrames
                << " overflowDrops=" << playback.videoQueueOverflowDrops
                << " lateDrops=" << playback.lateVideoDrops;
+        if (audioSink_) {
+            const OHAudioStreamInfo audio = audioSink_->streamInfo();
+            result << " audioDecoded="
+                   << decodedAudioFrames_.load(std::memory_order_relaxed)
+                   << " audioRendered=" << audio.renderedPcmFrames
+                   << " audioClock="
+                   << audioClockSamples_.load(std::memory_order_relaxed)
+                   << " audioLatencyMs="
+                   << maximumAudioLatencyMilliseconds_.load(
+                          std::memory_order_relaxed)
+                   << " audioStarts=" << audio.starts
+                   << " audioFlushes=" << audio.flushes
+                   << " audioDrains=" << audio.drains
+                   << " audioRestarts=" << audio.streamRestarts;
+        }
         if (!detail.empty()) {
             result << '\n' << detail;
         }
@@ -575,6 +608,14 @@ private:
             if (!surfaceReady_ || !mediaStarted_ || !selector_) {
                 continue;
             }
+            player_.setState(State::Paused);
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            player_.seek(250);
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            player_.setState(State::Playing);
+            audioLifecycleRequested_.store(
+                true,
+                std::memory_order_release);
             player_.setVideoRenderAPI({});
             selector_->close();
             selector_.reset();
@@ -610,6 +651,14 @@ private:
         }
         if (!mediaStarted_) {
             decodedFrames_.store(0, std::memory_order_relaxed);
+            decodedAudioFrames_.store(0, std::memory_order_relaxed);
+            audioClockSamples_.store(0, std::memory_order_relaxed);
+            maximumAudioLatencyMilliseconds_.store(
+                0,
+                std::memory_order_relaxed);
+            audioLifecycleRequested_.store(
+                false,
+                std::memory_order_release);
             mediaOpenCount_.store(1, std::memory_order_relaxed);
             passed_.store(false, std::memory_order_release);
             failed_.store(false, std::memory_order_release);
@@ -624,6 +673,7 @@ private:
     {
         const VideoRenderResult result = player_.renderVideoDetailed();
         if (result.status == VideoRenderStatus::Rendered) {
+            observeAudioClock();
             const ValidationPhase phase =
                 phase_.load(std::memory_order_acquire);
             const MobileRenderAPI api =
@@ -653,7 +703,8 @@ private:
                     && fatalFallbackObserved_.load(
                         std::memory_order_acquire)
                     && mediaOpenCount_.load(std::memory_order_relaxed)
-                        == 1) {
+                        == 1
+                    && audioValidationComplete()) {
                     phase_.store(
                         ValidationPhase::Complete,
                         std::memory_order_release);
@@ -673,7 +724,8 @@ private:
                                 InjectFatalAfterVulkanFrames)
                             + " fatalGLES="
                             + std::to_string(presented)
-                            + " mediaOpen=1";
+                            + " mediaOpen=1"
+                            + audioResultText();
                         setDetail(message);
                         logMessage(LOG_INFO, message);
                     }
@@ -714,6 +766,62 @@ private:
         setDetail("XComponent surface released; playback paused");
     }
 
+    void observeAudioClock()
+    {
+        if (!audioSink_) {
+            return;
+        }
+        const AudioSinkClock clock = audioSink_->clock();
+        if (!clock.valid) {
+            return;
+        }
+        audioClockSamples_.fetch_add(1, std::memory_order_relaxed);
+        auto previous = maximumAudioLatencyMilliseconds_.load(
+            std::memory_order_relaxed);
+        while (previous < clock.latencyMilliseconds
+               && !maximumAudioLatencyMilliseconds_.compare_exchange_weak(
+                   previous,
+                   clock.latencyMilliseconds,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    bool audioValidationComplete() const
+    {
+        if (!audioSink_
+            || !audioLifecycleRequested_.load(std::memory_order_acquire)
+            || decodedAudioFrames_.load(std::memory_order_relaxed) == 0
+            || audioClockSamples_.load(std::memory_order_relaxed) == 0) {
+            return false;
+        }
+        const OHAudioStreamInfo info = audioSink_->streamInfo();
+        return info.callbackFrames > 0
+            && info.callbackCount > 0
+            && info.renderedPcmFrames > 0
+            && info.starts >= 2
+            && info.flushes >= 1
+            && info.drains >= 1;
+    }
+
+    std::string audioResultText() const
+    {
+        const OHAudioStreamInfo info = audioSink_->streamInfo();
+        std::ostringstream result;
+        result << " audioDecoded="
+               << decodedAudioFrames_.load(std::memory_order_relaxed)
+               << " audioRendered=" << info.renderedPcmFrames
+               << " audioClock="
+               << audioClockSamples_.load(std::memory_order_relaxed)
+               << " audioLatencyMs="
+               << maximumAudioLatencyMilliseconds_.load(
+                      std::memory_order_relaxed)
+               << " audioStarts=" << info.starts
+               << " audioFlushes=" << info.flushes
+               << " audioDrains=" << info.drains
+               << " audioRestarts=" << info.streamRestarts;
+        return result.str();
+    }
+
     void setDetail(std::string detail)
     {
         std::lock_guard<std::mutex> lock(statusMutex_);
@@ -734,6 +842,7 @@ private:
     std::condition_variable controlCondition_;
     std::thread controlWorker_;
     Player player_;
+    std::shared_ptr<OHAudioAudioSink> audioSink_;
     std::unique_ptr<OHOSVulkanContext> vulkanContext_;
     std::shared_ptr<MobileVideoRendererSelector> selector_;
     OHNativeWindow* window_ = nullptr;
@@ -741,6 +850,9 @@ private:
     MediaStatus mediaStatus_ = MediaStatus::NoMedia;
     std::string detail_ = "Waiting for XComponent and packaged media";
     std::atomic<std::uint64_t> decodedFrames_ { 0 };
+    std::atomic<std::uint64_t> decodedAudioFrames_ { 0 };
+    std::atomic<std::uint64_t> audioClockSamples_ { 0 };
+    std::atomic<std::int64_t> maximumAudioLatencyMilliseconds_ { 0 };
     std::atomic<std::uint64_t> initialFallbackFrames_ { 0 };
     std::atomic<std::uint64_t> fatalFallbackFrames_ { 0 };
     std::atomic<std::uint64_t> mediaOpenCount_ { 0 };
@@ -757,6 +869,7 @@ private:
     std::atomic<bool> fatalVulkanSelected_ { false };
     std::atomic<bool> fatalFallbackObserved_ { false };
     std::atomic<bool> transitionQueued_ { false };
+    std::atomic<bool> audioLifecycleRequested_ { false };
     bool controlQuit_ = false;
     bool transitionRequested_ = false;
     bool surfaceReady_ = false;

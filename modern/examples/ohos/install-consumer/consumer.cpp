@@ -3,6 +3,8 @@
 #include <qtav/mobile_video_renderer.h>
 #include <qtav/ohos_opengl_video_renderer.h>
 #include <qtav/ohos_vulkan_video_renderer.h>
+#include <qtav/ohaudio_audio_sink.h>
+#include <qtav/swresample_audio_converter.h>
 
 #include <memory>
 #include <string>
@@ -13,6 +15,8 @@ int qtav_ohos_render_install_consumer()
 {
     qtav::OHOSOpenGLVideoRenderer renderer(
         qtav::OpenGLOutputPreference::SdrOnly);
+    qtav::OHAudioAudioSink audioSink;
+    qtav::SwresampleAudioConverter audioConverter;
     qtav::MobileRendererSelectorConfig selectorConfig;
     selectorConfig.openGLES = [] {
         return qtav::MobileRendererCandidate {
@@ -25,6 +29,8 @@ int qtav_ohos_render_install_consumer()
         std::move(selectorConfig));
     const qtav::VideoRenderCapabilities capabilities =
         renderer.capabilities();
+    const qtav::AudioSinkCapabilities audioCapabilities =
+        audioSink.capabilities();
     const qtav::BorrowedOHOSVulkanContext emptyVulkanContext;
     return capabilities.customViewport
             && capabilities.rotation
@@ -35,6 +41,13 @@ int qtav_ohos_render_install_consumer()
             && !renderer.hdrOutputActive()
             && renderer.colorComponentBits() == 0
             && selector.selectedAPI() == qtav::MobileRenderAPI::None
+            && audioCapabilities.hasDeviceClock
+            && audioCapabilities.supportsPause
+            && audioCapabilities.maximumChannels == 2
+            && audioConverter.open(
+                { 48'000, 1, qtav::SampleFormat::Float, "mono" },
+                { 48'000, 2, qtav::SampleFormat::Float, "stereo" })
+                .success
             && !emptyVulkanContext.isValid()
             && std::string(
                    qtav::mobileRenderAPIName(
