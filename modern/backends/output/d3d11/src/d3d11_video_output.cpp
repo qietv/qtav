@@ -337,6 +337,8 @@ public:
         renderer_->setHardwareFrameInterop(interop_);
         renderer_->setAllowSoftwareMappingFallback(
             options_.allowSoftwareMappingFallback);
+        renderer_->setDirectDecoderTextureSamplingEnabled(
+            options_.directDecoderTextureSampling);
 
         VideoRenderConfig renderConfig;
         renderConfig.surfaceSize = surface_.size;
@@ -395,8 +397,11 @@ public:
         HardwareDecodeConfig previousConfig;
         if (options_.configureHardwareDecoding) {
             previousConfig = player.hardwareDecodeConfig();
+            D3D11VAHardwareDecodeOptions decodeOptions;
+            decodeOptions.directDecoderTextureSampling =
+                options_.directDecoderTextureSampling;
             player.setHardwareDecodeConfig(
-                d3d11vaHardwareDecodeConfig(access));
+                d3d11vaHardwareDecodeConfig(access, decodeOptions));
         }
         player.setVideoRenderAPI(renderer);
 

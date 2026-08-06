@@ -11,6 +11,7 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/shaders/custom.h>
 
+#include <d3d11_1.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -793,11 +794,20 @@ D3D11HardwareFrameInterop::importFrame(
 
 class D3D11VideoRenderer::Impl {
 public:
+    struct DecoderSourceCopy {
+        ComPtr<ID3D11Texture2D> texture;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        int width = 0;
+        int height = 0;
+        std::array<pl_tex, 2> planes {};
+    };
+
     struct InFlightRender {
         ComPtr<ID3D11Query> completion;
         ComPtr<ID3D11Texture2D> target;
         VideoFrame source;
         std::shared_ptr<D3D11TextureFrame> imported;
+        std::shared_ptr<DecoderSourceCopy> decoderSourceCopy;
         std::array<pl_tex, 2> sourceTextures {};
         pl_tex targetTexture = nullptr;
     };
@@ -824,6 +834,9 @@ public:
                                  : BorrowedD3D11DeviceContext {})
         , currentTarget_(std::move(currentTarget))
     {
+        if (context_) {
+            context_.get()->QueryInterface(IID_PPV_ARGS(&context1_));
+        }
         scRgbOutputHook_.stages = PL_HOOK_OUTPUT;
         scRgbOutputHook_.input = PL_HOOK_SIG_COLOR;
         scRgbOutputHook_.hook = &Impl::scaleScRgbOutput;
@@ -974,6 +987,7 @@ public:
         if (render.targetTexture && d3d11_) {
             pl_tex_destroy(d3d11_->gpu, &render.targetTexture);
         }
+        render.decoderSourceCopy.reset();
         render.imported.reset();
         render.source = {};
         render.target.Reset();
@@ -986,6 +1000,121 @@ public:
         }
         inFlightRenders_.clear();
         availableCompletionQueries_.clear();
+    }
+
+    void destroyDecoderSourceCopy(DecoderSourceCopy& copy) noexcept
+    {
+        if (d3d11_) {
+            for (pl_tex& plane : copy.planes) {
+                if (plane) {
+                    pl_tex_destroy(d3d11_->gpu, &plane);
+                }
+            }
+        }
+        copy.planes = {};
+        copy.texture.Reset();
+        copy.format = DXGI_FORMAT_UNKNOWN;
+        copy.width = 0;
+        copy.height = 0;
+    }
+
+    void destroyDecoderSourceCopies() noexcept
+    {
+        for (const auto& copy : decoderSourceCopies_) {
+            if (copy) {
+                destroyDecoderSourceCopy(*copy);
+            }
+        }
+        decoderSourceCopies_.clear();
+    }
+
+    std::shared_ptr<DecoderSourceCopy> acquireDecoderSourceCopy(
+        DXGI_FORMAT format,
+        int width,
+        int height,
+        bool tenBit,
+        std::string& error)
+    {
+        for (const auto& candidate : decoderSourceCopies_) {
+            if (candidate && candidate.use_count() == 1
+                && candidate->format == format
+                && candidate->width == width
+                && candidate->height == height) {
+                return candidate;
+            }
+        }
+
+        std::shared_ptr<DecoderSourceCopy> copy;
+        for (const auto& candidate : decoderSourceCopies_) {
+            if (candidate && candidate.use_count() == 1) {
+                copy = candidate;
+                break;
+            }
+        }
+        if (!copy) {
+            if (decoderSourceCopies_.size() >= maximumInFlightRenders) {
+                error = "The D3D11 decoder-source copy ring is busy";
+                return {};
+            }
+            copy = std::make_shared<DecoderSourceCopy>();
+            decoderSourceCopies_.push_back(copy);
+        } else {
+            destroyDecoderSourceCopy(*copy);
+        }
+
+        D3D11_TEXTURE2D_DESC description {};
+        description.Width = static_cast<UINT>(width);
+        description.Height = static_cast<UINT>(height);
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = format;
+        description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const HRESULT createResult = device_.get()->CreateTexture2D(
+            &description,
+            nullptr,
+            &copy->texture);
+        if (FAILED(createResult)) {
+            error = hresultText(
+                "Creating a shader-readable D3D11 decoder-source copy",
+                createResult);
+            destroyDecoderSourceCopy(*copy);
+            return {};
+        }
+
+        copy->format = format;
+        copy->width = width;
+        copy->height = height;
+        const std::array<DXGI_FORMAT, 2> planeFormats {
+            tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
+            tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM,
+        };
+        const std::array<int, 2> planeWidths {
+            width,
+            width / 2,
+        };
+        const std::array<int, 2> planeHeights {
+            height,
+            height / 2,
+        };
+        for (std::size_t plane = 0; plane < copy->planes.size(); ++plane) {
+            pl_d3d11_wrap_params params {};
+            params.tex = copy->texture.Get();
+            params.array_slice = 0;
+            params.fmt = planeFormats[plane];
+            params.w = planeWidths[plane];
+            params.h = planeHeights[plane];
+            copy->planes[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
+            if (!copy->planes[plane]
+                || !copy->planes[plane]->params.sampleable) {
+                error = takeLogError(
+                    "libplacebo cannot wrap a D3D11 decoder-source copy plane");
+                destroyDecoderSourceCopy(*copy);
+                return {};
+            }
+        }
+        return copy;
     }
 
     bool retireCompletedRenders(std::string& error)
@@ -1061,6 +1190,7 @@ public:
             pl_gpu_finish(d3d11_->gpu);
         }
         destroyInFlightRenders();
+        destroyDecoderSourceCopies();
         for (pl_tex& texture : uploadTextures_) {
             if (texture && d3d11_) {
                 pl_tex_destroy(d3d11_->gpu, &texture);
@@ -1132,6 +1262,8 @@ public:
         const VideoFrame& source,
         const std::shared_ptr<D3D11TextureFrame>& imported,
         std::array<pl_tex, 2>& textures,
+        std::shared_ptr<DecoderSourceCopy>& decoderSourceCopy,
+        bool directDecoderTextureSampling,
         pl_frame& frame,
         pl_dovi_metadata& dovi,
         std::string& error)
@@ -1151,10 +1283,9 @@ public:
             || description.SampleDesc.Count != 1
             || imported->arraySlice() >= description.ArraySize
             || static_cast<UINT>(source.width()) > description.Width
-            || static_cast<UINT>(source.height()) > description.Height
-            || !(description.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+            || static_cast<UINT>(source.height()) > description.Height) {
             error =
-                "The imported D3D11 texture is not a shader-readable default resource";
+                "The imported D3D11 texture is not a compatible default resource";
             return false;
         }
 
@@ -1188,24 +1319,92 @@ public:
                 static_cast<int>(description.Height),
                 static_cast<int>((description.Height + 1U) / 2U),
             };
-            for (std::size_t plane = 0; plane < textures.size(); ++plane) {
-                pl_d3d11_wrap_params params {};
-                params.tex = imported->texture();
-                params.array_slice =
-                    static_cast<int>(imported->arraySlice());
-                params.fmt = planeFormats[plane];
-                params.w = widths[plane];
-                params.h = heights[plane];
-                textures[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
-                if (!textures[plane] || !textures[plane]->params.sampleable) {
-                    error = takeLogError(
-                        "libplacebo cannot wrap a D3D11 decoder plane");
+            const std::array<pl_tex, 2>* sampledPlanes = &textures;
+            if (directDecoderTextureSampling) {
+                if (!(description.BindFlags
+                      & D3D11_BIND_SHADER_RESOURCE)) {
+                    error =
+                        "Direct D3D11 decoder-texture sampling requires shader-resource binding";
                     return false;
                 }
+                for (std::size_t plane = 0; plane < textures.size(); ++plane) {
+                    pl_d3d11_wrap_params params {};
+                    params.tex = imported->texture();
+                    params.array_slice =
+                        static_cast<int>(imported->arraySlice());
+                    params.fmt = planeFormats[plane];
+                    params.w = widths[plane];
+                    params.h = heights[plane];
+                    textures[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
+                    if (!textures[plane]
+                        || !textures[plane]->params.sampleable) {
+                        error = takeLogError(
+                            "libplacebo cannot directly wrap a D3D11 decoder plane");
+                        return false;
+                    }
+                }
+            } else {
+                const int copyWidth = (source.width() + 1) & ~1;
+                const int copyHeight = (source.height() + 1) & ~1;
+                if (copyWidth <= 0 || copyHeight <= 0
+                    || static_cast<UINT>(copyWidth) > description.Width
+                    || static_cast<UINT>(copyHeight) > description.Height) {
+                    error =
+                        "The visible D3D11 decoder region exceeds its allocation";
+                    return false;
+                }
+                decoderSourceCopy = acquireDecoderSourceCopy(
+                    description.Format,
+                    copyWidth,
+                    copyHeight,
+                    tenBit,
+                    error);
+                if (!decoderSourceCopy) {
+                    return false;
+                }
+
+                const D3D11_BOX sourceBox {
+                    0,
+                    0,
+                    0,
+                    static_cast<UINT>(copyWidth),
+                    static_cast<UINT>(copyHeight),
+                    1,
+                };
+                const UINT sourceSubresource = D3D11CalcSubresource(
+                    0,
+                    imported->arraySlice(),
+                    description.MipLevels);
+                if (context1_) {
+                    context1_->CopySubresourceRegion1(
+                        decoderSourceCopy->texture.Get(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        imported->texture(),
+                        sourceSubresource,
+                        &sourceBox,
+                        D3D11_COPY_DISCARD);
+                } else {
+                    context_.get()->CopySubresourceRegion(
+                        decoderSourceCopy->texture.Get(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        imported->texture(),
+                        sourceSubresource,
+                        &sourceBox);
+                }
+                decoderSurfaceCopies_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                sampledPlanes = &decoderSourceCopy->planes;
             }
             frame.num_planes = 2;
-            initializePlane(frame.planes[0], textures[0], 1, 0);
-            initializePlane(frame.planes[1], textures[1], 2, 1);
+            initializePlane(frame.planes[0], (*sampledPlanes)[0], 1, 0);
+            initializePlane(frame.planes[1], (*sampledPlanes)[1], 2, 1);
             frame.crop = {
                 0.0F,
                 0.0F,
@@ -1227,6 +1426,11 @@ public:
                 return false;
             }
         } else {
+            if (!(description.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+                error =
+                    "The imported D3D11 texture is not shader-readable";
+                return false;
+            }
             pl_d3d11_wrap_params params {};
             params.tex = imported->texture();
             params.array_slice = static_cast<int>(imported->arraySlice());
@@ -1283,12 +1487,14 @@ public:
     std::shared_ptr<D3D11DeviceAccess> deviceAccess_;
     BorrowedD3D11Device device_;
     BorrowedD3D11DeviceContext context_;
+    ComPtr<ID3D11DeviceContext1> context1_;
     D3D11CurrentTargetCallback currentTarget_;
     std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop_;
     EventCallback eventCallback_;
     VideoRenderConfig config_;
     D3D11AdvancedColorInfo advancedColorInfo_;
     bool allowSoftwareMappingFallback_ = false;
+    bool directDecoderTextureSamplingEnabled_ = false;
     bool open_ = false;
 
     pl_log log_ = nullptr;
@@ -1296,6 +1502,7 @@ public:
     pl_renderer renderer_ = nullptr;
     pl_hook scRgbOutputHook_ {};
     std::array<pl_tex, 4> uploadTextures_ {};
+    std::vector<std::shared_ptr<DecoderSourceCopy>> decoderSourceCopies_;
     std::deque<InFlightRender> inFlightRenders_;
     std::vector<ComPtr<ID3D11Query>> availableCompletionQueries_;
     std::string lastLogError_;
@@ -1491,6 +1698,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     D3D11CurrentTargetCallback currentTarget;
     std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop;
     bool allowSoftwareMappingFallback = false;
+    bool directDecoderTextureSampling = false;
     {
         std::unique_lock<std::mutex> lock(
             impl_->stateMutex_,
@@ -1507,6 +1715,8 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             hardwareInterop = impl_->hardwareInterop_;
             allowSoftwareMappingFallback =
                 impl_->allowSoftwareMappingFallback_;
+            directDecoderTextureSampling =
+                impl_->directDecoderTextureSamplingEnabled_;
         }
     }
     if (!currentTarget) {
@@ -1632,6 +1842,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
     pl_frame image {};
     std::array<pl_tex, 2> hardwareTextures {};
+    std::shared_ptr<Impl::DecoderSourceCopy> decoderSourceCopy;
     std::shared_ptr<D3D11TextureFrame> imported;
     std::shared_ptr<HardwareFrameMapping> mappedFrame;
     std::unique_ptr<AVFrame, AVFrameDeleter> mappedNative;
@@ -1658,6 +1869,8 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                     frame,
                     imported,
                     hardwareTextures,
+                    decoderSourceCopy,
+                    directDecoderTextureSampling,
                     image,
                     dovi,
                     error)) {
@@ -1800,10 +2013,13 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             Impl::InFlightRender inFlight;
             inFlight.completion = std::move(completion);
             inFlight.target = std::move(targetTextureNative);
-            inFlight.source = frame;
-            inFlight.imported = std::move(imported);
-            inFlight.sourceTextures = hardwareTextures;
-            hardwareTextures = {};
+            inFlight.decoderSourceCopy = std::move(decoderSourceCopy);
+            if (!inFlight.decoderSourceCopy) {
+                inFlight.source = frame;
+                inFlight.imported = std::move(imported);
+                inFlight.sourceTextures = hardwareTextures;
+                hardwareTextures = {};
+            }
             inFlight.targetTexture = targetTexture;
             targetTexture = nullptr;
             impl_->inFlightRenders_.push_back(std::move(inFlight));
@@ -1898,6 +2114,7 @@ void D3D11VideoRenderer::flush() noexcept
     (void)contextGuard;
     pl_gpu_finish(impl_->d3d11_->gpu);
     impl_->destroyInFlightRenders();
+    impl_->destroyDecoderSourceCopies();
 }
 
 BorrowedD3D11Device D3D11VideoRenderer::device() const noexcept
@@ -1978,6 +2195,25 @@ bool D3D11VideoRenderer::allowSoftwareMappingFallback() const noexcept
     }
     std::lock_guard<std::mutex> lock(impl_->stateMutex_);
     return impl_->allowSoftwareMappingFallback_;
+}
+
+void D3D11VideoRenderer::setDirectDecoderTextureSamplingEnabled(
+    bool enabled) noexcept
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    impl_->directDecoderTextureSamplingEnabled_ = enabled;
+}
+
+bool D3D11VideoRenderer::directDecoderTextureSamplingEnabled() const noexcept
+{
+    if (!impl_) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    return impl_->directDecoderTextureSamplingEnabled_;
 }
 
 D3D11AdvancedColorInfo

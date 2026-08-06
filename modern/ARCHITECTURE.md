@@ -184,12 +184,16 @@ satisfy strict no-intermediate source zero-copy. A Vulkan native image qualifies
 for the strict claim only when an explicit `VkFormat` and plane mapping let the
 renderer wrap the retained decoded allocation directly for libplacebo.
 
-Windows needs no normalization shader. D3D11VA textures are created with
-`D3D11_BIND_SHADER_RESOURCE`; the interop retains the exact NV12/P010 array
-slice, and libplacebo wraps its luma and chroma plane views directly. A D3D11
-Video Processor RGB conversion is deliberately absent because it would erase
-the raw Profile 5 representation before Dolby Vision reshaping. This direct
-plane wrapping meets the strict no-intermediate source zero-copy definition.
+Windows needs no normalization shader. By default the decoder array is not
+shader-readable: the renderer copies only the even-aligned visible rectangle
+into a same-format NV12/P010 shader-readable texture, then libplacebo wraps its
+luma and chroma plane views. The bounded copy remains GPU-local and zero-CPU-
+copy, but it is not strict no-intermediate source zero-copy. An explicit option
+instead creates `D3D11_BIND_SHADER_RESOURCE` decoder textures and wraps the
+retained array slice directly; only that mode satisfies the strict claim. A
+D3D11 Video Processor RGB conversion is deliberately absent in both modes
+because it would erase the raw Profile 5 representation before Dolby Vision
+reshaping.
 
 ## Dolby Vision and HDR behavior
 
@@ -232,7 +236,9 @@ The Windows path applies the same ordering through D3D11 only:
 
 ```text
 FFmpeg HEVC/D3D11VA + parsed RPU
-       -> retained shader-readable P010 texture-array slice
+       -> retained P010 texture-array slice
+       -> visible-region same-format GPU copy (default)
+          or direct decoder slice (explicit option)
        -> libplacebo D3D11 luma/chroma plane views
        -> Dolby Vision reshape
        -> libplacebo color/tone/gamut pipeline

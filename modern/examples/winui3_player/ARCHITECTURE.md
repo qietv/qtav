@@ -132,17 +132,19 @@ frame-latency cap, and non-blocking presentation all live on the private output
 thread, so neither context contention nor a busy compositor stalls WASAPI or
 the WinUI dispatcher.
 
-Hardware frames normally remain on the selected D3D11 device. Their raw
-NV12/P010 planes pass through libplacebo color processing and rendering
-without a CPU map. Submitted decoder slices and swap-chain back buffers stay
-retained until GPU completion; output resize drains those submissions before
-replacing the buffers. Every successfully imported D3D11VA frame uses fast
-libplacebo parameters and remains in the bounded completion-query queue until
-its decoder resources can be recycled, regardless of adapter vendor. Dolby
-Vision raw NV12/P010 imports sample the retained decoder texture-array slice
-directly; there is no intermediate GPU copy. Software frames remain outside
-this imported-frame policy. Unsupported media or devices fall back through
-QtAVCore's software decode/render path rather than an application-side decoder.
+Hardware frames remain on the selected D3D11 device. Their raw NV12/P010
+planes pass through libplacebo color processing and rendering without a CPU
+map. By default the renderer copies only the even-aligned visible rectangle
+into a bounded same-format ring, using `D3D11_COPY_DISCARD` on D3D11.1, then
+releases the decoder slice after ordered submission. Copied textures and swap-
+chain back buffers stay retained until GPU completion; output resize drains
+those submissions before replacing the buffers. Every successfully imported
+D3D11VA frame uses fast libplacebo parameters. The high-level output also
+offers explicit direct decoder-texture sampling, which removes the copy but
+retains scarce decoder resources through completion and requests shader-
+readable decoder arrays. Software frames remain outside this imported-frame
+policy. Unsupported media or devices fall back through QtAVCore's software
+decode/render path rather than an application-side decoder.
 
 ### Seek and progress
 
@@ -181,8 +183,9 @@ resets output counters. Important interpretations are:
 - normal scheduled cadence with low rendered cadence points at render
   contention, surface state, or the graphics driver;
 - `present-busy` means non-blocking `Present()` found compositor backpressure;
-- `decoder-copies` is a retained compatibility counter and remains zero while
-  the renderer samples Dolby Vision decoder slices directly;
+- `decoder-copies` counts default raw NV12/P010 visible-region GPU copies and
+  should rise with rendered hardware frames; it remains zero only in explicit
+  direct decoder-texture mode or when hardware frames are not rendered;
 - `coalesced` means multiple redraw notifications were intentionally combined;
 - `no-frame/player-busy/renderer-busy` classifies unsuccessful attempts, while
   `renderer-busy(state/serialize/context/in-flight)` locates backend

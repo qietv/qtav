@@ -187,6 +187,14 @@ public:
     hardwareFrameInterop() const noexcept;
     void setAllowSoftwareMappingFallback(bool allow) noexcept;
     bool allowSoftwareMappingFallback() const noexcept;
+    // Bypasses the default decoder-to-shader GPU copy and samples compatible
+    // shader-bound NV12/P010 decoder texture-array slices directly. This is
+    // an explicitly unsafe compatibility/performance option: D3D11 does not
+    // guarantee decoder-surface sampling, and drivers may expose padding,
+    // throughput, seek, or resource-lifetime failures. Keep disabled unless
+    // the exact adapter, driver, codec, seek, and shutdown matrix is accepted.
+    void setDirectDecoderTextureSamplingEnabled(bool enabled) noexcept;
+    bool directDecoderTextureSamplingEnabled() const noexcept;
     D3D11AdvancedColorInfo advancedColorInfo() const noexcept;
     // Atomically returns and resets the accumulated render-stage maxima.
     D3D11VideoRendererStatistics takeStatistics() noexcept;

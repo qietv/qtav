@@ -71,6 +71,12 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputOptions {
     bool allowWarpFallback = true;
     bool allowSoftwareMappingFallback = true;
     bool configureHardwareDecoding = true;
+    // Unsafe opt-in matching D3D11VideoRenderer's direct decoder-texture
+    // sampling mode. The default performs one visible-region same-GPU copy
+    // into an ordinary shader resource. Direct sampling may be faster or use
+    // less power, but D3D11 does not guarantee it and driver-specific padding,
+    // performance, seek, and shutdown failures have been observed.
+    bool directDecoderTextureSampling = false;
 };
 
 enum class D3D11PresentationColorSpace {

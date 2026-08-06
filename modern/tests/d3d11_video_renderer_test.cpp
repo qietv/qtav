@@ -643,6 +643,10 @@ void testHdrPresentation(
                 current.view.Get(),
             };
         });
+    assert(!renderer->directDecoderTextureSamplingEnabled());
+    renderer->setDirectDecoderTextureSamplingEnabled(true);
+    assert(renderer->directDecoderTextureSamplingEnabled());
+    renderer->setDirectDecoderTextureSamplingEnabled(false);
     int errors = 0;
     renderer->setEventCallback(
         [&](const qtav::VideoRenderEvent& event) {

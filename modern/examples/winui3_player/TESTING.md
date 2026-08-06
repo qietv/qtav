@@ -76,12 +76,15 @@ for queue growth, cadence, or shutdown behavior.
 
 For cross-vendor D3D11 handoff, record the adapter PCI vendor and driver
 version. Every vendor enables native immediate-context multithread protection,
-retains imported resources through the bounded completion-query queue, uses
-fast parameters for imported D3D11VA frames, and leaves successful per-frame
-submission asynchronous. Exercise ordinary H.264/NV12, HDR10/P010, and Dolby
-Vision when supported, including cold starts, a sustained run, repeated seeks,
-and close while playing. `decoder-copies` must remain zero because Dolby Vision
-samples the retained decoder array slice directly. Software frames and the
+uses fast parameters for imported D3D11VA frames, and leaves successful per-
+frame submission asynchronous. Exercise ordinary H.264/NV12, HDR10/P010, and
+Dolby Vision when supported, including cold starts, a sustained run, repeated
+seeks, and close while playing. In the default policy, `decoder-copies` must
+increase with successfully rendered hardware frames while CPU map/transfer
+counters remain zero. Also run the explicit direct decoder-texture policy as an
+A/B check: it must keep `decoder-copies` at zero and request shader-readable
+decoder resources. Record cadence and render-stage maxima for both policies;
+do not infer one vendor's performance from another. Software frames and the
 explicit software-mapping fallback retain their default render parameters.
 
 ## Diagnosing cadence and stalls

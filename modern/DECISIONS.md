@@ -945,3 +945,102 @@ The libplacebo run reported `directPlanes=60`, `normalization=0`, and zero
 decoded-source CPU map, transfer, staging, or upload. Restoring the default
 disabled-workaround build then passed the complete connected OHOS regression,
 including opaque Vulkan sampling and Vulkan-to-OpenGL/software fallbacks.
+
+## AD-010: Windows copies the visible decoder region by default
+
+- Date: 2026-08-06
+- Status: Accepted; native cross-vendor regression is tracked in `PLAN.md`
+- Scope: Windows D3D11VA decoder-surface lifetime, libplacebo source wrapping,
+  post-seek cadence, deterministic shutdown, and direct-sampling policy
+- Supersedes: AD-006 item 4 and AD-007's default direct decoder-slice sampling;
+  native multithread protection, fast parameters, asynchronous submission, and
+  bounded completion lifetime remain accepted
+
+### Context
+
+Commit `bfdcf07` fixed an Intel Iris Xe performance regression by caching the
+RTV and two decoder-plane SRVs created by `pl_d3d11_wrap()`. That removed per-
+frame view destruction from the D3D11 runtime deletion pool. On the recorded
+NVIDIA RTX 3050, however, `legend.mkv` could settle at 25 fps after a seek to
+22:48 and then stop permanently. The video decode worker was mapped exactly to
+FFmpeg's `ff_dxva2_common_end_frame()` call to
+`ID3D11VideoContext::DecoderBeginFrame`, ending in the NVIDIA user-mode
+driver's CPU wait. Because decode still owned the reservation-aware shared
+immediate-context lock, the output worker accumulated handoff timeouts, audio
+entered buffering, and ordered WinUI shutdown waited for the blocked decoder.
+
+Repair-oriented A/B tests isolated resource-view lifetime:
+
+1. Increasing FFmpeg's extra D3D11VA surfaces from 4 to 32 delayed reuse but
+   still reached persistent context timeouts.
+2. Draining renderer state during seek initially recovered, then failed again
+   as the active decoder slices continued to cycle.
+3. Returning decoder-plane wrappers to transient completion-query lifetime
+   sustained the exact seek scene for 90 seconds and closed in 128 ms.
+4. Restoring the persistent wrappers and calling D3D11.1 `DiscardView` after
+   completion reproduced the permanent stall after about 28 seconds.
+
+The root cause is retained shader views on reusable decoder-array slices, not
+seek queue flushing, surface count, stale pixels, `Present()` backpressure, or
+Player shutdown ordering. The close hang is downstream: stopping correctly
+waits for a decoder operation that cannot be interrupted after it enters the
+driver.
+
+The legacy QtAV path does not shader-sample decoder output directly; it feeds
+an `ID3D11VideoProcessorInputView` into a separate output texture. mpv also
+defaults to a GPU-to-GPU copy from a D3D11VA decoder surface to a shader
+resource, copying only the even-aligned visible rectangle with
+`CopySubresourceRegion1()` and `D3D11_COPY_DISCARD`. mpv exposes direct decoder
+sampling only as an opt-in and warns that D3D11 does not guarantee this use.
+
+### Decision
+
+1. Decoder arrays do not request `D3D11_BIND_SHADER_RESOURCE` by default.
+   `InteropD3D11` validates and retains the exact same-device raw NV12/P010
+   decoder slice without submitting a conversion.
+2. `RenderD3D11` copies only the even-aligned visible rectangle into a bounded
+   three-entry, same-format, shader-readable NV12/P010 ring. D3D11.1 uses
+   `CopySubresourceRegion1()` with `D3D11_COPY_DISCARD`; a compatibility context
+   uses `CopySubresourceRegion()` with the identical box.
+3. Persistent libplacebo plane wrappers belong only to ordinary ring textures.
+   The decoder frame can be released after the ordered copy and draw commands
+   are submitted; the selected ring entry, borrowed target, and completion
+   query remain alive until GPU completion.
+4. The copy and libplacebo draw remain asynchronous on the natively protected,
+   reservation-aware immediate context. Successful frames retain fast render
+   parameters and add no per-frame `pl_gpu_finish()`.
+5. Raw luma/chroma values and the exact FFmpeg Dolby Vision RPU reach
+   libplacebo before semantic color conversion. No CPU map, upload, Video
+   Processor RGB conversion, or cross-device copy is introduced.
+6. Direct decoder-texture sampling remains available only when both decoder and
+   renderer opt in. It requests shader-readable decoder arrays, uses transient
+   decoder-plane wrappers, retains the decoder frame through completion, and
+   reports zero `decoderSurfaceCopies`. The high-level output configures both
+   ends with one option.
+7. `HardwareInteropCapabilities::zeroCopy` continues to describe that the
+   interop can expose a direct path; it does not mean the renderer selected it.
+   `decoderSurfaceCopies` is the runtime evidence: it increments once per
+   submitted raw frame in the default policy and remains zero in direct mode.
+
+### Consequences
+
+- The default avoids shader views on decoder-array slices and returns scarce
+  decoder surfaces after submission instead of after draw completion.
+- The cost is one device-local raw visible-region copy per submitted hardware
+  frame. Decoder padding is not copied and the discard flag permits the driver
+  to avoid preserving prior destination contents.
+- Intel keeps persistent luma/chroma views on a three-texture ordinary-resource
+  ring, so the repair does not restore per-frame SRV creation/destruction churn.
+- Direct mode is useful for controlled performance A/B testing, but is not
+  automatically selected by vendor and retains its documented seek, shutdown,
+  padding, and driver-compatibility risk.
+- Static/shared CTest, WinUI Release, repeated NVIDIA seek/close, and same-build
+  AMD and Intel cadence runs are acceptance gates recorded in `PLAN.md`.
+
+### Primary references
+
+- [Microsoft D3D11 decoder surface allocation and release](https://learn.microsoft.com/en-us/windows/win32/medfound/supporting-direct3d-11-video-decoding-in-media-foundation)
+- [Microsoft `CopySubresourceRegion1`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11_1/nf-d3d11_1-id3d11devicecontext1-copysubresourceregion1)
+- [Microsoft D3D11 copy flags](https://learn.microsoft.com/en-us/windows/win32/api/d3d11_1/ne-d3d11_1-d3d11_copy_flags)
+- [mpv D3D11VA hardware interop](https://github.com/mpv-player/mpv/blob/master/video/out/d3d11/hwdec_d3d11va.c)
+- [mpv `d3d11va-zero-copy` option](https://github.com/mpv-player/mpv/blob/master/DOCS/man/options.rst#d3d11va-zero-copyyesno)

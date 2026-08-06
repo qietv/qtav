@@ -18,6 +18,7 @@ remain with a link to their replacement.
 | [ADR-007](#adr-007-coalesce-progress-interaction-into-one-asynchronous-seek) | Coalesce progress interaction into one asynchronous seek | Accepted |
 | [ADR-008](#adr-008-use-opaque-rgb10pq-video-presentation) | Use opaque RGB10/PQ video presentation | Accepted |
 | [ADR-009](#adr-009-retry-transient-render-contention-with-bounded-context-handoff) | Retry transient render contention with bounded context handoff | Accepted |
+| [ADR-010](#adr-010-copy-the-visible-decoder-region-by-default) | Copy the visible decoder region by default | Accepted |
 
 ## ADR-001: Unpackaged, self-contained WinUI 3 application
 
@@ -319,3 +320,38 @@ are no longer reported as missing frames.
 - The same-build Intel performance regression remains required; this decision
   corrects generic retry semantics but does not claim cross-device performance
   equivalence.
+
+## ADR-010: Copy the visible decoder region by default
+
+- **Status:** Accepted
+- **Date:** 2026-08-06
+
+### Context
+
+Directly sampling an FFmpeg D3D11VA texture array removes one GPU-local copy,
+but forces shader-resource usage onto decoder allocations and retains scarce
+decoder slices until the asynchronous draw completes. The policy is sensitive
+to driver handling of decoder padding, seek/flush lifetime, and shutdown.
+mpv's current D3D11VA backend uses a visible-region same-format copy by default
+and exposes direct sampling only as a user opt-in with compatibility warnings.
+
+### Decision
+
+The example keeps `D3D11VideoOutputOptions::directDecoderTextureSampling`
+disabled. QtAVCore copies the even-aligned visible NV12/P010 rectangle into a
+bounded three-entry shader-readable ring. A D3D11.1 context uses
+`CopySubresourceRegion1()` with `D3D11_COPY_DISCARD`; the fallback uses the same
+source box without the flag. The source stays raw, so libplacebo remains the
+only Dolby Vision and color authority. No CPU map, RGB intermediate, Video
+Processor conversion, or per-frame GPU drain is introduced.
+
+### Consequences
+
+- The default path incurs one same-device GPU copy per rendered hardware frame
+  and reports it in `decoder-copies`.
+- Decoder textures return to FFmpeg after ordered copy/draw submission instead
+  of remaining retained through GPU completion.
+- Advanced applications can opt into direct sampling for an A/B performance
+  test, but must accept the documented driver/lifetime risks.
+- NVIDIA, AMD, and Intel regression must cover cold start, sustained cadence,
+  repeated seek, media replacement, and close while playing for this policy.
