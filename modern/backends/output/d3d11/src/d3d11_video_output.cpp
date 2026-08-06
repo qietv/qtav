@@ -157,6 +157,8 @@ public:
         std::atomic<std::uint64_t> coalescedRenderRequests { 0 };
         std::atomic<std::uint64_t> renderPasses { 0 };
         std::atomic<std::uint64_t> presentedFrames { 0 };
+        std::atomic<std::uint64_t> presentationCapacityWaits { 0 };
+        std::atomic<std::uint64_t> presentationCapacityTimeouts { 0 };
         std::atomic<std::uint64_t> busyPresents { 0 };
         std::atomic<std::uint64_t> noFrameRenderAttempts { 0 };
         std::atomic<std::uint64_t> playerBusyRenderAttempts { 0 };
@@ -182,6 +184,8 @@ public:
         std::atomic<std::int64_t> maximumRenderGapMicroseconds { 0 };
         std::atomic<std::int64_t> maximumRenderMicroseconds { 0 };
         std::atomic<std::int64_t> maximumPresentMicroseconds { 0 };
+        std::atomic<std::int64_t>
+            maximumPresentationCapacityWaitMicroseconds { 0 };
         std::atomic<std::int64_t> maximumColorSetupMicroseconds { 0 };
         std::atomic<std::int64_t> maximumInteropMicroseconds { 0 };
         std::atomic<std::int64_t> maximumBufferUpdateMicroseconds { 0 };
@@ -628,6 +632,10 @@ public:
             state->coalescedRenderRequests.exchange(0);
         result.renderPasses = state->renderPasses.exchange(0);
         result.presentedFrames = state->presentedFrames.exchange(0);
+        result.presentationCapacityWaits =
+            state->presentationCapacityWaits.exchange(0);
+        result.presentationCapacityTimeouts =
+            state->presentationCapacityTimeouts.exchange(0);
         result.busyPresents = state->busyPresents.exchange(0);
         result.noFrameRenderAttempts =
             state->noFrameRenderAttempts.exchange(0);
@@ -666,6 +674,8 @@ public:
             state->maximumRenderMicroseconds.exchange(0);
         result.maximumPresentMicroseconds =
             state->maximumPresentMicroseconds.exchange(0);
+        result.maximumPresentationCapacityWaitMicroseconds =
+            state->maximumPresentationCapacityWaitMicroseconds.exchange(0);
         result.maximumColorSetupMicroseconds =
             state->maximumColorSetupMicroseconds.exchange(0);
         result.maximumInteropMicroseconds =
@@ -1002,16 +1012,27 @@ private:
 
             if (frameLatencyWaitableObject_
                 && waitForPresentationCapacity) {
+                state->presentationCapacityWaits.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                const auto capacityWaitStarted = steadyMicroseconds();
                 const DWORD waitStatus = WaitForSingleObjectEx(
                     frameLatencyWaitableObject_,
                     frameLatencyWaitMilliseconds,
                     FALSE);
+                updateMaximum(
+                    state->maximumPresentationCapacityWaitMicroseconds,
+                    steadyMicroseconds() - capacityWaitStarted);
                 if (waitStatus == WAIT_TIMEOUT) {
-                    state->busyPresents.fetch_add(
+                    state->presentationCapacityTimeouts.fetch_add(
                         1,
                         std::memory_order_relaxed);
-                    requestRender(state);
-                    continue;
+                    // A delayed waitable-object signal is not proof that the
+                    // composition swap chain lacks capacity. In particular,
+                    // Intel 4K HDR paths can return from this bounded wait late
+                    // even though the following nonblocking Present succeeds.
+                    // Continue the pass and let Present provide the definitive
+                    // backpressure result instead of dropping this redraw.
                 }
                 if (waitStatus == WAIT_FAILED) {
                     setError(

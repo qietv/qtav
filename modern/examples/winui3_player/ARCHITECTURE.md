@@ -180,7 +180,12 @@ resets output counters. Important interpretations are:
   decode, clock, or Player presentation scheduling;
 - normal scheduled cadence with low rendered cadence points at render
   contention, surface state, or the graphics driver;
-- `present-busy` means non-blocking `Present()` found compositor backpressure;
+- `capacity-wait(timeout)` reports waits on the swap chain's frame-latency
+  handle and how many exhausted the bounded wait; `max-capacity-wait-ms`
+  reports the longest wait. A timeout is diagnostic only: the render pass
+  continues and non-blocking `Present()` makes the final capacity decision;
+- `present-busy` means non-blocking `Present()` itself returned
+  `DXGI_ERROR_WAS_STILL_DRAWING`;
 - `decoder-copies` is a retained compatibility counter and remains zero while
   the renderer samples Dolby Vision decoder slices directly;
 - `coalesced` means multiple redraw notifications were intentionally combined;

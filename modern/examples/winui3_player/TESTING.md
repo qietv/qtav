@@ -99,8 +99,12 @@ Interpret the main fields together:
   surface loss, compositor backpressure, or a D3D11 driver stage.
 - Growing `coalesced` means the output receives redraws faster than it can
   service them; occasional coalescing is expected under pressure.
-- `present-busy` shows non-blocking swap-chain backpressure. Correlate it with
-  render gaps rather than treating any nonzero count as a failure.
+- `capacity-wait(timeout)` shows waits on the frame-latency handle and the
+  subset that exhausted the bounded wait. Correlate repeated timeouts and
+  `max-capacity-wait-ms` with render gaps. A timeout no longer skips a render
+  pass; non-blocking `Present()` remains the authoritative capacity check.
+- `present-busy` counts only non-blocking `Present()` calls that returned
+  `DXGI_ERROR_WAS_STILL_DRAWING`; it no longer includes capacity-wait timeouts.
 - `no-frame/player-busy/renderer-busy` classifies unsuccessful render attempts;
   `renderer-busy(state/serialize/context/in-flight)` identifies the backend
   lock or capacity involved.
@@ -123,6 +127,18 @@ Interpret the main fields together:
 - High `>80ms gaps(video/render)` with low CPU can indicate blocking I/O, clock
   starvation, driver waits, or a queue/lifetime bug rather than insufficient
   decode throughput.
+
+The repository libplacebo package also has an opt-in Windows D3D11 probe for a
+slow `pl_render_image()` pass. Set
+`QTAV_LIBPLACEBO_D3D11_DIAGNOSTICS=C:\QtAVTraces\libplacebo-d3d11.log` before
+starting the player. Calls taking at least 0.5 ms are appended with the process,
+thread, stage, and CPU duration; covered stages include timer query/start/end,
+dynamic stream-buffer map/unmap, state binding, draw, unbinding, message-queue
+drain, and total raster/pass execution. No log file is created when no covered
+call crosses the threshold. `QTAV_LIBPLACEBO_D3D11_DISABLE_TIMERS=1` is a
+diagnostic A/B that disables only libplacebo's D3D11 timer queries for a newly
+created GPU; it is not a supported playback mode or a production workaround.
+Leave both variables unset for ordinary validation.
 
 For audio noise, also test another output endpoint and a local copy of the same
 media. Determine whether the problem follows the stream, network path, format

@@ -1239,8 +1239,10 @@ render thread, HDR policy, or presentation loop in application code.
 
 The composition output caps DXGI frame latency at one, uses non-blocking
 `Present()` and a bounded waitable-object wait on its private render thread,
-and retries when the compositor is busy. It never waits for presentation
-capacity on the UI thread. Retryable Player/backend contention enters a
+and retries when the compositor is busy. A waitable-object timeout is recorded
+but does not suppress the render pass; the following non-blocking `Present()`
+is the authoritative capacity check. It never waits for presentation capacity
+on the UI thread. Retryable Player/backend contention enters a
 latest-frame mailbox rather than becoming an immediate drop. A newer frame
 supersedes an older pending frame. Before each output pass makes its first
 non-blocking D3D11 context attempt, it creates a render-thread reservation. An
@@ -1250,14 +1252,16 @@ retry mailbox and bounded 1/2/4/8/16 ms backoff. There is no busy spin and the
 WinUI thread does not wait for this exchange.
 
 `takeStatistics()` returns and resets render requests/passes, presented frames,
-coalesced requests, busy presents, reason-level no-frame/Player/renderer-busy
-attempts, retry wakeups, superseded and terminal frames, renderer lock-stage
-contention, reservation-aware versus unreserved context ownership, handoff
-waits/timeouts, the retained decoder-surface-copy diagnostic counter, long
-gaps, render/present maxima, and the renderer's color, interop, buffer-update,
-and draw-stage maxima. Detailed D3D11 fields split completion-query retirement
-and acquisition, render-target clear, `pl_render_image()`, completion `End()`,
-and retained-resource insertion. They also expose libplacebo pass count and
+coalesced requests, frame-latency capacity waits/timeouts and their maximum
+duration, non-blocking `Present()` busy results, reason-level
+no-frame/Player/renderer-busy attempts, retry wakeups, superseded and terminal
+frames, renderer lock-stage contention, reservation-aware versus unreserved
+context ownership, handoff waits/timeouts, the retained decoder-surface-copy
+diagnostic counter, long gaps, render/present maxima, and the renderer's color,
+interop, buffer-update, and draw-stage maxima. Detailed D3D11 fields split
+completion-query retirement and acquisition, render-target clear,
+`pl_render_image()`, completion `End()`, and retained-resource insertion. They
+also expose libplacebo pass count and
 pass-graph changes plus asynchronous rolling GPU pass/frame samples and CPU
 callback boundaries. The GPU samples may describe an earlier completed pass,
 so they correlate CPU and GPU behavior over an interval rather than identifying

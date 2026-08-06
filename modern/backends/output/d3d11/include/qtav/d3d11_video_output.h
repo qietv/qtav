@@ -124,6 +124,14 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
     std::int64_t maximumRenderGapMicroseconds = 0;
     std::int64_t maximumRenderMicroseconds = 0;
     std::int64_t maximumPresentMicroseconds = 0;
+    // A capacity wait follows a successful or busy Present when the flip-model
+    // swap chain exposes a frame-latency waitable object. A bounded timeout is
+    // recorded but does not veto the render pass; nonblocking Present() remains
+    // the authoritative backpressure check. busyPresents counts only
+    // DXGI_ERROR_WAS_STILL_DRAWING returned by Present().
+    std::uint64_t presentationCapacityWaits = 0;
+    std::uint64_t presentationCapacityTimeouts = 0;
+    std::int64_t maximumPresentationCapacityWaitMicroseconds = 0;
     std::uint64_t busyPresents = 0;
     // Compatibility mirror of terminalRenderDrops. Recovered retry attempts
     // are not skipped renders.

@@ -152,6 +152,12 @@ int main(int argc, char** argv)
     assert(busyStatistics.retryWakeups > 0);
     assert(busyStatistics.contextHandoffWaits > 0);
     assert(busyStatistics.contextHandoffTimeouts > 0);
+    // WARP does not create a frame-latency waitable object. Keep the new
+    // capacity diagnostics distinct from renderer/context contention.
+    assert(busyStatistics.presentationCapacityWaits == 0);
+    assert(busyStatistics.presentationCapacityTimeouts == 0);
+    assert(
+        busyStatistics.maximumPresentationCapacityWaitMicroseconds == 0);
     assert(busyStatistics.skippedRenders == 0);
     assert(busyStatistics.terminalRenderDrops == 0);
 

@@ -827,6 +827,10 @@ struct MainWindowPrivate final {
             outputStatistics.coalescedRenderRequests;
         const auto passes = outputStatistics.renderPasses;
         const auto rendered = outputStatistics.presentedFrames;
+        const auto presentationCapacityWaits =
+            outputStatistics.presentationCapacityWaits;
+        const auto presentationCapacityTimeouts =
+            outputStatistics.presentationCapacityTimeouts;
         const auto busyPresents = outputStatistics.busyPresents;
         const auto skippedRenders = outputStatistics.skippedRenders;
         const auto noFrameRenders =
@@ -870,6 +874,8 @@ struct MainWindowPrivate final {
             outputStatistics.maximumRenderMicroseconds;
         const auto maximumPresent =
             outputStatistics.maximumPresentMicroseconds;
+        const auto maximumPresentationCapacityWait =
+            outputStatistics.maximumPresentationCapacityWaitMicroseconds;
         const auto maximumColorSetup =
             outputStatistics.maximumColorSetupMicroseconds;
         const auto maximumInterop =
@@ -917,6 +923,8 @@ struct MainWindowPrivate final {
             << L", passes=" << passes
             << L", rendered=" << static_cast<double>(rendered) / elapsed
             << L" fps, coalesced=" << coalesced
+            << L", capacity-wait(timeout)=" << presentationCapacityWaits
+            << L'(' << presentationCapacityTimeouts << L')'
             << L", present-busy=" << busyPresents
             << L", render-skipped=" << skippedRenders
             << L" (no-frame/player-busy/renderer-busy="
@@ -945,6 +953,8 @@ struct MainWindowPrivate final {
             << static_cast<double>(maximumRender) / 1'000.0
             << L'/'
             << static_cast<double>(maximumPresent) / 1'000.0
+            << L", max-capacity-wait-ms="
+            << static_cast<double>(maximumPresentationCapacityWait) / 1'000.0
             << L", max-stage-ms(color/interop/buffer/draw)="
             << static_cast<double>(maximumColorSetup) / 1'000.0
             << L'/'

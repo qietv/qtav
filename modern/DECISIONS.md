@@ -392,8 +392,9 @@ look like a process leak.
    after seek must not replace the frame that is about to be displayed.
 3. `D3D11VideoOutput` owns presentation on its private render thread, caps
    flip-model frame latency at one, coalesces redraws, and uses non-blocking
-   `Present()` plus bounded waitable-object backpressure when available before
-   retrying.
+   `Present()` plus a bounded waitable-object throttle when available. A
+   throttle timeout is diagnostic rather than a dropped render pass;
+   non-blocking `Present()` remains the authoritative backpressure result.
 4. A hardware-frame import remains alive through libplacebo draw-command
    submission and is retained by the renderer's bounded GPU-completion queue.
    AD-007 requires native immediate-context multithread protection and keeps
@@ -403,9 +404,10 @@ look like a process leak.
    texture pool. Per-frame libplacebo wrappers are released after submission;
    libplacebo's renderer owns its bounded reusable shader/render caches and
    teardown performs the only explicit GPU drain.
-6. Retry attempts, terminal drops, compositor-busy presents, and maximum render
-   stage durations are counted without per-frame logging. AD-008 defines the
-   reason-level counters and compatibility `skippedRenders` semantics.
+6. Retry attempts, terminal drops, capacity waits/timeouts, compositor-busy
+   presents, and maximum render stage durations are counted without per-frame
+   logging. AD-008 defines the reason-level counters and compatibility
+   `skippedRenders` semantics.
 
 ### Consequences
 

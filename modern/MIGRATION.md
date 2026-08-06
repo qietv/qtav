@@ -266,7 +266,9 @@ failures, keeps only the latest pending frame, and retries on its private
 thread. For immediate-context contention it reserves priority over new
 FFmpeg-side acquisitions, performs an immediate bounded handoff wait, and only
 then applies bounded backoff; recovered retries are not counted as terminal
-drops.
+drops. Its bounded frame-latency wait is a throttle, not a render veto: a
+timeout is exposed through `D3D11VideoOutputStatistics`, then the pass continues
+and non-blocking `Present()` decides whether compositor backpressure is real.
 
 Opaque video players may additionally select
 `D3D11HdrPresentationMode::HDR10` and `DXGI_ALPHA_MODE_IGNORE` in
