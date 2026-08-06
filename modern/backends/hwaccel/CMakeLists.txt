@@ -1,2 +1,3 @@
 qtav_add_optional_backend(QTAV_HW_D3D11VA qtav_hw_d3d11va d3d11va)
 qtav_add_optional_backend(QTAV_HW_MEDIACODEC qtav_hw_mediacodec mediacodec)
+qtav_add_optional_backend(QTAV_HW_OHCODEC qtav_hw_ohcodec ohcodec)

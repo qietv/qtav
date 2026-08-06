@@ -11,17 +11,18 @@ endif()
 find_package(PkgConfig QUIET)
 
 # The vcpkg FFmpeg wrapper selects its host pkgconf executable only after this
-# find module returns. On a fresh Windows static-package configure, that is too
-# late to populate the imported targets with FFmpeg's transitive dependency
-# closure. Bootstrap the one host pkgconf shipped beside the target prefix so
-# the first configure has the same link interface as subsequent configures.
+# find module returns. On a fresh Windows-native or Windows-hosted OHOS
+# configure, that is too late to populate the imported targets with FFmpeg's
+# transitive dependency closure. Bootstrap the one host pkgconf shipped beside
+# the target prefix so the first configure has the same link interface as
+# subsequent configures.
 if(NOT PkgConfig_FOUND
-   AND WIN32
    AND DEFINED VCPKG_INSTALLED_DIR
    AND NOT VCPKG_INSTALLED_DIR STREQUAL "")
     file(
         GLOB _ffmpeg_vcpkg_pkgconf_candidates
         LIST_DIRECTORIES FALSE
+        "${VCPKG_INSTALLED_DIR}/*/tools/pkgconf/pkgconf"
         "${VCPKG_INSTALLED_DIR}/*/tools/pkgconf/pkgconf.exe"
     )
     list(LENGTH _ffmpeg_vcpkg_pkgconf_candidates

@@ -1,0 +1,37 @@
+Device: HUAWEI Mate 60 Pro ALN-AL80 / Maleoon 910
+System: HarmonyOS 6.1.0.135 / OpenHarmony 6.1.1.120 / API 24
+Date: 2026-08-06
+libplacebo: 7.351.0
+
+Diagnostic mapping:
+  queried VkFormat = VK_FORMAT_UNDEFINED
+  externalFormat 1000156003 -> forced
+    VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
+  externalFormat 1000156013 -> forced
+    VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
+
+The forced modes deliberately omit VkExternalFormatOHOS from
+VkImageCreateInfo::pNext. VkImageCreateInfo::format is set to the mapped
+explicit VkFormat, while VkExternalMemoryImageCreateInfo still declares
+VK_EXTERNAL_MEMORY_HANDLE_TYPE_OH_NATIVE_BUFFER_BIT_OHOS.
+
+Stage 1 - forced VkFormat, application-owned Vulkan YCbCr shader:
+QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS mode=forced-vkformat-native codecs=h264,hevc h264Rendered=30 hevcRendered=30 acquired=60 imported=60 directPlanes=0 opaqueImports=60 forcedVkFormatImports=60 forcedNativeSamples=60 forcedLibplacebo=0 codecQueued=60 availableCallbacks=60 acquireFences=0 releasedAfterGpu=59 nativeFormat=35 vkFormat=0 forcedVkFormat=1000156013 externalFormat=1000156013 exactQueueMax=1 schedulerDrops=18 rendererDiscards=0 opaqueRejected=0 objectProbes=0 objectProbeSuccesses=0 unsupportedRejected=0 normalization=60 cpuMap=0 transfer=0 staging=0 upload=0
+
+Stage 2 - forced VkFormat, direct pl_vulkan_wrap/libplacebo rendering:
+QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS mode=forced-vkformat-libplacebo codecs=h264,hevc h264Rendered=30 hevcRendered=30 acquired=60 imported=60 directPlanes=60 opaqueImports=0 forcedVkFormatImports=60 forcedNativeSamples=0 forcedLibplacebo=60 codecQueued=60 availableCallbacks=60 acquireFences=0 releasedAfterGpu=59 nativeFormat=35 vkFormat=0 forcedVkFormat=1000156013 externalFormat=1000156013 exactQueueMax=1 schedulerDrops=19 rendererDiscards=0 opaqueRejected=0 objectProbes=0 objectProbeSuccesses=0 unsupportedRejected=0 normalization=0 cpuMap=0 transfer=0 staging=0 upload=0
+
+Both stages used the generated H.264/NV12 fixture for the first 30 frames and
+an HEVC Main10/yuv420p10le fixture for the final 30 frames. The last reported
+format is therefore P010. At each marker, the playback callback still owns the
+most recent frame; the other 59 buffers have been returned after GPU
+completion, and the final retained buffer is returned when the callback
+unwinds during teardown.
+
+Conclusion:
+  - the forced explicit NV12/P010 VkImages can be imported and shader-sampled;
+  - libplacebo 7.351.0 accepts both explicit multi-planar formats and renders
+    them without the RGBA16F source-normalization pass;
+  - this proves device behavior, not that an implementation-defined
+    externalFormat-to-VkFormat numeric mapping is a portable or documented
+    application contract.

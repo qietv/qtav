@@ -25,8 +25,7 @@
 namespace qtav {
 namespace {
 
-constexpr char NormalizeVertexShader[] = R"qtav(
-#version 300 es
+constexpr char NormalizeVertexShader[] = R"qtav(#version 300 es
 
 out vec2 textureCoordinate;
 
@@ -45,8 +44,7 @@ void main()
 }
 )qtav";
 
-constexpr char NormalizeFragmentShader[] = R"qtav(
-#version 300 es
+constexpr char RawNormalizeFragmentShader[] = R"qtav(#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 #extension GL_EXT_YUV_target : require
 
@@ -361,7 +359,7 @@ GLuint compileShader(GLenum type, const char* source, std::string& error)
 {
     const GLuint shader = glCreateShader(type);
     if (!shader) {
-        error = "glCreateShader(raw external normalization) failed";
+        error = "glCreateShader(external-image normalization) failed";
         return 0;
     }
     glShaderSource(shader, 1, &source, nullptr);
@@ -369,7 +367,7 @@ GLuint compileShader(GLenum type, const char* source, std::string& error)
     GLint compiled = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
     if (compiled != GL_TRUE) {
-        error = "Raw external normalization shader compilation failed: "
+        error = "External-image normalization shader compilation failed: "
             + shaderLog(shader, false);
         glDeleteShader(shader);
         return 0;
@@ -513,7 +511,7 @@ private:
                 extensions,
                 "GL_OES_EGL_image_external_essl3")) {
             error =
-                "Raw AHardwareBuffer Y/Cb/Cr normalization requires GL_EXT_YUV_target and GL_OES_EGL_image_external_essl3";
+                "Raw external Y/Cb/Cr normalization requires GL_EXT_YUV_target and GL_OES_EGL_image_external_essl3";
             return false;
         }
         if (!hasExtension(extensions, "GL_EXT_color_buffer_float")
@@ -521,7 +519,7 @@ private:
                 extensions,
                 "GL_EXT_color_buffer_half_float")) {
             error =
-                "Raw AHardwareBuffer normalization requires a renderable RGBA16F texture";
+                "Raw external Y/Cb/Cr normalization requires a renderable RGBA16F texture";
             return false;
         }
         std::string shaderError;
@@ -535,7 +533,7 @@ private:
         }
         const GLuint fragment = compileShader(
             GL_FRAGMENT_SHADER,
-            NormalizeFragmentShader,
+            RawNormalizeFragmentShader,
             shaderError);
         if (!fragment) {
             glDeleteShader(vertex);
@@ -550,13 +548,13 @@ private:
             GLint linked = GL_FALSE;
             glGetProgramiv(program_, GL_LINK_STATUS, &linked);
             if (linked != GL_TRUE) {
-                error = "Raw external normalization program link failed: "
+                error = "External-image normalization program link failed: "
                     + shaderLog(program_, true);
                 glDeleteProgram(program_);
                 program_ = 0;
             }
         } else {
-            error = "glCreateProgram(raw external normalization) failed";
+            error = "glCreateProgram(external-image normalization) failed";
         }
         glDeleteShader(fragment);
         glDeleteShader(vertex);
@@ -571,16 +569,24 @@ private:
             program_,
             "externalTransform");
         if (sampler < 0 || transform_ < 0) {
-            error = "Raw external normalization uniforms are unavailable";
+            error = "External-image normalization uniforms are unavailable";
+            destroy();
             return false;
         }
         glUniform1i(sampler, 0);
         glGenVertexArrays(1, &vertexArray_);
         if (!vertexArray_) {
-            error = "Raw external normalization VAO creation failed";
+            error = "External-image normalization VAO creation failed";
+            destroy();
             return false;
         }
-        return checkError("Raw external normalization program", error);
+        if (!checkError(
+                "External-image normalization program",
+                error)) {
+            destroy();
+            return false;
+        }
+        return true;
     }
 
     bool ensure(int width, int height, std::string& error)
@@ -628,6 +634,14 @@ private:
                 != GL_FRAMEBUFFER_COMPLETE) {
             error =
                 "The raw Y/Cb/Cr RGBA16F normalization target is incomplete";
+            if (framebuffer_) {
+                glDeleteFramebuffers(1, &framebuffer_);
+                framebuffer_ = 0;
+            }
+            if (texture_) {
+                glDeleteTextures(1, &texture_);
+                texture_ = 0;
+            }
             return false;
         }
         width_ = width;
@@ -716,6 +730,12 @@ bool OpenGLHardwareFrameInterop::releaseFrame(
     return true;
 }
 
+bool OpenGLHardwareFrameInterop::initializeCurrentContext(
+    std::string&)
+{
+    return true;
+}
+
 OpenGLHardwareFrameInterop::~OpenGLHardwareFrameInterop() = default;
 
 class OpenGLVideoRenderer::Impl {
@@ -751,7 +771,10 @@ public:
         }
         auto* self = static_cast<Impl*>(privateData);
         std::lock_guard<std::mutex> lock(self->logMutex_);
-        self->lastLogError_ = message;
+        if (!self->lastLogError_.empty()) {
+            self->lastLogError_ += " | ";
+        }
+        self->lastLogError_ += message;
     }
 
     std::string takeLogError(std::string fallback)
@@ -792,6 +815,15 @@ public:
         if (!version || major < 3) {
             error =
                 "The libplacebo OpenGL renderer requires a current OpenGL ES 3.x context";
+            return false;
+        }
+        if (hardwareInterop_
+            && !hardwareInterop_->initializeCurrentContext(error)) {
+            hardwareInterop_->releaseCurrentContextResources();
+            if (error.empty()) {
+                error =
+                    "The OpenGL ES hardware interop could not initialize its current-context resources";
+            }
             return false;
         }
         pl_log_params logParams {};
@@ -837,14 +869,14 @@ public:
 
     void destroyResources() noexcept
     {
+        if (openGL_) {
+            pl_gpu_finish(openGL_->gpu);
+        }
         if (hardwareInterop_) {
             hardwareInterop_->releaseCurrentContextResources();
         }
         preparedHardware_ = {};
         preparedKey_ = {};
-        if (openGL_) {
-            pl_gpu_finish(openGL_->gpu);
-        }
         normalizer_.destroy();
         for (pl_tex& texture : uploadTextures_) {
             if (texture && openGL_) {
@@ -961,7 +993,7 @@ public:
             internalFormat = GL_RGBA16F;
         } else if (hasDovi) {
             error =
-                "Dolby Vision requires the raw AHardwareBuffer Y/Cb/Cr OpenGL import path";
+                "Dolby Vision requires the raw external Y/Cb/Cr OpenGL import path";
             return false;
         }
         pl_opengl_wrap_params wrapParams {};
@@ -1177,10 +1209,15 @@ bool OpenGLVideoRenderer::configure(const VideoRenderConfig& config)
     return configured;
 }
 
-bool OpenGLVideoRenderer::render(const VideoFrame& frame)
+VideoRenderAttemptResult OpenGLVideoRenderer::renderDetailed(
+    const VideoFrame& frame)
 {
     if (!impl_ || !frame) {
-        return false;
+        return {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            "The OpenGL ES renderer received an invalid frame",
+        };
     }
     std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
     VideoRenderConfig config;
@@ -1197,26 +1234,27 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
         }
     }
     if (!config.surfaceSize.isValid()) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The OpenGL ES renderer is not open");
-        return false;
+        const std::string detail = "The OpenGL ES renderer is not open";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
     const OpenGLRenderTarget nativeTarget = currentTarget
         ? currentTarget()
         : OpenGLRenderTarget {};
     if (!nativeTarget.isValid()) {
+        const std::string detail =
+            "The current OpenGL ES target is unavailable";
         impl_->notify(
             VideoRenderEventType::SurfaceLost,
-            "The current OpenGL ES target is unavailable");
-        return false;
+            detail);
+        return { VideoRenderAttemptStatus::SurfaceLost, 0, detail };
     }
     if (nativeTarget.size.width != config.surfaceSize.width
         || nativeTarget.size.height != config.surfaceSize.height) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The current OpenGL ES target size does not match the configured surface");
-        return false;
+        const std::string detail =
+            "The current OpenGL ES target size does not match the configured surface";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
 
     std::string error;
@@ -1228,11 +1266,20 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
                 impl_->prepareHardwareFrame(frame, error);
             if (status == OpenGLHardwareImportStatus::Pending
                 || status == OpenGLHardwareImportStatus::Stale) {
-                return false;
+                return {
+                    status == OpenGLHardwareImportStatus::Pending
+                        ? VideoRenderAttemptStatus::DeferredUntilRedraw
+                        : VideoRenderAttemptStatus::Discarded,
+                    0,
+                    error,
+                };
             }
             if (status != OpenGLHardwareImportStatus::Ready) {
-                impl_->notify(VideoRenderEventType::Error, std::move(error));
-                return false;
+                const std::string detail = error.empty()
+                    ? "The OpenGL ES hardware frame preparation failed"
+                    : error;
+                impl_->notify(VideoRenderEventType::Error, detail);
+                return { VideoRenderAttemptStatus::FatalError, 0, detail };
             }
         }
         external = impl_->preparedHardware_;
@@ -1254,8 +1301,8 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
                 error = std::move(releaseError);
             }
         }
-        impl_->notify(VideoRenderEventType::Error, std::move(error));
-        return false;
+        impl_->notify(VideoRenderEventType::Error, error);
+        return { VideoRenderAttemptStatus::FatalError, 0, error };
     }
 
     struct pl_frame image {};
@@ -1330,14 +1377,18 @@ bool OpenGLVideoRenderer::render(const VideoFrame& frame)
         impl_->preparedKey_ = {};
     }
     if (!rendered || !submitted || !presented || !error.empty()) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            error.empty()
-                ? "libplacebo OpenGL rendering failed"
-                : std::move(error));
-        return false;
+        const std::string detail = error.empty()
+            ? "libplacebo OpenGL rendering failed"
+            : error;
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
-    return true;
+    return { VideoRenderAttemptStatus::Presented, 0, {} };
+}
+
+bool OpenGLVideoRenderer::render(const VideoFrame& frame)
+{
+    return renderDetailed(frame).frameConsumed();
 }
 
 void OpenGLVideoRenderer::close() noexcept
@@ -1393,20 +1444,40 @@ void OpenGLVideoRenderer::setHardwareFrameInterop(
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
-    std::shared_ptr<OpenGLHardwareFrameInterop> previous;
+    std::string error;
     {
-        std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
-        previous = std::move(impl_->hardwareInterop_);
-        impl_->hardwareInterop_ = std::move(hardwareInterop);
+        std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+        std::shared_ptr<OpenGLHardwareFrameInterop> previous;
+        bool rendererOpen = false;
+        {
+            std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
+            previous = std::move(impl_->hardwareInterop_);
+            rendererOpen = impl_->open_;
+        }
+        if (previous) {
+            previous->setFrameAvailableCallback({});
+            previous->releaseCurrentContextResources();
+        }
+        if (hardwareInterop && rendererOpen
+            && !hardwareInterop->initializeCurrentContext(error)) {
+            hardwareInterop->releaseCurrentContextResources();
+            hardwareInterop.reset();
+            if (error.empty()) {
+                error =
+                    "The OpenGL ES hardware interop could not initialize its current-context resources";
+            }
+        }
+        {
+            std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
+            impl_->hardwareInterop_ = std::move(hardwareInterop);
+        }
+        impl_->preparedHardware_ = {};
+        impl_->preparedKey_ = {};
+        impl_->connectHardwareInterop();
     }
-    if (previous) {
-        previous->setFrameAvailableCallback({});
-        previous->releaseCurrentContextResources();
+    if (!error.empty()) {
+        impl_->notify(VideoRenderEventType::Error, std::move(error));
     }
-    impl_->preparedHardware_ = {};
-    impl_->preparedKey_ = {};
-    impl_->connectHardwareInterop();
 }
 
 std::shared_ptr<OpenGLHardwareFrameInterop>

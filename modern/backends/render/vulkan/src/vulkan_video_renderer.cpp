@@ -19,7 +19,7 @@
 #include "frame_internal.h"
 #include "qtav_libplacebo_ffmpeg_bridge.h"
 
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
 #include "external_normalize_frag_spv.inc"
 #include "external_normalize_vert_spv.inc"
 #endif
@@ -362,7 +362,7 @@ std::string vkResult(const char* operation, VkResult result)
         + std::to_string(static_cast<int>(result)) + ')';
 }
 
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
 class ExternalImageNormalizer {
 public:
     explicit ExternalImageNormalizer(BorrowedVulkanDevice device)
@@ -402,8 +402,8 @@ public:
             || !sourceSampler || width <= 0 || height <= 0) {
             error =
                 preserveYcbcr
-                ? "The Android external-format image cannot expose unconverted YCbCr for Dolby Vision"
-                : "The Android external-format image is incomplete";
+                ? "The external-format image cannot expose unconverted YCbCr for Dolby Vision"
+                : "The external-format image is incomplete";
             return false;
         }
         if (!ensure(source, sourceSampler, width, height, error)) {
@@ -412,7 +412,7 @@ public:
         const VulkanNormalizedSourceRect crop =
             source->normalizedSourceRect();
         if (!crop.isValid()) {
-            error = "The Android external-format image has an invalid crop";
+            error = "The external-format image has an invalid crop";
             return false;
         }
 
@@ -664,6 +664,7 @@ public:
         if (image_ && device_.queue) {
             vkQueueWaitIdle(device_.queue);
         }
+        destroy();
     }
 
 private:
@@ -1329,7 +1330,7 @@ public:
         : device_(device)
         , currentTarget_(std::move(currentTarget))
         , hardwareInterop_(std::move(hardwareInterop))
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
         , externalNormalizer_(device)
 #endif
     {
@@ -1468,7 +1469,7 @@ public:
         if (vulkan_) {
             pl_gpu_finish(vulkan_->gpu);
         }
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
         externalNormalizer_.finish();
 #endif
         retainedHardwareFrames_.clear();
@@ -1609,7 +1610,7 @@ public:
         const bool hasDovi = doviBitDepth != 0;
         externalNormalized = false;
         if (sourceFormat == VK_FORMAT_UNDEFINED) {
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
             if (!externalNormalizer_.convert(
                     imported,
                     source.width(),
@@ -1641,11 +1642,11 @@ public:
         wrapParams.height = sourceHeight;
         wrapParams.format = sourceFormat;
         wrapParams.usage = sourceUsage;
-        wrapParams.debug_tag = "QtAVCore MediaCodec source";
+        wrapParams.debug_tag = "QtAVCore hardware-decoder source";
         texture = pl_vulkan_wrap(vulkan_->gpu, &wrapParams);
         if (!texture) {
             error = takeLogError(
-                "libplacebo cannot wrap the imported MediaCodec image");
+                "libplacebo cannot wrap the imported hardware-decoder image");
             return false;
         }
         pl_vulkan_release_params release {};
@@ -1677,7 +1678,7 @@ public:
             initializePlane(frame.planes[2], texture->planes[2], 1, 2);
         } else {
             error =
-                "The imported MediaCodec Vulkan format has no libplacebo YUV plane mapping";
+                "The imported Vulkan hardware format has no libplacebo YUV plane mapping";
             return false;
         }
         const bool tenBit = sourceFormat
@@ -1774,7 +1775,7 @@ public:
         hold.semaphore.value = holdValue;
         if (!pl_vulkan_hold_ex(vulkan_->gpu, &hold)) {
             error = takeLogError(
-                "libplacebo could not release the MediaCodec image");
+                "libplacebo could not release the hardware-decoder image");
             return 0;
         }
         if (externalNormalized) {
@@ -1829,7 +1830,7 @@ public:
     VideoRenderConfig config_;
     VulkanCurrentTargetCallback currentTarget_;
     std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop_;
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
     ExternalImageNormalizer externalNormalizer_;
 #endif
     EventCallback eventCallback_;
@@ -1960,10 +1961,15 @@ bool VulkanVideoRenderer::configure(const VideoRenderConfig& config)
     return configured;
 }
 
-bool VulkanVideoRenderer::render(const VideoFrame& frame)
+VideoRenderAttemptResult VulkanVideoRenderer::renderDetailed(
+    const VideoFrame& frame)
 {
     if (!impl_ || !frame) {
-        return false;
+        return {
+            VideoRenderAttemptStatus::FatalError,
+            0,
+            "The Vulkan renderer received an invalid frame",
+        };
     }
     std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
     VideoRenderConfig config;
@@ -1978,8 +1984,9 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         }
     }
     if (!config.surfaceSize.isValid()) {
-        impl_->notify(VideoRenderEventType::Error, "The Vulkan renderer is not open");
-        return false;
+        const std::string detail = "The Vulkan renderer is not open";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
     impl_->retireCompletedHardwareFrames();
 
@@ -1991,39 +1998,53 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
             impl_->notify(
                 VideoRenderEventType::Error,
                 "The Vulkan renderer has no compatible interop for this hardware frame");
-            return false;
+            return {
+                VideoRenderAttemptStatus::FatalError,
+                0,
+                "The Vulkan renderer has no compatible interop for this hardware frame",
+            };
         }
         const VulkanHardwareImportStatus status =
             hardwareInterop->prepareFrame(frame, error);
         if (status == VulkanHardwareImportStatus::Pending) {
-            return false;
+            return {
+                VideoRenderAttemptStatus::DeferredUntilRedraw,
+                0,
+                error,
+            };
         }
         if (status != VulkanHardwareImportStatus::Ready) {
-            impl_->notify(
-                VideoRenderEventType::Error,
-                error.empty()
-                    ? "The Vulkan hardware frame preparation failed"
-                    : std::move(error));
-            return false;
+            const VideoRenderAttemptStatus attemptStatus =
+                status == VulkanHardwareImportStatus::Stale
+                ? VideoRenderAttemptStatus::Discarded
+                : VideoRenderAttemptStatus::FatalError;
+            const std::string detail = error.empty()
+                ? "The Vulkan hardware frame preparation failed"
+                : error;
+            if (attemptStatus == VideoRenderAttemptStatus::FatalError) {
+                impl_->notify(VideoRenderEventType::Error, detail);
+            }
+            return { attemptStatus, 0, detail };
         }
     }
 
     const VulkanRenderTarget nativeTarget =
         currentTarget ? currentTarget() : VulkanRenderTarget {};
     if (!nativeTarget.isValid()) {
+        const std::string detail = "The current Vulkan target is unavailable";
         impl_->notify(
             VideoRenderEventType::SurfaceLost,
-            "The current Vulkan target is unavailable");
-        return false;
+            detail);
+        return { VideoRenderAttemptStatus::SurfaceLost, 0, detail };
     }
     if (nativeTarget.extent.width
             != static_cast<std::uint32_t>(config.surfaceSize.width)
         || nativeTarget.extent.height
             != static_cast<std::uint32_t>(config.surfaceSize.height)) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            "The current Vulkan target extent does not match the configured surface");
-        return false;
+        const std::string detail =
+            "The current Vulkan target extent does not match the configured surface";
+        impl_->notify(VideoRenderEventType::Error, detail);
+        return { VideoRenderAttemptStatus::FatalError, 0, detail };
     }
 
     pl_tex targetTexture = nullptr;
@@ -2032,8 +2053,8 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         if (targetTexture) {
             pl_tex_destroy(impl_->vulkan_->gpu, &targetTexture);
         }
-        impl_->notify(VideoRenderEventType::Error, std::move(error));
-        return false;
+        impl_->notify(VideoRenderEventType::Error, error);
+        return { VideoRenderAttemptStatus::FatalError, 0, error };
     }
 
     pl_frame image {};
@@ -2042,19 +2063,29 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
     pl_dovi_metadata dovi {};
     bool externalNormalized = false;
     bool mappedSoftware = false;
+    VideoRenderAttemptStatus failureStatus =
+        VideoRenderAttemptStatus::FatalError;
     if (frame.hasHardwareFrame()) {
         VulkanHardwareImportResult importedResult =
             hardwareInterop->importFrame(frame);
         if (!importedResult) {
+            if (importedResult.status
+                == VulkanHardwareImportStatus::Pending) {
+                failureStatus =
+                    VideoRenderAttemptStatus::DeferredUntilRedraw;
+            } else if (importedResult.status
+                       == VulkanHardwareImportStatus::Stale) {
+                failureStatus = VideoRenderAttemptStatus::Discarded;
+            }
             error = importedResult.detail.empty()
                 ? "The prepared Vulkan hardware frame import failed"
                 : std::move(importedResult.detail);
         } else {
             imported = std::move(importedResult.texture);
-            if (imported->width() != frame.width()
-                || imported->height() != frame.height()) {
+            if (imported->width() < frame.width()
+                || imported->height() < frame.height()) {
                 error =
-                    "The imported Vulkan image dimensions do not match the decoded frame";
+                    "The imported Vulkan image is smaller than the decoded frame";
             } else {
                 impl_->wrapHardwareSource(
                     frame,
@@ -2136,14 +2167,23 @@ bool VulkanVideoRenderer::render(const VideoFrame& frame)
         impl_->retireCompletedHardwareFrames();
     }
     if (!rendered || !targetFinished) {
-        impl_->notify(
-            VideoRenderEventType::Error,
-            error.empty()
-                ? "libplacebo rendering failed"
-                : std::move(error));
-        return false;
+        if (!targetFinished) {
+            failureStatus = VideoRenderAttemptStatus::FatalError;
+        }
+        const std::string detail = error.empty()
+            ? "libplacebo rendering failed"
+            : error;
+        if (failureStatus == VideoRenderAttemptStatus::FatalError) {
+            impl_->notify(VideoRenderEventType::Error, detail);
+        }
+        return { failureStatus, 0, detail };
     }
-    return true;
+    return { VideoRenderAttemptStatus::Presented, 0, {} };
+}
+
+bool VulkanVideoRenderer::render(const VideoFrame& frame)
+{
+    return renderDetailed(frame).frameConsumed();
 }
 
 void VulkanVideoRenderer::close() noexcept

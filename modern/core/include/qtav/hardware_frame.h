@@ -17,6 +17,7 @@ enum class HardwareDeviceType {
     MediaCodec,
     OpenGL,
     Vulkan,
+    OHCodec,
 };
 
 enum class HardwareHandleType {

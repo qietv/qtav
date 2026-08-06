@@ -1,0 +1,31 @@
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index ea0752cb..d73eacb2 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -47,14 +47,14 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
+                                int min_order, int max_order)
+ {
+     if (single) {
+-        GLSL("const uint mmr_idx = 0u; \n");
++        GLSL("const int mmr_idx = 0; \n");
+     } else {
+-        GLSL("uint mmr_idx = uint(coeffs.y); \n");
++        GLSL("int mmr_idx = int(coeffs.y); \n");
+     }
+ 
+     assert(min_order <= max_order);
+     if (min_order < max_order)
+-        GLSL("uint order = uint(coeffs.w); \n");
++        GLSL("int order = int(coeffs.w); \n");
+ 
+     GLSL("vec4 sigX;                            \n"
+          "s = coeffs.x;                         \n"
+@@ -79,7 +79,7 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
+ 
+         if (max_order == 3) {
+             if (min_order < 3)
+-                GLSL("if (order >= 3 { \n");
++                GLSL("if (order >= 3) { \n");
+ 
+             GLSL("s += dot("$"[mmr_idx + 4].xyz, sig2 * sig);   \n"
+                  "s += dot("$"[mmr_idx + 5], sigX2 * sigX);     \n",

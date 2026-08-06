@@ -15,10 +15,12 @@ Supported build hosts and targets:
 | --- | --- | --- |
 | macOS | Android arm64-v8a, API 28 | `arm64-android-28-static` |
 | macOS | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
+| 64-bit Windows with DevEco Studio | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows with Visual Studio and Clang tools | Windows x64 | `x64-windows-static-md` |
 
 macOS itself is not a QtAVCore target. Windows dependencies must be built and
-validated on Windows; the PowerShell entry point is not a cross-compiler.
+validated on Windows; `build-windows.ps1` is not a cross-compiler. The separate
+`build-ohos.ps1` entry point uses the DevEco native SDK to cross-compile OHOS.
 
 ## Pinned dependency policy
 
@@ -34,6 +36,9 @@ The FFmpeg overlay applies this policy:
 - `--enable-libsmb2`, using the FFmpeg integration patch and protocol sources
   imported from the reference `avbuild2` tree;
 - `--enable-vulkan --enable-libplacebo --enable-libass --enable-libdav1d`;
+- `--enable-ohcodec` for the OHOS triplet, with H.264 and HEVC wrapper
+  decoders plus the opaque explicit surface-output decision API required by
+  installed-package verification;
 - FFmpeg's native VVC/H.266 decoder remains enabled because the build never
   disables the native decoder set; no external VVC encoder is included;
 - `--enable-lto --enable-small --disable-avdevice --disable-iamf`;
@@ -62,6 +67,14 @@ The mobile/OHOS libass overlay disables automatic system-font discovery and
 does not pull fontconfig. Applications must supply an explicit default font or
 subtitle fonts; this avoids treating OHOS as a Linux desktop solely because of
 vcpkg's current platform model.
+
+The OHOS FFmpeg overlay installs `libavcodec/ohcodec_surface.h`. Its opaque
+token permits exactly one immediate render, monotonic timed render, or drop of
+an OHCodec surface output without exposing FFmpeg's private decoder structure.
+Releasing the last frame reference without an explicit decision unconditionally
+drops the output; it never implicitly renders an abandoned output.
+It does not expose `OH_AVBuffer`/`OH_NativeBuffer` texture interop. The API and
+retirement criteria are recorded in [FD-004](DECISIONS.md).
 
 The resulting FFmpeg binaries are GPLv3. Review the complete notices under
 each installed triplet's `share/` directory before distribution.
@@ -112,7 +125,28 @@ directly or set `OHOS_SDK_ROOT`:
 
 The OpenHarmony compiler target and CMake platform are fixed to OHOS API 23.
 
-## Windows with Visual Studio
+## OHOS on Windows
+
+Run from 64-bit PowerShell with DevEco Studio/OpenHarmony native SDK and Visual
+Studio C++ Build Tools installed:
+
+```powershell
+git submodule update --init ffmpeg/vcpkg
+./ffmpeg/scripts/build-ohos.ps1
+```
+
+The script locates the normal DevEco SDK automatically. Use `-SdkRoot` for a
+non-standard SDK, `-InstallRoot` for a different vcpkg database, or `-WorkRoot`
+for a different space-free work directory. Because DevEco is normally under
+`Program Files`, the script creates a stable no-space SDK junction below the
+work root for OpenSSL/FFmpeg MSYS build steps. Windows `patchelf.exe` is
+acquired by vcpkg when required; a separate WSL or macOS installation is not
+needed.
+
+See [`../modern/OHOS_WINDOWS.md`](../modern/OHOS_WINDOWS.md) for the complete
+dependency plus QtAVCore build and install workflow.
+
+## Windows x64 target with Visual Studio
 
 Run from 64-bit PowerShell on a Windows machine with Visual Studio C++ tools
 and the **C++ Clang tools for Windows** component installed:
@@ -161,7 +195,9 @@ cmake -S modern -B build/modern-android \
 
 Use the corresponding OHOS or Windows triplet for those targets. The build
 scripts accept `QTAV_FFMPEG_INSTALL_ROOT` on macOS and `-InstallRoot` on
-Windows when a different artifact directory is needed.
+Windows when a different artifact directory is needed. For a Windows-hosted
+OHOS parent build, prefer `modern/scripts/build-ohos.ps1`, which supplies the
+required vcpkg and OHOS chainload toolchains together.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the subproject's layering,
 dependency graph, target model, and parent-project integration contract, and
@@ -174,3 +210,5 @@ Maintenance rules for agents and contributors are in [`AGENTS.md`](AGENTS.md).
 self-hosted macOS arm64 runner and Windows on a self-hosted Visual Studio
 runner. The OHOS job uses `OHOS_SDK_ROOT` when set and otherwise checks
 `$HOME/Library/OpenHarmony/Sdk/23`; macOS-native `patchelf` must be installed.
+This describes the current CI assignment only; local OHOS builds are supported
+on both macOS and Windows.

@@ -2,7 +2,7 @@ if(WIN32)
     return()
 endif()
 
-if(ANDROID)
+if(ANDROID OR CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$")
     find_library(QTAV_VULKAN_LIBRARY_PATH vulkan)
     if(QTAV_VULKAN_LIBRARY_PATH)
         set(QTAV_VULKAN_LIBRARY vulkan)
@@ -34,7 +34,7 @@ if(NOT QTAV_VULKAN_LIBRARY
 endif()
 
 set(QTAV_VULKAN_INTEROP_SHADER_SOURCES)
-if(ANDROID)
+if(ANDROID OR CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$")
     set(QTAV_GLSLC_HINTS)
     if(DEFINED ANDROID_NDK AND DEFINED ANDROID_HOST_TAG)
         list(APPEND QTAV_GLSLC_HINTS
@@ -46,7 +46,8 @@ if(ANDROID)
         HINTS ${QTAV_GLSLC_HINTS}
         NO_CMAKE_FIND_ROOT_PATH)
     if(NOT QTAV_GLSLC_EXECUTABLE)
-        return()
+        message(FATAL_ERROR
+            "The Vulkan external-format normalizer requires glslc; set QTAV_GLSLC_EXECUTABLE")
     endif()
     set(QTAV_VULKAN_GENERATED_DIRECTORY
         "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -105,14 +106,23 @@ target_compile_definitions(
     qtav_render_vulkan
     PRIVATE QTAV_RENDER_VULKAN_BUILDING_LIBRARY
 )
+if(QTAV_VULKAN_INTEROP_SHADER_SOURCES)
+    target_compile_definitions(
+        qtav_render_vulkan
+        PRIVATE QTAV_VULKAN_EXTERNAL_NORMALIZER=1)
+endif()
 target_include_directories(qtav_render_vulkan
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
         "${PROJECT_SOURCE_DIR}/core/src"
-        $<$<BOOL:${ANDROID}>:${QTAV_VULKAN_GENERATED_DIRECTORY}>
 )
+if(QTAV_VULKAN_INTEROP_SHADER_SOURCES)
+    target_include_directories(
+        qtav_render_vulkan
+        PRIVATE "${QTAV_VULKAN_GENERATED_DIRECTORY}")
+endif()
 target_link_libraries(qtav_render_vulkan
     PUBLIC
         QtAV::Core
@@ -152,6 +162,8 @@ endif()
 
 if(ANDROID)
     add_subdirectory(android)
+elseif(CMAKE_SYSTEM_NAME MATCHES "^(OHOS|OpenHarmony)$")
+    add_subdirectory(ohos)
 endif()
 
 if(QTAV_CORE_INSTALL)

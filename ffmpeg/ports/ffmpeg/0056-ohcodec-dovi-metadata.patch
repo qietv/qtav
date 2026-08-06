@@ -1,0 +1,292 @@
+diff --git a/configure b/configure
+index 0949dee..e4d8223 100644
+--- a/configure
++++ b/configure
+@@ -3613,7 +3613,7 @@ hevc_mf_encoder_deps="mediafoundation"
+ hevc_nvenc_encoder_deps="nvenc"
+ hevc_nvenc_encoder_select="atsc_a53"
+ hevc_oh_decoder_deps="ohcodec"
+-hevc_oh_decoder_select="hevc_mp4toannexb_bsf"
++hevc_oh_decoder_select="dovi_rpudec hevc_mp4toannexb_bsf hevc_parser"
+ hevc_oh_encoder_deps="ohcodec"
+ hevc_qsv_decoder_select="hevc_mp4toannexb_bsf qsvdec"
+ hevc_qsv_encoder_select="hevcparse qsvenc"
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index 02934c8..39c21d4 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -36,11 +36,20 @@
+ #include "avcodec.h"
+ #include "codec_internal.h"
+ #include "decode.h"
++#include "dovi_rpu.h"
++#include "h2645_parse.h"
++#include "hevc/hevc.h"
+ #include "hwconfig.h"
+ #include "ohcodec.h"
+ #include "ohcodec_surface.h"
+ #include "pthread_internal.h"
+ 
++typedef struct OHCodecDOVIMetadata {
++    int64_t presentation_time_us;
++    AVBufferRef *metadata;
++    struct OHCodecDOVIMetadata *next;
++} OHCodecDOVIMetadata;
++
+ typedef struct OHCodecDecContext {
+     AVClass *avclass;
+     OH_AVCodec *dec;
+@@ -73,6 +82,13 @@ typedef struct OHCodecDecContext {
+ 
+     char *name;
+     int allow_sw;
++
++#if CONFIG_HEVC_OH_DECODER
++    DOVIContext dovi;
++    OHCodecDOVIMetadata *dovi_head;
++    OHCodecDOVIMetadata *dovi_tail;
++    int dovi_depth;
++#endif
+     unsigned mutex_cond_cnt;
+ } OHCodecDecContext;
+ 
+@@ -119,6 +135,159 @@ int av_ohcodec_render_buffer_at_time(AVOHCodecBuffer *buffer, int64_t time)
+             time));
+ }
+ 
++#if CONFIG_HEVC_OH_DECODER
++static int64_t ohcodec_presentation_time_us(AVCodecContext *avctx,
++                                            int64_t pts)
++{
++    if (pts == AV_NOPTS_VALUE)
++        return 0;
++    if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den)
++        return av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
++    return pts;
++}
++
++static void ohcodec_dovi_queue_pop(OHCodecDecContext *s,
++                                   OHCodecDOVIMetadata *previous,
++                                   OHCodecDOVIMetadata *entry)
++{
++    if (previous)
++        previous->next = entry->next;
++    else
++        s->dovi_head = entry->next;
++    if (s->dovi_tail == entry)
++        s->dovi_tail = previous;
++    av_buffer_unref(&entry->metadata);
++    av_free(entry);
++    s->dovi_depth--;
++}
++
++static void ohcodec_dovi_queue_flush(OHCodecDecContext *s)
++{
++    while (s->dovi_head)
++        ohcodec_dovi_queue_pop(s, NULL, s->dovi_head);
++}
++
++static int ohcodec_dovi_queue_packet(AVCodecContext *avctx,
++                                     OHCodecDecContext *s,
++                                     const AVPacket *pkt)
++{
++    H2645Packet h2645_pkt = { 0 };
++    AVDOVIMetadata *metadata = NULL;
++    AVBufferRef *metadata_buf = NULL;
++    OHCodecDOVIMetadata *entry = NULL;
++    const uint8_t *sd;
++    size_t sd_size;
++    int metadata_size;
++    int has_vcl = 0;
++    int rpu_parsed = 0;
++    int ret;
++
++    sd = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF, &sd_size);
++    if (sd && sd_size >= sizeof(s->dovi.cfg))
++        s->dovi.cfg = *(const AVDOVIDecoderConfigurationRecord *) sd;
++
++    ret = ff_h2645_packet_split(&h2645_pkt, pkt->data, pkt->size, avctx, 0,
++                                AV_CODEC_ID_HEVC, 0);
++    if (ret < 0) {
++        ret = 0;
++        goto out;
++    }
++
++    for (int i = h2645_pkt.nb_nals - 1; i >= 0; i--) {
++        const H2645NAL *nal = &h2645_pkt.nals[i];
++        if (nal->type < 32)
++            has_vcl = 1;
++        if (rpu_parsed || nal->type != HEVC_NAL_UNSPEC62 || nal->size <= 2 ||
++            nal->nuh_layer_id || nal->temporal_id)
++            continue;
++
++        ret = ff_dovi_rpu_parse(&s->dovi, nal->data + 2, nal->size - 2,
++                                avctx->err_recognition);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Error parsing Dolby Vision RPU for OHCodec output.\n");
++            ret = 0;
++            goto out;
++        }
++        rpu_parsed = 1;
++    }
++
++    if (!has_vcl) {
++        ret = 0;
++        goto out;
++    }
++
++    metadata_size = ff_dovi_get_metadata(&s->dovi, &metadata);
++    if (metadata_size <= 0) {
++        ret = metadata_size;
++        goto out;
++    }
++    metadata_buf = av_buffer_create((uint8_t *) metadata, metadata_size,
++                                    NULL, NULL, 0);
++    if (!metadata_buf) {
++        av_free(metadata);
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    metadata = NULL;
++
++    entry = av_mallocz(sizeof(*entry));
++    if (!entry) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    entry->presentation_time_us =
++        ohcodec_presentation_time_us(avctx, pkt->pts);
++    entry->metadata = metadata_buf;
++    metadata_buf = NULL;
++    if (s->dovi_tail)
++        s->dovi_tail->next = entry;
++    else
++        s->dovi_head = entry;
++    s->dovi_tail = entry;
++    s->dovi_depth++;
++
++    if (s->dovi_depth > 256) {
++        av_log(avctx, AV_LOG_WARNING,
++               "Dropping stale Dolby Vision metadata queued for OHCodec.\n");
++        ohcodec_dovi_queue_pop(s, NULL, s->dovi_head);
++    }
++    ret = 0;
++
++out:
++    ff_h2645_packet_uninit(&h2645_pkt);
++    av_buffer_unref(&metadata_buf);
++    av_free(metadata);
++    return ret;
++}
++
++static int ohcodec_dovi_attach_frame(OHCodecDecContext *s,
++                                     AVFrame *frame,
++                                     int64_t presentation_time_us)
++{
++    OHCodecDOVIMetadata *previous = NULL;
++    OHCodecDOVIMetadata *entry = s->dovi_head;
++
++    while (entry) {
++        if (entry->presentation_time_us == presentation_time_us) {
++            AVBufferRef *metadata = av_buffer_ref(entry->metadata);
++            if (!metadata)
++                return AVERROR(ENOMEM);
++            if (!av_frame_new_side_data_from_buf(
++                    frame, AV_FRAME_DATA_DOVI_METADATA, metadata)) {
++                av_buffer_unref(&metadata);
++                return AVERROR(ENOMEM);
++            }
++            ohcodec_dovi_queue_pop(s, previous, entry);
++            return 0;
++        }
++        previous = entry;
++        entry = entry->next;
++    }
++    return 0;
++}
++#endif
++
+ static void oh_decode_release(AVRefStructOpaque unused, void *obj)
+ {
+     OH_AVCodec **decp = obj;
+@@ -407,6 +576,16 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+ {
+     OHCodecDecContext *s = avctx->priv_data;
+ 
++#if CONFIG_HEVC_OH_DECODER
++    s->dovi.logctx = avctx;
++    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
++        const AVPacketSideData *sd =
++            ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
++        if (sd && sd->size >= sizeof(s->dovi.cfg))
++            s->dovi.cfg = *(const AVDOVIDecoderConfigurationRecord *) sd->data;
++    }
++#endif
++
+     // Initialize these fields first, so oh_decode_close can destroy them safely
+     int ret = ff_pthread_init(s, mutex_cond_offsets);
+     if (ret < 0)
+@@ -454,6 +633,11 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
+ 
+     av_packet_unref(&s->pkt);
+ 
++#if CONFIG_HEVC_OH_DECODER
++    ohcodec_dovi_queue_flush(s);
++    ff_dovi_ctx_unref(&s->dovi);
++#endif
++
+     av_fifo_freep2(&s->input_queue);
+ 
+     av_fifo_freep2(&s->output_queue);
+@@ -599,9 +783,22 @@ static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
+             return AVERROR_EXTERNAL;
+     }
+ 
++    int ret;
+     if (s->output_to_window)
+-        return oh_decode_wrap_hw_buffer(avctx, frame, output, &attr);
+-    return oh_decode_wrap_sw_buffer(avctx, frame, output, &attr);
++        ret = oh_decode_wrap_hw_buffer(avctx, frame, output, &attr);
++    else
++        ret = oh_decode_wrap_sw_buffer(avctx, frame, output, &attr);
++    if (ret < 0)
++        return ret;
++
++#if CONFIG_HEVC_OH_DECODER
++    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
++        ret = ohcodec_dovi_attach_frame(s, frame, attr.pts);
++        if (ret < 0)
++            av_frame_unref(frame);
++    }
++#endif
++    return ret;
+ }
+ 
+ static int oh_decode_send_pkt(AVCodecContext *avctx, OHBufferQueueItem *input)
+@@ -701,6 +898,13 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+             ret = ff_decode_get_packet(avctx, &s->pkt);
+             if (ret < 0 && ret != AVERROR_EOF)
+                 return ret;
++#if CONFIG_HEVC_OH_DECODER
++            if (ret >= 0 && avctx->codec_id == AV_CODEC_ID_HEVC) {
++                ret = ohcodec_dovi_queue_packet(avctx, s, &s->pkt);
++                if (ret < 0)
++                    return ret;
++            }
++#endif
+         }
+ 
+         // Wait input buffer
+@@ -731,6 +935,11 @@ static void oh_decode_flush(AVCodecContext *avctx)
+ 
+     OH_VideoDecoder_Flush(s->dec);
+ 
++#if CONFIG_HEVC_OH_DECODER
++    ohcodec_dovi_queue_flush(s);
++    ff_dovi_ctx_flush(&s->dovi);
++#endif
++
+     ff_mutex_lock(&s->input_mutex);
+     ff_mutex_lock(&s->output_mutex);
+     av_fifo_reset2(s->input_queue);

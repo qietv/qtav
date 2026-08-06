@@ -1,9 +1,8 @@
 # Android and OHOS mobile design
 
-This document fixes the shared design boundary for the Android and OHOS
-production paths before either platform hardware decoder is added. The two
-platforms reuse portable rendering and test logic, but they do not share a
-native application, window-system, audio, or codec ABI.
+This document records the shared design boundary for the Android and OHOS
+production paths. The two platforms reuse portable rendering and test logic,
+but they do not share a native application, window-system, audio, or codec ABI.
 
 ## Responsibility and target boundaries
 
@@ -22,33 +21,38 @@ The reusable pieces are compile-time C++ targets in this repository:
   `platform/ohos/`;
 - OHOS EGL context and surface integration belongs under
   `backends/render/opengl/ohos/`;
-- `qtav_audio_aaudio` and a future OHOS OHAudio target are separate audio
+- `qtav_audio_aaudio` and `qtav_audio_ohaudio` are separate audio backends;
+- `qtav_hw_mediacodec` and `qtav_hw_ohcodec` are separate hardware-decoder
   backends;
-- `qtav_hw_mediacodec` and a future OHCodec target are separate hardware
-  decoder backends;
 - Vulkan and OpenGL ES native-buffer import are separate, optional interop
   targets; texture import remains separate from decoding and final rendering.
+
+Every platform interop target is limited to native import, format/plane
+exposure, timestamp/generation correlation, producer/release synchronization,
+and source lifetime through GPU completion. It does not own semantic color,
+Dolby Vision, tone/gamut mapping, scaling, or output encoding.
 
 No Android or OHOS SDK declaration may enter an installed core header.
 Backend-specific public headers may expose strong native types when needed,
 but core continues to see only `VideoRenderAPI`, `AudioSink`,
 `HardwareDecodeConfig`, and `HardwareFrame`.
 
-## Shared Vulkan renderer engine
+## Shared libplacebo Vulkan renderer engine
 
-The Vulkan engine consumes software `VideoFrame` values and a current render
-target supplied by a platform adapter. It is responsible for:
+The Vulkan engine consumes software `VideoFrame` values or retained native
+images and a current render target supplied by a platform adapter. libplacebo
+is the sole semantic authority for pixel-format interpretation, range and
+matrix conversion, transfer functions, primaries conversion, Dolby Vision
+reshaping, tone mapping, gamut mapping, scaling, and SDR/HDR output encoding.
+The QtAVCore Vulkan layer is responsible only for:
 
-- packed RGB and planar or bi-planar YUV staging;
-- YUV420/YUV422/YUV444, NV12/NV21, and little-endian P010 sampling;
-- limited/full range normalization and BT.601, BT.709, or BT.2020 matrices;
-- PQ/HLG/SDR transfer handling and source-primary conversion using the
-  structured frame metadata;
-- viewport, Fit/Fill/Stretch aspect modes, and all right-angle rotations;
-- pipeline, descriptor, sampler, shader, geometry, and staging-buffer
-  lifetime;
-- a bounded ring of in-flight frame resources, with one retained
-  `VideoFrame` per submitted slot until its completion fence is signalled;
+- mapping supported FFmpeg software storage or wrapping an imported native
+  image as a libplacebo source;
+- viewport, Fit/Fill/Stretch aspect modes, and right-angle rotations expressed
+  through libplacebo geometry;
+- target image, format, output-color contract, and generation tracking;
+- a bounded ring of in-flight resources, with one retained `VideoFrame` per
+  submitted slot until its completion fence is signalled;
 - explicit image layout transitions and queue submission synchronization.
 
 The engine borrows the selected Vulkan physical device, logical device, queue,
@@ -59,33 +63,34 @@ completion fence, and presentation semaphore for one render. A target
 generation changes whenever a surface or swapchain is recreated; stale
 generation resources are retired only after their fences complete.
 
-The implemented engine lives in `backends/render/vulkan/`. It supports every
-planned software pixel family through a storage-buffer shader, applies the
-structured SDR/HDR color inputs plus viewport/aspect/rotation geometry, and
-uses a bounded three-frame resource ring with one retained source frame per
-submission fence. Deterministic offscreen readback checks cover ring reuse,
-YUV output, limited/full range, BT.601/BT.709 conversion, P010/BT.2020 PQ and
-HLG input, HDR mastering-display/MaxCLL/default-luminance selection, viewport,
-rotation, and target-generation replacement. Deterministic targets cover SDR
-BGRA8 HDR-to-SDR compression, 10-bit HDR10/PQ output, 10-bit HDR10/HLG output,
-HLG-to-PQ conversion, and FP16 extended-sRGB-linear plus BT.2020-linear values
-above reference white. Output encoding is explicit rather than being inferred
-from the image format.
+The implemented engine lives in `backends/render/vulkan/`. It maps the planned
+software pixel families through the shared FFmpeg/libplacebo bridge and uses a
+bounded three-frame resource ring with one retained source frame per submission
+fence. Deterministic offscreen readback covers source formats, structured
+SDR/HDR metadata, geometry, target generation, SDR tone mapping, native PQ/HLG,
+and extended-linear output. Output encoding is explicit rather than inferred
+from the image format. Backend-local shaders are allowed only when an opaque
+native image must be normalized into a raw component representation before
+libplacebo; those shaders may crop or repack channels, but may not implement a
+matrix, transfer, gamut, tone-map, Dolby Vision, scaling, or output operation.
+Portable source/target contracts and deterministic vectors are shared between
+Android and OHOS; native import and presentation remain platform-specific.
 
-Shader input structures, color conversion constants, geometry generation,
-staging layout, capability decisions, and golden pixel vectors are shared
-between Android and OHOS. Deterministic engine tests use offscreen images and
-do not require a window system.
+Dolby Vision in this design means FFmpeg-parsed metadata for the
+residual-disabled base-layer case, applied by libplacebo after raw source
+components have been preserved. Enhancement-layer reconstruction, Dolby
+licensing, and certification are not claimed.
 
 ## OpenGL ES fallback renderer
 
 Android and OHOS use Vulkan as the preferred software-frame renderer and
 OpenGL ES through EGL as the required fallback. The OpenGL ES engine implements
 the same `VideoRenderAPI` behavior for supported software RGB, planar YUV,
-NV12/NV21, and P010 inputs. It reuses color-conversion constants, shader input
-definitions, geometry, capability rules, and golden vectors where their
-semantics match Vulkan, while keeping shaders, upload resources,
-synchronization, and lifetime rules native to OpenGL ES.
+NV12/NV21, and P010 inputs. It maps frames and structured metadata through the
+same FFmpeg/libplacebo bridge. libplacebo generates the OpenGL shaders and owns
+the same semantic color, geometry, tone/gamut, Dolby Vision, and output
+decisions as Vulkan; QtAVCore does not maintain parallel conversion constants
+or a second semantic shader pipeline.
 
 `qtav_render_opengl` contains reusable OpenGL ES rendering logic.
 Android and OHOS have separate EGL/window adapters because `ANativeWindow`,
@@ -105,10 +110,10 @@ recover either mobile renderer.
 
 The implemented baseline lives under `backends/render/opengl/`.
 `QtAV::RenderOpenGL` uploads YUV420/422/444, NV12/NV21, little-endian P010,
-RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames, applies the same structured
-range, matrix, transfer, primaries, viewport, aspect, and rotation semantics as
-the Vulkan path, and renders to a caller-supplied current framebuffer whose
-target contract explicitly selects SDR sRGB, BT.2020/PQ, or BT.2020/HLG.
+RGB/BGR/RGBA/BGRA/ARGB, and Gray8 software frames, gives their structured
+metadata and geometry to libplacebo, and renders to a caller-supplied current
+framebuffer whose target contract explicitly selects SDR sRGB, BT.2020/PQ, or
+BT.2020/HLG.
 P010/PQ/HLG input is deterministically tone-mapped only for the SDR target;
 native HDR targets preserve luminance, convert primaries to BT.2020, and encode
 PQ or HLG as selected. `QtAV::RenderOpenGLAndroid` separately owns its EGL
@@ -120,6 +125,14 @@ sets and verifies the corresponding Android buffer dataspace. Android device
 checks cover all advertised upload families, viewport, rotation,
 target-generation replacement, P010/PQ-to-SDR readback, PQ/HLG output numeric
 encoding, real RGB10_A2/PQ presentation, and compositor HDR-layer recognition.
+`QtAV::RenderOpenGLOHOS` separately retains the XComponent
+`OHNativeWindow`, owns its EGL display, OpenGL ES 3.x context, surface, swap,
+and generation, and verifies exact RGBA8 plus sRGB native-window/EGL state.
+The first OHOS slice exposes `SdrOnly` and SDR fallback for `PreferHdr`, while
+`RequireHdr` fails explicitly until an OHOS HDR format, EGL colorspace, and
+compositor path passes the device capability gate. The connected OHOS harness
+proves initial GLES selection, Vulkan and GLES resize recreation, and fatal
+one-way Vulkan-to-GLES fallback on one media open.
 The application/platform selector is implemented separately as
 `QtAV::RenderMobile`.
 
@@ -165,10 +178,21 @@ performs the configured bounded number of complete same-API recreations,
 whereas `Error` is fatal. Fatal or repeatedly unrecoverable Vulkan is retired
 for the session before OpenGL ES is created and the retained frame is retried.
 OpenGL ES context/display/surface loss is classified as recoverable by the
-Android adapter and uses the same bounded recreation path; fatal OpenGL ES or
-failed recovery enters the explicit no-renderer state. Selection notifications
-record selected, recovered, fallback, and unavailable transitions with their
-reasons.
+Android and OHOS adapters and uses the same bounded recreation path; fatal
+OpenGL ES or failed recovery enters the explicit no-renderer state. Selection
+notifications record selected, recovered, fallback, and unavailable
+transitions with their reasons.
+
+The portable `VideoRenderAttemptResult` is the synchronous decision boundary
+used by both mobile APIs and their native adapters. `Presented` completes the
+frame, `DeferredUntilRedraw` retains that exact frame until an asynchronous
+producer/GPU callback raises `RedrawRequested`, `RetryAfterBackoff` asks the
+application for a bounded timer retry, and `Discarded` terminally consumes a
+stale or retired-generation frame. `SurfaceLost` starts bounded same-API
+recreation; `FatalError` starts the one-way Vulkan-to-OpenGL ES policy. These
+outcomes no longer depend on guessing from a boolean return plus a synchronous
+event side channel. Legacy boolean renderers remain supported through the
+default retry-after-backoff mapping.
 
 The platform calls `suspendSurface()` before releasing a native-window
 generation, updates the application state captured by the factories, and calls
@@ -201,10 +225,9 @@ without mapping. OpenGL ES interop requires the prepared candidate to
 advertise the source hardware device; no callback or a `None` decision makes
 presentation explicitly unavailable.
 
-An asynchronous interop attempt may return `false` before its producer image
-is ready without emitting `SurfaceLost` or `Error`. The selector treats this
-as retryable and preserves the active API. Only an emitted lifecycle or fatal
-event starts recovery or fallback.
+An asynchronous interop attempt returns `DeferredUntilRedraw` before its
+producer image is ready. The selector preserves the active API and exact frame;
+only `SurfaceLost` or `FatalError` starts recovery or fallback.
 
 ## Platform surface adapters
 
@@ -262,16 +285,20 @@ backends:
    software-decode fallback policy.
 3. A decoded output carries its media timestamp, surface generation, and a
    single pending decision: present at a requested monotonic time or drop.
-4. The scheduler bounds outstanding undecided outputs. When the bound is
+4. Releasing an undecided token, or the last retained FFmpeg frame reference
+   when no token decision was made, is abandonment. It unconditionally
+   drops/frees the codec output and never infers presentation from native
+   buffer attributes.
+5. The scheduler bounds outstanding undecided outputs. When the bound is
    reached it applies the documented late-frame drop policy instead of
    blocking an unbounded decoder queue.
-5. Seek, loop, stop, and media replacement invalidate the scheduling
+6. Seek, loop, stop, and media replacement invalidate the scheduling
    generation, drop pending outputs, flush the native codec, and reject late
    callbacks from an older generation.
-6. Surface loss stops release-for-presentation immediately. Recreating the
+7. Surface loss stops release-for-presentation immediately. Recreating the
    surface either rebinds the codec when supported or reopens it explicitly;
    the application remains responsible for the native surface lifetime.
-7. A copied generic hardware frame retains only resources whose native API
+8. A copied generic hardware frame retains only resources whose native API
    permits post-callback retention. Direct-surface output that cannot be
    retained is represented as a presentation token, not a fake texture
    handle.
@@ -290,12 +317,22 @@ The Android 16 device checkpoint passes H.264 and HEVC with bounded output,
 both present and drop, seek/flush, media replacement, explicit stop,
 background/foreground surface loss and reopen, stale-generation rejection,
 and clean shutdown. No decoded pixel is mapped in this direct path. This
-completes the prerequisite for the implemented `SurfaceTexture`/OpenGL ES and
-private-`AImageReader`/Vulkan paths described below. The separate Vulkan
-interop checkpoint provides shader-readable `AImageReader`/`AHardwareBuffer`
-frames; the
+completes the prerequisite for the implemented private-`AImageReader`
+OpenGL ES and Vulkan paths described below. Those separate interop checkpoints
+provide shader-readable retained `AImageReader`/`AHardwareBuffer` frames; the
 direct-surface path itself still makes no texture-interoperability claim.
 Decoder fallback and renderer/interop fallback remain independent.
+
+The OHOS direct-surface checkpoint is implemented in `QtAV::HWOHCodec` using
+FFmpeg's explicit OHCodec wrapper and opaque single-decision release token. The
+2026-08-05 signed HAP passed on a Mate 60 Pro (`ALN-AL80`), HarmonyOS
+6.1.0.135 / OpenHarmony 6.1.1.120 API 24. H.264 presented 48 outputs and
+dropped 5; HEVC presented 40 and dropped 5. One pause/resume, one 2000 ms
+target/callback seek, media replacement, explicit stop, background/foreground,
+surface recreation, and stale-generation rejection all passed. The run reached
+`maxPending=2`, observed `pendingAtStop=1`, drained to `pendingEnd=0`, and kept
+`maxQueued=0`. This completes the OHCodec direct-surface lifecycle prerequisite
+without making a texture-interoperability claim.
 
 ## Zero-CPU-copy texture interop
 
@@ -315,6 +352,12 @@ conversion pass, and presenting it are allowed. This definition does not claim
 that a codec, driver, or system compositor performs no internal hardware copy.
 Tests and status output use the precise `zero-CPU-copy` or `zero-CPU-map`
 wording rather than an unqualified end-to-end zero-copy claim.
+
+**Strict no-intermediate source zero-copy** is narrower. It requires an
+explicit native graphics format and plane mapping so the exact retained
+decoder allocation can be wrapped directly as libplacebo's source. A
+pre-libplacebo normalization draw or intermediate source texture disqualifies
+the strict claim even when all decoded-source CPU counters remain zero.
 
 The shared interop contract requires:
 
@@ -353,6 +396,15 @@ provides the release sync fd returned through asynchronous image deletion.
 The adapter correlates codec and acquired-image timestamps, bounds outstanding
 images, and never calls `AHardwareBuffer_lock*()`.
 
+If Vulkan reports an explicit `VkFormat` and plane mapping, libplacebo can wrap
+the imported decoder allocation directly and the path can qualify as strict
+source zero-copy. An opaque external format may instead require a GPU-only raw
+representation normalization texture before libplacebo. That remains
+zero-CPU-copy, but is not strict source zero-copy. The normalization shader may
+only crop or preserve/repack raw components; semantic color conversion, Dolby
+Vision, tone/gamut mapping, scaling, and output encoding remain libplacebo's
+exclusive responsibility.
+
 `QtAV::RenderVulkan` exposes the decoder-independent retained sampled-image
 contract used by this target; it keeps the imported image, hardware buffer,
 view, conversion sampler, and synchronization resources alive until the
@@ -364,41 +416,66 @@ pending-image high-water mark within the configured reader bound, and reports
 zero decoded-source map, software-transfer, staging-copy, and renderer-upload
 calls.
 
-The implemented Android OpenGL ES path uses a MediaCodec `Surface` backed by
-a detached `SurfaceTexture`. `updateTexImage()` exposes the current decoded
-image through `GL_TEXTURE_EXTERNAL_OES`; the adapter correlates timestamps and
-surface generations, retains the single current image until the renderer has
-submitted and flushed its draw, and releases each codec output exactly once.
-A native retry worker only schedules redraws and never touches GL.
-H.264/HEVC connected-device coverage includes bounded pending images,
-seek/flush, same-context EGL window suspension/recreation, clean texture
-attach/detach, and zero decoded-source CPU map, transfer, staging, or upload.
-A private `AImageReader` plus `AHardwareBuffer`/`EGLImage` import remains an
-optional future alternative when all required EGL, GL, format, and fence
-capabilities are present. Neither route reads decoded pixels through CPU
-memory. P010, HDR, and formats that cannot be sampled with the required color
-control remain capability-gated rather than silently converted on the CPU.
+The implemented Android OpenGL ES path uses a private GPU-sampled
+`AImageReader`, retains each `AHardwareBuffer`, imports it as an EGLImage, and
+samples raw Y/Cb/Cr through `GL_EXT_YUV_target`. A crop-aware GPU pass stores
+those raw components in RGBA16F before libplacebo. It performs no matrix,
+transfer, gamut, tone-map, Dolby Vision, scaling, or output operation. The
+adapter correlates timestamps and generations, waits the acquire fence, retains
+the exact source through presentation, and returns a release fence before
+releasing the image. This route is zero-CPU-copy but, because it uses the
+RGBA16F normalization texture, is not strict source zero-copy. Imports that
+cannot prove raw component sampling are rejected for the semantic/Dolby Vision
+path; implicit `SurfaceTexture` or external-OES YUV-to-RGB conversion is not a
+substitute.
 
-The confirmed OHOS OpenGL ES design supplies the `OHNativeWindow` produced by
-`OH_NativeImage` to OHCodec surface output, updates the surface image, and
-samples its bound `GL_TEXTURE_EXTERNAL_OES` texture. The adapter retains the
-corresponding codec presentation token and native-image generation until the
-consumer/release rules of the selected SDK permit reuse. This is a separate
-OHOS implementation; it does not reuse Android handles or ABI assumptions.
+The preferred OHOS hardware-frame interop target is implemented by the
+independent `QtAV::InteropOHCodecVulkan` target. Its application-owned interop
+object creates a private `OH_ConsumerSurface` and supplies that surface's
+producer window to `QtAV::HWOHCodec`. Surface-mode callback `OH_AVBuffer`
+objects do not expose usable native memory, so the adapter presents exactly one
+retained codec output into the private surface, acquires the corresponding
+`OHNativeWindowBuffer`, retains its `OH_NativeBuffer`, and imports it through
+`VK_OHOS_external_memory`. An acquire sync fd becomes a Vulkan semaphore. The
+consumer buffer stays retained until the renderer GPU timeline destroys the
+imported image and memory, then it is returned to the consumer surface.
 
-OHOS Vulkan is conditionally feasible, not yet a direct consequence of the
-current FFmpeg 8 OHCodec wrapper. OHOS exposes native-buffer Vulkan external
-memory, but the wrapper's buffer-output branch currently obtains a CPU address
-with `OH_AVBuffer_GetAddr()` and copies with `av_image_copy2()`. Before Vulkan
-interop can be called zero-CPU-copy, a backend or narrowly scoped FFmpeg bridge
-must instead expose and retain the decoded `OH_AVBuffer`/`OH_NativeBuffer`
-until GPU completion, import it through the target SDK's OHOS Vulkan external
-memory path, and then call `OH_VideoDecoder_FreeOutputBuffer()` without either
-CPU operation. The current surface-output wrapper provides present/drop
-tokens suitable for direct presentation and the `OH_NativeImage` GLES path,
-but it does not expose a Vulkan-importable native buffer. The exact bridge,
-format, protected-content, lifetime, and fence APIs remain target-SDK/device
-gates.
+The target accepts only explicit sampled two- or three-plane 4:2:0 8/10-bit
+`VkFormat` values that libplacebo wraps directly. It therefore claims strict
+source zero-copy only after that route succeeds. `VK_FORMAT_UNDEFINED` with an
+opaque external-format ID is rejected; this target deliberately does not add a
+raw GPU normalization texture that would weaken the claim to zero-CPU-copy.
+
+The OHOS OpenGL ES fallback is a separate, lower-priority target. It must prove
+raw `GL_EXT_YUV_target` sampling and normalize crop-aware Y/Cb/Cr into RGBA16F
+before libplacebo. It is therefore zero-CPU-copy, not strict source zero-copy.
+An implicit `OH_NativeImage` external-OES YUV-to-RGB path is no longer a target
+because it hides the raw source representation and cannot support the required
+libplacebo/Dolby Vision ordering. OHCodec/NativeImage may propagate the codec
+PTS unchanged in microseconds, so the interop compares the observed value and
+its microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
+then stores and correlates the selected value in nanoseconds. The FFmpeg
+OHCodec wrapper independently parses each HEVC RPU before submission, keys it
+by that same microsecond PTS, and attaches it only to the matching returned
+output. The private consumer-surface bridge avoids FFmpeg's software-copying
+OHCodec buffer-output branch and keeps the SDK types in the optional backend.
+Exact format,
+protected-content, lifetime, and fence support remain target-SDK/device gates.
+On 2026-08-06 the connected Mate 60 Pro acquired one real H.264 and one real
+HEVC buffer, both reported `NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP`, but Vulkan
+returned only `VK_FORMAT_UNDEFINED` with external format `1000156003`. The HAP
+therefore reported the expected strict `UNSUPPORTED` result with two opaque
+rejections and zero map/transfer/staging/upload/normalization counters. No OHOS
+texture-interop PASS is claimed until explicit-plane import, sampling, and
+post-GPU release execute on suitable hardware.
+
+On the same device, residual-disabled Profile 5 and Profile 8.4 each rendered
+45 HEVC frames through the raw OpenGL ES path with 45 RPU frames queued,
+timestamp-matched, and released. Both runs reported zero implicit-RGB images
+and zero decoded-source map/transfer/staging/upload calls. Profile 8.4 also
+validated MMR reshaping after the libplacebo overlay corrected generated GLES
+integer array indexing and third-order branch syntax. This is a zero-CPU-copy
+OpenGL result, not a strict source-zero-copy Vulkan result.
 
 When the active renderer changes from Vulkan to OpenGL ES, the implemented
 selector callback first permits the platform layer to reconfigure newly
@@ -443,6 +520,17 @@ AAudio disconnect callbacks by closing and rebuilding the default-route stream
 with the same negotiated format. The API 28 device baseline passes without an
 OpenSL ES fallback.
 
+The OHOS implementation now lives in `QtAV::AudioOHAudio`. It requests 48 kHz
+mono/stereo Float32 PCM in fast mode with normal-mode construction fallback,
+and uses the same portable allocation-free SPSC queue implementation without
+sharing any OHAudio ABI with Android. Its native write callback has the same
+bounded no-allocation/no-lock responsibilities, while
+`OH_AudioRenderer_GetAudioTimestampInfo()` supplies hardware-committed frame
+timing. Route changes, forced interruptions, errors, and stream reconstruction
+run on an OHOS-only management worker. The API 24 Mate 60 Pro baseline proves
+PCM delivery, clock/latency, pause/resume, seek/flush, and loop-boundary drain;
+the recorded run did not induce a physical route change.
+
 ## Connected-device validation
 
 Shared generated media and lifecycle scenarios cover:
@@ -455,19 +543,28 @@ Shared generated media and lifecycle scenarios cover:
   reopen, plus explicit failure when neither renderer is usable;
 - fatal Vulkan failure while MediaCodec is producing for a private
   AImageReader, followed by synchronous decoder rebind to the prepared
-  SurfaceTexture producer and continued external-OES rendering without a
-  media replacement or decoded-source CPU access;
+  OpenGL AImageReader producer and continued raw `GL_EXT_YUV_target` rendering
+  without a media replacement or decoded-source CPU access;
 - MediaCodec H.264/HEVC direct-surface output with explicit present/drop,
   seek/flush, media replacement, stop, background/foreground surface
   recreation, stale-generation rejection, bounded retained outputs, and clean
   shutdown;
+- OHCodec H.264/HEVC direct-surface output with timed present/drop,
+  pause/resume, 2000 ms seek, media replacement, stop, background/foreground,
+  surface recreation, stale-generation rejection, bounded retained outputs,
+  final-reference drop, and clean shutdown;
+- OHCodec H.264/HEVC private-ConsumerSurface native-buffer acquisition,
+  exact one-frame queueing, strict explicit-plane Vulkan gating, opaque-format
+  rejection, and zero CPU map/transfer/staging/upload/normalization counters;
 - MediaCodec H.264/HEVC private-AImageReader Vulkan import with timestamp
   correlation, native/external-format validation, aligned-allocation crop,
   bounded images, release-fence return, and zero decoded-source CPU
   map/transfer/staging/upload counters;
-- capability-gated MediaCodec/OHCodec native-buffer import through Vulkan and
-  OpenGL ES with zero CPU map/transfer calls, retained lifetime, fence
-  ordering, format/color validation, and explicit unsupported-path results;
+- capability-gated MediaCodec native-buffer import through Vulkan and OpenGL
+  ES with zero CPU map/transfer calls, retained lifetime, fence ordering,
+  format/color validation, and explicit unsupported-path results; the OHCodec
+  Vulkan test applies the same rule and reports `UNSUPPORTED`, not PASS, when
+  a real native buffer lacks an explicit multi-plane Vulkan format;
 - pause/resume and monotonic position;
 - seek and loop flush;
 - media replacement and explicit stop;

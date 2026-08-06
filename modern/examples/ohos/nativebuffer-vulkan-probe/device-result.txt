@@ -1,0 +1,27 @@
+Device: HUAWEI Mate 60 Pro ALN-AL80 / Maleoon 910
+System: HarmonyOS 6.1.0.135 / OpenHarmony 6.1.1.120 / API 24
+Date: 2026-08-06
+
+Object-only probe, first real OHCodec H.264 output:
+  nativeFormat=24
+  VkFormat=VK_FORMAT_UNDEFINED
+  externalFormat=1000156003
+  vkGetNativeBufferPropertiesOHOS=VK_SUCCESS
+  vkCreateSamplerYcbcrConversion=VK_SUCCESS
+  vkCreateSampler=VK_SUCCESS
+  vkCreateImage=VK_SUCCESS
+  vkAllocateMemory=VK_SUCCESS
+  vkBindImageMemory=VK_SUCCESS
+  vkCreateImageView=VK_SUCCESS
+  vkCreateDescriptorSetLayout=VK_SUCCESS
+
+Full shader-consumption result:
+QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS mode=opaque-ycbcr-normalized codecs=h264,hevc h264Rendered=30 hevcRendered=30 acquired=60 imported=60 directPlanes=0 opaqueImports=60 codecQueued=60 availableCallbacks=60 acquireFences=0 releasedAfterGpu=59 nativeFormat=24 vkFormat=0 externalFormat=1000156003 exactQueueMax=1 schedulerDrops=20 rendererDiscards=0 opaqueRejected=0 objectProbes=1 objectProbeSuccesses=1 unsupportedRejected=0 normalization=60 cpuMap=0 transfer=0 staging=0 upload=0
+
+At this marker, the playback callback still owns the most recent frame. The
+other 59 buffers have been returned after GPU completion; the final retained
+buffer is within the three-frame bound and is returned when that callback
+unwinds during teardown.
+
+Whole connected-device regression:
+QTAV_OHOS_RESULT PASS ... ohcodecVulkanLifecycle=pass ...

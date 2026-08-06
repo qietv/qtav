@@ -20,7 +20,8 @@ QtAVCore is maintained for Windows, Android, and OHOS targets only. The former
 macOS and iOS backends, tests, and integration notes were moved to
 [`../archived_apple/`](../archived_apple/) and are no longer maintained,
 built, tested, packaged, or installed. A macOS machine may still be used as a
-cross-compilation host for Android/OHOS; that does not make macOS a supported
+cross-compilation host for Android/OHOS, and 64-bit Windows may cross-compile
+OHOS with the DevEco native SDK; neither host role adds another supported
 QtAVCore target. Linux is not part of the active target matrix or roadmap.
 
 ## Current scope
@@ -34,6 +35,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - audio and video frame callbacks with reference-counted frame lifetime;
 - structured video range, primaries, transfer, matrix, chroma-location, HDR10
   mastering-display, and content-light metadata;
+- libplacebo as the sole semantic color/shader authority for the Windows
+  D3D11, Vulkan, and OpenGL ES GPU renderers, including color conversion,
+  Dolby Vision reshaping, tone/gamut mapping, scaling, and output encoding;
 - `prepare`, `seek`, pause/resume/stop, playback rate, A-B range, and loop;
 - media/track information and `avformat.*` property forwarding;
 - decoder-driven `setRenderCallback()` plus reason-aware render-thread
@@ -55,6 +59,12 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional Windows WASAPI shared-mode device sink with native playback timing;
 - optional Android AAudio device sink with callback-safe bounded buffering,
   device timing, latency reporting, and disconnect recovery;
+- optional OHOS OHAudio device sink with negotiated Float32 PCM,
+  callback-safe bounded buffering, hardware presentation timing, lifecycle
+  control, and non-callback route/error recovery;
+- optional OHOS OHCodec H.264/HEVC direct-surface hardware decoding through a
+  retained, versioned application-supplied `OHNativeWindow`, with move-only
+  present/drop/timed-presentation tokens;
 - optional D3D11VA hardware decoding on an application-selected retained
   D3D11 device, with reference-counted shader-readable NV12/P010 decoder
   texture-array slices and explicit software fallback;
@@ -75,12 +85,17 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional Android Vulkan surface adapter that retains the current
   `ANativeWindow` generation, selects a supported SDR/native-HDR swapchain,
   publishes its output color space, and owns surface/swapchain synchronization;
+- optional OHOS Vulkan surface adapter that retains an ArkUI/XComponent
+  `OHNativeWindow`, owns `VK_OHOS_surface` swapchain synchronization, and
+  delegates software-frame rendering to the same platform-neutral Vulkan
+  engine;
 - optional platform-neutral OpenGL ES 3.x renderer using libplacebo for
   software and hardware-frame color conversion, Dolby Vision RPU reshaping,
-  tone mapping, gamut mapping, and output encoding, plus an
-  Android EGL adapter that owns its display, context, window surface, and
-  surface generation, selects native 10-bit BT.2020/PQ or BT.2020/HLG when
-  available, and preserves an explicit RGBA8/sRGB SDR fallback;
+  tone mapping, gamut mapping, and output encoding, plus separate Android and
+  OHOS EGL adapters. Android selects native 10-bit BT.2020/PQ or BT.2020/HLG
+  when available and preserves an explicit RGBA8/sRGB SDR fallback; the first
+  OHOS adapter slice capability-gates an exact RGBA8/sRGB surface and reports
+  required HDR as unavailable until native HDR validation is complete;
 - optional platform-neutral mobile renderer selector that performs
   Vulkan-preferred startup, bounded same-API recovery, fatal one-way fallback
   to OpenGL ES, and an explicit no-renderer state;
@@ -97,12 +112,21 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   AAudio output, MediaCodec H.264/HEVC direct-surface validation, and
   H.264/HEVC private-AImageReader Vulkan plus AHardwareBuffer/EGLImage OpenGL
   ES texture paths;
+- a minimal OHOS ArkUI/XComponent HAP shell and connected-device harness for
+  generated-media software decode, Vulkan and OpenGL ES presentation, forced
+  initial OpenGL ES selection, and fatal one-way Vulkan-to-OpenGL ES fallback
+  without reopening media, plus OHAudio output/device-master timing and a
+  complete H.264/HEVC OHCodec direct-surface lifecycle matrix with bounded
+  output retention and stale-generation rejection, native Vulkan-to-OpenGL ES
+  OHCodec surface rebind, and an independent software-decode fallback, through
+  the repository arm64/API 23 dependency package;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
 keep consuming decoded frames through `onAudioFrame()` and can optionally bind
-an `AudioSink`; the Windows WASAPI and Android AAudio implementations remain
-separate backend targets so the core acquires no Qt or platform dependency.
+an `AudioSink`; the Windows WASAPI, Android AAudio, and OHOS OHAudio
+implementations remain separate backend targets so the core acquires no Qt or
+platform dependency.
 
 Current backend integration boundary:
 
@@ -127,6 +151,11 @@ Current backend integration boundary:
   Android output route, feeds AAudio's real-time callback from a bounded
   lock-free queue, maps AAudio presentation timestamps to the media timeline,
   and rebuilds a disconnected default-route stream on a non-callback thread;
+- `QtAV::AudioOHAudio` negotiates 48 kHz Float32 mono/stereo PCM against the
+  current OHOS output route, feeds OHAudio's real-time callback from the same
+  portable bounded SPSC queue, maps hardware-committed frame timestamps to the
+  media timeline, and rebuilds route-changed or failed streams on a dedicated
+  backend worker;
 - `HardwareDecodeConfig` selects an optional hardware device for video decode;
   its optional reference-counted `HardwareDecodeDevice` lets an in-tree
   backend supply a pre-created native device without exposing FFmpeg or
@@ -134,6 +163,10 @@ Current backend integration boundary:
   `QtAV::HWMediaCodec` explicitly selects FFmpeg's MediaCodec wrapper decoder,
   binds it to a versioned application `ANativeWindow`, and turns each decoded
   output into a single-decision direct-surface present/drop token;
+- `QtAV::HWOHCodec` retains and versions an application-supplied
+  `OHNativeWindow`, creates FFmpeg's `AV_HWDEVICE_TYPE_OHCODEC` device, and
+  explicitly selects the H.264/HEVC `*_ohcodec` wrapper decoder. Each surface
+  output becomes a single-decision present/drop/timed-presentation token;
 - `QtAV::InteropMediaCodecVulkan` owns a private GPU-sampled `AImageReader`,
   supplies its surface to `QtAV::HWMediaCodec`, correlates codec and image
   timestamps, imports retained `AHardwareBuffer` images and fences into the
@@ -164,7 +197,9 @@ Current backend integration boundary:
 - `QtAV::InteropD3D11` consumes same-device D3D11VA NV12/P010 texture-array
   slices as raw luma/chroma planes for libplacebo without a D3D11 Video
   Processor RGB conversion and without mapping, transferring, staging, or
-  uploading decoded pixels through CPU memory;
+  uploading decoded pixels through CPU memory. Because libplacebo wraps those
+  retained plane views directly, this is strict no-intermediate source
+  zero-copy;
 - `QtAV::OutputD3D11` combines the Windows device, renderer, decoder, and
   interop targets into a composition-surface output for ordinary applications;
   the application supplies a swap-chain binding callback, surface size, and
@@ -181,6 +216,10 @@ Current backend integration boundary:
   native HDR format/color-space pairs when available, and submits HDR10 static
   metadata when the application enabled `VK_EXT_hdr_metadata`; the application
   owns the Vulkan instance, device, queue, and NativeActivity;
+- `QtAV::RenderVulkanOHOS` owns the OHOS surface, swapchain, image views, and
+  acquire/present resources for a retained XComponent `OHNativeWindow`. The
+  ArkUI application owns the XComponent and borrowed Vulkan instance, device,
+  queue, and their lifetime;
 - `QtAV::RenderOpenGL` uploads the same software YUV420/422/444, NV12/NV21,
   P010, RGB/BGR/RGBA/BGRA/ARGB, and Gray8 families into OpenGL ES textures,
   maps their structured metadata through the shared FFmpeg/libplacebo bridge,
@@ -194,6 +233,11 @@ Current backend integration boundary:
   prefers an exact RGB10_A2 BT.2020/PQ surface, considers BT.2020/HLG, and
   falls back explicitly to RGBA8/sRGB while keeping Android and EGL types
   outside core public headers;
+- `QtAV::RenderOpenGLOHOS` retains the current XComponent `OHNativeWindow`
+  generation, owns its EGL display, OpenGL ES 3.x context, window surface, and
+  swap, and verifies an exact RGBA8/sRGB native-window contract. Native OHOS
+  HDR EGL selection remains capability-gated and is not claimed by this first
+  adapter slice;
 - `QtAV::RenderMobile` owns no graphics or platform resources. Applications
   supply Vulkan and OpenGL ES renderer factories for the current native-window
   generation; the selector keeps one stable `VideoRenderAPI` attached to
@@ -201,9 +245,12 @@ Current backend integration boundary:
   hardware-frame fallback callback selects OpenGL ES native interop,
   direct-surface presentation, software decode, or no video for subsequent
   output; cross-API fallback never retries or maps the retired native frame;
-- no OHOS hardware decoder or platform adapter has been implemented yet;
-  Android is the completed reference for the shared mobile
-  renderer/hardware-interop fallback policy.
+- OHOS OHCodec decoder selection, explicit direct-surface presentation tokens,
+  and the H.264/HEVC lifecycle matrix are implemented and device-validated.
+  Native hardware-frame texture interop remains pending. The preferred target
+  is retained `OH_NativeBuffer` import through Vulkan; the OpenGL ES fallback
+  requires raw `GL_EXT_YUV_target` sampling rather than implicit external-OES
+  YUV-to-RGB conversion.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
@@ -226,26 +273,43 @@ The accepted design is
 specified in [`MOBILE.md`](MOBILE.md).
 
 The Android Vulkan and OpenGL ES zero-CPU-copy paths are separate backends.
-Vulkan consumes private GPU-sampled
-`AImageReader` images by importing retained `AHardwareBuffer` allocations,
-native YCbCr/external formats, and acquire/release fences. OpenGL ES also owns
-a private GPU-sampled `AImageReader`, imports each retained
-`AHardwareBuffer` as an EGLImage, waits its acquire fence, and returns a
-release fence after submission. `GL_EXT_YUV_target` exposes raw Y, Cb, and Cr;
-a crop-aware GPU normalization pass stores those components in RGBA16F without
-performing color conversion, after which libplacebo applies FFmpeg's Dolby
-Vision metadata and the complete output color pipeline. Imports that cannot
-prove this raw contract are rejected for Dolby Vision rather than sampled
-through an implicitly converted SurfaceTexture. On OHOS, the confirmed GLES
-path uses
-`OH_NativeImage` plus an external-OES texture. OHOS Vulkan additionally needs
-a retained `OH_AVBuffer`/`OH_NativeBuffer` bridge because the current FFmpeg 8
-OHCodec buffer branch performs `OH_AVBuffer_GetAddr()` plus
-`av_image_copy2()` and therefore cannot satisfy this contract as-is. A
-zero-CPU-copy claim requires zero decoded-pixel map, software transfer, CPU
+Their platform interop responsibility stops at native import, format/plane
+exposure, timestamp/generation correlation, synchronization, and retained
+source lifetime; libplacebo owns all semantic processing.
+Vulkan consumes private GPU-sampled `AImageReader` images by importing retained
+`AHardwareBuffer` allocations, native YCbCr/external formats, and
+acquire/release fences. OpenGL ES also owns a private GPU-sampled
+`AImageReader`, imports each retained `AHardwareBuffer` as an EGLImage, waits
+its acquire fence, and returns a release fence after submission.
+`GL_EXT_YUV_target` exposes raw Y, Cb, and Cr; a crop-aware GPU normalization
+pass stores those components in RGBA16F without performing color conversion,
+after which libplacebo applies the complete semantic color pipeline.
+
+Here, zero-CPU-copy means zero decoded-source map, software transfer, CPU
 staging, and re-upload calls plus verified native-buffer lifetime and fence
-ordering. Unsupported imports are reported rather than silently mapped, and a
-Vulkan-to-OpenGL ES renderer switch does not itself authorize a CPU copy.
+ordering. It permits a GPU normalization texture. The narrower strict
+no-intermediate source zero-copy claim is allowed only when an explicit native
+format and plane mapping let libplacebo wrap the retained decoder allocation
+directly, with no normalization draw or intermediate source texture. Android
+OpenGL ES raw RGBA16F normalization and opaque-external-format Vulkan
+normalization are therefore zero-CPU-copy, but not strict source zero-copy.
+
+OHOS must use the same responsibility boundary. The preferred future route
+retains the exact `OH_AVBuffer`/`OH_NativeBuffer` and imports it through
+`VK_OHOS_external_memory`. Only an explicit `VkFormat`/plane mapping can
+qualify that route as strict
+source zero-copy. An opaque external format that needs GPU normalization keeps
+only the zero-CPU-copy claim. The OpenGL ES fallback requires raw
+`GL_EXT_YUV_target` sampling followed by RGBA16F GPU normalization; implicit
+external-OES YUV-to-RGB conversion is not a target. OHCodec/NativeImage may
+propagate the codec PTS unchanged in microseconds, so the interop compares the
+observed value and its microsecond-to-nanosecond candidate against the exact
+queued-frame PTS set, then stores and correlates the selected value in
+nanoseconds. The current FFmpeg 8 OHCodec buffer branch performs
+`OH_AVBuffer_GetAddr()` plus `av_image_copy2()`
+and cannot satisfy either native-buffer route as-is. Unsupported imports are
+reported rather than silently mapped, and a renderer switch does not itself
+authorize a CPU copy.
 
 ## Build
 
@@ -265,6 +329,35 @@ cmake --build build/modern
 ctest --test-dir build/modern --output-on-failure
 ```
 
+### OHOS arm64/API 23 on Windows
+
+On 64-bit Windows with DevEco Studio and the OpenHarmony native SDK installed,
+the supported PowerShell entry point builds the repository FFmpeg dependency
+closure locally, then builds and installs a shared Release QtAVCore SDK:
+
+```powershell
+./modern/scripts/build-ohos.ps1
+```
+
+Use `-SkipDependencies` after the local dependency package has already been
+verified, or `-LibraryType Static` for static QtAVCore archives. The scripts,
+output layout, SDK discovery, space-free SDK junction, shared-link policy, and
+HAP/signing boundary are documented in
+[`OHOS_WINDOWS.md`](OHOS_WINDOWS.md).
+
+To build the OHOS XComponent example and stage it into an existing signed
+DevEco project, use:
+
+```powershell
+./modern/examples/ohos/build-ohos-hap.ps1 `
+  -ProjectRoot C:/path/to/signed-project
+```
+
+With one HDC target connected, `run-connected-device.ps1` installs the signed
+HAP, starts its `EntryAbility`, and collects the native PASS/FAIL result. See
+[`examples/ohos/README.md`](examples/ohos/README.md) for the bundle-name and
+generated-media options.
+
 Backend switches are cache strings with `AUTO`, `ON`, and `OFF` values. `AUTO`
 enables a backend when its implementation and host requirements are available,
 `OFF` always disables it, and `ON` requires it or stops configuration with a
@@ -273,8 +366,9 @@ clear error. Current switches are:
 - render: `QTAV_RENDER_CPU`, `QTAV_RENDER_MOBILE`, `QTAV_RENDER_OPENGL`,
   `QTAV_RENDER_VULKAN`, and `QTAV_RENDER_D3D11`;
 - audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_AAUDIO`,
-  `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
-- hardware decode: `QTAV_HW_D3D11VA` and `QTAV_HW_MEDIACODEC`;
+  `QTAV_AUDIO_OHAUDIO`, `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
+- hardware decode: `QTAV_HW_D3D11VA`, `QTAV_HW_MEDIACODEC`, and
+  `QTAV_HW_OHCODEC`;
 - interop: `QTAV_INTEROP_D3D11`,
   `QTAV_INTEROP_MEDIACODEC_VULKAN`, and
   `QTAV_INTEROP_MEDIACODEC_OPENGL`;
@@ -283,10 +377,13 @@ clear error. Current switches are:
 `QTAV_RENDER_CPU=AUTO` builds the CPU renderer when libswscale is available,
 `QTAV_RENDER_MOBILE=AUTO` builds the dependency-free mobile renderer selector,
 `QTAV_RENDER_OPENGL=AUTO` builds the OpenGL ES renderer when GLES 3 headers
-and libraries are available and adds the Android EGL adapter on Android,
+and libraries are available and adds the native EGL adapter on Android
+(`QtAV::RenderOpenGLAndroid`) or OHOS (`QtAV::RenderOpenGLOHOS`),
 `QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader,
-libplacebo 7.351.0 or newer, and (on Android) `glslc` are available. The
-Android harness requires this backend explicitly,
+libplacebo 7.351.0 or newer, and (on Android/OHOS) `glslc` are available. It adds
+the native surface adapter target on Android (`QtAV::RenderVulkanAndroid`) or
+OHOS (`QtAV::RenderVulkanOHOS`). The Android and OHOS harnesses require this
+backend explicitly,
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
@@ -298,15 +395,22 @@ decoder targets are available. `QTAV_OUTPUT_D3D11=AUTO` builds the high-level Wi
 composition output when the D3D11 renderer, D3D11VA decoder, and interop
 targets are available. `QTAV_AUDIO_AAUDIO=AUTO` builds the AAudio sink on
 Android API 26 or newer; the current Android harness targets API 28 and does
-not require OpenSL ES fallback. `QTAV_HW_MEDIACODEC=AUTO` builds the Android
+not require OpenSL ES fallback. `QTAV_AUDIO_OHAUDIO=AUTO` builds the OHAudio
+sink for OHOS/OpenHarmony targets when `libohaudio` is available.
+`QTAV_HW_MEDIACODEC=AUTO` builds the Android
 MediaCodec direct-surface backend when the NDK Media APIs and FFmpeg's
 MediaCodec hardware context are available.
+`QTAV_HW_OHCODEC=AUTO` builds the OHOS decoder-selection backend when
+`libnative_window` and FFmpeg's OHCodec hardware context are available.
 `QTAV_INTEROP_MEDIACODEC_VULKAN=AUTO` builds the private-AImageReader Vulkan
 interop on Android API 26 or newer when the MediaCodec and Vulkan targets are
 both available.
 `QTAV_INTEROP_MEDIACODEC_OPENGL=AUTO` builds the private-AImageReader
 AHardwareBuffer/EGLImage interop on Android API 28 or newer when the
 MediaCodec and OpenGL ES targets are both available.
+`QTAV_INTEROP_OHCODEC_VULKAN=AUTO` builds the OHCodec/ConsumerSurface
+Vulkan interop on OHOS when the OHCodec and Vulkan targets plus
+`libnative_buffer`, `libnative_image`, and `libnative_window` are available.
 Backend implementations not otherwise described remain disabled under
 `AUTO`, and explicitly requesting one with `ON` is an error.
 
@@ -592,6 +696,225 @@ xrun count, transparent route-change count, and disconnect-restart count for
 diagnostics. The backend requires no OpenSL ES fallback at the current API 28
 baseline.
 
+### OHAudio device sink
+
+Link `QtAV::AudioOHAudio` and `QtAV::AudioResample` in an OHOS application
+whose minimum native platform is API 23 or newer:
+
+```cpp
+#include <qtav/ohaudio_audio_sink.h>
+#include <qtav/swresample_audio_converter.h>
+
+player
+    .setAudioFrameConverter(
+        std::make_shared<qtav::SwresampleAudioConverter>())
+    .setAudioSink(
+        std::make_shared<qtav::OHAudioAudioSink>());
+```
+
+The default configuration requests the current route in fast mode and
+negotiates 48 kHz mono/stereo interleaved Float32 PCM, falling back to normal
+latency mode if fast renderer construction is unavailable. Accepted PCM enters
+the same preallocated SPSC implementation used by the Android backend. The
+OHAudio write callback performs only bounded copies, silence fill, and atomic
+updates; stream construction, teardown, route recovery, and event delivery
+remain on non-callback threads.
+
+`clock()` maps `OH_AudioRenderer_GetAudioTimestampInfo()` hardware-committed
+frame positions to media timestamps. Its latency combines frames submitted to
+OHAudio but not yet committed with backend-queued PCM. Pause, flush, natural-
+end drain, underrun re-anchoring, forced audio interruptions, and teardown
+follow the generic `AudioSink` lifecycle. Output-device changes and native
+errors rebuild the negotiated stream on the backend worker, discard the old
+queued generation, and emit `Underrun` after successful recovery or
+`DeviceLost` if reconstruction fails.
+
+`OHAudioStreamInfo` exposes callback size, native frames/underflows, accepted
+PCM, lifecycle counters, route changes, and stream restarts for diagnostics.
+The connected Mate 60 Pro harness has validated native 440 Hz AAC output,
+device-master clock samples, non-negative combined latency, pause/resume,
+seek/flush, loop-boundary drain, and clean continuation through the existing
+Vulkan/OpenGL ES fallback scenario. Automated counters establish delivery and
+hardware timing; subjective audibility still requires a human listening check.
+
+### OHCodec direct-surface hardware decode
+
+Link `QtAV::HWOHCodec` in an OHOS application. Create a new
+`OHCodecSurface` for every ArkUI-published `OHNativeWindow` generation, set
+the returned configuration before opening H.264 or HEVC media, and consume
+each surface output from the decode-worker scheduler:
+
+```cpp
+#include <qtav/ohcodec_hardware_decoder.h>
+
+qtav::OHCodecSurface surface(nativeWindow);
+qtav::OHCodecHardwareDecodeOptions options;
+options.allowSoftwareFallback = false;
+
+player
+    .setHardwareDecodeConfig(
+        qtav::ohCodecHardwareDecodeConfig(surface, options))
+    .setVideoFrameScheduler(
+        [&surface](
+            const qtav::VideoFrame& frame,
+            int,
+            std::int64_t monotonicNanoseconds) {
+            auto output = qtav::ohCodecFrame(frame, surface);
+            return output
+                && output.presentAt(monotonicNanoseconds);
+        });
+player.setMedia(path);
+player.setState(qtav::State::Playing);
+```
+
+The backend retains the native window independently of ArkUI, creates an
+FFmpeg `AV_HWDEVICE_TYPE_OHCODEC` device for it, selects the explicit
+`*_ohcodec` wrapper, and tags decoded hardware frames with the exact surface
+generation. `OHCodecFrame` is a move-only, single-decision token. `present()`
+releases immediately to the configured window, `presentAt()` uses a
+`CLOCK_MONOTONIC` nanosecond timestamp, and `drop()` releases without display.
+Destroying an undecided token drops it. If an output instead reaches its final
+retained frame release without an explicit token decision, the FFmpeg overlay
+also unconditionally drops/frees it; abandonment never implies presentation.
+`ohCodecFrame()` rejects stale or foreign window generations.
+
+The repository FFmpeg overlay supplies the narrow opaque release API required
+to make that decision without copying FFmpeg's private decoder state. It is a
+surface-output API only: it does not expose an `OH_AVBuffer` or establish
+Vulkan/OpenGL ES native-buffer interop. The Player applies the same bounded
+packet-feed and no-deep-output-queue scheduling policy used by Android
+MediaCodec. On surface loss, pause playback, clear the scheduler and hardware
+configuration, let retained tokens finish or drop, publish a new
+`OHCodecSurface`, and resume with the replacement configuration.
+
+The complete signed HAP passed on 2026-08-05 on a Mate 60 Pro (`ALN-AL80`),
+HarmonyOS 6.1.0.135 / OpenHarmony 6.1.1.120 API 24. With software fallback
+disabled, H.264 presented 48 outputs and dropped 5; HEVC presented 40 and
+dropped 5. The run passed pause/resume, a 2000 ms target/callback seek, media
+replacement, explicit stop, background and foreground transitions, one
+surface recreation, and one stale-generation rejection. Output retention was
+bounded at `maxPending=2`; `pendingAtStop=1` drained to `pendingEnd=0`, and
+`maxQueued=0`. This completes the direct-surface lifecycle matrix. The
+separate `QtAV::InteropOHCodecVulkan` target now implements strict retained
+`OH_NativeBuffer` import, while `QtAV::InteropOHCodecOpenGL` provides the
+raw-component OpenGL ES route. The latter exposes raw components through
+`GL_EXT_YUV_target` and does not rely on implicit external-OES conversion.
+
+### OHCodec OpenGL ES raw-component interop
+
+Link `QtAV::HWOHCodec`, `QtAV::RenderOpenGLOHOS`, and
+`QtAV::InteropOHCodecOpenGL`. The interop supplies an `OH_NativeImage`
+producer window to OHCodec, retains the exact scheduled `VideoFrame`, and
+matches each image timestamp against the queued presentation timestamp after
+checking the device's observed microsecond and nanosecond forms. It samples
+raw Y/Cb/Cr through `GL_EXT_YUV_target` into an RGBA16F representation texture;
+libplacebo remains responsible for Dolby Vision reshaping, color conversion,
+tone/gamut mapping, scaling, and output encoding.
+
+The repository FFmpeg overlay enables the HEVC parser and built-in RPU decoder
+for `hevc_ohcodec`. It parses RPU NAL units before packet submission, keys the
+result by the exact microsecond PTS passed to OHCodec, and attaches
+`AV_FRAME_DATA_DOVI_METADATA` only to the output carrying that PTS. Seek,
+decoder flush, media replacement, and close clear both the parser state and
+the bounded pending-metadata queue.
+
+`OHCodecOpenGLInteropStatistics` reports
+`dolbyVisionFramesQueued`, `dolbyVisionTimestampMatches`, and
+`dolbyVisionFramesReleased`. These counters prove that the same metadata-
+bearing frame survived native-image association and stayed alive until image
+release; a profile validation fails when any rendered HEVC frame lacks that
+chain. On 2026-08-06 the signed Mate 60 Pro HAP passed Profile 5 and the
+checksum-pinned FFmpeg FATE Profile 8.4 sample with 45 rendered HEVC frames per
+run and `45/45/45` queued/matched/released RPU counts. Both runs used raw YCbCr,
+zero implicit-RGB images, and zero decoded-source CPU map, software transfer,
+staging, or renderer upload calls. The Profile 8.4 MMR path also exercises the
+repository libplacebo GLES shader-index correction.
+
+### OHCodec Vulkan native-buffer interop
+
+Link `QtAV::HWOHCodec`, `QtAV::RenderVulkanOHOS`, and
+`QtAV::InteropOHCodecVulkan`. The application-created Vulkan device must
+enable `VK_OHOS_external_memory`, `VK_EXT_queue_family_foreign`, and
+`VK_KHR_external_semaphore_fd`, enable `samplerYcbcrConversion`, then declare
+those facts in the interop
+configuration:
+
+```cpp
+#include <qtav/ohcodec_vulkan_interop.h>
+
+qtav::OHCodecVulkanInteropConfig interopConfig;
+interopConfig.width = 1920;
+interopConfig.height = 1080;
+interopConfig.ohosExternalMemoryEnabled = true;
+interopConfig.foreignQueueFamilyEnabled = true;
+interopConfig.syncFdSemaphoreEnabled = true;
+interopConfig.samplerYcbcrConversionEnabled = true;
+
+auto interop = std::make_shared<qtav::OHCodecVulkanInterop>(
+    borrowedVulkanDevice,
+    interopConfig);
+renderer->setHardwareFrameInterop(interop);
+player.setHardwareDecodeConfig(
+    qtav::ohCodecHardwareDecodeConfig(
+        interop->surface(),
+        { false, 8 }));
+```
+
+The interop owns a private `OH_ConsumerSurface`. Surface-mode OHCodec outputs
+do not expose native memory through their `OH_AVBuffer`; the interop therefore
+presents exactly one retained output into that surface, waits for its frame
+callback, acquires and retains the corresponding `OHNativeWindowBuffer`, and
+converts it to `OH_NativeBuffer`. An acquire sync fd is imported into a Vulkan
+semaphore. The consumer buffer remains retained until the renderer's GPU
+completion timeline retires the texture.
+
+Explicit sampled NV12/P010-compatible two- or three-plane `VkFormat` values
+are passed directly to `pl_vulkan_wrap`. For `VK_FORMAT_UNDEFINED` plus an
+opaque external-format ID, the interop creates `VkExternalFormatOHOS`, imports
+the same native buffer, and exposes a `VkSamplerYcbcrConversion` image view.
+The renderer samples it once into an RGBA16F GPU image before libplacebo. This
+opaque route never maps the decoded source, performs a software transfer,
+stages, or uploads its pixels; it is zero-CPU-copy but, because of the GPU
+normalization image, is not strict no-intermediate source zero-copy.
+
+The connected Mate 60 Pro probe on 2026-08-06 exercised real H.264/NV12,
+HEVC/NV12, and HEVC Main10/P010 outputs. The queried Vulkan format remained
+`VK_FORMAT_UNDEFINED`; NV12 exposed external format `1000156003` and P010
+exposed `1000156013`. A raw Vulkan object probe succeeded through YCbCr
+conversion, sampler, image/memory import, image view, and immutable descriptor
+layout. The full HAP then emitted
+`QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS mode=opaque-ycbcr-normalized` after 30
+H.264 and 30 HEVC shader-sampled frames: `acquired=60`, `imported=60`,
+`opaqueImports=60`, `normalization=60`, with zero CPU map, software transfer,
+staging, or upload.
+
+Two diagnostic-only modes then tested Huawei's proposed numeric
+reinterpretation. They omit `VkExternalFormatOHOS` from image creation and set
+`VkImageCreateInfo::format` to
+`VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` for `1000156003`, or
+`VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` for `1000156013`.
+Application-owned Vulkan YCbCr sampling passed 30 H.264/NV12 plus 30 HEVC
+Main10/P010 frames. Direct `pl_vulkan_wrap` with libplacebo 7.351.0 also passed
+all 60 frames with `directPlanes=60`, `normalization=0`, and zero CPU map,
+transfer, staging, or upload. This proves the device and libplacebo paths can
+consume the forced explicit formats. Production direct-plane use remains
+disabled until Huawei confirms that the implementation-defined
+external-format IDs may formally and stably be used as those `VkFormat`
+values across supported devices and system/driver versions.
+
+The same connected harness now exercises the shared selector with real
+OHCodec frames. After eight successful opaque Vulkan imports it injects a
+bounded fatal result, retires the Vulkan consumer surface, prepares an
+`OH_NativeImage` OpenGL ES candidate, and synchronously
+rebinds subsequent decoder output to the new surface without reopening the
+media. The 2026-08-06 run changed generation 5 to 6 and rendered 30 raw-YCbCr
+OpenGL ES frames. A separate session selected the independent software-decode
+route: it cleared `HardwareDecodeConfig`, discarded the retired hardware frame,
+then rendered 30 software frames through OpenGL ES. Both paths kept decoded-
+source CPU map, transfer, staging, and upload counters at zero. Direct-surface
+and no-video remain explicit application alternatives covered by deterministic
+selector tests.
+
 ### MediaCodec direct-surface hardware decode
 
 Link `QtAV::HWMediaCodec` in an Android application. Create a new
@@ -705,28 +1028,29 @@ The config's optional `width` and `height` are only the reader's default
 dimensions; when omitted, the interop uses `1x1`. MediaCodec overrides that
 default with its decoded output size, and every import uses the actual
 `AImage` dimensions and crop, so applications do not need a separate media
-probe before creating the zero-copy path.
+probe before creating the zero-CPU-copy path.
 `queueFrame()` performs a bounded wait for the matching asynchronous image to
 be acquired, serializing producer ownership transfer without waiting for the
 playback deadline or Vulkan submission. Applications should reserve their own
 bounded render slot before calling it, retain the exact `VideoFrame`, and
 render at the scheduler-provided deadline.
-Vulkan uses the
-driver-reported format or external format and suggested YCbCr conversion. The
+Vulkan uses the driver-reported explicit format or opaque external format. The
 renderer also applies the `AImage` crop rectangle, so codec-aligned native
 allocations may be larger than the visible decoded frame.
 
-libplacebo's public Vulkan wrapping API requires a defined `VkFormat`, while
-Android private MediaCodec buffers on tested devices expose only an external
-format. For that case the interop performs one GPU-only sampling pass into an
-FP16 Vulkan texture, applying only an immutable sampler and the visible crop.
-Ordinary frames use the driver's suggested YCbCr conversion. Dolby Vision
-frames instead use an identity conversion that preserves raw Y/Cb/Cr in
-component order, so libplacebo receives the base-layer signals required by
-the FFmpeg RPU metadata. No transfer, gamut mapping, tone mapping, HDR output
-encoding, or RPU processing is implemented in that small normalization pass;
-libplacebo performs those operations from the FP16 texture onward. This does
-not map, transfer, stage, or upload decoded pixels through the CPU.
+When the driver reports an explicit `VkFormat` and plane mapping, the retained
+decoder allocation can be wrapped directly for libplacebo; only that direct
+case qualifies as strict no-intermediate source zero-copy. Android private
+MediaCodec buffers on tested devices instead expose an opaque external format,
+so the interop performs one GPU-only sampling pass into an FP16 Vulkan texture,
+applying only raw representation normalization and the visible crop. Dolby
+Vision requires an identity/raw-component sampling contract so libplacebo
+receives the base-layer signals associated with FFmpeg's RPU metadata. No
+matrix, transfer, gamut mapping, tone mapping, HDR output encoding, or RPU
+processing belongs in this normalization pass; imports that cannot preserve
+raw components must be rejected for this path. The opaque-format path performs
+no decoded-source CPU map, transfer, staging, or upload, but its intermediate
+texture means it is zero-CPU-copy rather than strict source zero-copy.
 
 When an acquire sync fd is present it is imported into a temporary Vulkan
 semaphore. Submission waits on that semaphore and transfers ownership from
@@ -807,6 +1131,8 @@ matrix, transfer, gamut, tone mapping, or output encoding; libplacebo performs
 all of those operations after applying any FFmpeg `AVDOVIMetadata`. A
 configured `width` and `height` only set the AImageReader's initial size;
 MediaCodec output supplies each acquired image's actual dimensions and crop.
+This route is zero-CPU-copy, but the RGBA16F normalization texture means it is
+not strict no-intermediate source zero-copy.
 
 Call `flush()` before seek, loop, decoder/media replacement, explicit stop, or
 an interop-policy switch. Close the renderer while its context can still be
@@ -833,9 +1159,17 @@ player
     .setRenderCallback([&](void* key) {
         schedule_on_render_thread([&, key] {
             const auto result = player.renderVideoDetailed(key);
-            if (result.status == qtav::VideoRenderStatus::PlayerStateBusy
-                || result.status == qtav::VideoRenderStatus::RendererBusy) {
-                schedule_bounded_retry(key);
+            if (result.status
+                == qtav::VideoRenderStatus::RendererBusy) {
+                schedule_bounded_retry(
+                    key,
+                    result.retryAfterMilliseconds);
+            } else if (result.status
+                       == qtav::VideoRenderStatus::RendererDeferred) {
+                // Retain the exact frame; the backend will request redraw.
+            } else if (result.status
+                       == qtav::VideoRenderStatus::SurfaceLost) {
+                recreate_native_surface(key);
             }
         });
     });
@@ -858,14 +1192,24 @@ latency or repeatedly replacing the next presentable frame.
 `renderVideoDetailed()` runs on the caller's thread, so an OpenGL, Vulkan, or
 D3D integration can keep ownership of its native context and surface. Its
 immutable frame and renderer-binding snapshots are atomically published; the
-hot render path does not take the Player control mutex. The result distinguishes
-`Rendered`, `NoFrame`, `PlayerStateBusy`, and `RendererBusy`, and carries the
-frame sequence plus presentation generation needed to coalesce bounded
-retries. Retry only the two busy results; `NoFrame` waits for the next
-decoder-driven redraw. Player rechecks the generation after the backend call,
-so a seek, stop, or media replacement that overlaps rendering rejects the
-completed stale frame. The compatibility `renderVideo()` returns the rendered
-timestamp in seconds and collapses every other result to a negative value.
+hot render path does not take the Player control mutex. The backend-level
+`VideoRenderAttemptResult` distinguishes `Presented`,
+`DeferredUntilRedraw`, `RetryAfterBackoff`, `Discarded`, `SurfaceLost`, and
+`FatalError`. `renderVideoDetailed()` maps those to `Rendered`,
+`RendererDeferred`, `RendererBusy`, `FrameDiscarded`, `SurfaceLost`, and
+`RendererError`, while retaining `NoFrame` and the reserved
+`PlayerStateBusy`. It also carries the frame sequence, presentation generation,
+optional retry delay, and diagnostic detail. Retain and retry the exact frame
+only for `RendererDeferred` (after the backend raises `RedrawRequested`) or
+`RendererBusy` (after bounded timer backoff); terminal discarded/no-frame
+results wait for a newly published frame. Player rechecks the generation after
+the backend call, so a seek, stop, or media replacement that overlaps rendering
+returns `FrameDiscarded` for that stale completion. The compatibility
+`renderVideo()` returns the rendered timestamp in seconds and collapses every
+other result to a negative value. Existing boolean-only `VideoRenderAPI`
+implementations remain source-compatible: their `false` result maps to a
+one-millisecond `RetryAfterBackoff` attempt until they override
+`renderDetailed()`.
 A/V startup and playing seeks use a bounded video preroll before releasing
 device audio, avoiding an audio-first clock sprint while the first video
 frames are still being decoded.
@@ -949,14 +1293,16 @@ white and preserve brighter values above `1.0`.
 
 Software frames are mapped with libplacebo's FFmpeg bridge. When FFmpeg has
 parsed a Dolby Vision RPU into `AV_FRAME_DATA_DOVI_METADATA`, libplacebo maps
-the metadata, applies base-layer reshaping, and tone maps to the selected
-target. The repository FFmpeg overlay makes the HEVC MediaCodec wrapper run
-FFmpeg's own RPU parser before submitting each access unit, correlates the
-result with the reordered hardware output timestamp, and attaches the same
-frame side data used by the software decoder. MediaCodec frames then enter the
-same libplacebo DOVI path after zero-copy external-image normalization. This
-does not require libdovi: the optional raw-RPU parser remains disabled. RPUs
-that require a residual enhancement layer are rejected by this
+only residual-disabled base-layer metadata, applies base-layer reshaping, and
+tone maps to the selected target. The repository FFmpeg overlay makes the HEVC
+MediaCodec wrapper run FFmpeg's own RPU parser before submitting each access
+unit, correlates the result with the reordered hardware output timestamp, and
+attaches the same frame side data used by the software decoder. The OHCodec
+wrapper uses the corresponding exact microsecond-PTS queue for OHOS hardware
+outputs. MediaCodec and OHCodec frames then enter the same libplacebo DOVI path
+after zero-CPU-copy external-image normalization.
+This does not require libdovi: the optional raw-RPU parser remains disabled.
+RPUs that require a residual enhancement layer are rejected by this
 base-layer-only path; compressed passthrough, Dolby certification, and
 licensing are outside QtAVCore's scope.
 
@@ -1018,7 +1364,7 @@ submits frame-derived mastering-display and content-light metadata before
 presentation. `surfaceFormat()` and `hdrOutputActive()` expose the selected
 contract for diagnostics and tests.
 
-### OpenGL ES renderer and Android EGL adapter
+### OpenGL ES renderer and native EGL adapters
 
 Link `QtAV::RenderOpenGLAndroid` for the Android OpenGL ES fallback. The
 adapter owns its EGL display, OpenGL ES 3.x context, window surface, and swap
@@ -1061,6 +1407,16 @@ the EGL surface and refreshes the renderer target size.
 `eglSwapBuffers()`, and then releases it from the calling thread. The adapter
 does not create or select Vulkan and is not itself the Vulkan-to-OpenGL ES
 policy layer.
+
+On OHOS, link `QtAV::RenderOpenGLOHOS` and pass the current XComponent window
+to `OHOSOpenGLVideoRenderer::setWindow()`. The adapter takes an OHOS native-
+object reference, selects and verifies an exact RGBA8 EGLConfig and native
+window format, requests and verifies the sRGB color contract, and owns EGL
+surface/context recreation for that window generation. `SdrOnly` and
+`PreferHdr` currently produce SDR sRGB; `RequireHdr` fails explicitly because
+an OHOS native HDR format, EGL colorspace, and compositor contract has not yet
+passed the device capability gate. This keeps HDR-to-SDR tone mapping truthful
+while the broader OHOS HDR matrix remains pending.
 
 `QtAV::RenderOpenGL` is the reusable engine for applications or future
 platform adapters that already own an OpenGL ES 3.x context. Its
@@ -1352,12 +1708,12 @@ context must restore their state after `renderVideo()`.
 The software path uploads YUV420P, YUV422P, YUV444P, NV12, NV21, P010,
 RGB24, BGR24, RGBA, BGRA, ARGB, and Gray8 frames. It renders to single-sample
 BGRA8/RGBA8 UNORM, `R16G16B16A16_FLOAT`, or
-`R10G10B10A2_UNORM` 2D targets. The shader applies limited/full-range
-BT.601/BT.709/BT.2020 YUV conversion, PQ or HLG EOTF, linear-light
-BT.2020/Display-P3 to BT.709 conversion, display-aware luminance mapping, and
-the output transfer. It also supports custom viewports, Fit/Fill/Stretch, all
-right-angle rotations, resize, surface recreation, and surface/device-loss
-events.
+`R10G10B10A2_UNORM` 2D targets. libplacebo generates the D3D11 shaders and is
+the sole authority for limited/full-range YUV conversion, transfer functions,
+primaries conversion, Dolby Vision reshaping, display-aware tone/gamut mapping,
+scaling, and output encoding. The renderer supplies custom viewports,
+Fit/Fill/Stretch, all right-angle rotations, resize, surface recreation, and
+surface/device-loss events; it does not maintain a competing semantic shader.
 
 For general-purpose Windows presentation, create a flip-model
 `R16G16B16A16_FLOAT` swap chain. The renderer sets its color space to
@@ -1560,6 +1916,15 @@ submitted to the native stream. Pause, flush, drain, xrun detection, transparent
 route observation, and disconnect-triggered stream reconstruction remain
 inside the Android target.
 
+`QtAV::AudioOHAudio` implements `OHAudioAudioSink` on OHOS API 23 or newer.
+Its backend header exposes only QtAVCore value types and diagnostics; OHAudio
+declarations remain private to the implementation. It negotiates interleaved
+Float32 mono/stereo PCM, shares the allocation-free SPSC queue implementation
+with AAudio, anchors playback to hardware-committed native frame timestamps,
+and reports live queued/native latency. Pause, flush, drain, interruption,
+underrun, route-change rebuilding, and error recovery stay inside the OHOS
+target.
+
 `QtAV::PlatformWindows` owns the Windows-only `D3D11DeviceAccess` helper and
 strong non-owning wrappers for `ID3D11Device` and `ID3D11DeviceContext`; no
 Windows SDK type reaches the core headers. `QtAV::RenderD3D11` retains that
@@ -1642,16 +2007,28 @@ and verify channel data, drain timing, sample counts, and seek reset behavior.
 Audio-file tests verify RIFF/WAVE headers and little-endian samples, then run
 the player and converter to produce an exact 64,000-byte 16 kHz stereo S16
 payload from deterministic 8 kHz mono input.
-AAudio's portable SPSC queue test covers capacity, wraparound, timestamp
-continuity, rejection, and reset without an Android device. The connected
+The portable SPSC queue shared by AAudio and OHAudio is tested for capacity,
+wraparound, timestamp continuity, rejection, reset, and concurrent
+single-producer/single-consumer access without a device. The connected
 Android harness additionally verifies Float32 negotiation, real-time
 presentation, monotonic device-clock samples, non-negative combined latency,
 pause/resume, background/foreground recovery, drain, and clean close on an
 AAudio-capable device.
-The same connected harness verifies MediaCodec H.264/HEVC direct-surface
-outputs with explicit present/drop, seek/flush, media replacement, stop,
-surface-generation replacement, stale-token rejection, decoder/output
-lifetime, and NativeActivity shutdown.
+The connected OHOS HAP additionally verifies 48 kHz Float32 negotiation,
+real-time OHAudio presentation, device-master clock samples, combined latency,
+pause/resume, seek/flush, loop-boundary drain, and clean close while preserving
+the software Vulkan/OpenGL ES selector result.
+The OHOS HAP then verifies OHCodec H.264/HEVC direct-surface outputs with
+explicit timed present/drop, seek/flush, media replacement, stop, real
+background/foreground surface-generation replacement, stale-token rejection,
+bounded retained output, and decoder/output lifetime through shutdown.
+Its raw OpenGL ES phase additionally validates exact normalized-PTS Dolby
+Vision attachment for Profile 5 and Profile 8.4 with per-frame
+queued/matched/released counters and no implicit-RGB input.
+The connected Android harness separately verifies MediaCodec H.264/HEVC
+direct-surface outputs with explicit present/drop, seek/flush, media
+replacement, stop, surface-generation replacement, stale-token rejection,
+decoder/output lifetime, and NativeActivity shutdown.
 It then decodes H.264 and HEVC into separate private GPU-sampled
 `AImageReader` surfaces, imports external-format `AHardwareBuffer` images into
 Vulkan, samples aligned native allocations using their visible crop, and
@@ -1665,8 +2042,8 @@ imports return release fences with zero CPU map/transfer/staging/upload.
 Independent OpenGL ES phases import 99 H.264 and 180 HEVC
 AHardwareBuffer/EGLImages through the raw-YCbCr path, return a release fence
 for every imported image, survive seek plus EGL surface recreation, and retain
-the same zero-copy counters. A forced Vulkan failure rebinds MediaCodec to a
-new OpenGL AImageReader and presents another 180 raw frames without retrying
+the same zero-CPU-copy counters. A forced Vulkan failure rebinds MediaCodec to
+a new OpenGL AImageReader and presents another 180 raw frames without retrying
 the retired Vulkan image. Manual Profile 5 validation is recorded in
 [`DECISIONS.md`](DECISIONS.md).
 Windows D3D11 tests use the WARP device for deterministic offscreen rendering
@@ -1696,7 +2073,7 @@ exposes no endpoint.
 ## Architecture summary
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the complete ownership, threading,
-libplacebo color-pipeline, Android zero-copy, HDR, and packaging boundaries.
+libplacebo color-pipeline, Android zero-CPU-copy, HDR, and packaging boundaries.
 
 ```text
 Player facade
@@ -1734,7 +2111,7 @@ dependencies to the legacy library.
 See [MIGRATION.md](MIGRATION.md) for the QtAV API mapping, current limitations,
 and threading contract. See [PLAN.md](PLAN.md) for the persistent milestone
 status, next task, and backend implementation order. The accepted Windows
-D3D11VA device, frame-lifetime, and zero-copy interop design is recorded in
+D3D11VA device, frame-lifetime, and zero-CPU-copy interop design is recorded in
 [D3D11VA.md](D3D11VA.md).
 The shared Android/OHOS mobile renderer, native lifecycle, hardware-output,
 audio, and connected-device test boundaries are recorded in

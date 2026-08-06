@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "QtAVCore OHOS XComponent validation"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "QtAVCore software Vulkan playback validation"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "QtAVCore OHOS"
+    }
+  ]
+}

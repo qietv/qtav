@@ -9,7 +9,8 @@ vcpkg_from_git(
         0002-fix-windows-shlwapi-linkage.patch
         0003-use-static-spirv-cross.patch
         0004-align-windows-clang-allocations.patch
-        0005-add-d3d11-pass-diagnostics.patch
+        0005-fix-gles-dovi-mmr-indexing.patch
+        0006-add-d3d11-pass-diagnostics.patch
 )
 
 x_vcpkg_get_python_packages(

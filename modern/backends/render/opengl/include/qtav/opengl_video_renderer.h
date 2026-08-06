@@ -122,6 +122,12 @@ public:
 
     virtual ~OpenGLHardwareFrameInterop();
 
+    // Called with the renderer's OpenGL ES context current before the first
+    // hardware frame is prepared. Platform interop implementations whose
+    // producer surface is created from a context-bound external texture use
+    // this hook to publish that surface before decoder configuration. The
+    // default implementation has no context resources and succeeds.
+    virtual bool initializeCurrentContext(std::string& detail);
     virtual HardwareInteropCapabilities capabilities() const = 0;
     virtual bool supports(const HardwareFrame& frame) const noexcept = 0;
     virtual OpenGLHardwareImportResult prepareFrame(
@@ -156,6 +162,8 @@ public:
     void setEventCallback(EventCallback callback) override;
     bool open(const VideoRenderConfig& config) override;
     bool configure(const VideoRenderConfig& config) override;
+    VideoRenderAttemptResult renderDetailed(
+        const VideoFrame& frame) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
 

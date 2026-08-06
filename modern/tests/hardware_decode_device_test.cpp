@@ -24,6 +24,8 @@ AVHWDeviceType ffmpegDeviceType(qtav::HardwareDeviceType type)
         return AV_HWDEVICE_TYPE_D3D11VA;
     case qtav::HardwareDeviceType::MediaCodec:
         return AV_HWDEVICE_TYPE_MEDIACODEC;
+    case qtav::HardwareDeviceType::OHCodec:
+        return AV_HWDEVICE_TYPE_OHCODEC;
     default:
         return AV_HWDEVICE_TYPE_NONE;
     }

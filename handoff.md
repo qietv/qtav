@@ -15,6 +15,14 @@ post-seek draw overruns, render gaps, Present backpressure, and occasional
 five-second cadence loss. Thermal throttling may have amplified the first run,
 but it is not a sufficient root-cause explanation.
 
+An administrator WPR follow-up on 2026-08-05 used the Lenovo internal
+2880x1800/60-Hz SDR panel because the Philips display was not active. It
+captured and explained one 57.9-ms seek-transition frame, but it did **not**
+reproduce the defining issue: repeated settled 40-49-ms `pl_render_image()`
+calls after seeking. That trace is useful transition evidence, not a successful
+reproduction or resolution of the open regression. The next run will use the
+Philips 4K HDR display in a new conversation window.
+
 The originating machine now proceeds with OHOS development in parallel. The
 transferred Windows task owns only the unfinished Intel investigation and must
 merge its evidence and fix back without discarding the OHOS work. The complete
@@ -25,18 +33,18 @@ chronological record is in [`modern/PLAN.md`](modern/PLAN.md), especially
 ## Repository state
 
 - Repository: `C:\vscode\QtAV`
-- Current commit: `61afd1e4508e4817b9de4c8419df12880d19eb37`
+- Historical handoff baseline: `61afd1e4508e4817b9de4c8419df12880d19eb37`.
+  The branch has advanced since this file was created; run `git rev-parse HEAD`
+  and `git status --short` at the start of the next window rather than resetting
+  to this hash.
+- Intel diagnostic instrumentation entered history in
+  `8ce66844c7213dda54178b3d792b9161f426f11f`. Later commits primarily advance
+  the parallel OHOS work.
 - Active implementation: `modern/` (QtAVCore), not the legacy root QtAV tree.
-- Existing uncommitted Intel diagnostic work modifies the D3D11 renderer and
-  output statistics, WinUI cadence logging, `modern/README.md`,
-  `modern/examples/winui3_player/TESTING.md`, and `modern/PLAN.md`. Preserve it;
-  do not reset or overwrite it.
-- The shared worktree also contains separate OHOS/FFmpeg changes, including
-  `ffmpeg/scripts/build-ohos.ps1`, `ffmpeg/scripts/ohos-windows-common.ps1`,
-  `modern/scripts/`, `modern/CMakeLists.txt`, and related FFmpeg port/verification
-  files. These are not part of the Intel diagnosis. Do not discard, fold into
-  an Intel-only commit, or edit them unless the OHOS task explicitly requires
-  it.
+- The shared worktree can contain separate uncommitted OHOS source,
+  documentation, CMake, example, and interop changes. These are not part of the
+  Intel diagnosis. Inspect the live status, then do not discard, fold into an
+  Intel-only commit, or edit them unless the OHOS task explicitly requires it.
 - This `handoff.md` is intentionally at the repository root as the next-chat
   entry point.
 - No production source fix has been made for the Intel result. The source
@@ -53,8 +61,8 @@ Read before editing:
 
 ## Known-good build and executable
 
-The latest instrumented Windows build is based on the same commit plus the
-uncommitted diagnostic statistics:
+The instrumented Windows binary used for the administrator trace contains the
+diagnostic statistics now recorded in commit `8ce6684`:
 
 - CMake tree: `C:\vscode\QtAV\build\modern-shared-intel`
 - WinUI executable:
@@ -65,6 +73,22 @@ uncommitted diagnostic statistics:
 - WinUI Release build: zero MSBuild warnings and errors
 - the final WinUI build restored the normal HDR-preferred RGB10/PQ path after a
   temporary `SdrOnly` A/B
+
+Reference SHA-256 values for the exact binaries used by the administrator
+internal-SDR trace are:
+
+| Binary | SHA-256 |
+| --- | --- |
+| `QtAVWinUI3.exe` | `2C84EED7431E097ED6E51C54FB022B7410E821D25754586C2F2D7520D3E4F705` |
+| `qtav_render_d3d11.dll` | `E232B7B0053CB47BE159D8119AC88F5425DE93CA7CF84C6F53441B20CFF0D3E7` |
+| `qtav_output_d3d11.dll` | `C74CC47D45829486D68E3A13799DFE63E400D0377F385033B0A13354CF8A2FA3` |
+| `qtav_hw_d3d11va.dll` | `3953ACDCC4169E9B301911152B05701F3F67BFD0ECE5F37ED1B629813C8E1F07` |
+| `qtav_interop_d3d11.dll` | `CF85FE42E364E6D25F192E57E67C33FE0C186FFFC73A5A57CE27F6D6513F0427` |
+| `qtav_core.dll` | `4909AE3EAF97B7FCE6FC1FCA562CD0624A38E415787AFB28D4E158DA390E18BE` |
+
+Verify these before reusing the existing player. If they differ, record the new
+hashes and do not compare the resulting trace as though it used the same
+binary baseline.
 
 Fresh configure command:
 
@@ -267,6 +291,75 @@ The progress-slider suspicion is closed as a cause:
   and omit the committed seek. It would not generate this repeated D3D11 pass
   pattern.
 
+## Administrator WPR follow-up: internal SDR control
+
+An elevated WPR GPU trace was successfully captured on 2026-08-05. The Philips
+display was not active, so this was an exploratory control on the Lenovo
+internal 2880x1800/60-Hz SDR display rather than the required final environment.
+The WinUI surface was 2282x1091 and the output was BGRA8/80-nit SDR. D3D11VA,
+HEVC Main 10/P010, BT.2020/PQ input, and direct imported-frame rendering stayed
+active.
+
+Artifacts are outside the repository under `C:\QtAVTraces`:
+
+- primary ETL:
+  `qtav-intel-suzume-005956-internal-sdr-20260805.etl`
+  (3,236,954,112 bytes, 125.7455 seconds, zero lost buffers/events);
+- one-millisecond CPU activity export:
+  `activity-48.3s-50.5s-1ms.csv`;
+- exact slow-range event dump: `dump-48629-48687.csv`;
+- Direct3D11-provider export for the full trace: `d3d11-full.csv`;
+- render-thread stack reports:
+  `qtav-render-21344-48.629-48.687-stack.html` and
+  `qtav-render-21344-48.629-48.687-profileevent-stack.html`;
+- symbol retry report:
+  `symbol-retry-render-48.629-48.687.html`, with failures recorded in the
+  sibling `-errors.txt` file.
+
+One real pointer seek committed `seek: 59:56`. The transition window reported
+23.4 scheduled fps, 22.6 rendered fps, five coalesced redraws, 233.6/248.7-ms
+gaps, 57.9-ms render, 55.6-ms draw, and 41.8 ms in `pl_render_image()`. The next
+windows returned to approximately 24 fps. The historical repeated settled
+40-49-ms post-seek calls did not occur on this panel.
+
+The 58-ms render interval is 48.629-48.687 seconds in the ETL. Render thread
+TID 21344 consumed about 33.644 ms of CPU and was not running for about
+24.356 ms. The slow frame was reconstructed as follows:
+
+- at 48.631219 D3D11 created a new 256x1 R32_FLOAT tone-mapping LUT;
+- libplacebo `pl_gamut_map_generate()` created short-lived worker threads; the
+  render thread accumulated about 15.35 ms of `Waiting/UserRequest` while those
+  workers generated the gamut data;
+- from 48.647908 through 48.650215, 108 DemandZero events at
+  `qtav_render_d3d11.dll+0x3EA22` span exactly 3,145,728 bytes. Disassembly and
+  embedded assertion strings identify this instruction as the output write in
+  libplacebo `src/shaders/colorspace.c:fill_gamut_lut()`. The byte count is
+  exactly the default 48x32x256, four-component, 16-bit gamut LUT;
+- D3D11 created the new 48x32x256 R16G16B16A16_UNORM texture at 48.652516;
+- the new LUT's paging packet completed in about 0.130 ms, so its GPU upload was
+  not the long wait;
+- the same transition destroyed the old 3840x1664x24 P010 decoder texture pool.
+  VidMm uncommit/evict work caused about 4.584 ms of `Waiting/Executive`;
+- DXGI Present itself was 48.672504-48.672824, only 0.320 ms. The actual GPU
+  DmaPacket ran 48.672982-48.674152, about 1.170 ms, followed by an independent
+  flip.
+
+Across the complete trace, the 48x32x256 gamut texture was created only once
+and one older gamut texture was destroyed. The tone LUT was likewise replaced
+only once. This proves that the captured spike was a seek/reconfiguration
+transition composed mainly of CPU LUT generation plus old decoder-pool
+retirement. It was not a long shader, Present block, or persistent GPU queue
+stall. It cannot explain the repeated settled 40-49-ms calls recorded in the
+Philips runs.
+
+Two interpretation cautions follow from this trace:
+
+- the current `graph-change` counter does not expose LUT resource replacement;
+- libplacebo's reported rolling GPU timer is the latest completed asynchronous
+  query and can be stale. The ETL independently confirms approximately 1-2 ms
+  of GPU work for this transition frame, but future settled slow frames still
+  require ETW correlation rather than trusting `pass->last` alone.
+
 ## What the evidence currently excludes
 
 Do not restart diagnosis from these already-tested explanations unless new
@@ -332,70 +425,179 @@ ac3ca93 Fix WinUI3 Intel HDR rendering
 c9c89dc Route Windows D3D11 color through libplacebo
 ```
 
-## Administrator-machine test and investigation order
+## Symbol cache and limits
 
-The previous non-elevated host has WPR/WPA installed, but
-`wpr -start GPU -filemode` failed with `0xc5585011` while enabling the system
-performance profiling policy. No trace was produced. Run the next steps from an
-administrator-launched Codex or elevated Windows Terminal.
+Keep all trace and symbol artifacts outside the repository:
 
-1. Recreate or transfer the instrumented worktree. Confirm that the diagnostic
-   fields described above are present, build shared Release, run all 36 CTest
-   tests, and rebuild the Release WinUI player. Do not mix the separate OHOS
-   changes into an Intel-only commit.
-2. Record the new machine's adapter PCI IDs, Intel driver, Windows build, CPU,
-   memory, power mode/AC state, display resolution/refresh/HDR state, WinUI
-   surface size, and reported output color mode. Differences from the Lenovo
-   21HW baseline are expected but must be explicit.
-3. Verify that no build process is active. Cold-open `suzume.mkv`, open Debug,
-   and capture at least two settled pre-seek cadence lines. Confirm D3D11VA,
-   one libplacebo pass, zero decoder copies, and normal warm CPU/GPU timings.
-4. In an elevated PowerShell, check that no unrelated WPR recording is active:
+- Microsoft PDB downstream cache: `C:\QtAVTraces\symbols`
+- xperf/WPA symcache: `C:\QtAVTraces\symcache`
+- successful retry report:
+  `C:\QtAVTraces\symbol-retry-render-48.629-48.687.html`
+- retry diagnostics:
+  `C:\QtAVTraces\symbol-retry-render-48.629-48.687-errors.txt`
+
+Use these settings before opening or exporting a trace:
+
+```powershell
+$env:_NT_SYMBOL_PATH = @(
+  'srv*C:\QtAVTraces\symbols*https://msdl.microsoft.com/download/symbols'
+  'C:\vscode\QtAV\modern\examples\winui3_player\bin\x64\Release'
+  'C:\vscode\QtAV\build\modern-shared-intel\bin\Release'
+) -join ';'
+$env:_NT_SYMCACHE_PATH = 'C:\QtAVTraces\symcache'
+```
+
+The target slow-frame stack's important Microsoft symbols are already cached
+and load successfully:
+
+| PDB | Cached symbol-server index |
+| --- | --- |
+| `d3d11.pdb` | `0B6BA9C93E14B5272985D031DDE8B8451` |
+| `dxgi.pdb` | `BFCAB1F776380FC5672C4846BC4D15DD1` |
+| `dxgkrnl.pdb` | `66623333773BF1D2CE7E1B23804E969E1` |
+| `dxgmms2.pdb` | `BF12E6970158C5CF34CEC193303E99261` |
+| `ntkrnlmp.pdb` | `2A6E73CB5CCE9CCDA64E151FAC38D45C1` |
+
+`ntdll.pdb`, `kernelbase.pdb`, `ucrtbase.pdb`, DbgHelp, and the other system
+stack dependencies are also present in the cache. The retry report completed
+successfully; the remaining relevant failures are unavailable files rather
+than network timeouts.
+
+The installed Intel 32.0.101.7088 binaries identify the following private PDBs:
+
+| Module | PDB | GUID plus age / symbol index |
+| --- | --- | --- |
+| `igd10um64xe.dll` | `igd10um64xe.pdb` | `BDB5499CA2EC427389EE8B9FA574491A1` |
+| `igdgmm64.dll` | `igdgmm64.pdb` | `36048D7719CB4FD5A23C496F545F4F3A1` |
+| `igdkmdn64.sys` | `igdkmdn64.pdb` | `20C0890D892043628EFBCA67AE33D6911` |
+| `igd10iumd64.dll` | `igd10iumd64.pdb` | `3F37355B06A54D42878DB22855031C8B1` |
+| `igd11dxva64.dll` | `igd11dxva64.pdb` | `BB745E5E76544B78B617F7CE7D7DA1E31` |
+| `igddxvacommon64.dll` | `igddxvacommon64.pdb` | `BF5CC827517F4274BF835912B4E3049F1` |
+
+Direct requests for the first three exact indexes, including raw `.pdb`,
+compressed `.pd_`, and `file.ptr` forms, returned HTTP 404 from the
+[Microsoft public symbol server](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols).
+Intel's
+[official driver-binary service](https://www.intel.com/content/www/us/en/developer/topic-technology/gamedev/graphics-drivers.html)
+explicitly provides matching DLLs but not PDB files. Longer timeouts will not
+resolve Intel internal function names. Keep Intel frames as `module+RVA` unless
+Intel support supplies the matching private PDBs. The exact 7088 user-mode
+binaries remain installed under
+`C:\Windows\System32\DriverStore\FileRepository\iigd_dch.inf_amd64_046f5bd4083e9122`;
+Intel's hosted copies match their sizes.
+
+The current QtAV `Release` DLLs, including `qtav_render_d3d11.dll`,
+`qtav_core.dll`, and `qtav_hw_d3d11va.dll`, have empty PE debug directories and
+therefore no CodeView GUID/age that a symbol server can satisfy. The local
+`QtAVWinUI3.pdb` does match its executable, but it cannot symbolize the QtAV
+DLLs. A newly generated PDB can never symbolize the old ETL: the binary and PDB
+must be built together and retained with the new trace.
+
+For the Philips retest, first preserve a reproduction with the known Release
+binary. If deeper QtAV/libplacebo address resolution is needed, create a
+separate **optimized** symbol-enabled build, verify that every DLL contains a
+matching CodeView record/PDB, and capture a second ETL with exactly those
+binaries. Do not substitute an unoptimized Debug run for the cadence baseline.
+
+## Philips 4K HDR retest and investigation order
+
+The administrator trace path is now proven. The next conversation should focus
+on reproducing the original recurring failure on the Philips display, not on
+re-analyzing the already-explained internal-panel transition spike.
+
+1. In the new conversation, read `AGENTS.md` and this file, then run
+   `git rev-parse HEAD` and `git status --short`. Preserve all parallel OHOS
+   changes. Do not edit `modern/PLAN.md` merely for a diagnostic capture.
+2. Prefer the already validated instrumented Release binaries and verify their
+   SHA-256 values against the table above. Confirm no `cl`, `clang-cl`, `link`,
+   `msbuild`, `cmake`, `ninja`, Gradle, or unrelated WPR session is active. If a
+   rebuild is unavoidable, record that the binary baseline changed, run all
+   configured CTest tests (36/36 for the recorded baseline), and rebuild the
+   WinUI player with zero errors.
+3. Make `PHL0979` the active presentation display and record all of these before
+   playback:
+   - 3840x2160 at 60 Hz;
+   - Windows HDR enabled;
+   - Intel Iris Xe A7A0 and driver 32.0.101.7088;
+   - AC power, balanced plan, and no thermal/build load;
+   - WinUI surface size;
+   - RGB10/PQ output, SDR reference white, and display peak. The earlier target
+     values were 1708x814, 240 nits, and 1405 nits, but record the live values
+     rather than forcing stale ones.
+4. Set `_NT_SYMBOL_PATH` and `_NT_SYMCACHE_PATH` as documented above. In an
+   elevated PowerShell, start a fresh GPU trace only after confirming no other
+   recording owns the session:
 
    ```powershell
    wpr -status
    New-Item -ItemType Directory -Force C:\QtAVTraces
-   wpr -start GPU -filemode
+   wpr -start GPU -filemode -recordtempto C:\QtAVTraces
    ```
 
-   Do not cancel another user's recording. If a stale QtAV-owned session exists,
-   stop or cancel only that known session before retrying.
-5. While recording, retain 5-10 seconds of settled playback, make one ordinary
-   pointer seek to 1:00:00, release the pointer, and continue for 30-60 seconds.
-   Save/copy the Debug log, then stop the trace:
+   Do not cancel another user's recording. Stop or cancel only a stale session
+   known to belong to this QtAV investigation.
+5. Cold-open `C:\Users\zzzhr\Downloads\suzume.mkv`, open Debug, and let the
+   beginning play for 60-120 seconds. Capture at least two consecutive settled
+   cadence lines showing D3D11VA, one libplacebo pass, zero decoder copies, and
+   normal warm timings. Pause for five seconds and resume before seeking.
+6. Retain at least 5-10 seconds of settled playback in the trace, perform one
+   ordinary pointer seek to 1:00:00, release the pointer, move it away from the
+   slider, and continue for at least 60 seconds. Save the complete Debug log and
+   screenshots of the relevant five-second windows. Stop to a unique file, for
+   example:
 
    ```powershell
-   wpr -stop C:\QtAVTraces\qtav-intel-suzume-seek.etl
+   wpr -stop C:\QtAVTraces\qtav-intel-suzume-philips-hdr-010000.etl
    ```
 
-   Repeat at 1:40:00 only after the primary trace is valid. Keep separate ETL
-   files instead of overwriting the first capture.
-6. In WPA/GPUView, correlate the render thread's 40-86-ms CPU intervals with
-   D3D11 runtime and Intel user-mode-driver stacks, GPU queue packets, context
-   submissions, scheduling, and Present. Determine whether the delay is in the
-   timer start/query path, dynamic vertex-buffer `Map`/`Unmap`, state/resource
-   binding, `Draw`, unbinding, or a driver allocation/recycle operation. Verify
-   that the corresponding GPU pass remains near 1-2 ms.
-7. If ETW stacks do not identify the call, create a temporary reproducible
-   libplacebo 7.351.0 diagnostic patch that times each D3D11 operation listed in
-   step 6. Because this modifies `ffmpeg/**`, run
-   `ffmpeg/scripts/build-windows.ps1` and `cmake/verify-install.cmake` as required
-   by `AGENTS.md`. Do not diagnose by editing only an ignored vcpkg buildtree.
-8. Continue one-variable A/B testing at the same scene. RGB10/PQ versus
-   `SdrOnly` BGRA8 is already complete and both fail. Remaining useful isolates
-   are FP16 scRGB, reduced versus display-sized output, D3D11VA versus
-   `configureHardwareDecoding=false`, two versus three swap-chain buffers, and
-   reopen/seek behavior. Preserve libplacebo as the color authority.
-9. Implement only an evidence-backed fix. Preserve:
-   - native D3D11 multithread protection;
-   - bounded context handoff and reason-aware retry;
-   - asynchronous successful submissions;
-   - bounded completion-query retention;
-   - raw retained NV12/P010 decoder slice sampling;
-   - zero decoded-source map/transfer/copy.
-10. Re-run the validation matrix below. The Intel task is complete only when
+   Repeat 1:40:00 only after the first capture is valid, and never overwrite an
+   ETL. Close the player while playing after the final capture and verify a
+   deterministic exit.
+7. A seek-transition spike is expected and is **not** sufficient reproduction.
+   First identify and exclude any frame that creates the 48x32x256 gamut LUT,
+   replaces the 256x1 tone LUT, or destroys the old P010 decoder pool. The
+   primary trace is successful only if settled playback later contains repeated
+   40-86-ms `pl_render_image()` or Clear/Draw intervals without those transition
+   events, ideally with the associated 80-ms-or-longer render gaps or cadence
+   loss. If the Philips run remains stable, record non-reproduction instead of
+   manufacturing a fix from the internal-panel transition.
+8. For each settled slow frame, correlate the exact render-thread interval with
+   CPU running/waiting time, ReadyThread sources, D3D11/DXGI events, Intel UMD
+   `module+RVA` stacks, DxgKrnl queue/DMA packets, allocation/paging events,
+   Present, and independent flip. Determine whether the delay occurs in the
+   libplacebo timer Begin/End/GetData path, dynamic vertex/index-buffer
+   `Map`/`Unmap`, resource/state binding, `Draw`, unbinding, completion-query
+   retirement, or a driver allocation/recycle operation. Do not treat rolling
+   `pass->last` as the current frame's GPU duration without ETW confirmation.
+9. The strongest remaining diagnostic A/B is frame-latency pacing. Current
+   `d3d11_video_output.cpp` waits on the frame-latency object only after a prior
+   `Present(..., DXGI_PRESENT_DO_NOT_WAIT)` returned busy. Microsoft documents
+   waiting before rendering every frame, including the first frame. Instrument
+   the wait duration and compare a one-variable per-frame-wait build against the
+   current busy-latched behavior; do not present the A/B as a fix until the
+   settled trace identifies matching backpressure. See
+   [`IDXGISwapChain2::GetFrameLatencyWaitableObject`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-getframelatencywaitableobject)
+   and [`DXGI_PRESENT_DO_NOT_WAIT`](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-present).
+10. If ETW cannot isolate the D3D11 call, create a temporary reproducible
+    libplacebo 7.351.0 diagnostic patch that separately times timer queries,
+    stream-buffer Map/Unmap, bindings, Draw, and cleanup. Because this modifies
+    `ffmpeg/**`, run `ffmpeg/scripts/build-windows.ps1` and
+    `cmake/verify-install.cmake` as required by `AGENTS.md`. Do not diagnose by
+    editing only an ignored vcpkg buildtree.
+11. Continue later one-variable A/B testing only at the same failing scene.
+    RGB10/PQ versus `SdrOnly` BGRA8 already fails in both modes. Remaining useful
+    isolates are FP16 scRGB, reduced versus display-sized output, D3D11VA versus
+    `configureHardwareDecoding=false`, two versus three swap-chain buffers,
+    temporary protected-frame `pl_gpu_finish()`, and active context reservation.
+    A diagnostic `pl_gpu_finish()` result must not become the production fix.
+12. Implement only an evidence-backed correction. Preserve native D3D11
+    multithread protection, bounded context handoff and reason-aware retry,
+    asynchronous successful submission, bounded completion-query retention,
+    raw retained NV12/P010 decoder-slice sampling, and zero decoded-source
+    map/transfer/copy.
+13. Re-run the validation matrix below. The Intel task is complete only when
     the root cause, correction, exact-scene cadence/gaps, and cross-vendor
-    regression evidence are all recorded in `modern/PLAN.md`.
+    regression evidence are recorded in `modern/PLAN.md`.
 
 ## Validation required after a fix
 

@@ -346,7 +346,9 @@ public:
 
     PixelFormat softwareFormat() const noexcept override
     {
-        if (frame_ && deviceType_ == HardwareDeviceType::MediaCodec) {
+        if (frame_
+            && (deviceType_ == HardwareDeviceType::MediaCodec
+                || deviceType_ == HardwareDeviceType::OHCodec)) {
             return PixelFormat::Native;
         }
         if (!frame_ || !frame_->hw_frames_ctx) {
@@ -374,7 +376,8 @@ public:
                     reinterpret_cast<std::uintptr_t>(frame_->data[1])),
             };
         }
-        if (deviceType_ == HardwareDeviceType::MediaCodec) {
+        if (deviceType_ == HardwareDeviceType::MediaCodec
+            || deviceType_ == HardwareDeviceType::OHCodec) {
             if (type == HardwareHandleType::Frame) {
                 return {
                     type,

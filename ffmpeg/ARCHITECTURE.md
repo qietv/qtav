@@ -16,8 +16,9 @@ Windows outputs are independent and are never interchangeable.
 ```text
 build-android.sh ─┐
 build-ohos.sh ────┼─> install-unix.sh ─┐
-build-windows.ps1 ┘                     │
-                                       v
+build-ohos.ps1 ───┤                    │
+build-windows.ps1 ┘                    │
+                                      v
           vcpkg manifest + pinned registry baseline
                      + overlay ports
                      + target triplet
@@ -96,20 +97,24 @@ not FFmpeg executables or one combined shared object.
 
 ### OHOS
 
-- Build host: macOS.
+- Build host: macOS or 64-bit Windows.
 - Target: arm64-v8a, API 23.
 - Toolchain: OpenHarmony native SDK `ohos.toolchain.cmake`.
 - vcpkg triplet: `arm64-ohos-23-static`.
 - Dependencies: release-only static archives; SDK system runtime linkage
   remains governed by the OHOS toolchain.
-- Default SDK discovery: `$HOME/Library/OpenHarmony/Sdk/23`.
+- Default SDK discovery: `$HOME/Library/OpenHarmony/Sdk/23` on macOS or the
+  DevEco Studio SDK under `Program Files` on Windows.
 
 vcpkg has no first-class OHOS platform model at the pinned baseline. The
 triplet uses its Linux compatibility path for port selection, then the
 chainloaded toolchain redirects every compiler and target flag to OHOS. The
 `VCPKG_TARGET_IS_OHOS` marker lets overlays distinguish OHOS from a real Linux
-target. Host pkg-config libraries must never enter this build. A native
-macOS `patchelf` is used only for vcpkg packaging operations.
+target. Host pkg-config libraries must never enter this build. A native macOS
+`patchelf` is used only for macOS packaging operations; vcpkg acquires its
+Windows `patchelf.exe` tool when the PowerShell entry point requires it. The
+Windows script uses a stable no-space SDK junction because MSYS-driven OpenSSL
+and FFmpeg steps cannot reliably consume the normal `Program Files` path.
 
 ### Windows
 
@@ -148,12 +153,26 @@ project-specific behavior:
   Python glad generator, receives pinned glslang discovery, and normalizes
   Windows system library flags for FFmpeg's pkg-config probes. The optional
   external `libdovi` raw-RPU parser is not part of the dependency closure.
+  The overlay also corrects generated Dolby Vision MMR GLES shaders to use
+  integer array indices and valid third-order branch syntax; this is required
+  by the strict Maleoon compiler exercised by the OHOS Profile 8.4 run.
   QtAVCore exposes only libplacebo's D3D11 path on Windows, not its installed
   OpenGL or Vulkan capabilities. The static shader-translation closure is
   governed by [FD-002](DECISIONS.md).
 - the Android FFmpeg overlay enables FFmpeg's built-in RPU decoder for the
   HEVC MediaCodec wrapper and PTS-correlates parsed Dolby Vision metadata with
   hardware output frames before QtAVCore receives them.
+- the OHOS FFmpeg overlay requires the native H.264 and HEVC OHCodec wrappers;
+  configure failure is fatal. Its HEVC wrapper enables FFmpeg's built-in RPU
+  parser, keeps a bounded metadata queue keyed by the exact microsecond packet
+  PTS submitted to OHCodec, and attaches the result to the returned output with
+  the same PTS. Flush and close clear the queue and parser state. The overlay
+  also exposes a narrow opaque OHCodec surface output token with explicit
+  render, timed-render, and drop decisions. An undecided final frame release is
+  always a drop, never an implicit present. The verifier checks both decoder
+  symbols, the public header, and both release symbols in the installed
+  `libavcodec.a` archive. The compatibility boundary is governed by
+  [FD-004](DECISIONS.md).
 - libsmb2 supplies the missing private Winsock link metadata required by a
   static Windows consumer.
 
@@ -188,6 +207,8 @@ Every entry script runs `cmake/verify-install.cmake` after vcpkg installation.
 The verifier checks:
 
 - required FFmpeg 8/libavcodec 62 headers and metadata;
+- H.264/HEVC OHCodec decoder symbols plus the explicit surface-output header
+  and release symbols in the OHOS archive;
 - OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES/Dolby Vision
   reshaping, dav1d, and Vulkan, plus libplacebo D3D11/SPIRV-Cross on Windows;
 - the required FFmpeg feature records;
@@ -198,7 +219,8 @@ The root GitHub Actions workflow runs automatically for changes to
 `ffmpeg/**`: Android and OHOS use self-hosted macOS arm64 runners, while
 Windows uses a self-hosted Visual Studio runner. Successful target prefixes
 and the vcpkg status database are uploaded as artifacts for parent-project
-builds and inspection.
+builds and inspection. That is the current CI topology, not a local-host
+restriction; the OHOS package also has a supported Windows PowerShell entry.
 
 These fixed self-hosted runners retain vcpkg's default local binary archive
 directory between jobs. CI intentionally does not use `actions/cache` for that

@@ -78,10 +78,9 @@ Expected paths in the transfer commit:
 
 ```text
 ffmpeg/ports/libplacebo/portfile.cmake
-ffmpeg/ports/libplacebo/0005-add-d3d11-pass-diagnostics.patch
+ffmpeg/ports/libplacebo/0006-add-d3d11-pass-diagnostics.patch
 modern/DECISIONS.md
 modern/MIGRATION.md
-modern/PLAN.md
 modern/README.md
 modern/backends/output/d3d11/include/qtav/d3d11_video_output.h
 modern/backends/output/d3d11/src/d3d11_video_output.cpp
@@ -134,7 +133,7 @@ incorrect.
 ## libplacebo D3D11 diagnostic patch
 
 The repository libplacebo port now applies
-`ffmpeg/ports/libplacebo/0005-add-d3d11-pass-diagnostics.patch`.
+`ffmpeg/ports/libplacebo/0006-add-d3d11-pass-diagnostics.patch`.
 
 Set this before creating the player/GPU to append calls taking at least 0.5 ms:
 

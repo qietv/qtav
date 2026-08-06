@@ -1214,6 +1214,10 @@ private:
                             1,
                             std::memory_order_relaxed);
                         break;
+                    case VideoRenderStatus::RendererDeferred:
+                    case VideoRenderStatus::FrameDiscarded:
+                    case VideoRenderStatus::SurfaceLost:
+                    case VideoRenderStatus::RendererError:
                     case VideoRenderStatus::Rendered:
                         break;
                     }

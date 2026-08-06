@@ -824,3 +824,126 @@ build/UI-capture load. After an idle interval, a fresh process restored
 steady coalescing, busy, superseded, or terminal counts; warm draw maxima were
 about 35-43 ms. `PLAN.md` therefore records the high-load result as an
 environmental caution and keeps only the Intel performance comparison open.
+
+## AD-009: OHOS external-format guessing is a bounded workaround
+
+- Date: 2026-08-06
+- Status: Accepted
+- Scope: OHCodec `OH_NativeBuffer` import, Vulkan multi-planar formats, and
+  libplacebo source wrapping on OHOS
+
+### Context
+
+Surface-mode OHCodec output was presented into a private
+`OH_ConsumerSurface`, acquired as the exact retained
+`OHNativeWindowBuffer`/`OH_NativeBuffer`, and queried with
+`vkGetNativeBufferPropertiesOHOS()`. On the connected Mate 60 Pro/Maleoon 910,
+the query returned `VK_SUCCESS` but reported
+`VkNativeBufferFormatPropertiesOHOS::format = VK_FORMAT_UNDEFINED`.
+
+The observed buffers were:
+
+```text
+H.264/NV12:
+  nativeFormat   = NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP (24)
+  format         = VK_FORMAT_UNDEFINED
+  externalFormat = 1000156003
+
+HEVC Main10/P010:
+  nativeFormat   = NATIVEBUFFER_PIXEL_FMT_YCBCR_P010 (35)
+  format         = VK_FORMAT_UNDEFINED
+  externalFormat = 1000156013
+```
+
+The external IDs are numerically equal to
+`VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` and
+`VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16`, respectively, but
+`externalFormat` is an implementation-defined identifier intended for
+`VkExternalFormatOHOS`; numerical equality alone is not a portable Vulkan
+format contract.
+
+Three connected-device probes separated hardware consumption from interface
+representation:
+
+1. The standard opaque path used `VK_FORMAT_UNDEFINED +
+   VkExternalFormatOHOS`. Vulkan object creation, NativeBuffer memory import,
+   shader sampling, queue submission, and completion all succeeded.
+2. A diagnostic path omitted `VkExternalFormatOHOS`, guessed the explicit
+   NV12/P010 format from the two allowlisted external IDs, and used that format
+   in `VkImageCreateInfo`. Application-owned Vulkan sampling succeeded for 30
+   NV12 and 30 P010 frames.
+3. The same guessed explicit images were passed to libplacebo 7.351.0.
+   `pl_vulkan_wrap()` created the direct Y/UV planes and rendered all 60
+   frames with no RGBA source-normalization intermediate.
+
+All paths reported zero decoded-source CPU map, software transfer, staging,
+or upload. These results prove current-device capability and libplacebo's
+acceptance of the guessed explicit formats. They do not prove that Huawei
+supports the numerical mapping across devices, GPUs, system releases, buffer
+modifiers, compression modes, usages, dataspaces, or HDR configurations.
+
+### Decision
+
+1. A successful `vkGetNativeBufferPropertiesOHOS()` call with an explicit
+   supported `format` remains the standard direct-plane path. That queried
+   `VkFormat` may be passed to libplacebo subject to normal feature, import,
+   synchronization, and lifetime validation.
+2. A successful query with `format == VK_FORMAT_UNDEFINED` does not mean that
+   the NativeBuffer is unconsumable. The standards-based fallback imports it
+   with `VkExternalFormatOHOS` and samples it through
+   `VkSamplerYcbcrConversion`. When needed, a GPU-only representation-
+   normalization pass feeds libplacebo. This is zero-CPU-copy, but it is not
+   strict raw-plane/no-intermediate zero-copy.
+3. When the query succeeds but reports `VK_FORMAT_UNDEFINED`, OHOS code may
+   consider an allowlisted guess from `externalFormat` to an explicit
+   `VkFormat`, then attempt direct Vulkan/libplacebo consumption. This is a
+   workaround, not the final OHOS format-negotiation solution and not a
+   general cast of arbitrary external IDs.
+4. The only currently evidenced guesses are:
+
+   ```text
+   1000156003 -> VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
+   1000156013 -> VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
+   ```
+
+   Any workaround implementation must also validate the expected OH native
+   format, dimensions, texture usage, sampled-image features, image creation,
+   NativeBuffer memory import/bind, and libplacebo plane mapping. Any mismatch
+   or Vulkan/libplacebo failure must select the established opaque,
+   OpenGL ES, direct-surface, software-decode, or no-video fallback instead of
+   retrying an unsafe cast.
+5. The guessed mapping remains disabled by default while its production
+   contract is unconfirmed. It must be separately diagnosable and must not be
+   described as portable, standard, certified, or guaranteed to preserve raw
+   P010 precision for Dolby Vision.
+6. Before further OHOS strict Vulkan direct-plane or Dolby Vision work is
+   accepted, obtain additional confirmation of the mapping's formal status,
+   supported device/system scope, feature semantics, modifier/compression
+   constraints, and P010 raw 10-bit plane guarantee. Record that evidence as a
+   follow-up decision before promoting, narrowing, or rejecting the workaround.
+
+### Consequences
+
+- `VK_FORMAT_UNDEFINED` is no longer treated as evidence of hardware failure.
+- The opaque external-format path remains the correctness fallback and keeps
+  decoded pixels off the CPU, while its GPU intermediate and converted sample
+  semantics remain explicit.
+- The guessed direct-plane path can be used for investigation and, if the
+  application explicitly opts into the risk, as a bounded workaround. Its
+  allowlist and fallback behavior prevent unknown external IDs from silently
+  being reinterpreted.
+- libplacebo support is no longer the open question: it accepts the two
+  explicit NV12/P010 formats. The open question is whether OHOS/Huawei formally
+  permits deriving those formats from the returned external IDs.
+- Milestone completion and production claims remain gated on the additional
+  vendor/interface confirmation rather than on the successful single-device
+  probe alone.
+
+### Current validation evidence
+
+On the Mate 60 Pro, both the application-owned forced-format sampler and the
+direct libplacebo path rendered 30 H.264/NV12 plus 30 HEVC Main10/P010 frames.
+The libplacebo run reported `directPlanes=60`, `normalization=0`, and zero
+decoded-source CPU map, transfer, staging, or upload. Restoring the default
+disabled-workaround build then passed the complete connected OHOS regression,
+including opaque Vulkan sampling and Vulkan-to-OpenGL/software fallbacks.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -90,6 +91,51 @@ struct QTAV_CORE_EXPORT VideoRenderEvent {
     std::string detail;
 };
 
+// Result of one backend render attempt. This is deliberately independent of
+// Player's frame sequence and presentation generation: adapters classify only
+// what happened to the supplied frame and Player adds snapshot identity.
+enum class VideoRenderAttemptStatus {
+    // The frame was submitted to the current presentation target.
+    Presented,
+    // The backend is waiting for an asynchronous producer or GPU resource and
+    // will emit RedrawRequested when the same retained frame can be retried.
+    DeferredUntilRedraw,
+    // Transient pressure requires a bounded timer retry. A zero delay leaves
+    // the concrete backoff policy to the application.
+    RetryAfterBackoff,
+    // This frame is terminally stale, superseded, or deliberately consumed by
+    // a non-renderer route. It must not be retried.
+    Discarded,
+    // The current native surface generation is invalid and must be recreated.
+    SurfaceLost,
+    // The active renderer cannot continue without replacement or fallback.
+    FatalError,
+};
+
+struct QTAV_CORE_EXPORT VideoRenderAttemptResult {
+    VideoRenderAttemptStatus status =
+        VideoRenderAttemptStatus::RetryAfterBackoff;
+    std::uint32_t retryAfterMilliseconds = 0;
+    std::string detail;
+
+    bool presented() const noexcept
+    {
+        return status == VideoRenderAttemptStatus::Presented;
+    }
+
+    bool frameConsumed() const noexcept
+    {
+        return presented()
+            || status == VideoRenderAttemptStatus::Discarded;
+    }
+
+    bool retryable() const noexcept
+    {
+        return status == VideoRenderAttemptStatus::DeferredUntilRedraw
+            || status == VideoRenderAttemptStatus::RetryAfterBackoff;
+    }
+};
+
 class QTAV_CORE_EXPORT VideoRenderAPI {
 public:
     using EventCallback = std::function<void(const VideoRenderEvent&)>;
@@ -102,6 +148,13 @@ public:
     virtual bool configure(const VideoRenderConfig& config) = 0;
     virtual bool render(const VideoFrame& frame) = 0;
     virtual void close() noexcept = 0;
+    // New backends should override this method and classify every attempt.
+    // The default preserves source compatibility for existing bool renderers
+    // by treating false as a short timer-backoff request. It is appended after
+    // the original virtual surface so existing method slots stay stable while
+    // the 2.x API is still being integrated.
+    virtual VideoRenderAttemptResult renderDetailed(
+        const VideoFrame& frame);
 };
 
 } // namespace qtav
