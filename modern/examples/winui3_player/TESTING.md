@@ -133,12 +133,24 @@ slow `pl_render_image()` pass. Set
 `QTAV_LIBPLACEBO_D3D11_DIAGNOSTICS=C:\QtAVTraces\libplacebo-d3d11.log` before
 starting the player. Calls taking at least 0.5 ms are appended with the process,
 thread, stage, and CPU duration; covered stages include timer query/start/end,
-dynamic stream-buffer map/unmap, state binding, draw, unbinding, message-queue
-drain, and total raster/pass execution. No log file is created when no covered
-call crosses the threshold. `QTAV_LIBPLACEBO_D3D11_DISABLE_TIMERS=1` is a
+dynamic stream-buffer map/unmap, individual IA/VS/RS/PS/OM state setup,
+constant-buffer `UpdateSubresource` resolution (`buffer-resolve-update`), draw,
+unbinding, message-queue drain, and total state/raster/pass execution. No log
+file is created when no covered call crosses the threshold.
+`QTAV_LIBPLACEBO_D3D11_DISABLE_TIMERS=1` is a
 diagnostic A/B that disables only libplacebo's D3D11 timer queries for a newly
 created GPU; it is not a supported playback mode or a production workaround.
 Leave both variables unset for ordinary validation.
+
+The D3D11 renderer caches libplacebo wrappers for recurring output textures
+and NV12/P010 decoder-array planes. This avoids per-frame RTV/SRV creation and
+the periodic Intel `FlushDeletionPool`/`DxgkDestroyAllocation2` stall that can
+surface in an otherwise unrelated amortized D3D11 call. `flush()` releases the
+bounded caches after submitted work completes, so callers must continue to
+invoke it before resizing or replacing a borrowed target. In a settled
+hardware-decoded run, no probe entry for `buffer-resolve-update` or `draw` at
+the 0.5-ms threshold is expected; repeated entries warrant an ETW stack check
+rather than a timer, sleep, per-frame GPU finish, or software-copy workaround.
 
 For audio noise, also test another output endpoint and a local copy of the same
 media. Determine whether the problem follows the stream, network path, format

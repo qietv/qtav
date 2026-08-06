@@ -1,5 +1,5 @@
 diff --git a/src/d3d11/gpu.h b/src/d3d11/gpu.h
-index 3717f34..283311f 100644
+index c6d842e..2b5fcdf 100644
 --- a/src/d3d11/gpu.h
 +++ b/src/d3d11/gpu.h
 @@ -68,6 +68,11 @@ struct pl_gpu_d3d11 {
@@ -26,7 +26,7 @@ index 3717f34..283311f 100644
      ID3D11Buffer *buf;
      ID3D11Buffer *staging;
 diff --git a/src/d3d11/gpu.c b/src/d3d11/gpu.c
-index 553ff94..906e2f7 100644
+index 50572d8..1c78b58 100644
 --- a/src/d3d11/gpu.c
 +++ b/src/d3d11/gpu.c
 @@ -18,6 +18,7 @@
@@ -171,8 +171,23 @@ index 553ff94..906e2f7 100644
      if (!p->spirv)
          goto error;
  
+diff --git a/src/d3d11/gpu_buf.c b/src/d3d11/gpu_buf.c
+index 955e6e1..3dcfc42 100644
+--- a/src/d3d11/gpu_buf.c
++++ b/src/d3d11/gpu_buf.c
+@@ -235,8 +235,10 @@ void pl_d3d11_buf_resolve(pl_gpu gpu, pl_buf buf)
+     if (!buf_p->data || !buf_p->dirty)
+         return;
+ 
++    uint64_t diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_UpdateSubresource(p->imm, (ID3D11Resource *) buf_p->buf,
+         0, NULL, buf_p->data, 0, 0);
++    pl_d3d11_diagnostic_end(gpu, "buffer-resolve-update", diagnostic);
+ }
+ 
+ bool pl_d3d11_buf_read(pl_gpu gpu, pl_buf buf, size_t offset, void *dest,
 diff --git a/src/d3d11/gpu_pass.c b/src/d3d11/gpu_pass.c
-index 8043fc1..3fe68cd 100644
+index 0f934a1..cf2bb3c 100644
 --- a/src/d3d11/gpu_pass.c
 +++ b/src/d3d11/gpu_pass.c
 @@ -81,8 +81,11 @@ static bool stream_buf_upload(pl_gpu gpu, struct d3d_stream_buf *stream,
@@ -205,19 +220,123 @@ index 8043fc1..3fe68cd 100644
  
      if (p->fl <= D3D_FEATURE_LEVEL_9_3 && params->index_buf) {
          // Index buffers are unsupported because we can't tell if they are an
-@@ -1101,6 +1107,7 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
+@@ -1101,16 +1107,23 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
              index_fmts[params->index_fmt], params->index_offset);
      }
  
++    uint64_t state_bind_started = pl_d3d11_diagnostic_start(gpu);
 +    uint64_t diagnostic = pl_d3d11_diagnostic_start(gpu);
      ID3D11DeviceContext_IASetInputLayout(p->imm, pass_p->layout);
++    pl_d3d11_diagnostic_end(gpu, "state-ia-layout", diagnostic);
  
      static const D3D_PRIMITIVE_TOPOLOGY prim_topology[] = {
-@@ -1164,16 +1171,20 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
+         [PL_PRIM_TRIANGLE_LIST] = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+         [PL_PRIM_TRIANGLE_STRIP] = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+     };
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_IASetPrimitiveTopology(p->imm,
+         prim_topology[pass->params.vertex_type]);
++    pl_d3d11_diagnostic_end(gpu, "state-ia-topology", diagnostic);
+ 
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_VSSetShader(p->imm, pass_p->vs, NULL, 0);
++    pl_d3d11_diagnostic_end(gpu, "state-vs-shader", diagnostic);
+ 
+     ID3D11Buffer **cbvs = pass_p->cbv_arr;
+     ID3D11ShaderResourceView **srvs = pass_p->srv_arr;
+@@ -1119,15 +1132,29 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
+ 
+     // Set vertex shader resources. The device context is called conditionally
+     // because the debug layer complains if these are called with 0 resources.
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     fill_resources(gpu, pass, &pass_p->vertex, params, cbvs, srvs, samplers);
+-    if (pass_p->vertex.cbvs.num)
++    pl_d3d11_diagnostic_end(gpu, "state-vs-fill", diagnostic);
++    if (pass_p->vertex.cbvs.num) {
++        diagnostic = pl_d3d11_diagnostic_start(gpu);
+         ID3D11DeviceContext_VSSetConstantBuffers(p->imm, 0, pass_p->vertex.cbvs.num, cbvs);
+-    if (pass_p->vertex.srvs.num)
++        pl_d3d11_diagnostic_end(gpu, "state-vs-cb", diagnostic);
++    }
++    if (pass_p->vertex.srvs.num) {
++        diagnostic = pl_d3d11_diagnostic_start(gpu);
+         ID3D11DeviceContext_VSSetShaderResources(p->imm, 0, pass_p->vertex.srvs.num, srvs);
+-    if (pass_p->vertex.samplers.num)
++        pl_d3d11_diagnostic_end(gpu, "state-vs-srv", diagnostic);
++    }
++    if (pass_p->vertex.samplers.num) {
++        diagnostic = pl_d3d11_diagnostic_start(gpu);
+         ID3D11DeviceContext_VSSetSamplers(p->imm, 0, pass_p->vertex.samplers.num, samplers);
++        pl_d3d11_diagnostic_end(gpu, "state-vs-sampler", diagnostic);
++    }
+ 
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_RSSetState(p->imm, p->rstate);
++    pl_d3d11_diagnostic_end(gpu, "state-rs-state", diagnostic);
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_RSSetViewports(p->imm, 1, (&(D3D11_VIEWPORT) {
+         .TopLeftX = params->viewport.x0,
+         .TopLeftY = params->viewport.y0,
+@@ -1136,44 +1163,72 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
+         .MinDepth = 0,
+         .MaxDepth = 1,
+     }));
++    pl_d3d11_diagnostic_end(gpu, "state-rs-viewport", diagnostic);
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_RSSetScissorRects(p->imm, 1, (&(D3D11_RECT) {
+         .left = params->scissors.x0,
+         .top = params->scissors.y0,
+         .right = params->scissors.x1,
+         .bottom = params->scissors.y1,
+     }));
++    pl_d3d11_diagnostic_end(gpu, "state-rs-scissor", diagnostic);
+ 
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_PSSetShader(p->imm, pass_p->ps, NULL, 0);
++    pl_d3d11_diagnostic_end(gpu, "state-ps-shader", diagnostic);
+ 
+     // Set pixel shader resources
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     fill_resources(gpu, pass, &pass_p->main, params, cbvs, srvs, samplers);
+-    if (pass_p->main.cbvs.num)
++    pl_d3d11_diagnostic_end(gpu, "state-ps-fill", diagnostic);
++    if (pass_p->main.cbvs.num) {
++        diagnostic = pl_d3d11_diagnostic_start(gpu);
+         ID3D11DeviceContext_PSSetConstantBuffers(p->imm, 0, pass_p->main.cbvs.num, cbvs);
+-    if (pass_p->main.srvs.num)
++        pl_d3d11_diagnostic_end(gpu, "state-ps-cb", diagnostic);
++    }
++    if (pass_p->main.srvs.num) {
++        diagnostic = pl_d3d11_diagnostic_start(gpu);
+         ID3D11DeviceContext_PSSetShaderResources(p->imm, 0, pass_p->main.srvs.num, srvs);
+-    if (pass_p->main.samplers.num)
++        pl_d3d11_diagnostic_end(gpu, "state-ps-srv", diagnostic);
++    }
++    if (pass_p->main.samplers.num) {
++        diagnostic = pl_d3d11_diagnostic_start(gpu);
+         ID3D11DeviceContext_PSSetSamplers(p->imm, 0, pass_p->main.samplers.num, samplers);
++        pl_d3d11_diagnostic_end(gpu, "state-ps-sampler", diagnostic);
++    }
+ 
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_OMSetBlendState(p->imm, pass_p->bstate, NULL,
+                                         D3D11_DEFAULT_SAMPLE_MASK);
++    pl_d3d11_diagnostic_end(gpu, "state-om-blend", diagnostic);
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     ID3D11DeviceContext_OMSetDepthStencilState(p->imm, p->dsstate, 0);
++    pl_d3d11_diagnostic_end(gpu, "state-om-depth", diagnostic);
+ 
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
+     fill_uavs(pass, params, uavs);
++    pl_d3d11_diagnostic_end(gpu, "state-om-fill-uav", diagnostic);
+ 
+     struct pl_tex_d3d11 *target_p = PL_PRIV(params->target);
++    diagnostic = pl_d3d11_diagnostic_start(gpu);
      ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(
          p->imm, 1, &target_p->rtv, NULL, 1, pass_p->uavs.num, uavs, NULL);
++    pl_d3d11_diagnostic_end(gpu, "state-om-targets", diagnostic);
  
-+    pl_d3d11_diagnostic_end(gpu, "state-bind", diagnostic);
++    pl_d3d11_diagnostic_end(gpu, "state-bind", state_bind_started);
 +    diagnostic = pl_d3d11_diagnostic_start(gpu);
      if (params->index_data || params->index_buf) {
          ID3D11DeviceContext_DrawIndexed(p->imm, params->vertex_count, 0, 0);
@@ -234,7 +353,7 @@ index 8043fc1..3fe68cd 100644
      for (int i = 0; i < PL_MAX(pass_p->main.cbvs.num, pass_p->vertex.cbvs.num); i++)
          cbvs[i] = NULL;
      for (int i = 0; i < PL_MAX(pass_p->main.srvs.num, pass_p->vertex.srvs.num); i++)
-@@ -1196,6 +1207,8 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
+@@ -1196,6 +1251,8 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
          ID3D11DeviceContext_PSSetSamplers(p->imm, 0, pass_p->main.samplers.num, samplers);
      ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(
          p->imm, 0, NULL, NULL, 1, pass_p->uavs.num, uavs, NULL);
@@ -243,7 +362,7 @@ index 8043fc1..3fe68cd 100644
  }
  
  static void pass_run_compute(pl_gpu gpu, const struct pl_pass_run_params *params)
-@@ -1267,8 +1280,11 @@ void pl_d3d11_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+@@ -1267,8 +1324,11 @@ void pl_d3d11_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
      struct pl_gpu_d3d11 *p = PL_PRIV(gpu);
      struct d3d11_ctx *ctx = p->ctx;
      pl_pass pass = params->pass;
@@ -255,7 +374,7 @@ index 8043fc1..3fe68cd 100644
  
      if (pass->params.type == PL_PASS_COMPUTE) {
          pass_run_compute(gpu, params);
-@@ -1276,6 +1292,11 @@ void pl_d3d11_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+@@ -1276,6 +1336,11 @@ void pl_d3d11_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
          pass_run_raster(gpu, params);
      }
  

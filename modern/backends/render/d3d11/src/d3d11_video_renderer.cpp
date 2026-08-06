@@ -798,8 +798,18 @@ public:
         ComPtr<ID3D11Texture2D> target;
         VideoFrame source;
         std::shared_ptr<D3D11TextureFrame> imported;
-        std::array<pl_tex, 2> sourceTextures {};
-        pl_tex targetTexture = nullptr;
+    };
+
+    struct WrappedTexture {
+        // pl_d3d11_wrap creates a fresh RTV/SRV. Cache recurring swap-chain
+        // targets and decoder-array slices so the D3D11 runtime does not
+        // accumulate per-frame view destruction in its deletion pool.
+        ID3D11Texture2D* native = nullptr;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        int arraySlice = 0;
+        int width = 0;
+        int height = 0;
+        pl_tex texture = nullptr;
     };
 
     struct RenderPassProbe {
@@ -813,6 +823,11 @@ public:
     };
 
     static constexpr std::size_t maximumInFlightRenders = 3;
+    // Target buffers normally rotate within a small swap-chain set. The
+    // source bound accommodates two plane views for a large decoder pool and
+    // remains finite across media replacement without an intervening flush.
+    static constexpr std::size_t maximumTargetTextureCacheEntries = 8;
+    static constexpr std::size_t maximumSourceTextureCacheEntries = 512;
 
     Impl(
         std::shared_ptr<D3D11DeviceAccess> deviceAccess,
@@ -966,14 +981,6 @@ public:
 
     void destroyInFlightRender(InFlightRender& render) noexcept
     {
-        for (pl_tex& texture : render.sourceTextures) {
-            if (texture && d3d11_) {
-                pl_tex_destroy(d3d11_->gpu, &texture);
-            }
-        }
-        if (render.targetTexture && d3d11_) {
-            pl_tex_destroy(d3d11_->gpu, &render.targetTexture);
-        }
         render.imported.reset();
         render.source = {};
         render.target.Reset();
@@ -986,6 +993,86 @@ public:
         }
         inFlightRenders_.clear();
         availableCompletionQueries_.clear();
+    }
+
+    void destroyWrappedTextures(
+        std::vector<WrappedTexture>& textures) noexcept
+    {
+        if (d3d11_) {
+            for (WrappedTexture& wrapped : textures) {
+                if (wrapped.texture) {
+                    pl_tex_destroy(d3d11_->gpu, &wrapped.texture);
+                }
+            }
+        }
+        textures.clear();
+    }
+
+    pl_tex findWrappedTexture(
+        const std::vector<WrappedTexture>& textures,
+        ID3D11Texture2D* native,
+        DXGI_FORMAT format,
+        int arraySlice,
+        int width,
+        int height) const noexcept
+    {
+        const auto found = std::find_if(
+            textures.begin(),
+            textures.end(),
+            [=](const WrappedTexture& wrapped) {
+                return wrapped.native == native
+                    && wrapped.format == format
+                    && wrapped.arraySlice == arraySlice
+                    && wrapped.width == width
+                    && wrapped.height == height;
+            });
+        return found == textures.end() ? nullptr : found->texture;
+    }
+
+    pl_tex wrapCachedTexture(
+        std::vector<WrappedTexture>& textures,
+        ID3D11Texture2D* native,
+        DXGI_FORMAT format,
+        int arraySlice,
+        int width,
+        int height)
+    {
+        if (pl_tex cached = findWrappedTexture(
+                textures,
+                native,
+                format,
+                arraySlice,
+                width,
+                height)) {
+            return cached;
+        }
+
+        pl_d3d11_wrap_params params {};
+        params.tex = native;
+        params.array_slice = arraySlice;
+        params.fmt = format;
+        params.w = width;
+        params.h = height;
+        pl_tex texture = pl_d3d11_wrap(d3d11_->gpu, &params);
+        if (texture) {
+            textures.push_back({
+                native,
+                format,
+                arraySlice,
+                width,
+                height,
+                texture,
+            });
+        }
+        return texture;
+    }
+
+    void recycleWrappedTextures(
+        std::vector<WrappedTexture>& textures) noexcept
+    {
+        pl_gpu_finish(d3d11_->gpu);
+        destroyInFlightRenders();
+        destroyWrappedTextures(textures);
     }
 
     bool retireCompletedRenders(std::string& error)
@@ -1061,6 +1148,8 @@ public:
             pl_gpu_finish(d3d11_->gpu);
         }
         destroyInFlightRenders();
+        destroyWrappedTextures(sourceTextureCache_);
+        destroyWrappedTextures(targetTextureCache_);
         for (pl_tex& texture : uploadTextures_) {
             if (texture && d3d11_) {
                 pl_tex_destroy(d3d11_->gpu, &texture);
@@ -1104,13 +1193,26 @@ public:
         pl_frame& frame,
         std::string& error)
     {
-        pl_d3d11_wrap_params params {};
-        params.tex = native;
-        params.array_slice = 0;
-        params.fmt = format;
-        params.w = width;
-        params.h = height;
-        texture = pl_d3d11_wrap(d3d11_->gpu, &params);
+        texture = findWrappedTexture(
+            targetTextureCache_,
+            native,
+            format,
+            0,
+            width,
+            height);
+        if (!texture) {
+            if (targetTextureCache_.size()
+                >= maximumTargetTextureCacheEntries) {
+                recycleWrappedTextures(targetTextureCache_);
+            }
+            texture = wrapCachedTexture(
+                targetTextureCache_,
+                native,
+                format,
+                0,
+                width,
+                height);
+        }
         if (!texture || !texture->params.renderable) {
             error = takeLogError(
                 "libplacebo cannot wrap the D3D11 render target");
@@ -1167,6 +1269,12 @@ public:
             return false;
         }
 
+        const std::size_t maximumNewEntries = rawYuv ? 2 : 1;
+        if (sourceTextureCache_.size() + maximumNewEntries
+            > maximumSourceTextureCacheEntries) {
+            recycleWrappedTextures(sourceTextureCache_);
+        }
+
         if (rawYuv) {
             const bool tenBit = format == PixelFormat::P010;
             if (description.Format
@@ -1189,14 +1297,13 @@ public:
                 static_cast<int>((description.Height + 1U) / 2U),
             };
             for (std::size_t plane = 0; plane < textures.size(); ++plane) {
-                pl_d3d11_wrap_params params {};
-                params.tex = imported->texture();
-                params.array_slice =
-                    static_cast<int>(imported->arraySlice());
-                params.fmt = planeFormats[plane];
-                params.w = widths[plane];
-                params.h = heights[plane];
-                textures[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
+                textures[plane] = wrapCachedTexture(
+                    sourceTextureCache_,
+                    imported->texture(),
+                    planeFormats[plane],
+                    static_cast<int>(imported->arraySlice()),
+                    widths[plane],
+                    heights[plane]);
                 if (!textures[plane] || !textures[plane]->params.sampleable) {
                     error = takeLogError(
                         "libplacebo cannot wrap a D3D11 decoder plane");
@@ -1227,13 +1334,13 @@ public:
                 return false;
             }
         } else {
-            pl_d3d11_wrap_params params {};
-            params.tex = imported->texture();
-            params.array_slice = static_cast<int>(imported->arraySlice());
-            params.fmt = imported->dxgiFormat();
-            params.w = source.width();
-            params.h = source.height();
-            textures[0] = pl_d3d11_wrap(d3d11_->gpu, &params);
+            textures[0] = wrapCachedTexture(
+                sourceTextureCache_,
+                imported->texture(),
+                imported->dxgiFormat(),
+                static_cast<int>(imported->arraySlice()),
+                source.width(),
+                source.height());
             if (!textures[0] || !textures[0]->params.sampleable) {
                 error = takeLogError(
                     "libplacebo cannot wrap the imported D3D11 texture");
@@ -1296,6 +1403,8 @@ public:
     pl_renderer renderer_ = nullptr;
     pl_hook scRgbOutputHook_ {};
     std::array<pl_tex, 4> uploadTextures_ {};
+    std::vector<WrappedTexture> sourceTextureCache_;
+    std::vector<WrappedTexture> targetTextureCache_;
     std::deque<InFlightRender> inFlightRenders_;
     std::vector<ComPtr<ID3D11Query>> availableCompletionQueries_;
     std::string lastLogError_;
@@ -1802,10 +1911,6 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             inFlight.target = std::move(targetTextureNative);
             inFlight.source = frame;
             inFlight.imported = std::move(imported);
-            inFlight.sourceTextures = hardwareTextures;
-            hardwareTextures = {};
-            inFlight.targetTexture = targetTexture;
-            targetTexture = nullptr;
             impl_->inFlightRenders_.push_back(std::move(inFlight));
             updateMaximum(
                 impl_->maximumInFlightRetentionMicroseconds_,
@@ -1829,15 +1934,6 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         // failure path.
         pl_gpu_finish(impl_->d3d11_->gpu);
     }
-    for (pl_tex& texture : hardwareTextures) {
-        if (texture) {
-            pl_tex_destroy(impl_->d3d11_->gpu, &texture);
-        }
-    }
-    if (targetTexture) {
-        pl_tex_destroy(impl_->d3d11_->gpu, &targetTexture);
-    }
-
     const HRESULT drawReason =
         impl_->device_.get()->GetDeviceRemovedReason();
     if (detail::d3d11FailureEvent(drawReason)
@@ -1898,6 +1994,8 @@ void D3D11VideoRenderer::flush() noexcept
     (void)contextGuard;
     pl_gpu_finish(impl_->d3d11_->gpu);
     impl_->destroyInFlightRenders();
+    impl_->destroyWrappedTextures(impl_->sourceTextureCache_);
+    impl_->destroyWrappedTextures(impl_->targetTextureCache_);
 }
 
 BorrowedD3D11Device D3D11VideoRenderer::device() const noexcept

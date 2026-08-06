@@ -153,7 +153,27 @@ timer-query-start
 stream-map-discard
 stream-map-no-overwrite
 stream-unmap
+buffer-resolve-update
 state-bind
+state-ia-layout
+state-ia-topology
+state-vs-shader
+state-vs-fill
+state-vs-cb
+state-vs-srv
+state-vs-sampler
+state-rs-state
+state-rs-viewport
+state-rs-scissor
+state-ps-shader
+state-ps-fill
+state-ps-cb
+state-ps-srv
+state-ps-sampler
+state-om-blend
+state-om-depth
+state-om-fill-uav
+state-om-targets
 draw
 state-unbind
 message-queue
@@ -560,6 +580,46 @@ Record all of the following for the next handoff or commit description:
 - original Iris Xe post-fix evidence
 - AMD/NVIDIA regression status
 - remaining limitations or hardware confirmation still pending
+
+## 2026-08-06 administrator ETW conclusion and repair
+
+The original Iris Xe machine now has a verified repair. An elevated CPU+GPU
+WPR capture of `legend.mkv` at the 22:48 seek point recorded zero lost events
+and showed the 52-ms slow call in
+`UpdateSubresource_Amortized -> FlushDeletionPool -> CView::~CView ->
+DxgkDestroyAllocation2 -> TerminateAllocations`, through Intel's
+`igd10um64xe.dll`. Replacing the upload with a dynamic constant buffer made
+`Map(WRITE_DISCARD)` fast but merely moved the same deletion-pool stall to
+`Draw_Amortized`, so that experiment was removed.
+
+The actual producer of the deferred work was QtAV's per-frame destruction of
+three libplacebo D3D11 texture wrappers: one output RTV and two NV12/P010
+decoder-plane SRVs. `D3D11VideoRenderer` now caches these wrappers by native
+texture, format, slice, and dimensions. The target/source caches are bounded;
+normal rendering remains asynchronous and zero-copy, while the existing
+`flush()` and close paths finish submitted work before releasing cached views.
+
+With only that repair active, the no-WPR run held 24.9-25.2 rendered fps after
+the seek. Settled draw maxima fell from recurring 61-66 ms to 12.4-14.5 ms;
+GPU time remained 1.6-1.9 ms, HDR remained RGB10/PQ, and decoder copies stayed
+zero. The final elevated ETL also had zero lost events, held 24.8-25.1 fps, and
+contained no qualifying `UpdateSubresource` or `Draw` probe event. Evidence:
+
+- baseline ETL: `C:\QtAVTraces\irisxe-legend-2248-admin-20260806-163801.etl`
+- baseline stack report:
+  `C:\QtAVTraces\irisxe-update-subresource-stack-20260806-163801.html`
+- final no-WPR log:
+  `C:\QtAVTraces\irisxe-legend-2248-cache-final-nowpr-20260806.txt`
+- final ETL:
+  `C:\QtAVTraces\irisxe-legend-2248-cache-final-admin-20260806-170810.etl`
+- final app/probe logs share the final ETL basename.
+
+The repository Windows dependency build and install verification passed after
+the rejected experiment was removed. Final shared and static Release suites
+each passed 36/36, and the formal WinUI Release rebuild completed with zero
+warnings and errors. The original Intel gate is closed; same-commit AMD/NVIDIA
+regression remains before declaring the generic Windows release matrix
+complete.
 
 The task is complete only when the original Iris Xe result is recorded and any
 generic Windows correction has the required cross-vendor evidence. If the

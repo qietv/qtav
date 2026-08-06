@@ -18,9 +18,12 @@ matrix or roadmap. A macOS development machine may still act only as a
 cross-compilation host for Android/OHOS; 64-bit Windows is also a supported
 OHOS cross-compilation host through the DevEco native SDK.
 
-OHOS is now the active local development target. AD-007 is closed after the
-current vendor-neutral D3D11VA/libplacebo policy was accepted on NVIDIA, Intel,
-and AMD platforms.
+Windows cross-vendor regression is now the active development target. Run the
+current Intel wrapper-cache repair on NVIDIA first and AMD second. Existing
+OHOS implementation and validation records are retained, but all unfinished
+OHOS work is explicitly postponed until this Windows regression sequence is
+complete. AD-007 remains closed after the vendor-neutral D3D11VA/libplacebo
+policy was accepted on NVIDIA, Intel, and AMD platforms.
 
 The user's separate AMD integrated-GPU 4K frame-loss report is objectively
 located, corrected, and fully verified by reason-aware render retry plus
@@ -28,16 +31,14 @@ proactive bounded D3D11 context handoff, without changing AD-007's
 imported-frame policy. A controlled cold rerun restored both supplied files to
 source cadence with zero terminal context drops; the intervening stressed
 draw-throughput shortfall was a transient prolonged-build/UI-capture load
-state rather than a retained regression. The same commit and objective
-cadence/lifecycle matrix now also pass on NVIDIA. The separate Intel 4K
-post-seek performance investigation remains incomplete and has been transferred
-to another Intel Windows machine where Codex can run with administrator rights
-for WPR/GPUView capture and an evidence-backed fix. By explicit user priority,
-that external Windows track no longer blocks local OHOS work; its fix and full
-cross-vendor validation are still required before the Intel/Windows matrix can
-close. Local development begins with the OHOS target-clarification/toolchain
-gate and the portable render-result semantics required by its Vulkan/OpenGL
-adapters, without copying the Windows-only D3D11 reservation mechanism.
+state rather than a retained regression. The earlier objective cadence and
+lifecycle matrix also passed on NVIDIA. The separate Intel 4K post-seek
+performance regression is fixed and verified on the original Iris Xe machine
+with administrator WPR/ETW evidence. Those AMD and NVIDIA results predate the
+final Intel wrapper-cache repair and therefore do not replace regression of the
+current source revision. The generic Windows release gate remains open for the
+current-revision NVIDIA and AMD matrix, in that order. OHOS resumes afterward
+at its existing item-10 format-contract confirmation gate.
 
 The archival removes the former Apple backend options/targets and the
 `VideoToolbox`/`Metal` public hardware-device identifiers. The unused Linux
@@ -113,8 +114,9 @@ Continuation checkpoint:
   drop, and per-stage timing statistics;
   its progress slider observes already-handled thumb pointer events and
   commits only one seek when a drag ends instead of issuing intermediate seeks;
-  Milestones 5 and 6 are complete; the OHOS production path is now the active
-  local development track, and the Android example playback-stutter regression
+  Milestones 5 and 6 are complete; the OHOS production path has a retained
+  development baseline but is currently deferred behind Windows NVIDIA/AMD
+  regression, and the Android example playback-stutter regression
   recorded below is fixed and connected-device verified; the shared Android/OHOS
   responsibility and lifecycle design is now recorded in `MOBILE.md`, and the
   Android arm64 Vulkan checkpoint cross-builds FFmpeg 8.1.2 plus QtAVCore,
@@ -371,8 +373,9 @@ Current verification:
   confirmations did not include exact adapter/driver and objective cadence
   data, so they are not performance baselines. A subjective report of 4K
   dropped frames on an AMD integrated GPU is tracked separately in `Next
-  task`; that AMD repair and the NVIDIA same-commit performance confirmation
-  are now complete, with Intel remaining;
+  task`; that AMD repair and the NVIDIA performance confirmation were completed
+  first, the later Intel repair is now complete, and the final Intel repair
+  revision still requires NVIDIA then AMD regression;
 - `legend.mkv` confirms that the brightness report is not Dolby-Vision-only:
   its decoded metadata is BT.2020/PQ and the current sample reports active
   RGB10/PQ output with 240-nit system SDR white and a 1405-nit display peak.
@@ -756,9 +759,11 @@ Completed file-output checkpoint:
 ## Android manual final-test player gate
 
 This user-requested Android player gate is complete. Its results remain the
-Android regression baseline. The unfinished Intel Windows check is transferred
-to a separate administrator-capable machine; on this machine the portable
-Android/OHOS render-result follow-up and Milestone 7 OHOS work are now active:
+Android regression baseline. At this checkpoint the unfinished Intel Windows
+check was transferred to a separate administrator-capable machine while the
+portable Android/OHOS render-result follow-up and Milestone 7 OHOS work
+advanced locally. The Intel investigation subsequently completed; unfinished
+OHOS work is now deferred while NVIDIA and AMD regress the final repair:
 
 1. [x] Add a user-facing standard Android activity under
    `modern/examples/android_player/` with an upper video surface, current
@@ -841,10 +846,35 @@ Android/OHOS render-result follow-up and Milestone 7 OHOS work are now active:
 
 ## Next task
 
-There are now two explicit work tracks. The Intel Windows track remains open
-and is transferred to another Intel machine for administrator-only GPU tracing,
-root-cause confirmation, repair, and cross-vendor regression. The active local
-track is OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
+The active work track is Windows cross-vendor regression. The Intel wrapper-
+cache repair and original Iris Xe administrator verification are complete.
+Before closing the generic Windows release gate, validate that exact current
+source revision and Release configuration on NVIDIA first and AMD second.
+Earlier AMD repair and NVIDIA validation remain useful baselines, but they do
+not replace regression after the Intel renderer change.
+
+Active Windows regression order:
+
+1. [ ] NVIDIA: build the current source revision in shared and static Release
+   configurations, pass both complete CTest suites and a zero-warning WinUI 3
+   player build, then run the generated H.264/NV12 control, `legend.mkv`,
+   `wednesday.mp4`, and available 4K SDR coverage. Exercise cold start,
+   sustained playback, repeated seek, pause/resume, media replacement, resize,
+   and close while playing. Record adapter/driver/display/power conditions,
+   source/scheduled/rendered cadence, render gaps and reason counters, stage
+   maxima, D3D11VA/raw-plane state, and decoded-source copy counters.
+2. [ ] AMD: repeat the same source revision, binaries/configuration, media
+   scenes, lifecycle sequence, objective counters, and build/test gates on the
+   Radeon system. Do not substitute the earlier AMD repair run for this final
+   wrapper-cache regression.
+3. [ ] Compare NVIDIA and AMD results with the completed Iris Xe reference. If
+   both preserve source cadence, accepted lifecycle behavior, D3D11VA raw-plane
+   zero-copy, and the full test baseline, record the exact evidence and close
+   the generic Windows release gate. If either regresses, capture an elevated
+   WPR/ETW trace and renderer diagnostics on that vendor before changing code.
+
+The OHOS track is explicitly postponed by user priority. Its completed
+Milestone 7 target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
 lifecycle matrix, and raw-YCbCr `OH_NativeImage`/OpenGL ES/libplacebo
@@ -868,9 +898,9 @@ The next Dolby Vision slice is partly complete: FFmpeg-parsed RPU metadata is
 now correlated to exact OHCodec outputs by normalized PTS, and Profile 5 plus
 Profile 8.4 pass through the raw OpenGL ES/libplacebo path. Its strict Vulkan
 half remains gated by the same missing explicit multi-plane device format as
-item 10.
+item 10. No completed OHOS status is rolled back by this scheduling change.
 
-The immediate next local OHOS step is the item-10 confirmation gate, before
+When OHOS work resumes, its next step is the item-10 confirmation gate, before
 further strict Vulkan or Dolby Vision implementation advances: obtain Huawei's
 written position on the mapping, its supported device/system and buffer-
 configuration scope, the meaning of returned format features after a guessed
@@ -880,7 +910,7 @@ evidence in a follow-up architecture decision, then either promote a narrowly
 supported mapping, retain it as an explicitly opted-in workaround, or reject
 it and use the opaque/fallback paths.
 
-Active local OHOS execution order:
+Deferred OHOS execution order:
 
 1. [x] Complete the Milestone 7 target-clarification gate: record HarmonyOS
    NEXT versus OpenHarmony target, SDK/API version, signing, device, and
@@ -1165,15 +1195,16 @@ cross-check, and the Windows Release `qtav_output_d3d11` target compiled with
 the expanded Player status set. No Windows D3D11 reservation or mailbox policy
 was copied into the portable layer.
 
-Transferred Intel Windows checklist (not the next local task):
+Windows regression checklist (active NVIDIA then AMD; Intel reference complete):
 
-AD-007 is complete: the current protected, asynchronous imported-frame policy
-is accepted on NVIDIA, Intel, and AMD. The AMD WinUI 3/D3D11 counted loss is
+AD-007 is complete: the protected, asynchronous imported-frame policy is
+accepted on NVIDIA, Intel, and AMD. The AMD WinUI 3/D3D11 counted loss was
 traced to generic render retry/context-handoff semantics, corrected by
-proactive bounded handoff, and fully verified on the Radeon 880M with both
-supplied 4K files. The same-commit NVIDIA cadence and lifecycle matrix is also
-complete; the remaining Windows task consists only of the transferred Intel
-post-seek performance investigation.
+proactive bounded handoff, and verified on the Radeon 880M with both supplied
+4K files. The earlier NVIDIA cadence/lifecycle matrix also passed. The later
+Intel post-seek regression is now repaired and verified on the original Iris
+Xe system. The active task is to regress that final wrapper-cache revision on
+NVIDIA and then AMD.
 
 Earlier correctness observations used older
 workaround combinations and do not satisfy this performance baseline. Do not
@@ -1193,30 +1224,27 @@ regression unless new synchronization or driver-failure evidence appears.
    coalesced redraws, `present-busy`, `render-skipped`, gaps over 80 ms, and
    color/interop/buffer/draw stage maxima. Confirm D3D11VA and zero
    decoded-source CPU map.
-3. [~] Run the NVIDIA and Intel confirmations from the same commit and Release
+3. [ ] Run the NVIDIA and AMD confirmations from the same source revision and Release
    configuration, using the same source scenes, duration, output resolution,
    color mode, window state, and cadence/stage counters. Match display refresh,
    HDR, and power conditions where practical and record every unavoidable
    difference. Capture at least two settled windows and one 60-120 second run
-   on each device; a subjective "looks smooth" result is not a baseline. The
-   NVIDIA confirmation is complete. Intel now has a same-commit objective
-   checkpoint, but remains open because the `legend.mkv` 22:48 seek scene did
-   not consistently retain the settled pre-seek cadence/render-gap baseline.
+   on each device; a subjective "looks smooth" result is not a baseline. Use
+   the completed Intel Iris Xe evidence as the reference, and treat the older
+   NVIDIA/AMD results as pre-repair baselines only.
 4. [x] Locate the first AMD stage that misses the frame budget. Separate input,
    decode, audio-clock, and Player scheduling loss from renderer/context loss
    and swap-chain/compositor backpressure. Compare vendors only after
    accounting for source frame rate, display refresh, output mode, and power;
    a visual comparison or raw cross-device fps alone is not a diagnosis.
-5. [~] Run the common matrix on the remaining NVIDIA and Intel devices:
+5. [ ] Run the common matrix on NVIDIA and AMD against the final Intel repair:
    generated 1080p H.264/NV12 control, 4K SDR when available, HDR10/P010
    `legend.mkv`, and Dolby Vision Profile 5 `wednesday.mp4`. Include cold
    start, sustained playback, seek, media replacement, and close while
    playing, while preserving the accepted AD-007 synchronization policy. The
-   AMD supplied-file repair and lifecycle validation are complete. NVIDIA is
-   complete for the generated H.264 control and both supplied HDR files; no
-   separate 4K SDR control was available. Intel passed the H.264 control and
-   Dolby Vision workload, but its HDR10 `legend.mkv` seek-scene result remains
-   open.
+   older AMD supplied-file repair and NVIDIA matrix are historical baselines;
+   both vendors must be repeated because the renderer wrapper lifetime changed
+   for the final Intel fix.
 6. [~] Run controlled diagnostic A/Bs only after the failing stage is known.
    Candidate renderer-side isolates are native-size versus reduced-size output,
    HDR RGB10/PQ versus SDR BGRA8, and windowed versus display-sized
@@ -1337,9 +1365,9 @@ AMD correction checkpoint on 2026-08-04:
   (`_ITERATOR_DEBUG_LEVEL=2`); no ABI-unsafe override was retained.
 - the AMD evidence rejects a renderer-throughput bottleneck and validates the
   generic retry/handoff correction on the supplied Dolby Vision Profile 5 and
-  HDR10 workloads. The same-build Intel regression, remaining common media and
-  lifecycle matrix, and trusted-player comparison remain open; item 4 was
-  provisionally complete at this checkpoint, while the overall
+  HDR10 workloads. At this checkpoint the same-build Intel regression,
+  remaining common media and lifecycle matrix, and trusted-player comparison
+  remained open; item 4 was provisionally complete, while the overall
   user-prioritized performance task was not.
 
 AMD proactive-handoff refinement on 2026-08-04:
@@ -1555,9 +1583,10 @@ is not yet accepted:
   playing were exercised. Delivered close requests exited in about 226-386 ms
   without a `QtAVWinUI3` Application Error or Windows Error Reporting event.
   No separate 4K SDR control or Intel trusted-player comparison was completed.
-  Keep the Intel task open for a controlled `legend.mkv` 22:48 diagnostic A/B;
-  do not treat zero terminal drops alone as completion while repeatable warm
-  render gaps and occasional cadence loss remain.
+  At this checkpoint the Intel task remained open for a controlled
+  `legend.mkv` 22:48 diagnostic A/B; zero terminal drops alone did not satisfy
+  completion while repeatable warm render gaps and occasional cadence loss
+  remained.
 
 Intel clean-load follow-up on 2026-08-05 with the additional supplied
 `suzume.mkv` does not satisfy the no-reproduction closure condition:
@@ -1599,9 +1628,9 @@ Intel clean-load follow-up on 2026-08-05 with the additional supplied
   was not available, but the processor performance/frequency, queue, and GPU
   samples show no concurrent load collapse during the reproduced windows.
   Thermal throttling may have amplified the earlier `legend.mkv` result, but
-  it does not explain away this clean-load, Debug-independent recurrence.
-  Keep the Intel issue open and include both `legend.mkv` 22:48 and
-  `suzume.mkv` 1:00:00/1:40:00 in the controlled diagnostic A/B.
+  it does not explain away this clean-load, Debug-independent recurrence. At
+  this checkpoint the Intel issue remained open, with both `legend.mkv` 22:48
+  and `suzume.mkv` 1:00:00/1:40:00 required in the controlled diagnostic A/B.
 
 Intel D3D11 pass-submission follow-up on 2026-08-05 narrows the issue but does
 not yet justify a production fix:
@@ -1650,6 +1679,130 @@ not yet justify a production fix:
   repeated stalls in the earlier run. A stuck pointer release would instead
   leave the progress UI in scrubbing mode and omit the committed seek. Mouse
   hover is therefore excluded as the cause of the post-seek D3D11 stalls.
+
+Intel D3D11 API-level root-cause checkpoint on 2026-08-06 confirms the first
+blocking call but deliberately does not select a production repair:
+
+- the investigation used the original Lenovo 21HW/Iris Xe system and Philips
+  HDR display recorded above, an instrumented worktree based on commit
+  `849839cb20438f5b25613f887b9958f09c4e10f6`, and the repository
+  FFmpeg/libplacebo package. The corrected capacity policy from `3a768db`
+  remained active. Two `suzume.mkv` regressions, seeking separately to
+  1:00:00 and 1:40:00, returned to about 23.8-24.2 fps with zero capacity
+  timeout, actual Present busy, terminal loss, and decoder copy in settled
+  windows. This confirms that the correction did not recreate the earlier
+  UHD 770 timeout/requeue cadence loss;
+- `legend.mkv` at 22:48 still reproduced the original Iris Xe signature after
+  that correction: recurring roughly 44-49-ms `pl_render_image()` CPU wall
+  intervals, about 1.6-1.9-ms GPU pass time in the timer-enabled split run,
+  zero actual Present busy, and zero decoder copies. Capacity timeouts that
+  occasionally appeared downstream were therefore consequences of the slow
+  render submission, not an authoritative busy signal or its cause;
+- the expanded environment-gated libplacebo probe first reduced the slow
+  interval to pixel-shader `fill_resources()`, with roughly 35-41 ms in
+  `state-ps-fill` while every individual IA/VS/RS/PS/OM setter stayed below the
+  0.5-ms recording threshold. Source inspection showed that the only driver
+  call in that fill path is `pl_d3d11_buf_resolve()` uploading the pass's
+  host-writable uniform buffer;
+- a final direct probe around that call recorded 21 qualifying
+  `buffer-resolve-update` events during the 88-second `legend.mkv` run. Thirteen
+  exceeded 30 ms and four exceeded 40 ms. The largest nested event measured
+  47.160 ms in `ID3D11DeviceContext::UpdateSubresource`, 47.480 ms in
+  `state-ps-fill`, 47.624 ms in all state binding, and 48.973 ms in the entire
+  pass. The upload alone therefore explains about 99% of the observed slow
+  pass wall time. Logs are retained as
+  `C:\QtAVTraces\irisxe-legend-2248-buffer-resolve-20260806-162212.txt` and
+  `C:\QtAVTraces\libplacebo-d3d11-legend-2248-buffer-resolve-20260806-162212.log`;
+- libplacebo creates this host-writable, unformatted uniform buffer as a
+  default-usage `D3D11_BIND_CONSTANT_BUFFER`, mirrors partial writes in system
+  memory, and resolves the whole buffer with `UpdateSubresource` before use.
+  The same implementation remains in
+  [upstream v7.360.0](https://github.com/haasn/libplacebo/blob/v7.360.0/src/d3d11/gpu_buf.c)
+  and current `master`, so a version-only update does not remove the path.
+  Microsoft documents a
+  [resource-contention path](https://learn.microsoft.com/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-updatesubresource)
+  for `UpdateSubresource`; the observed CPU-side stalls are consistent with the
+  driver serializing or failing to rename the repeatedly updated buffer while
+  an earlier draw still references it;
+- the leading repair candidate is a correctly declared dynamic constant buffer
+  updated with `Map(D3D11_MAP_WRITE_DISCARD)`, full-buffer copy, and `Unmap`,
+  following Microsoft's
+  [dynamic-resource guidance](https://learn.microsoft.com/windows/win32/direct3d11/how-to--use-dynamic-resources)
+  so the runtime can rename storage instead of blocking on the prior use.
+  A bounded constant-buffer ring or a supported discard update is an alternate
+  design. These remain hypotheses until an isolated Intel A/B removes the
+  direct-call stalls without changing pixels or lifetime, followed by the same
+  H.264, `suzume.mkv`, `legend.mkv`, and `wednesday.mp4` matrix on Intel plus
+  AMD and NVIDIA. Do not ship a vendor-only sleep, flush, or quality fallback;
+- the diagnostic patch was rebuilt through `ffmpeg/scripts/build-windows.ps1`
+  and passed `cmake/verify-install.cmake`. The repository-prefix shared Release
+  build succeeded, all 16 D3D11/WASAPI/Windows-focused CTest tests passed, and
+  the WinUI Release player linked against that exact build with zero warnings
+  and errors. At this checkpoint the Intel issue remained open for repair and
+  cross-vendor proof, not for further localization of the first blocking API.
+
+Intel D3D11 root-cause repair and original-machine validation on 2026-08-06:
+
+- an elevated `WPR CPU + GPU` file-mode capture of the unmodified slow path
+  reproduced `legend.mkv` after a seek to 22:48. The 1.30-GB ETL retained zero
+  lost buffers and zero lost events. In the exact 52-ms
+  `UpdateSubresource` interval, sampled stacks entered
+  `CContext::TID3D11DeviceContext_UpdateSubresource_Amortized`, Intel's
+  `igd10um64xe.dll`, `NOutermost::CDevice::FlushDeletionPool`,
+  `CView::~CView`, `ZwGdiDdDDIDestroyAllocation2`,
+  `DxgkDestroyAllocation2`, and `DXGDEVICE::TerminateAllocations`. The durable
+  inputs are
+  `C:\QtAVTraces\irisxe-legend-2248-admin-20260806-163801.etl` and
+  `C:\QtAVTraces\irisxe-update-subresource-stack-20260806-163801.html`;
+- a dynamic-constant-buffer experiment changed the upload to
+  `Map(D3D11_MAP_WRITE_DISCARD)` and made every map shorter than the 0.5-ms
+  probe threshold, but the same roughly 49-55-ms periodic delay moved to
+  `CContext::TID3D11DeviceContext_Draw_Amortized`. Its ETW stack still entered
+  the same `FlushDeletionPool`/`CView`/DXG allocation-destruction path. This
+  falsified constant-buffer contention as the root cause and the experiment
+  was removed rather than shipped;
+- QtAV's D3D11 renderer was creating three fresh libplacebo wrappers per
+  hardware frame: one RTV wrapper for the recurring output texture and two
+  plane-specific SRV wrappers for the recurring NV12/P010 decoder-array slice.
+  Completion retirement destroyed those wrappers every frame. The resulting
+  view churn accumulated in the D3D11 runtime deletion pool, and an arbitrary
+  later amortized API call synchronously drained it through the Intel driver
+  and DXG kernel;
+- the production repair caches wrappers by native texture identity, format,
+  array slice, and dimensions. Target and decoder-plane caches are bounded to
+  8 and 512 entries. Normal frames remain asynchronous and add no finish,
+  copy, map, staging transfer, or vendor branch. Existing `flush()` now
+  finishes submitted work and releases both caches before resize/target
+  replacement; close does the same. A capacity rollover also finishes and
+  clears only the affected cache, which is a rare safety bound rather than a
+  per-frame path;
+- in the final no-WPR run with the dynamic-buffer experiment removed,
+  `legend.mkv` settled at 24.9-25.2 rendered fps for seven post-seek windows.
+  The transition window peaked at 28.3 ms in `pl_render_image()`; subsequent
+  draw maxima were 12.4-14.5 ms instead of the former recurring 61-66 ms, GPU
+  pass time remained 1.6-1.9 ms, actual Present busy and decoder copies stayed
+  zero, and the libplacebo probe recorded no `UpdateSubresource` or `Draw`
+  call at or above 0.5 ms. The log is
+  `C:\QtAVTraces\irisxe-legend-2248-cache-final-nowpr-20260806.txt`;
+- the final elevated CPU+GPU ETL independently retained zero lost buffers and
+  events. After the seek transition, settled windows rendered 24.8-25.1 fps,
+  draw maxima stayed 12.4-14.2 ms, and the probe contained only a 0.661-ms
+  cold raster total, a 1.468-ms cold pass total, and one 0.528-ms timer-query
+  poll. No qualifying buffer upload, draw, deletion-pool, or DXG allocation-
+  destruction recurrence remained. HDR stayed active as RGB10/PQ at a
+  1405-nit reported display peak, D3D11VA kept raw P010 sampling, and decoder
+  copies remained zero. The final evidence is
+  `C:\QtAVTraces\irisxe-legend-2248-cache-final-admin-20260806-170810.etl`,
+  its sibling player log, and its sibling libplacebo log;
+- the repository dependency script and `cmake/verify-install.cmake` passed
+  after removing the failed experiment. The 16 directly affected
+  D3D11/D3D11VA/interop/output/native-A/V tests pass; final shared and static
+  Release suites each pass 36/36, and the WinUI Release player rebuilds with
+  zero warnings and errors. One unrelated shared audio-sink test twice exited
+  transiently with `0xc0000409` in an earlier straight suite, then passed five
+  consecutive direct runs and the final full suite. The original Iris Xe
+  repair gate is closed; current-revision NVIDIA then AMD validation remains
+  the release-completion work.
 
 The prior Android task is retained below as completed history, not as the
 active next step.
@@ -2245,21 +2398,21 @@ libplacebo own plane sampling, Dolby Vision/HDR processing, and final output.
 
 Following platform slice:
 
-1. [~] External Windows machine: complete the Intel administrator trace,
-   evidence-backed correction, and same-commit matrix described in `Next task`;
-   AMD repair and NVIDIA verification are complete.
-2. [~] This machine: the portable render-result contract, target/toolchain
+1. [~] Windows (active): the Iris Xe wrapper-cache repair and original-machine
+   administrator ETW validation are complete; run the current revision on
+   NVIDIA and then AMD before closing the generic Windows release gate.
+2. [~] OHOS (deferred): the portable render-result contract, target/toolchain
    gate, HAP/XComponent Vulkan and OpenGL ES adapters, shared-selector fallback,
    OHAudio output, and OHCodec direct-surface lifecycle matrix are complete;
-   continue with OHOS `OH_NativeImage`/OpenGL ES native hardware-frame interop
-   without waiting for the external Intel trace.
+   retain those results and resume at item 10 only after the Windows regression
+   sequence.
 
 Platform implementation order after the contracts are stable:
 
 1. Windows reference path.
 2. Android production path with connected-device validation.
 3. Android playback performance/regression work.
-4. OHOS production path with connected-device validation (active local slice).
+4. OHOS production path with connected-device validation (currently deferred).
 
 ## Milestone 3 — Portable reference backends
 
@@ -2334,9 +2487,9 @@ Acceptance:
 
 Status: complete; Milestone 6 is also complete. AD-007 is accepted across
 NVIDIA, Intel, and AMD; the AMD integrated-GPU cadence correction and NVIDIA
-same-commit matrix are fully validated. The Intel post-seek performance matrix
-remains incomplete on the external Windows track, while Milestone 7 is active
-locally.
+matrix are retained as pre-Intel-repair baselines. The Intel post-seek repair
+and original-machine administrator validation are complete. The active Windows
+track now repeats the final revision on NVIDIA and AMD; Milestone 7 is deferred.
 
 ## Milestone 6 — Android production path
 
@@ -2427,17 +2580,19 @@ Acceptance:
 - Android SDK types remain outside core public headers.
 
 Status: complete. Its connected-device results remain the Android regression
-baseline. The Intel matrix continues on the external administrator-capable
-Windows machine; the portable Android/OHOS result contract and OHAudio slice
-are complete. OHCodec decoder selection, its direct-surface lifecycle matrix,
-and its raw-YCbCr `OH_NativeImage`/OpenGL ES/libplacebo path are complete;
-local work proceeds into retained-`OH_NativeBuffer` Vulkan direct wrapping.
+baseline. The Intel repair and administrator validation are complete; NVIDIA
+then AMD regression of that final revision is the active Windows track. The
+portable Android/OHOS result contract and OHAudio slice are complete. OHCodec
+decoder selection, its direct-surface lifecycle matrix, and its raw-YCbCr
+`OH_NativeImage`/OpenGL ES/libplacebo path are also complete; further retained-
+`OH_NativeBuffer` Vulkan work is deferred.
 
-## Active milestone 7 — OHOS production path
+## Deferred milestone 7 — OHOS production path
 
-This is now the active local development milestone. The transferred Intel
-Windows performance issue remains open in parallel and must not be described as
-fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
+This milestone is explicitly postponed while the final Intel repair revision
+is regressed on NVIDIA and then AMD. The Intel Windows performance issue is
+fixed and verified on the original Iris Xe machine. Target clarification, the
+OHOS arm64/API 23 dependency and
 toolchain validation, portable render-result contract, Vulkan/OpenGL ES
 selector path, OHAudio sink, OHCodec H.264/HEVC direct-surface lifecycle matrix,
 and raw-YCbCr OHCodec/OpenGL ES/libplacebo path are complete and connected-
