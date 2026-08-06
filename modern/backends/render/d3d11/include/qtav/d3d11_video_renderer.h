@@ -50,6 +50,9 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11AdvancedColorInfo {
 
 struct QTAV_RENDER_D3D11_EXPORT D3D11VideoRendererStatistics {
     // Per-stage maxima accumulated since the previous takeStatistics() call.
+    // Raw NV12/P010 decoder slices are copied once on the GPU into a bounded
+    // shader-resource ring. This avoids creating shader views on decoder
+    // resources while keeping decoded pixels out of CPU memory.
     std::uint64_t decoderSurfaceCopies = 0;
     // Mutually exclusive reasons for render() returning false because a
     // transient renderer resource was busy.
@@ -107,9 +110,10 @@ using D3D11CurrentTargetCallback = std::function<D3D11RenderTarget()>;
 
 // A backend-specific, reference-counted view of a D3D11 texture imported from
 // a hardware video frame. NV12/P010 decoder surfaces are exposed in their raw
-// form so libplacebo can sample their planes before Dolby Vision reshaping and
-// color conversion. The returned native objects are borrowed and remain valid
-// while this object is alive.
+// form so the renderer can preserve their planes in a same-format GPU copy
+// before libplacebo performs Dolby Vision reshaping and color conversion. The
+// returned native objects are borrowed and remain valid while this object is
+// alive.
 class QTAV_RENDER_D3D11_EXPORT D3D11TextureFrame {
 public:
     virtual ~D3D11TextureFrame();

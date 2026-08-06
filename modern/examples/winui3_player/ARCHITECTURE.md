@@ -134,15 +134,16 @@ the WinUI dispatcher.
 
 Hardware frames normally remain on the selected D3D11 device. Their raw
 NV12/P010 planes pass through libplacebo color processing and rendering
-without a CPU map. Submitted decoder slices and swap-chain back buffers stay
-retained until GPU completion; output resize drains those submissions before
-replacing the buffers. Every successfully imported D3D11VA frame uses fast
-libplacebo parameters and remains in the bounded completion-query queue until
-its decoder resources can be recycled, regardless of adapter vendor. Dolby
-Vision raw NV12/P010 imports sample the retained decoder texture-array slice
-directly; there is no intermediate GPU copy. Software frames remain outside
-this imported-frame policy. Unsupported media or devices fall back through
-QtAVCore's software decode/render path rather than an application-side decoder.
+without a CPU map. Each raw decoder slice is copied once on the GPU into a
+bounded ordinary NV12/P010 shader-resource ring before libplacebo sampling.
+Submitted decoder slices, selected ring entries, and swap-chain back buffers
+stay retained until GPU completion; output resize drains those submissions
+before replacing the buffers. Every successfully imported D3D11VA frame uses
+fast libplacebo parameters and remains in the bounded completion-query queue
+until its resources can be recycled, regardless of adapter vendor. Software
+frames remain outside this imported-frame policy. Unsupported media or devices
+fall back through QtAVCore's software decode/render path rather than an
+application-side decoder.
 
 ### Seek and progress
 
@@ -186,8 +187,8 @@ resets output counters. Important interpretations are:
   continues and non-blocking `Present()` makes the final capacity decision;
 - `present-busy` means non-blocking `Present()` itself returned
   `DXGI_ERROR_WAS_STILL_DRAWING`;
-- `decoder-copies` is a retained compatibility counter and remains zero while
-  the renderer samples Dolby Vision decoder slices directly;
+- `decoder-copies` counts same-format decoder-to-shader GPU copies for raw
+  NV12/P010 hardware frames; it remains zero for software frames;
 - `coalesced` means multiple redraw notifications were intentionally combined;
 - `no-frame/player-busy/renderer-busy` classifies unsuccessful attempts, while
   `renderer-busy(state/serialize/context/in-flight)` locates backend

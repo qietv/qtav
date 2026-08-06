@@ -18,6 +18,7 @@ remain with a link to their replacement.
 | [ADR-007](#adr-007-coalesce-progress-interaction-into-one-asynchronous-seek) | Coalesce progress interaction into one asynchronous seek | Accepted |
 | [ADR-008](#adr-008-use-opaque-rgb10pq-video-presentation) | Use opaque RGB10/PQ video presentation | Accepted |
 | [ADR-009](#adr-009-retry-transient-render-contention-with-bounded-context-handoff) | Retry transient render contention with bounded context handoff | Accepted |
+| [ADR-010](#adr-010-copy-decoder-slices-before-shader-sampling) | Copy decoder slices before shader sampling | Accepted |
 
 ## ADR-001: Unpackaged, self-contained WinUI 3 application
 
@@ -319,3 +320,49 @@ are no longer reported as missing frames.
 - The same-build Intel performance regression remains required; this decision
   corrects generic retry semantics but does not claim cross-device performance
   equivalence.
+
+## ADR-010: Copy decoder slices before shader sampling
+
+- **Status:** Accepted
+- **Date:** 2026-08-06
+
+### Context
+
+The persistent D3D11 plane-view cache removed Intel's per-frame SRV creation
+and destruction cost, but it also kept SRVs alive on FFmpeg's reusable
+D3D11VA texture-array slices. On the NVIDIA seek regression, the video decode
+worker then waited indefinitely inside `DecoderBeginFrame` while holding the
+shared immediate-context guard. Rendering could only report context handoff
+timeouts, audio entered buffering, and deterministic shutdown waited for the
+blocked decode worker.
+
+Increasing the decoder surface pool delayed the failure but did not remove it.
+Draining renderer state during seek and invalidating completed views also
+failed. Making decoder-slice plane views transient removed the NVIDIA stall and
+restored prompt close, but would reintroduce the Intel view-deletion churn.
+
+### Decision
+
+For raw NV12/P010 hardware frames, `QtAV::RenderD3D11` submits one same-format
+`CopySubresourceRegion` from the retained decoder slice into a three-entry
+ordinary shader-resource ring. libplacebo keeps persistent plane views only on
+those ordinary textures. The exact `VideoFrame`, imported decoder slice, and
+selected ring entry stay alive until the existing completion query retires.
+
+The copy remains asynchronous on the protected shared immediate context. It
+does not map, transfer through system memory, stage, upload, convert to RGB, or
+add a per-frame `pl_gpu_finish()`. Raw components and exact Dolby Vision RPU
+metadata still reach libplacebo before color conversion. The diagnostic
+`decoder-copies` counter increments once for each submitted raw hardware frame.
+
+### Consequences
+
+- The renderer no longer creates shader views on D3D11VA decoder resources.
+- Persistent view reuse remains bounded, avoiding Intel's per-frame deletion
+  pool regression without retaining those views on decoder slices.
+- The Windows D3D11VA path remains zero-CPU-copy but is no longer described as
+  strict no-intermediate source zero-copy.
+- Shutdown remains deterministic because the production correction removes the
+  upstream decoder stall; it does not detach or abandon the decode worker.
+- The full NVIDIA seek/close regression and same-build Intel/AMD performance
+  checks remain validation gates for this policy.

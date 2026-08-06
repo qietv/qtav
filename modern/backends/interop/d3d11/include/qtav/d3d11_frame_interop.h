@@ -12,10 +12,10 @@
 
 namespace qtav {
 
-// Retains same-device, shader-readable D3D11VA NV12/P010 decoder slices for
-// direct plane sampling by libplacebo's D3D11 backend. No Video Processor RGB
-// conversion or decoded-pixel CPU mapping occurs before Dolby Vision/HDR
-// processing.
+// Retains same-device D3D11VA NV12/P010 decoder slices in raw form. The D3D11
+// renderer copies each slice into its bounded same-format GPU texture ring
+// before libplacebo sampling; no Video Processor RGB conversion or
+// decoded-pixel CPU mapping occurs before Dolby Vision/HDR processing.
 class QTAV_INTEROP_D3D11_EXPORT D3D11FrameInterop final
     : public D3D11HardwareFrameInterop {
 public:

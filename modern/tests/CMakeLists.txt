@@ -785,14 +785,14 @@ if(FFMPEG_EXECUTABLE)
                 FIXTURES_SETUP qtav_interop_d3d11_main10_media
         )
         add_test(
-            NAME qtav_interop_d3d11_zero_copy
+            NAME qtav_interop_d3d11_raw_copy
             COMMAND
                 qtav_interop_d3d11_test
                 "${QTAV_INTEROP_D3D11_TEST_MEDIA}"
                 "${QTAV_INTEROP_D3D11_MAIN10_TEST_MEDIA}"
         )
         set_tests_properties(
-            qtav_interop_d3d11_zero_copy
+            qtav_interop_d3d11_raw_copy
             PROPERTIES
                 FIXTURES_REQUIRED
                     "qtav_interop_d3d11_media;qtav_interop_d3d11_main10_media"

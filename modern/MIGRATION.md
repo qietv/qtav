@@ -355,13 +355,14 @@ implemented. `QtAV::RenderD3D11` now exposes decoder-independent
 the adapter layer; imported raw texture pointers and array-slice identity
 remain valid while the texture-frame object lives. `QtAV::InteropD3D11`
 implements same-device validation and retains the decoder NV12/P010 slice
-without a Video Processor RGB pass. The renderer wraps plane-specific D3D11
-views with libplacebo, attaches the exact FFmpeg Dolby Vision RPU before color
-conversion, and renders directly to the selected SDR, FP16 scRGB, or RGB10/PQ
-target. PQ/BT.2020 and Profile 5 hardware frames therefore preserve their raw
-semantic input through the zero-CPU-map path. Direct plane wrapping uses no
-normalization draw or intermediate source texture and therefore satisfies the
-strict no-intermediate source zero-copy definition. The renderer reports D3D11
+  without a Video Processor RGB pass. The renderer performs one same-format GPU
+  copy into a bounded NV12/P010 shader-resource ring, wraps that texture's
+  plane-specific D3D11 views with libplacebo, attaches the exact FFmpeg Dolby
+  Vision RPU before color conversion, and renders to the selected SDR, FP16
+  scRGB, or RGB10/PQ target. PQ/BT.2020 and Profile 5 hardware frames therefore
+  preserve their raw semantic input through the zero-CPU-map path. The GPU
+  intermediate means this is zero-CPU-copy rather than strict no-intermediate
+  source zero-copy. The renderer reports D3D11
 hardware-frame capability and
 offers an explicit, disabled-by-default software mapping fallback through
 `setAllowSoftwareMappingFallback()`. The interop and renderer use the same
@@ -375,24 +376,25 @@ console test passes with an active WASAPI render endpoint and audible output,
 while sessions without an endpoint report a CTest skip. The retained-resource
 contract remains documented in [D3D11VA.md](D3D11VA.md).
 
-Hardware imports, their copied core frames, and borrowed targets are retained
-until a D3D11 completion event reports that the libplacebo draw has finished.
-The renderer bounds this queue at three submissions, and
+Hardware imports, their copied core frames, selected raw-copy ring entries, and
+borrowed targets are retained until a D3D11 completion event reports that the
+libplacebo draw has finished. The renderer bounds this queue at three
+submissions, and
 `D3D11VideoRenderer::flush()` explicitly drains it before target resize or
 replacement. Decoder, interop, and renderer submissions share a natively
 multithread-protected immediate context plus QtAVCore's recursive guard.
 Every successfully imported D3D11VA frame uses libplacebo's fast sampling
 policy without the optional GPU histogram peak-detection pass. Successful
 per-frame submission remains asynchronous, without `pl_gpu_finish()`, and
-Dolby Vision raw NV12/P010 input samples the retained decoder array slice
-directly without a GPU copy. Software frames keep the default render
-parameters. Normal flush, resize, media replacement, failure cleanup, and
-teardown still perform the explicit drains required by their lifecycles.
-This vendor-neutral policy is accepted on NVIDIA, Intel, and AMD. A separately
-reported visual 4K cadence issue on an AMD integrated GPU remains a performance
-investigation rather than an imported-frame correctness regression. Closure
+Dolby Vision raw NV12/P010 input receives one asynchronous same-device GPU copy
+before plane sampling. Software frames keep the default render parameters.
+Normal flush, resize, media replacement, failure cleanup, and teardown still
+perform the explicit drains required by their lifecycles. Persistent views on
+decoder slices were removed after they caused an NVIDIA post-seek
+`DecoderBeginFrame` wait; the ordinary copy textures retain persistent views
+without reintroducing Intel's per-frame view-destruction churn. Closure still
 requires a same-build Intel performance regression and exact hardware, driver,
-and objective cadence/stage data from both final test devices.
+and objective cadence/stage data from the final devices.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

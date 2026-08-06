@@ -846,16 +846,18 @@ OHOS work is now deferred while NVIDIA and AMD regress the final repair:
 
 ## Next task
 
-The active work track is Windows cross-vendor regression. The Intel wrapper-
-cache repair and original Iris Xe administrator verification are complete.
-Before closing the generic Windows release gate, validate that exact current
-source revision and Release configuration on NVIDIA first and AMD second.
-Earlier AMD repair and NVIDIA validation remain useful baselines, but they do
-not replace regression after the Intel renderer change.
+The active work track is Windows cross-vendor regression of the bounded raw
+decoder-copy repair. The Intel wrapper-cache repair exposed a separate NVIDIA
+failure caused by persistent shader views on reusable decoder slices; its root
+cause and NVIDIA correction are now verified. Before closing the generic
+Windows release gate, repeat the exact current source revision and Release
+configuration on AMD and then on the original Intel machine. Earlier AMD and
+Intel results remain useful baselines, but do not replace regression after the
+decoder-resource lifetime change.
 
 Active Windows regression order:
 
-1. [ ] NVIDIA: build the current source revision in shared and static Release
+1. [~] NVIDIA: build the current source revision in shared and static Release
    configurations, pass both complete CTest suites and a zero-warning WinUI 3
    player build, then run the generated H.264/NV12 control, `legend.mkv`,
    `wednesday.mp4`, and available 4K SDR coverage. Exercise cold start,
@@ -867,11 +869,134 @@ Active Windows regression order:
    scenes, lifecycle sequence, objective counters, and build/test gates on the
    Radeon system. Do not substitute the earlier AMD repair run for this final
    wrapper-cache regression.
-3. [ ] Compare NVIDIA and AMD results with the completed Iris Xe reference. If
-   both preserve source cadence, accepted lifecycle behavior, D3D11VA raw-plane
-   zero-copy, and the full test baseline, record the exact evidence and close
-   the generic Windows release gate. If either regresses, capture an elevated
-   WPR/ETW trace and renderer diagnostics on that vendor before changing code.
+3. [ ] Compare NVIDIA and AMD results with a fresh same-build Iris Xe
+   regression. If all preserve source cadence, accepted lifecycle behavior,
+   D3D11VA raw-plane zero-CPU-copy with one reported device-local copy, and the
+   full test baseline, record the exact evidence and close the generic Windows
+   release gate. If either regresses, capture an elevated WPR/ETW trace and
+   renderer diagnostics on that vendor before changing code.
+
+NVIDIA current-revision checkpoint on 2026-08-06 (failed; gate remains open):
+
+- exact revision `bfdcf07541cd6f8effa22888c9cc24aaf7d7bfac` was configured
+  independently as shared and static ClangCL Release builds against the verified
+  repository Windows FFmpeg prefix. Both complete suites pass 36/36 (8.81 s
+  shared, 8.33 s static), and the WinUI 3 Release player builds with zero
+  warnings and errors;
+- the runtime system uses an NVIDIA GeForce RTX 3050 (`10DE:2584`), driver
+  591.86 / `32.0.15.9186`, Balanced power mode, and a PHL 27B1U7903 at
+  3840x2160/59 Hz. Windows HDR is active; the player selected RGB10/PQ with
+  240-nit SDR white and a reported 1405-nit display peak;
+- the generated 1080p H.264/NV12 control and a generated 3840x2160/29.97 SDR
+  H.264/NV12 control both sustain 29.8-30.2 scheduled/rendered fps after
+  warm-up. D3D11VA raw-plane rendering remains active, actual Present busy,
+  terminal drops, and decoder copies remain zero. Repeated seek, pause/resume,
+  resize, minimize/restore, media replacement, and close while playing recover
+  cleanly; the final close exits in 159 ms. `wednesday.mp4` likewise sustains
+  23.8-24.1 fps for roughly two minutes after a seek to 29:39, with 12.1-16.1
+  ms settled draw maxima and zero Present busy, terminal drops, or decoder
+  copies, before a successful same-process replacement with the H.264 control;
+- `legend.mkv` instead reproduces a vendor-specific fatal regression twice
+  after a seek to 22:48. The first run initially holds 24.9-25.1 fps, then
+  develops 80-81 ms color work and finally reports repeated D3D11 device removal
+  with HRESULT `0x887A0007`. In the strict repeat, one transition window falls
+  to 7.2 scheduled / 6.1 rendered fps with 97 context-busy attempts,
+  reservation-aware/unreserved ownership `97/0`, handoff wait/timeout `100/97`,
+  retry/superseded/terminal `90/6/6`, zero Present busy, and zero decoder
+  copies. Playback then remains in buffering with no further video or audio,
+  and close cannot complete within ten seconds;
+- the administrator follow-up re-ran the physical-player matrix from the same
+  binary. The 1080p H.264/NV12 control held 29.9-30.0 fps for 45 seconds and
+  closed in 203 ms. `wednesday.mp4` recovered to 23.8-24.1 fps after seeks to
+  29:39 and 10:00 and closed in 302 ms. `suzume.mkv` recovered to 23.9-24.1 fps
+  after seeks to 1:00:00 and 30:00 and closed in 276 ms; two isolated
+  reservation-aware handoff timeouts in one window and one in a later window
+  recovered immediately. All three runs retained D3D11VA, zero Present busy,
+  and zero decoder copies;
+- the elevated `legend.mkv` repeat again failed after seeking to 22:48. It first
+  settled at 24.9-25.0 fps, then accumulated 60 reservation-aware context-busy
+  attempts in one window and 114/114 handoff waits/timeouts in the next, before
+  video and audio both stopped in buffering. Close still did not complete in
+  ten seconds. The full CPU+GPU WPR trace is
+  `C:\QtAVTraces\nvidia-legend-cpu-gpu-20260806-1829.etl` (6,263,144,448 bytes),
+  with pre-close and post-close full dumps at
+  `C:\QtAVTraces\nvidia-legend-wpr-hang-full-20260806-1832.dmp` and
+  `C:\QtAVTraces\nvidia-legend-post-close-hang-20260806-1834.dmp`. WPR reports
+  no lost events or buffers; profile samples are mostly idle, and the DxgKrnl
+  interval records the device active with no TDR or device-removal event. The
+  Windows System log likewise has no Display, nvlddmkm, or DxgKrnl reset;
+- exact address mapping against a no-debug `/MAP` relink whose PE sections are
+  byte-identical to the tested `qtav_core.dll` places the blocked video-decode
+  thread in `Player::runVideoDecode -> Player::decodePacket ->
+  avcodec_send_packet -> hevc_receive_frame -> decode_nal_units ->
+  dxva2_hevc_end_frame -> ff_dxva2_common_end_frame`. Its return address is the
+  instruction immediately after FFmpeg's indirect
+  `ID3D11VideoContext::DecoderBeginFrame` call. The callee is blocked in
+  `d3d11.dll -> nvwgf2umx.dll ->
+  NtGdiDdDDIWaitForSynchronizationObjectFromCpu` while FFmpeg's installed lock
+  callback owns the reservation-aware `D3D11DeviceAccess` context lock. The
+  output thread therefore cannot acquire the context and retries until cadence
+  collapses. In the post-close dump the UI thread waits in `Player::setState`
+  from `MainWindowPrivate::Shutdown` for that uninterruptible decode call;
+- the libplacebo probe logged only an initial 546-us pass-run event and no
+  qualifying event at failure time; the output worker is waiting rather than
+  blocked in `pl_render_image` in both dumps. Native
+  `ID3D10Multithread` protection, imported-frame fast parameters, asynchronous
+  successful rendering, and zero decoder copies remain intact. This is not
+  evidence to reopen AD-007 or add a per-frame `pl_gpu_finish`; the unresolved
+  trigger is the NVIDIA `DecoderBeginFrame` synchronization wait/resource
+  interaction. No production code was changed, AMD validation has not started,
+  and the generic Windows release gate remains open.
+
+NVIDIA decoder-view root-cause and repair checkpoint on 2026-08-06:
+
+- repair-oriented A/B tests disproved the seek-flush and insufficient-surface
+  hypotheses. Raising `extra_hw_frames` from 4 to 32 only delayed the failure;
+  draining renderer state during seek recovered temporarily and then failed
+  under continued slice reuse; D3D11.1 `DiscardView` after GPU completion also
+  reproduced the permanent stall. Returning only decoder-plane wrappers to
+  transient completion-query lifetime sustained the exact `legend.mkv` scene
+  for 90 seconds and made close complete in 128 ms. The necessary trigger is
+  therefore a long-lived plane SRV on a reusable D3D11VA decoder-array slice;
+  the close hang is downstream of the decode worker's driver wait;
+- the legacy QtAV D3D11 path consumes the decoder slice through a Video
+  Processor input view and a separate output texture rather than direct shader
+  sampling. Microsoft documents decoder output as a reusable surface pool whose
+  availability follows renderer release and `CopySubresourceRegion` as an
+  asynchronous same-GPU operation. mpv defaults to a decoder-to-shader GPU copy
+  and explicitly warns that directly sampling D3D11 decoder surfaces can invoke
+  driver bugs. Those independent contracts match the local A/B evidence;
+- the production correction preserves raw NV12/P010 and exact Dolby Vision RPU
+  semantics while submitting one same-format `CopySubresourceRegion` into a
+  three-entry ordinary shader-resource ring. libplacebo plane views are cached
+  only on those ring textures. The exact source/import/copy/target lifetime
+  remains bounded by the existing completion queries; native multithread
+  protection, fast render parameters, and asynchronous success remain intact,
+  with no CPU map/transfer/staging/upload or per-frame GPU drain. D3D11 interop
+  no longer advertises strict source zero copy, and `decoder-copies` now counts
+  the accepted device-local raw copies;
+- the corrected ClangCL Release trees pass shared CTest 36/36 in 8.54 seconds
+  and static CTest 36/36 in 8.42 seconds. Native H.264/NV12 and HEVC
+  Main10/P010 tests verify D3D11VA, raw copy, nonzero copy statistics, HDR
+  readback, seek/lifecycle, retained-frame use, and zero CPU mapping. The WinUI
+  3 Release player built from the shared tree with zero warnings and errors;
+- three independent NVIDIA cold starts opened `legend.mkv`, sought to 22:48,
+  and continued for approximately 98, 70, and 70 seconds. Settled windows held
+  24.9-25.2 scheduled/rendered fps with audio near 31 fps, RGB10/PQ, D3D11VA,
+  zero Present busy and terminal drops, and about 129-132 decoder copies per
+  five-second window. One isolated reservation-aware handoff timeout in the
+  first and third runs recovered immediately; persistent contention never
+  developed. Closing the main window while playing exited in 170, 165, and
+  180 ms;
+- the Dolby Vision control sought `wednesday.mp4` to 29:39, settled at
+  23.8-24.2 fps with zero terminal drops, and closed in 171 ms. The generated
+  H.264/NV12 control settled at 29.9-30.1 fps and closed in 278 ms. Both retained
+  D3D11VA and reported one decoder copy per submitted raw frame;
+- the exact fatal NVIDIA seek/close gate is corrected. The broader NVIDIA item
+  remains partial until its current-revision 4K SDR, pause/resume, media-
+  replacement, and resize matrix is repeated. AMD and the original Intel
+  machine must then validate the same raw-copy revision before the generic
+  Windows release gate closes. OHOS remains deferred by the stated priority.
 
 The OHOS track is explicitly postponed by user priority. Its completed
 Milestone 7 target/toolchain gate, portable Android/OHOS

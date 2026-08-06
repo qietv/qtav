@@ -142,7 +142,10 @@ D3D11FrameInterop::capabilities() const
     if (impl_ && impl_->available()) {
         result.sourceDevices = { HardwareDeviceType::D3D11 };
         result.targetDevice = HardwareDeviceType::D3D11;
-        result.zeroCopy = true;
+        // Import itself only retains the decoder slice, but RenderD3D11 uses
+        // one same-device GPU copy before shader sampling. Do not advertise
+        // the end-to-end path as strict source zero-copy.
+        result.zeroCopy = false;
     }
     return result;
 }

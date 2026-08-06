@@ -793,17 +793,26 @@ D3D11HardwareFrameInterop::importFrame(
 
 class D3D11VideoRenderer::Impl {
 public:
+    struct DecoderSourceCopy {
+        ComPtr<ID3D11Texture2D> texture;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        int width = 0;
+        int height = 0;
+        std::array<pl_tex, 2> planes {};
+    };
+
     struct InFlightRender {
         ComPtr<ID3D11Query> completion;
         ComPtr<ID3D11Texture2D> target;
         VideoFrame source;
         std::shared_ptr<D3D11TextureFrame> imported;
+        std::shared_ptr<DecoderSourceCopy> decoderSourceCopy;
     };
 
     struct WrappedTexture {
         // pl_d3d11_wrap creates a fresh RTV/SRV. Cache recurring swap-chain
-        // targets and decoder-array slices so the D3D11 runtime does not
-        // accumulate per-frame view destruction in its deletion pool.
+        // targets and non-decoder imported textures so the D3D11 runtime does
+        // not accumulate per-frame view destruction in its deletion pool.
         ID3D11Texture2D* native = nullptr;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         int arraySlice = 0;
@@ -823,9 +832,10 @@ public:
     };
 
     static constexpr std::size_t maximumInFlightRenders = 3;
-    // Target buffers normally rotate within a small swap-chain set. The
-    // source bound accommodates two plane views for a large decoder pool and
-    // remains finite across media replacement without an intervening flush.
+    // Target buffers normally rotate within a small swap-chain set. Non-raw
+    // imported textures remain bounded across media replacement without an
+    // intervening flush. Raw decoder slices use the three-entry source-copy
+    // ring instead of keeping shader views on decoder resources.
     static constexpr std::size_t maximumTargetTextureCacheEntries = 8;
     static constexpr std::size_t maximumSourceTextureCacheEntries = 512;
 
@@ -981,6 +991,7 @@ public:
 
     void destroyInFlightRender(InFlightRender& render) noexcept
     {
+        render.decoderSourceCopy.reset();
         render.imported.reset();
         render.source = {};
         render.target.Reset();
@@ -1008,6 +1019,32 @@ public:
         textures.clear();
     }
 
+    void destroyDecoderSourceCopy(DecoderSourceCopy& copy) noexcept
+    {
+        if (d3d11_) {
+            for (pl_tex& plane : copy.planes) {
+                if (plane) {
+                    pl_tex_destroy(d3d11_->gpu, &plane);
+                }
+            }
+        }
+        copy.planes = {};
+        copy.texture.Reset();
+        copy.format = DXGI_FORMAT_UNKNOWN;
+        copy.width = 0;
+        copy.height = 0;
+    }
+
+    void destroyDecoderSourceCopies() noexcept
+    {
+        for (const auto& copy : decoderSourceCopies_) {
+            if (copy) {
+                destroyDecoderSourceCopy(*copy);
+            }
+        }
+        decoderSourceCopies_.clear();
+    }
+
     pl_tex findWrappedTexture(
         const std::vector<WrappedTexture>& textures,
         ID3D11Texture2D* native,
@@ -1029,6 +1066,22 @@ public:
         return found == textures.end() ? nullptr : found->texture;
     }
 
+    pl_tex wrapTexture(
+        ID3D11Texture2D* native,
+        DXGI_FORMAT format,
+        int arraySlice,
+        int width,
+        int height)
+    {
+        pl_d3d11_wrap_params params {};
+        params.tex = native;
+        params.array_slice = arraySlice;
+        params.fmt = format;
+        params.w = width;
+        params.h = height;
+        return pl_d3d11_wrap(d3d11_->gpu, &params);
+    }
+
     pl_tex wrapCachedTexture(
         std::vector<WrappedTexture>& textures,
         ID3D11Texture2D* native,
@@ -1047,13 +1100,8 @@ public:
             return cached;
         }
 
-        pl_d3d11_wrap_params params {};
-        params.tex = native;
-        params.array_slice = arraySlice;
-        params.fmt = format;
-        params.w = width;
-        params.h = height;
-        pl_tex texture = pl_d3d11_wrap(d3d11_->gpu, &params);
+        pl_tex texture =
+            wrapTexture(native, format, arraySlice, width, height);
         if (texture) {
             textures.push_back({
                 native,
@@ -1065,6 +1113,94 @@ public:
             });
         }
         return texture;
+    }
+
+    std::shared_ptr<DecoderSourceCopy> acquireDecoderSourceCopy(
+        const D3D11_TEXTURE2D_DESC& sourceDescription,
+        bool tenBit,
+        std::string& error)
+    {
+        for (const auto& candidate : decoderSourceCopies_) {
+            if (candidate && candidate.use_count() == 1
+                && candidate->format == sourceDescription.Format
+                && candidate->width
+                    == static_cast<int>(sourceDescription.Width)
+                && candidate->height
+                    == static_cast<int>(sourceDescription.Height)) {
+                return candidate;
+            }
+        }
+
+        std::shared_ptr<DecoderSourceCopy> copy;
+        for (const auto& candidate : decoderSourceCopies_) {
+            if (candidate && candidate.use_count() == 1) {
+                copy = candidate;
+                break;
+            }
+        }
+        if (!copy) {
+            if (decoderSourceCopies_.size() >= maximumInFlightRenders) {
+                error = "The D3D11 decoder-source copy ring is busy";
+                return {};
+            }
+            copy = std::make_shared<DecoderSourceCopy>();
+            decoderSourceCopies_.push_back(copy);
+        } else {
+            destroyDecoderSourceCopy(*copy);
+        }
+
+        D3D11_TEXTURE2D_DESC copyDescription {};
+        copyDescription.Width = sourceDescription.Width;
+        copyDescription.Height = sourceDescription.Height;
+        copyDescription.MipLevels = 1;
+        copyDescription.ArraySize = 1;
+        copyDescription.Format = sourceDescription.Format;
+        copyDescription.SampleDesc.Count = 1;
+        copyDescription.Usage = D3D11_USAGE_DEFAULT;
+        copyDescription.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const HRESULT createResult = device_.get()->CreateTexture2D(
+            &copyDescription,
+            nullptr,
+            &copy->texture);
+        if (FAILED(createResult)) {
+            error = hresultText(
+                "Creating a shader-readable D3D11 decoder-source copy",
+                createResult);
+            destroyDecoderSourceCopy(*copy);
+            return {};
+        }
+
+        copy->format = sourceDescription.Format;
+        copy->width = static_cast<int>(sourceDescription.Width);
+        copy->height = static_cast<int>(sourceDescription.Height);
+        const std::array<DXGI_FORMAT, 2> planeFormats {
+            tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
+            tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM,
+        };
+        const std::array<int, 2> planeWidths {
+            copy->width,
+            (copy->width + 1) / 2,
+        };
+        const std::array<int, 2> planeHeights {
+            copy->height,
+            (copy->height + 1) / 2,
+        };
+        for (std::size_t plane = 0; plane < copy->planes.size(); ++plane) {
+            copy->planes[plane] = wrapTexture(
+                copy->texture.Get(),
+                planeFormats[plane],
+                0,
+                planeWidths[plane],
+                planeHeights[plane]);
+            if (!copy->planes[plane]
+                || !copy->planes[plane]->params.sampleable) {
+                error = takeLogError(
+                    "libplacebo cannot wrap a D3D11 decoder-source copy plane");
+                destroyDecoderSourceCopy(*copy);
+                return {};
+            }
+        }
+        return copy;
     }
 
     void recycleWrappedTextures(
@@ -1148,6 +1284,7 @@ public:
             pl_gpu_finish(d3d11_->gpu);
         }
         destroyInFlightRenders();
+        destroyDecoderSourceCopies();
         destroyWrappedTextures(sourceTextureCache_);
         destroyWrappedTextures(targetTextureCache_);
         for (pl_tex& texture : uploadTextures_) {
@@ -1234,6 +1371,7 @@ public:
         const VideoFrame& source,
         const std::shared_ptr<D3D11TextureFrame>& imported,
         std::array<pl_tex, 2>& textures,
+        std::shared_ptr<DecoderSourceCopy>& decoderSourceCopy,
         pl_frame& frame,
         pl_dovi_metadata& dovi,
         std::string& error)
@@ -1269,12 +1407,6 @@ public:
             return false;
         }
 
-        const std::size_t maximumNewEntries = rawYuv ? 2 : 1;
-        if (sourceTextureCache_.size() + maximumNewEntries
-            > maximumSourceTextureCacheEntries) {
-            recycleWrappedTextures(sourceTextureCache_);
-        }
-
         if (rawYuv) {
             const bool tenBit = format == PixelFormat::P010;
             if (description.Format
@@ -1283,33 +1415,27 @@ public:
                     "The imported D3D11 decoder texture format is inconsistent";
                 return false;
             }
-            const std::array<DXGI_FORMAT, 2> planeFormats {
-                tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
-                tenBit ? DXGI_FORMAT_R16G16_UNORM
-                       : DXGI_FORMAT_R8G8_UNORM,
-            };
-            const std::array<int, 2> widths {
-                static_cast<int>(description.Width),
-                static_cast<int>((description.Width + 1U) / 2U),
-            };
-            const std::array<int, 2> heights {
-                static_cast<int>(description.Height),
-                static_cast<int>((description.Height + 1U) / 2U),
-            };
-            for (std::size_t plane = 0; plane < textures.size(); ++plane) {
-                textures[plane] = wrapCachedTexture(
-                    sourceTextureCache_,
-                    imported->texture(),
-                    planeFormats[plane],
-                    static_cast<int>(imported->arraySlice()),
-                    widths[plane],
-                    heights[plane]);
-                if (!textures[plane] || !textures[plane]->params.sampleable) {
-                    error = takeLogError(
-                        "libplacebo cannot wrap a D3D11 decoder plane");
-                    return false;
-                }
+            decoderSourceCopy = acquireDecoderSourceCopy(
+                description,
+                tenBit,
+                error);
+            if (!decoderSourceCopy) {
+                return false;
             }
+            context_.get()->CopySubresourceRegion(
+                decoderSourceCopy->texture.Get(),
+                0,
+                0,
+                0,
+                0,
+                imported->texture(),
+                D3D11CalcSubresource(
+                    0,
+                    imported->arraySlice(),
+                    description.MipLevels),
+                nullptr);
+            decoderSurfaceCopies_.fetch_add(1, std::memory_order_relaxed);
+            textures = decoderSourceCopy->planes;
             frame.num_planes = 2;
             initializePlane(frame.planes[0], textures[0], 1, 0);
             initializePlane(frame.planes[1], textures[1], 2, 1);
@@ -1334,6 +1460,10 @@ public:
                 return false;
             }
         } else {
+            if (sourceTextureCache_.size() + 1
+                > maximumSourceTextureCacheEntries) {
+                recycleWrappedTextures(sourceTextureCache_);
+            }
             textures[0] = wrapCachedTexture(
                 sourceTextureCache_,
                 imported->texture(),
@@ -1403,6 +1533,7 @@ public:
     pl_renderer renderer_ = nullptr;
     pl_hook scRgbOutputHook_ {};
     std::array<pl_tex, 4> uploadTextures_ {};
+    std::vector<std::shared_ptr<DecoderSourceCopy>> decoderSourceCopies_;
     std::vector<WrappedTexture> sourceTextureCache_;
     std::vector<WrappedTexture> targetTextureCache_;
     std::deque<InFlightRender> inFlightRenders_;
@@ -1741,6 +1872,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
     pl_frame image {};
     std::array<pl_tex, 2> hardwareTextures {};
+    std::shared_ptr<Impl::DecoderSourceCopy> decoderSourceCopy;
     std::shared_ptr<D3D11TextureFrame> imported;
     std::shared_ptr<HardwareFrameMapping> mappedFrame;
     std::unique_ptr<AVFrame, AVFrameDeleter> mappedNative;
@@ -1767,6 +1899,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
                     frame,
                     imported,
                     hardwareTextures,
+                    decoderSourceCopy,
                     image,
                     dovi,
                     error)) {
@@ -1911,6 +2044,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             inFlight.target = std::move(targetTextureNative);
             inFlight.source = frame;
             inFlight.imported = std::move(imported);
+            inFlight.decoderSourceCopy = std::move(decoderSourceCopy);
             impl_->inFlightRenders_.push_back(std::move(inFlight));
             updateMaximum(
                 impl_->maximumInFlightRetentionMicroseconds_,
@@ -1994,6 +2128,7 @@ void D3D11VideoRenderer::flush() noexcept
     (void)contextGuard;
     pl_gpu_finish(impl_->d3d11_->gpu);
     impl_->destroyInFlightRenders();
+    impl_->destroyDecoderSourceCopies();
     impl_->destroyWrappedTextures(impl_->sourceTextureCache_);
     impl_->destroyWrappedTextures(impl_->targetTextureCache_);
 }

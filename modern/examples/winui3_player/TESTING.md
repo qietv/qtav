@@ -80,9 +80,11 @@ retains imported resources through the bounded completion-query queue, uses
 fast parameters for imported D3D11VA frames, and leaves successful per-frame
 submission asynchronous. Exercise ordinary H.264/NV12, HDR10/P010, and Dolby
 Vision when supported, including cold starts, a sustained run, repeated seeks,
-and close while playing. `decoder-copies` must remain zero because Dolby Vision
-samples the retained decoder array slice directly. Software frames and the
-explicit software-mapping fallback retain their default render parameters.
+and close while playing. `decoder-copies` must advance with successfully
+submitted raw NV12/P010 hardware frames; this is the bounded same-format GPU
+copy that prevents shader views from being kept on decoder slices. Software
+frames and the explicit software-mapping fallback retain their default render
+parameters and do not increment it.
 
 ## Diagnosing cadence and stalls
 

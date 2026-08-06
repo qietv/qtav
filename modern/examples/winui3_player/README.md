@@ -18,15 +18,16 @@ The example demonstrates:
 - an optional Debug window with playback, decode, render, device, and cadence
   diagnostics.
 
-The D3D11 renderer keeps submitted decoder slices and swap-chain back buffers
-alive until their GPU completion event. Every successfully imported D3D11VA
-frame uses libplacebo's fast sampling policy without an additional GPU
-histogram peak-detection pass. Submission stays asynchronous without a
-per-frame `pl_gpu_finish()`, and Dolby Vision raw NV12/P010 frames sample the
-retained decoder slice directly instead of creating a GPU copy. Native D3D11
-multithread protection, the shared recursive guard, the bounded completion
-queue, and lifecycle drains remain active. Software frames keep the default
-render parameters.
+The D3D11 renderer keeps submitted decoder slices, their selected raw-copy ring
+entries, and swap-chain back buffers alive until GPU completion. Every
+successfully imported D3D11VA frame uses libplacebo's fast sampling policy
+without an additional GPU histogram peak-detection pass. Submission stays
+asynchronous without a per-frame `pl_gpu_finish()`. Raw Dolby Vision/HDR
+NV12/P010 data receives one same-format GPU copy into a bounded ordinary
+shader-resource texture before libplacebo sampling; decoded pixels never pass
+through CPU memory. Native D3D11 multithread protection, the shared recursive
+guard, the bounded completion queue, and lifecycle drains remain active.
+Software frames keep the default render parameters.
 
 The example's video surface is opaque, so it explicitly selects RGB10/PQ
 presentation with `DXGI_ALPHA_MODE_IGNORE`. This bypasses the extra scRGB/DWM
