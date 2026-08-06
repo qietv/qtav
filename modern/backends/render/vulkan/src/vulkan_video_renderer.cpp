@@ -19,7 +19,7 @@
 #include "frame_internal.h"
 #include "qtav_libplacebo_ffmpeg_bridge.h"
 
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
 #include "external_normalize_frag_spv.inc"
 #include "external_normalize_vert_spv.inc"
 #endif
@@ -362,7 +362,7 @@ std::string vkResult(const char* operation, VkResult result)
         + std::to_string(static_cast<int>(result)) + ')';
 }
 
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
 class ExternalImageNormalizer {
 public:
     explicit ExternalImageNormalizer(BorrowedVulkanDevice device)
@@ -402,8 +402,8 @@ public:
             || !sourceSampler || width <= 0 || height <= 0) {
             error =
                 preserveYcbcr
-                ? "The Android external-format image cannot expose unconverted YCbCr for Dolby Vision"
-                : "The Android external-format image is incomplete";
+                ? "The external-format image cannot expose unconverted YCbCr for Dolby Vision"
+                : "The external-format image is incomplete";
             return false;
         }
         if (!ensure(source, sourceSampler, width, height, error)) {
@@ -412,7 +412,7 @@ public:
         const VulkanNormalizedSourceRect crop =
             source->normalizedSourceRect();
         if (!crop.isValid()) {
-            error = "The Android external-format image has an invalid crop";
+            error = "The external-format image has an invalid crop";
             return false;
         }
 
@@ -664,6 +664,7 @@ public:
         if (image_ && device_.queue) {
             vkQueueWaitIdle(device_.queue);
         }
+        destroy();
     }
 
 private:
@@ -1329,7 +1330,7 @@ public:
         : device_(device)
         , currentTarget_(std::move(currentTarget))
         , hardwareInterop_(std::move(hardwareInterop))
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
         , externalNormalizer_(device)
 #endif
     {
@@ -1468,7 +1469,7 @@ public:
         if (vulkan_) {
             pl_gpu_finish(vulkan_->gpu);
         }
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
         externalNormalizer_.finish();
 #endif
         retainedHardwareFrames_.clear();
@@ -1609,7 +1610,7 @@ public:
         const bool hasDovi = doviBitDepth != 0;
         externalNormalized = false;
         if (sourceFormat == VK_FORMAT_UNDEFINED) {
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
             if (!externalNormalizer_.convert(
                     imported,
                     source.width(),
@@ -1829,7 +1830,7 @@ public:
     VideoRenderConfig config_;
     VulkanCurrentTargetCallback currentTarget_;
     std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop_;
-#if defined(__ANDROID__)
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
     ExternalImageNormalizer externalNormalizer_;
 #endif
     EventCallback eventCallback_;

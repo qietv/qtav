@@ -15,6 +15,17 @@
 
 namespace qtav {
 
+enum class OHCodecVulkanExternalFormatProbeMode {
+    Disabled,
+    // Diagnostic only: reinterpret a recognized opaque externalFormat as its
+    // numerically identical explicit VkFormat, then sample it through the
+    // renderer's native Vulkan normalization shader.
+    ForcedVkFormatNativeSampling,
+    // Diagnostic only: reinterpret the externalFormat as an explicit VkFormat
+    // and expose it directly to pl_vulkan_wrap/libplacebo.
+    ForcedVkFormatLibplacebo,
+};
+
 struct QTAV_INTEROP_OHCODEC_VULKAN_EXPORT
 OHCodecVulkanInteropConfig {
     // Optional default consumer-surface dimensions. OHCodec may replace these
@@ -26,6 +37,11 @@ OHCodecVulkanInteropConfig {
     bool ohosExternalMemoryEnabled = false;
     bool foreignQueueFamilyEnabled = false;
     bool syncFdSemaphoreEnabled = false;
+    // Required when vkGetNativeBufferPropertiesOHOS exposes an opaque
+    // externalFormat and Vulkan must create a sampler YCbCr conversion.
+    bool samplerYcbcrConversionEnabled = false;
+    OHCodecVulkanExternalFormatProbeMode externalFormatProbeMode =
+        OHCodecVulkanExternalFormatProbeMode::Disabled;
 };
 
 struct QTAV_INTEROP_OHCODEC_VULKAN_EXPORT
@@ -33,9 +49,15 @@ OHCodecVulkanInteropStatistics {
     std::uint64_t nativeBuffersAcquired = 0;
     std::uint64_t nativeBuffersImported = 0;
     std::uint64_t directPlaneImports = 0;
+    std::uint64_t opaqueExternalImports = 0;
+    std::uint64_t forcedVkFormatImports = 0;
+    std::uint64_t forcedVkFormatNativeSamples = 0;
+    std::uint64_t forcedVkFormatLibplaceboImports = 0;
     std::uint64_t codecOutputsQueued = 0;
     std::uint64_t frameAvailableCallbacks = 0;
     std::uint64_t acquireFencesImported = 0;
+    std::uint64_t opaqueExternalObjectProbes = 0;
+    std::uint64_t opaqueExternalObjectProbeSuccesses = 0;
     std::uint64_t opaqueFormatsRejected = 0;
     std::uint64_t unsupportedFormatsRejected = 0;
     std::uint64_t outputsReleasedAfterGpu = 0;
@@ -46,16 +68,17 @@ OHCodecVulkanInteropStatistics {
     std::uint64_t normalizationPasses = 0;
     std::int32_t lastNativeFormat = 0;
     VkFormat lastVulkanFormat = VK_FORMAT_UNDEFINED;
+    VkFormat lastForcedVulkanFormat = VK_FORMAT_UNDEFINED;
     std::uint64_t lastExternalFormat = 0;
 };
 
 // Presents one OHCodec output into a private OH_ConsumerSurface, acquires the
 // exact queued OHNativeWindowBuffer, and imports its OH_NativeBuffer through
-// VK_OHOS_external_memory. Only explicit two- or three-plane Vulkan formats
-// accepted by libplacebo are exposed; opaque external formats are reported as
-// unsupported rather than normalized or copied. The acquired consumer buffer
-// remains retained until VulkanVideoRenderer's GPU completion timeline retires
-// the returned texture frame.
+// VK_OHOS_external_memory. Explicit two- or three-plane Vulkan formats can be
+// wrapped by libplacebo directly. Opaque external formats expose a YCbCr
+// conversion/view/sampler pair for the renderer's GPU-only normalization pass.
+// The acquired consumer buffer remains retained until VulkanVideoRenderer's
+// GPU completion timeline retires the returned texture frame.
 class QTAV_INTEROP_OHCODEC_VULKAN_EXPORT
 OHCodecVulkanInterop final : public VulkanHardwareFrameInterop {
 public:

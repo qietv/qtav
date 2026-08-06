@@ -117,8 +117,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   initial OpenGL ES selection, and fatal one-way Vulkan-to-OpenGL ES fallback
   without reopening media, plus OHAudio output/device-master timing and a
   complete H.264/HEVC OHCodec direct-surface lifecycle matrix with bounded
-  output retention and stale-generation rejection, through the repository
-  arm64/API 23 dependency package;
+  output retention and stale-generation rejection, native Vulkan-to-OpenGL ES
+  OHCodec surface rebind, and an independent software-decode fallback, through
+  the repository arm64/API 23 dependency package;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -379,7 +380,7 @@ clear error. Current switches are:
 and libraries are available and adds the native EGL adapter on Android
 (`QtAV::RenderOpenGLAndroid`) or OHOS (`QtAV::RenderOpenGLOHOS`),
 `QTAV_RENDER_VULKAN=AUTO` builds the Vulkan renderer when a Vulkan loader,
-libplacebo 7.351.0 or newer, and (on Android) `glslc` are available. It adds
+libplacebo 7.351.0 or newer, and (on Android/OHOS) `glslc` are available. It adds
 the native surface adapter target on Android (`QtAV::RenderVulkanAndroid`) or
 OHOS (`QtAV::RenderVulkanOHOS`). The Android and OHOS harnesses require this
 backend explicitly,
@@ -407,7 +408,7 @@ both available.
 `QTAV_INTEROP_MEDIACODEC_OPENGL=AUTO` builds the private-AImageReader
 AHardwareBuffer/EGLImage interop on Android API 28 or newer when the
 MediaCodec and OpenGL ES targets are both available.
-`QTAV_INTEROP_OHCODEC_VULKAN=AUTO` builds the strict OHCodec/ConsumerSurface
+`QTAV_INTEROP_OHCODEC_VULKAN=AUTO` builds the OHCodec/ConsumerSurface
 Vulkan interop on OHOS when the OHCodec and Vulkan targets plus
 `libnative_buffer`, `libnative_image`, and `libnative_window` are available.
 Backend implementations not otherwise described remain disabled under
@@ -829,12 +830,13 @@ zero implicit-RGB images, and zero decoded-source CPU map, software transfer,
 staging, or renderer upload calls. The Profile 8.4 MMR path also exercises the
 repository libplacebo GLES shader-index correction.
 
-### OHCodec Vulkan strict native-buffer interop
+### OHCodec Vulkan native-buffer interop
 
 Link `QtAV::HWOHCodec`, `QtAV::RenderVulkanOHOS`, and
 `QtAV::InteropOHCodecVulkan`. The application-created Vulkan device must
 enable `VK_OHOS_external_memory`, `VK_EXT_queue_family_foreign`, and
-`VK_KHR_external_semaphore_fd`, then declare those facts in the interop
+`VK_KHR_external_semaphore_fd`, enable `samplerYcbcrConversion`, then declare
+those facts in the interop
 configuration:
 
 ```cpp
@@ -846,6 +848,7 @@ interopConfig.height = 1080;
 interopConfig.ohosExternalMemoryEnabled = true;
 interopConfig.foreignQueueFamilyEnabled = true;
 interopConfig.syncFdSemaphoreEnabled = true;
+interopConfig.samplerYcbcrConversionEnabled = true;
 
 auto interop = std::make_shared<qtav::OHCodecVulkanInterop>(
     borrowedVulkanDevice,
@@ -865,21 +868,52 @@ converts it to `OH_NativeBuffer`. An acquire sync fd is imported into a Vulkan
 semaphore. The consumer buffer remains retained until the renderer's GPU
 completion timeline retires the texture.
 
-Only explicit sampled NV12/P010-compatible two- or three-plane `VkFormat`
-values are passed directly to `pl_vulkan_wrap`. `VK_FORMAT_UNDEFINED` plus an
-opaque external-format ID is reported as unsupported; this strict path never
-maps the decoded source, performs a software transfer, stages or uploads its
-pixels, or creates an RGBA normalization intermediate.
+Explicit sampled NV12/P010-compatible two- or three-plane `VkFormat` values
+are passed directly to `pl_vulkan_wrap`. For `VK_FORMAT_UNDEFINED` plus an
+opaque external-format ID, the interop creates `VkExternalFormatOHOS`, imports
+the same native buffer, and exposes a `VkSamplerYcbcrConversion` image view.
+The renderer samples it once into an RGBA16F GPU image before libplacebo. This
+opaque route never maps the decoded source, performs a software transfer,
+stages, or uploads its pixels; it is zero-CPU-copy but, because of the GPU
+normalization image, is not strict no-intermediate source zero-copy.
 
-The connected Mate 60 Pro probe on 2026-08-06 exercised real H.264 and HEVC
-outputs. Both reported `NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP` but only
-`VkFormat=VK_FORMAT_UNDEFINED` with external format `1000156003`, so the HAP
-correctly emitted `QTAV_OHOS_OHCODEC_VULKAN_RESULT UNSUPPORTED` with two
-buffers acquired, zero imported/direct-plane buffers, two opaque rejections,
-and all CPU/transfer/staging/upload/normalization counters at zero. This proves
-the fail-closed capability path; strict direct sampling and GPU-completion
-release still require a device that exposes an explicit multi-plane Vulkan
-format.
+The connected Mate 60 Pro probe on 2026-08-06 exercised real H.264/NV12,
+HEVC/NV12, and HEVC Main10/P010 outputs. The queried Vulkan format remained
+`VK_FORMAT_UNDEFINED`; NV12 exposed external format `1000156003` and P010
+exposed `1000156013`. A raw Vulkan object probe succeeded through YCbCr
+conversion, sampler, image/memory import, image view, and immutable descriptor
+layout. The full HAP then emitted
+`QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS mode=opaque-ycbcr-normalized` after 30
+H.264 and 30 HEVC shader-sampled frames: `acquired=60`, `imported=60`,
+`opaqueImports=60`, `normalization=60`, with zero CPU map, software transfer,
+staging, or upload.
+
+Two diagnostic-only modes then tested Huawei's proposed numeric
+reinterpretation. They omit `VkExternalFormatOHOS` from image creation and set
+`VkImageCreateInfo::format` to
+`VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` for `1000156003`, or
+`VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` for `1000156013`.
+Application-owned Vulkan YCbCr sampling passed 30 H.264/NV12 plus 30 HEVC
+Main10/P010 frames. Direct `pl_vulkan_wrap` with libplacebo 7.351.0 also passed
+all 60 frames with `directPlanes=60`, `normalization=0`, and zero CPU map,
+transfer, staging, or upload. This proves the device and libplacebo paths can
+consume the forced explicit formats. Production direct-plane use remains
+disabled until Huawei confirms that the implementation-defined
+external-format IDs may formally and stably be used as those `VkFormat`
+values across supported devices and system/driver versions.
+
+The same connected harness now exercises the shared selector with real
+OHCodec frames. After eight successful opaque Vulkan imports it injects a
+bounded fatal result, retires the Vulkan consumer surface, prepares an
+`OH_NativeImage` OpenGL ES candidate, and synchronously
+rebinds subsequent decoder output to the new surface without reopening the
+media. The 2026-08-06 run changed generation 5 to 6 and rendered 30 raw-YCbCr
+OpenGL ES frames. A separate session selected the independent software-decode
+route: it cleared `HardwareDecodeConfig`, discarded the retired hardware frame,
+then rendered 30 software frames through OpenGL ES. Both paths kept decoded-
+source CPU map, transfer, staging, and upload counters at zero. Direct-surface
+and no-video remain explicit application alternatives covered by deterministic
+selector tests.
 
 ### MediaCodec direct-surface hardware decode
 

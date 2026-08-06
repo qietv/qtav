@@ -72,18 +72,294 @@ bool compatibleNativeFormat(std::int32_t format) noexcept
         || format == NATIVEBUFFER_PIXEL_FMT_YCBCR_P010;
 }
 
+VkFormat explicitFormatFromOpaqueId(std::uint64_t externalFormat) noexcept
+{
+    switch (externalFormat) {
+    case static_cast<std::uint64_t>(
+        VK_FORMAT_G8_B8R8_2PLANE_420_UNORM):
+        return VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    case static_cast<std::uint64_t>(
+        VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16):
+        return VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+    default:
+        return VK_FORMAT_UNDEFINED;
+    }
+}
+
+bool probeOpaqueExternalFormatObjects(
+    const BorrowedVulkanDevice& device,
+    OH_NativeBuffer* nativeBuffer,
+    const OH_NativeBuffer_Config& nativeConfig,
+    const VkNativeBufferPropertiesOHOS& properties,
+    const VkNativeBufferFormatPropertiesOHOS& formatProperties,
+    bool samplerYcbcrConversionEnabled,
+    std::string& detail)
+{
+    if (!samplerYcbcrConversionEnabled) {
+        detail =
+            "opaque direct probe stopped: samplerYcbcrConversion was not enabled on VkDevice";
+        return false;
+    }
+    if (!nativeBuffer || formatProperties.format != VK_FORMAT_UNDEFINED
+        || formatProperties.externalFormat == 0) {
+        detail =
+            "opaque direct probe stopped: NativeBuffer has no opaque externalFormat";
+        return false;
+    }
+
+    VkSamplerYcbcrConversion conversion = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView imageView = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    const auto cleanup = [&] {
+        if (descriptorSetLayout) {
+            vkDestroyDescriptorSetLayout(
+                device.device,
+                descriptorSetLayout,
+                nullptr);
+        }
+        if (imageView) {
+            vkDestroyImageView(device.device, imageView, nullptr);
+        }
+        if (sampler) {
+            vkDestroySampler(device.device, sampler, nullptr);
+        }
+        if (conversion) {
+            vkDestroySamplerYcbcrConversion(
+                device.device,
+                conversion,
+                nullptr);
+        }
+        if (image) {
+            vkDestroyImage(device.device, image, nullptr);
+        }
+        if (memory) {
+            vkFreeMemory(device.device, memory, nullptr);
+        }
+    };
+    const auto failed = [&](const char* operation, VkResult result) {
+        detail = "opaque direct probe stopped at "
+            + resultError(operation, result);
+        cleanup();
+        return false;
+    };
+
+    VkExternalFormatOHOS conversionExternalFormat {
+        VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_OHOS,
+    };
+    conversionExternalFormat.externalFormat =
+        formatProperties.externalFormat;
+    VkSamplerYcbcrConversionCreateInfo conversionInfo {
+        VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO,
+    };
+    conversionInfo.pNext = &conversionExternalFormat;
+    conversionInfo.format = VK_FORMAT_UNDEFINED;
+    conversionInfo.ycbcrModel = formatProperties.suggestedYcbcrModel;
+    conversionInfo.ycbcrRange = formatProperties.suggestedYcbcrRange;
+    conversionInfo.components =
+        formatProperties.samplerYcbcrConversionComponents;
+    conversionInfo.xChromaOffset =
+        formatProperties.suggestedXChromaOffset;
+    conversionInfo.yChromaOffset =
+        formatProperties.suggestedYChromaOffset;
+    conversionInfo.chromaFilter =
+        (formatProperties.formatFeatures
+            & VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT)
+            != 0U
+        ? VK_FILTER_LINEAR
+        : VK_FILTER_NEAREST;
+    VkResult result = vkCreateSamplerYcbcrConversion(
+        device.device,
+        &conversionInfo,
+        nullptr,
+        &conversion);
+    if (result != VK_SUCCESS) {
+        return failed("vkCreateSamplerYcbcrConversion", result);
+    }
+
+    VkSamplerYcbcrConversionInfo samplerConversion {
+        VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+    };
+    samplerConversion.conversion = conversion;
+    VkSamplerCreateInfo samplerInfo {
+        VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+    };
+    samplerInfo.pNext = &samplerConversion;
+    samplerInfo.magFilter = conversionInfo.chromaFilter;
+    samplerInfo.minFilter = conversionInfo.chromaFilter;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = 1.0F;
+    result = vkCreateSampler(
+        device.device,
+        &samplerInfo,
+        nullptr,
+        &sampler);
+    if (result != VK_SUCCESS) {
+        return failed("vkCreateSampler(YCbCr)", result);
+    }
+
+    VkExternalFormatOHOS imageExternalFormat {
+        VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_OHOS,
+    };
+    imageExternalFormat.externalFormat = formatProperties.externalFormat;
+    VkExternalMemoryImageCreateInfo externalMemory {
+        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+    };
+    externalMemory.pNext = &imageExternalFormat;
+    externalMemory.handleTypes =
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OH_NATIVE_BUFFER_BIT_OHOS;
+    VkImageCreateInfo imageInfo {
+        VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+    };
+    imageInfo.pNext = &externalMemory;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_UNDEFINED;
+    imageInfo.extent = {
+        static_cast<std::uint32_t>(nativeConfig.width),
+        static_cast<std::uint32_t>(nativeConfig.height),
+        1,
+    };
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    result = vkCreateImage(
+        device.device,
+        &imageInfo,
+        nullptr,
+        &image);
+    if (result != VK_SUCCESS) {
+        return failed("vkCreateImage(opaque OH_NativeBuffer)", result);
+    }
+
+    VkMemoryRequirements requirements {};
+    vkGetImageMemoryRequirements(
+        device.device,
+        image,
+        &requirements);
+    const std::uint32_t memoryType = firstMemoryType(
+        properties.memoryTypeBits & requirements.memoryTypeBits);
+    if (memoryType == std::numeric_limits<std::uint32_t>::max()) {
+        detail =
+            "opaque direct probe stopped: no compatible Vulkan memory type";
+        cleanup();
+        return false;
+    }
+    VkMemoryDedicatedAllocateInfo dedicated {
+        VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+    };
+    dedicated.image = image;
+    VkImportNativeBufferInfoOHOS import {
+        VK_STRUCTURE_TYPE_IMPORT_NATIVE_BUFFER_INFO_OHOS,
+    };
+    import.pNext = &dedicated;
+    import.buffer = nativeBuffer;
+    VkMemoryAllocateInfo allocation {
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+    };
+    allocation.pNext = &import;
+    allocation.allocationSize = properties.allocationSize;
+    allocation.memoryTypeIndex = memoryType;
+    result = vkAllocateMemory(
+        device.device,
+        &allocation,
+        nullptr,
+        &memory);
+    if (result != VK_SUCCESS) {
+        return failed("vkAllocateMemory(opaque OH_NativeBuffer)", result);
+    }
+    result = vkBindImageMemory(device.device, image, memory, 0);
+    if (result != VK_SUCCESS) {
+        return failed("vkBindImageMemory(opaque OH_NativeBuffer)", result);
+    }
+
+    VkSamplerYcbcrConversionInfo viewConversion {
+        VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+    };
+    viewConversion.conversion = conversion;
+    VkImageViewCreateInfo viewInfo {
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+    };
+    viewInfo.pNext = &viewConversion;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_UNDEFINED;
+    viewInfo.components = {
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    result = vkCreateImageView(
+        device.device,
+        &viewInfo,
+        nullptr,
+        &imageView);
+    if (result != VK_SUCCESS) {
+        return failed("vkCreateImageView(opaque OH_NativeBuffer)", result);
+    }
+
+    VkDescriptorSetLayoutBinding binding {};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    binding.pImmutableSamplers = &sampler;
+    VkDescriptorSetLayoutCreateInfo layoutInfo {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+    };
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &binding;
+    result = vkCreateDescriptorSetLayout(
+        device.device,
+        &layoutInfo,
+        nullptr,
+        &descriptorSetLayout);
+    if (result != VK_SUCCESS) {
+        return failed(
+            "vkCreateDescriptorSetLayout(opaque OH_NativeBuffer)",
+            result);
+    }
+
+    detail =
+        "opaque direct probe created VkSamplerYcbcrConversion, VkSampler, imported VkImage memory, VkImageView, and immutable-sampler descriptor layout; shader sampling was not attempted";
+    cleanup();
+    return true;
+}
+
 struct AtomicStatistics {
     std::atomic<std::uint64_t> nativeBuffersAcquired { 0 };
     std::atomic<std::uint64_t> nativeBuffersImported { 0 };
     std::atomic<std::uint64_t> directPlaneImports { 0 };
+    std::atomic<std::uint64_t> opaqueExternalImports { 0 };
+    std::atomic<std::uint64_t> forcedVkFormatImports { 0 };
+    std::atomic<std::uint64_t> forcedVkFormatNativeSamples { 0 };
+    std::atomic<std::uint64_t> forcedVkFormatLibplaceboImports { 0 };
     std::atomic<std::uint64_t> codecOutputsQueued { 0 };
     std::atomic<std::uint64_t> frameAvailableCallbacks { 0 };
     std::atomic<std::uint64_t> acquireFencesImported { 0 };
+    std::atomic<std::uint64_t> opaqueExternalObjectProbes { 0 };
+    std::atomic<std::uint64_t> opaqueExternalObjectProbeSuccesses { 0 };
     std::atomic<std::uint64_t> opaqueFormatsRejected { 0 };
     std::atomic<std::uint64_t> unsupportedFormatsRejected { 0 };
     std::atomic<std::uint64_t> outputsReleasedAfterGpu { 0 };
+    std::atomic<std::uint64_t> normalizationPasses { 0 };
     std::atomic<std::int32_t> lastNativeFormat { 0 };
     std::atomic<std::int32_t> lastVulkanFormat {
+        static_cast<std::int32_t>(VK_FORMAT_UNDEFINED),
+    };
+    std::atomic<std::int32_t> lastForcedVulkanFormat {
         static_cast<std::int32_t>(VK_FORMAT_UNDEFINED),
     };
     std::atomic<std::uint64_t> lastExternalFormat { 0 };
@@ -140,6 +416,9 @@ struct SharedState {
     OH_NativeImage* consumerSurface = nullptr;
     PFN_vkGetNativeBufferPropertiesOHOS getNativeBufferProperties = nullptr;
     PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
+    bool samplerYcbcrConversionEnabled = false;
+    OHCodecVulkanExternalFormatProbeMode externalFormatProbeMode =
+        OHCodecVulkanExternalFormatProbeMode::Disabled;
     std::mutex mutex;
     FrameKey queuedFrame;
     bool frameAvailable = false;
@@ -225,6 +504,21 @@ public:
                 vkQueueWaitIdle(state_->device.queue);
             }
         }
+        if (imageView_) {
+            vkDestroyImageView(state_->device.device, imageView_, nullptr);
+            imageView_ = VK_NULL_HANDLE;
+        }
+        if (sampler_) {
+            vkDestroySampler(state_->device.device, sampler_, nullptr);
+            sampler_ = VK_NULL_HANDLE;
+        }
+        if (conversion_) {
+            vkDestroySamplerYcbcrConversion(
+                state_->device.device,
+                conversion_,
+                nullptr);
+            conversion_ = VK_NULL_HANDLE;
+        }
         if (image_) {
             vkDestroyImage(state_->device.device, image_, nullptr);
             image_ = VK_NULL_HANDLE;
@@ -280,12 +574,12 @@ public:
 
     VkImageView imageView() const noexcept override
     {
-        return VK_NULL_HANDLE;
+        return imageView_;
     }
 
     VkSampler sampler() const noexcept override
     {
-        return VK_NULL_HANDLE;
+        return sampler_;
     }
 
     VkFormat format() const noexcept override
@@ -319,6 +613,11 @@ public:
         // timeline. Destruction therefore happens only after sampling has
         // completed. Destruction is therefore the point at which the acquired
         // consumer buffer returns to the OH_ConsumerSurface.
+        if (!submitted_ && format_ == VK_FORMAT_UNDEFINED) {
+            state_->statistics.normalizationPasses.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         submitted_ = true;
     }
 
@@ -475,25 +774,154 @@ private:
         state_->statistics.lastExternalFormat.store(
             formatProperties.externalFormat,
             std::memory_order_relaxed);
-        if (formatProperties.format == VK_FORMAT_UNDEFINED) {
-            status = VulkanHardwareImportStatus::Unsupported;
-            error = "OH_NativeBuffer exposes only an opaque Vulkan external format; strict direct plane wrapping is unavailable: nativeFormat="
-                + std::to_string(nativeConfig.format)
-                + " externalFormat="
-                + std::to_string(formatProperties.externalFormat);
-            state_->statistics.opaqueFormatsRejected.fetch_add(
-                1,
+        const bool queriedOpaqueExternal =
+            formatProperties.format == VK_FORMAT_UNDEFINED;
+        const bool forceVkFormat = queriedOpaqueExternal
+            && state_->externalFormatProbeMode
+                != OHCodecVulkanExternalFormatProbeMode::Disabled;
+        const bool forcedNativeSampling = forceVkFormat
+            && state_->externalFormatProbeMode
+                == OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatNativeSampling;
+        const bool forcedLibplacebo = forceVkFormat
+            && state_->externalFormatProbeMode
+                == OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatLibplacebo;
+        VkFormat importFormat = formatProperties.format;
+        if (forceVkFormat) {
+            importFormat = explicitFormatFromOpaqueId(
+                formatProperties.externalFormat);
+            state_->statistics.lastForcedVulkanFormat.store(
+                static_cast<std::int32_t>(importFormat),
                 std::memory_order_relaxed);
-            return false;
+            if (importFormat == VK_FORMAT_UNDEFINED) {
+                status = VulkanHardwareImportStatus::Unsupported;
+                error = "forced VkFormat probe has no recognized NV12/P010 mapping for externalFormat="
+                    + std::to_string(formatProperties.externalFormat);
+                state_->statistics.unsupportedFormatsRejected.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                return false;
+            }
         }
-        if (!directPlaneFormat(formatProperties.format)
+        const bool useOpaqueExternalFormat =
+            queriedOpaqueExternal && !forceVkFormat;
+        const bool createYcbcrSampler =
+            useOpaqueExternalFormat || forcedNativeSampling;
+        if (createYcbcrSampler) {
+            if (!state_->samplerYcbcrConversionEnabled
+                || (useOpaqueExternalFormat
+                    && formatProperties.externalFormat == 0)) {
+                status = VulkanHardwareImportStatus::Unsupported;
+                error = "OH_NativeBuffer exposes an opaque Vulkan external format, but samplerYcbcrConversion is unavailable: nativeFormat="
+                    + std::to_string(nativeConfig.format)
+                    + " externalFormat="
+                    + std::to_string(formatProperties.externalFormat);
+                state_->statistics.opaqueFormatsRejected.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                return false;
+            }
+            if (useOpaqueExternalFormat
+                && state_->statistics.opaqueExternalObjectProbes.load(
+                    std::memory_order_relaxed)
+                == 0) {
+                state_->statistics.opaqueExternalObjectProbes.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                std::string probeDetail;
+                if (!probeOpaqueExternalFormatObjects(
+                        state_->device,
+                        nativeBuffer_,
+                        nativeConfig,
+                        properties,
+                        formatProperties,
+                        state_->samplerYcbcrConversionEnabled,
+                        probeDetail)) {
+                    status = VulkanHardwareImportStatus::Error;
+                    error = probeDetail;
+                    state_->statistics.opaqueFormatsRejected.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    return false;
+                }
+                state_->statistics.opaqueExternalObjectProbeSuccesses.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
+            VkExternalFormatOHOS conversionExternalFormat {
+                VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_OHOS,
+            };
+            conversionExternalFormat.externalFormat =
+                formatProperties.externalFormat;
+            VkSamplerYcbcrConversionCreateInfo conversionInfo {
+                VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO,
+            };
+            conversionInfo.pNext = useOpaqueExternalFormat
+                ? &conversionExternalFormat
+                : nullptr;
+            conversionInfo.format = importFormat;
+            conversionInfo.ycbcrModel =
+                formatProperties.suggestedYcbcrModel;
+            conversionInfo.ycbcrRange =
+                formatProperties.suggestedYcbcrRange;
+            conversionInfo.components =
+                formatProperties.samplerYcbcrConversionComponents;
+            conversionInfo.xChromaOffset =
+                formatProperties.suggestedXChromaOffset;
+            conversionInfo.yChromaOffset =
+                formatProperties.suggestedYChromaOffset;
+            conversionInfo.chromaFilter =
+                (formatProperties.formatFeatures
+                    & VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT)
+                    != 0U
+                ? VK_FILTER_LINEAR
+                : VK_FILTER_NEAREST;
+            VkResult result = vkCreateSamplerYcbcrConversion(
+                state_->device.device,
+                &conversionInfo,
+                nullptr,
+                &conversion_);
+            if (result != VK_SUCCESS) {
+                status = VulkanHardwareImportStatus::Error;
+                error = resultError(
+                    "vkCreateSamplerYcbcrConversion(OH_NativeBuffer)",
+                    result);
+                return false;
+            }
+            VkSamplerYcbcrConversionInfo samplerConversion {
+                VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+            };
+            samplerConversion.conversion = conversion_;
+            VkSamplerCreateInfo samplerInfo {
+                VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            };
+            samplerInfo.pNext = &samplerConversion;
+            samplerInfo.magFilter = conversionInfo.chromaFilter;
+            samplerInfo.minFilter = conversionInfo.chromaFilter;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.maxLod = 1.0F;
+            result = vkCreateSampler(
+                state_->device.device,
+                &samplerInfo,
+                nullptr,
+                &sampler_);
+            if (result != VK_SUCCESS) {
+                status = VulkanHardwareImportStatus::Error;
+                error = resultError(
+                    "vkCreateSampler(YCbCr OH_NativeBuffer)",
+                    result);
+                return false;
+            }
+        } else if (!directPlaneFormat(importFormat)
             || (formatProperties.formatFeatures
                 & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
                 == 0U) {
             status = VulkanHardwareImportStatus::Unsupported;
             error = "OH_NativeBuffer exposes no supported sampled Vulkan 4:2:0 plane format: VkFormat="
                 + std::to_string(
-                    static_cast<std::int32_t>(formatProperties.format))
+                    static_cast<std::int32_t>(importFormat))
                 + " features="
                 + std::to_string(formatProperties.formatFeatures);
             state_->statistics.unsupportedFormatsRejected.fetch_add(
@@ -505,6 +933,14 @@ private:
         VkExternalMemoryImageCreateInfo externalMemory {
             VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
         };
+        VkExternalFormatOHOS imageExternalFormat {
+            VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_OHOS,
+        };
+        imageExternalFormat.externalFormat =
+            formatProperties.externalFormat;
+        externalMemory.pNext = useOpaqueExternalFormat
+            ? &imageExternalFormat
+            : nullptr;
         externalMemory.handleTypes =
             VK_EXTERNAL_MEMORY_HANDLE_TYPE_OH_NATIVE_BUFFER_BIT_OHOS;
         VkImageCreateInfo imageInfo {
@@ -512,7 +948,7 @@ private:
         };
         imageInfo.pNext = &externalMemory;
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = formatProperties.format;
+        imageInfo.format = importFormat;
         imageInfo.extent = {
             static_cast<std::uint32_t>(nativeConfig.width),
             static_cast<std::uint32_t>(nativeConfig.height),
@@ -596,9 +1032,47 @@ private:
             return false;
         }
 
+        if (createYcbcrSampler) {
+            VkSamplerYcbcrConversionInfo viewConversion {
+                VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+            };
+            viewConversion.conversion = conversion_;
+            VkImageViewCreateInfo viewInfo {
+                VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            };
+            viewInfo.pNext = &viewConversion;
+            viewInfo.image = image_;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = importFormat;
+            viewInfo.components = {
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+            };
+            viewInfo.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.layerCount = 1;
+            result = vkCreateImageView(
+                state_->device.device,
+                &viewInfo,
+                nullptr,
+                &imageView_);
+            if (result != VK_SUCCESS) {
+                status = VulkanHardwareImportStatus::Error;
+                error = resultError(
+                    "vkCreateImageView(opaque OH_NativeBuffer)",
+                    result);
+                return false;
+            }
+        }
+
         width_ = nativeConfig.width;
         height_ = nativeConfig.height;
-        format_ = formatProperties.format;
+        format_ = forcedNativeSampling
+            ? VK_FORMAT_UNDEFINED
+            : importFormat;
         sourceRect_ = {
             0.0F,
             0.0F,
@@ -610,9 +1084,34 @@ private:
         state_->statistics.nativeBuffersImported.fetch_add(
             1,
             std::memory_order_relaxed);
-        state_->statistics.directPlaneImports.fetch_add(
-            1,
-            std::memory_order_relaxed);
+        if (forceVkFormat) {
+            state_->statistics.forcedVkFormatImports.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            if (forcedNativeSampling) {
+                state_->statistics.forcedVkFormatNativeSamples.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                state_->statistics.opaqueExternalImports.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            } else if (forcedLibplacebo) {
+                state_->statistics.forcedVkFormatLibplaceboImports.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                state_->statistics.directPlaneImports.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
+        } else if (useOpaqueExternalFormat) {
+            state_->statistics.opaqueExternalImports.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        } else {
+            state_->statistics.directPlaneImports.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         status = VulkanHardwareImportStatus::Ready;
         return true;
     }
@@ -627,6 +1126,9 @@ private:
     int height_ = 0;
     VkImage image_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    VkImageView imageView_ = VK_NULL_HANDLE;
+    VkSamplerYcbcrConversion conversion_ = VK_NULL_HANDLE;
+    VkSampler sampler_ = VK_NULL_HANDLE;
     VkSemaphore acquireSemaphore_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VulkanNormalizedSourceRect sourceRect_;
@@ -674,6 +1176,10 @@ public:
         state_->device = device;
         state_->getNativeBufferProperties = getProperties;
         state_->importSemaphoreFd = importSemaphoreFd;
+        state_->samplerYcbcrConversionEnabled =
+            config.samplerYcbcrConversionEnabled;
+        state_->externalFormatProbeMode =
+            config.externalFormatProbeMode;
         state_->consumerSurface = OH_ConsumerSurface_Create();
         if (!state_->consumerSurface) {
             error_ = "OH_ConsumerSurface_Create failed for OHCodec Vulkan interop";
@@ -1018,6 +1524,16 @@ OHCodecVulkanInterop::statistics() const noexcept
         std::memory_order_relaxed);
     result.directPlaneImports = source.directPlaneImports.load(
         std::memory_order_relaxed);
+    result.opaqueExternalImports = source.opaqueExternalImports.load(
+        std::memory_order_relaxed);
+    result.forcedVkFormatImports = source.forcedVkFormatImports.load(
+        std::memory_order_relaxed);
+    result.forcedVkFormatNativeSamples =
+        source.forcedVkFormatNativeSamples.load(
+            std::memory_order_relaxed);
+    result.forcedVkFormatLibplaceboImports =
+        source.forcedVkFormatLibplaceboImports.load(
+            std::memory_order_relaxed);
     result.codecOutputsQueued = source.codecOutputsQueued.load(
         std::memory_order_relaxed);
     result.frameAvailableCallbacks =
@@ -1025,6 +1541,12 @@ OHCodecVulkanInterop::statistics() const noexcept
             std::memory_order_relaxed);
     result.acquireFencesImported = source.acquireFencesImported.load(
         std::memory_order_relaxed);
+    result.opaqueExternalObjectProbes =
+        source.opaqueExternalObjectProbes.load(
+            std::memory_order_relaxed);
+    result.opaqueExternalObjectProbeSuccesses =
+        source.opaqueExternalObjectProbeSuccesses.load(
+            std::memory_order_relaxed);
     result.opaqueFormatsRejected = source.opaqueFormatsRejected.load(
         std::memory_order_relaxed);
     result.unsupportedFormatsRejected =
@@ -1033,10 +1555,15 @@ OHCodecVulkanInterop::statistics() const noexcept
     result.outputsReleasedAfterGpu =
         source.outputsReleasedAfterGpu.load(
             std::memory_order_relaxed);
+    result.normalizationPasses = source.normalizationPasses.load(
+        std::memory_order_relaxed);
     result.lastNativeFormat = source.lastNativeFormat.load(
         std::memory_order_relaxed);
     result.lastVulkanFormat = static_cast<VkFormat>(
         source.lastVulkanFormat.load(std::memory_order_relaxed));
+    result.lastForcedVulkanFormat = static_cast<VkFormat>(
+        source.lastForcedVulkanFormat.load(
+            std::memory_order_relaxed));
     result.lastExternalFormat = source.lastExternalFormat.load(
         std::memory_order_relaxed);
     return result;

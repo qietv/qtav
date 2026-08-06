@@ -55,6 +55,24 @@ constexpr std::size_t OHCodecOpenGLMaximumScheduledFrames = 1;
 constexpr std::uint64_t RequiredOHCodecVulkanH264Frames = 30;
 constexpr std::uint64_t RequiredOHCodecVulkanHEVCFrames = 30;
 constexpr std::size_t OHCodecVulkanMaximumScheduledFrames = 1;
+constexpr std::uint64_t InjectOHCodecFallbackAfterVulkanFrames = 8;
+constexpr std::uint64_t RequiredOHCodecNativeFallbackFrames = 30;
+constexpr std::uint64_t RequiredOHCodecSoftwareFallbackFrames = 30;
+constexpr std::size_t OHCodecFallbackMaximumScheduledFrames = 1;
+
+constexpr OHCodecVulkanExternalFormatProbeMode
+externalFormatProbeMode() noexcept
+{
+#if defined(QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE) \
+    && QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE == 1
+    return OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatNativeSampling;
+#elif defined(QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE) \
+    && QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE == 2
+    return OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatLibplacebo;
+#else
+    return OHCodecVulkanExternalFormatProbeMode::Disabled;
+#endif
+}
 
 enum class ValidationPhase {
     InitialFallback,
@@ -64,6 +82,7 @@ enum class ValidationPhase {
     OHCodec,
     OHCodecOpenGL,
     OHCodecVulkan,
+    OHCodecFallback,
     Complete,
 };
 
@@ -99,6 +118,10 @@ enum class OHCodecControlAction {
     StopVulkanHEVC,
     RenderVulkanFrame,
     AbortVulkan,
+    RenderFallbackFrame,
+    FinishNativeFallback,
+    FinishSoftwareFallback,
+    AbortFallback,
 };
 
 enum class OHCodecOpenGLPhase {
@@ -123,12 +146,26 @@ enum class OHCodecVulkanPhase {
     Complete,
 };
 
+enum class OHCodecFallbackPhase {
+    Inactive,
+    NativeInterop,
+    NativeInteropFinalizing,
+    SoftwareDecode,
+    SoftwareDecodeFinalizing,
+    Complete,
+};
+
 struct ScheduledOHCodecOpenGLFrame {
     std::uint64_t serial = 0;
     VideoFrame frame;
 };
 
 struct ScheduledOHCodecVulkanFrame {
+    std::uint64_t serial = 0;
+    VideoFrame frame;
+};
+
+struct ScheduledOHCodecFallbackFrame {
     std::uint64_t serial = 0;
     VideoFrame frame;
 };
@@ -150,7 +187,29 @@ const char* validationPhaseName(ValidationPhase phase) noexcept
         return "ohcodec-opengl";
     case ValidationPhase::OHCodecVulkan:
         return "ohcodec-vulkan";
+    case ValidationPhase::OHCodecFallback:
+        return "ohcodec-fallback";
     case ValidationPhase::Complete:
+        return "complete";
+    }
+    return "unknown";
+}
+
+const char* ohCodecFallbackPhaseName(
+    OHCodecFallbackPhase phase) noexcept
+{
+    switch (phase) {
+    case OHCodecFallbackPhase::Inactive:
+        return "inactive";
+    case OHCodecFallbackPhase::NativeInterop:
+        return "native-interop";
+    case OHCodecFallbackPhase::NativeInteropFinalizing:
+        return "native-interop-finalizing";
+    case OHCodecFallbackPhase::SoftwareDecode:
+        return "software-decode";
+    case OHCodecFallbackPhase::SoftwareDecodeFinalizing:
+        return "software-decode-finalizing";
+    case OHCodecFallbackPhase::Complete:
         return "complete";
     }
     return "unknown";
@@ -453,9 +512,11 @@ public:
         player_
             .setVideoFrameScheduler({})
             .setHardwareDecodeConfig({});
+        clearOHCodecFallbackFrames();
         std::lock_guard<std::mutex> lock(pipelineMutex_);
         teardownOHCodecOpenGLLocked();
         teardownOHCodecVulkanLocked();
+        teardownOHCodecFallbackLocked();
         mediaStarted_ = false;
         mediaReady_ = false;
     }
@@ -523,10 +584,20 @@ public:
                 == ValidationPhase::OHCodecOpenGL
             && ohCodecOpenGLPhase_.load(std::memory_order_acquire)
                 != OHCodecOpenGLPhase::Complete;
+        const bool interruptedOHCodecFallback =
+            phase_.load(std::memory_order_acquire)
+                == ValidationPhase::OHCodecFallback
+            && ohCodecFallbackPhase_.load(std::memory_order_acquire)
+                != OHCodecFallbackPhase::Complete;
         releaseSurfaceLocked();
         if (interruptedOHCodecOpenGL) {
             failOHCodecOpenGL(
                 "The XComponent surface was replaced during OHCodec/OpenGL interop validation");
+            return;
+        }
+        if (interruptedOHCodecFallback) {
+            failOHCodecFallback(
+                "The XComponent surface was replaced during OHCodec selector fallback validation");
             return;
         }
         window_ = window;
@@ -555,6 +626,9 @@ public:
             std::memory_order_release);
         ohCodecVulkanPhase_.store(
             OHCodecVulkanPhase::Inactive,
+            std::memory_order_release);
+        ohCodecFallbackPhase_.store(
+            OHCodecFallbackPhase::Inactive,
             std::memory_order_release);
         initialFallbackFrames_.store(0, std::memory_order_relaxed);
         fatalFallbackFrames_.store(0, std::memory_order_relaxed);
@@ -616,6 +690,12 @@ public:
                 if (!selector_->recreateSurface()) {
                     fail(
                         "The OHOS mobile selector could not follow the XComponent resize");
+                }
+            } else if (ohCodecFallbackSelector_) {
+                if (!ohCodecFallbackSelector_->configure(
+                        renderConfig_)) {
+                    failOHCodecFallback(
+                        "The OHCodec fallback selector rejected the XComponent resize");
                 }
             } else if (ohCodecVulkanRenderer_
                        && (previousSize.width
@@ -699,6 +779,10 @@ public:
                << ohCodecVulkanPhaseName(
                       ohCodecVulkanPhase_.load(
                           std::memory_order_acquire))
+               << " ohcodecFallbackPhase="
+               << ohCodecFallbackPhaseName(
+                      ohCodecFallbackPhase_.load(
+                          std::memory_order_acquire))
                << " api="
                << mobileRenderAPIName(
                       lastSelectedAPI_.load(std::memory_order_acquire))
@@ -744,6 +828,15 @@ public:
                       std::memory_order_relaxed)
                << " ohcodecVulkanHEVC="
                << ohCodecVulkanHEVCRendered_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecFallbackVulkan="
+               << ohCodecFallbackVulkanPresented_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecFallbackGLES="
+               << ohCodecFallbackOpenGLPresented_.load(
+                      std::memory_order_relaxed)
+               << " ohcodecFallbackSoftware="
+               << ohCodecFallbackSoftwarePresented_.load(
                       std::memory_order_relaxed)
                << " delivered=" << playback.deliveredVideoFrames
                << " overflowDrops=" << playback.videoQueueOverflowDrops
@@ -1384,7 +1477,8 @@ private:
     {
         if (failed_.load(std::memory_order_acquire)
             && action != OHCodecControlAction::AbortOpenGL
-            && action != OHCodecControlAction::AbortVulkan) {
+            && action != OHCodecControlAction::AbortVulkan
+            && action != OHCodecControlAction::AbortFallback) {
             return;
         }
 
@@ -1538,6 +1632,21 @@ private:
             break;
         case OHCodecControlAction::AbortVulkan:
             abortOHCodecVulkanValidation();
+            break;
+        case OHCodecControlAction::RenderFallbackFrame:
+            ohCodecFallbackRenderQueued_.store(
+                false,
+                std::memory_order_release);
+            renderScheduledOHCodecFallbackFrame();
+            break;
+        case OHCodecControlAction::FinishNativeFallback:
+            finalizeOHCodecNativeFallback();
+            break;
+        case OHCodecControlAction::FinishSoftwareFallback:
+            finalizeOHCodecSoftwareFallback();
+            break;
+        case OHCodecControlAction::AbortFallback:
+            abortOHCodecFallbackValidation();
             break;
         }
     }
@@ -2708,6 +2817,10 @@ private:
         interopConfig.ohosExternalMemoryEnabled = true;
         interopConfig.foreignQueueFamilyEnabled = true;
         interopConfig.syncFdSemaphoreEnabled = true;
+        interopConfig.samplerYcbcrConversionEnabled =
+            context->samplerYcbcrConversionEnabled();
+        interopConfig.externalFormatProbeMode =
+            externalFormatProbeMode();
         auto interop = std::make_shared<OHCodecVulkanInterop>(
             context->borrowed().device,
             interopConfig);
@@ -3017,6 +3130,9 @@ private:
         }
         if (result.detail.find("opaque Vulkan external format")
             != std::string::npos) {
+            logMessage(
+                LOG_INFO,
+                "QTAV_OHOS_NATIVEBUFFER_VULKAN_PROBE " + result.detail);
             {
                 std::lock_guard<std::mutex> queueLock(
                     ohCodecVulkanQueueMutex_);
@@ -3103,10 +3219,18 @@ private:
             statistics.directPlaneImports
                 >= ohCodecVulkanH264Rendered_.load(
                     std::memory_order_relaxed)
+            && statistics.opaqueFormatsRejected == 0
+            && statistics.normalizationPasses == 0;
+        const bool opaqueSampledH264 =
+            statistics.opaqueExternalImports
+                >= ohCodecVulkanH264Rendered_.load(
+                    std::memory_order_relaxed)
+            && statistics.normalizationPasses
+                >= ohCodecVulkanH264Rendered_.load(
+                    std::memory_order_relaxed)
             && statistics.opaqueFormatsRejected == 0;
-        if ((!opaqueUnsupported && !directH264)
-            || statistics.unsupportedFormatsRejected != 0
-            || statistics.normalizationPasses != 0) {
+        if ((!opaqueUnsupported && !directH264 && !opaqueSampledH264)
+            || statistics.unsupportedFormatsRejected != 0) {
             failOHCodecVulkan(
                 "OHCodec/Vulkan H.264 did not satisfy strict direct-plane import before replacement");
             return;
@@ -3122,6 +3246,8 @@ private:
             LOG_INFO,
             "QTAV_OHOS_CHECKPOINT OHCODEC_VULKAN_MEDIA_REPLACED from=h264 to=hevc directPlanes="
                 + std::to_string(statistics.directPlaneImports)
+                + " opaqueImports="
+                + std::to_string(statistics.opaqueExternalImports)
                 + " opaqueRejected="
                 + std::to_string(statistics.opaqueFormatsRejected));
     }
@@ -3157,6 +3283,11 @@ private:
             .setHardwareDecodeConfig({});
         renderer->setEventCallback({});
         renderer->close();
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            ohCodecVulkanRenderer_.reset();
+        }
+        renderer.reset();
 
         const OHCodecVulkanInteropStatistics statistics =
             interop->statistics();
@@ -3170,7 +3301,7 @@ private:
                 > 0
             && ohCodecVulkanMaximumScheduledFrames_.load(
                    std::memory_order_relaxed)
-                <= OHCodecVulkanMaximumScheduledFrames
+                <= VulkanVideoRenderer::FramesInFlight
             && statistics.codecOutputsQueued
                 >= statistics.nativeBuffersAcquired
             && statistics.frameAvailableCallbacks
@@ -3180,7 +3311,6 @@ private:
             && statistics.softwareTransferCalls == 0
             && statistics.stagingCopies == 0
             && statistics.rendererUploads == 0
-            && statistics.normalizationPasses == 0
             && mediaOpenCount_.load(std::memory_order_relaxed) == 6
             && player_.state() == State::Stopped;
         const bool directPassed =
@@ -3198,9 +3328,41 @@ private:
             && statistics.directPlaneImports
                 == statistics.nativeBuffersImported
             && statistics.outputsReleasedAfterGpu
+                <= statistics.nativeBuffersImported
+            && statistics.nativeBuffersImported
+                    - statistics.outputsReleasedAfterGpu
+                <= VulkanVideoRenderer::FramesInFlight
+            && statistics.opaqueFormatsRejected == 0
+            && statistics.normalizationPasses == 0
+            && (statistics.lastVulkanFormat != VK_FORMAT_UNDEFINED
+                || (statistics.forcedVkFormatLibplaceboImports
+                        == statistics.nativeBuffersImported
+                    && statistics.lastForcedVulkanFormat
+                        != VK_FORMAT_UNDEFINED));
+        const bool opaqueSampledPassed =
+            ohCodecVulkanH264Rendered_.load(std::memory_order_relaxed)
+                >= RequiredOHCodecVulkanH264Frames
+            && ohCodecVulkanHEVCRendered_.load(
+                   std::memory_order_relaxed)
+                >= RequiredOHCodecVulkanHEVCFrames
+            && statistics.nativeBuffersAcquired >= totalRendered
+            && statistics.nativeBuffersImported >= totalRendered
+            && statistics.codecOutputsQueued
+                >= statistics.nativeBuffersImported
+            && statistics.frameAvailableCallbacks
+                >= statistics.nativeBuffersImported
+            && statistics.opaqueExternalImports
+                == statistics.nativeBuffersImported
+            && statistics.outputsReleasedAfterGpu
+                <= statistics.nativeBuffersImported
+            && statistics.nativeBuffersImported
+                    - statistics.outputsReleasedAfterGpu
+                <= VulkanVideoRenderer::FramesInFlight
+            && statistics.normalizationPasses
                 == statistics.nativeBuffersImported
             && statistics.opaqueFormatsRejected == 0
-            && statistics.lastVulkanFormat != VK_FORMAT_UNDEFINED;
+            && statistics.lastVulkanFormat == VK_FORMAT_UNDEFINED
+            && statistics.lastExternalFormat != 0;
         const bool opaqueUnsupportedPassed =
             totalRendered == 0
             && statistics.codecOutputsQueued >= 2
@@ -3209,17 +3371,40 @@ private:
             && statistics.directPlaneImports == 0
             && statistics.outputsReleasedAfterGpu == 0
             && statistics.opaqueFormatsRejected >= 2
+            && statistics.opaqueExternalObjectProbes
+                == statistics.opaqueFormatsRejected
             && (statistics.lastNativeFormat
                     == NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP
                 || statistics.lastNativeFormat
                     == NATIVEBUFFER_PIXEL_FMT_YCBCR_P010)
             && statistics.lastVulkanFormat == VK_FORMAT_UNDEFINED
             && statistics.lastExternalFormat != 0;
+        const bool vulkanSampled = directPassed || opaqueSampledPassed;
         const bool passed = commonPassed
-            && (directPassed || opaqueUnsupportedPassed);
+            && (vulkanSampled || opaqueUnsupportedPassed);
         if (!passed) {
             failOHCodecVulkan(
-                "OHCodec/Vulkan statistics did not satisfy strict source zero copy");
+                "OHCodec/Vulkan statistics did not satisfy source sampling: rendered="
+                + std::to_string(totalRendered)
+                + " acquired="
+                + std::to_string(statistics.nativeBuffersAcquired)
+                + " imported="
+                + std::to_string(statistics.nativeBuffersImported)
+                + " opaqueImports="
+                + std::to_string(statistics.opaqueExternalImports)
+                + " normalized="
+                + std::to_string(statistics.normalizationPasses)
+                + " released="
+                + std::to_string(statistics.outputsReleasedAfterGpu)
+                + " queued="
+                + std::to_string(statistics.codecOutputsQueued)
+                + " callbacks="
+                + std::to_string(statistics.frameAvailableCallbacks)
+                + " mediaOpen="
+                + std::to_string(
+                    mediaOpenCount_.load(std::memory_order_relaxed))
+                + " state="
+                + std::to_string(static_cast<int>(player_.state())));
             return;
         }
 
@@ -3232,21 +3417,22 @@ private:
         ohCodecVulkanPhase_.store(
             OHCodecVulkanPhase::Complete,
             std::memory_order_release);
-        phase_.store(
-            ValidationPhase::Complete,
+        ohCodecVulkanFinalStatistics_ = statistics;
+        ohCodecVulkanDirectPassed_.store(
+            vulkanSampled,
             std::memory_order_release);
-        passed_.store(true, std::memory_order_release);
-        bool expected = false;
-        if (!passLogged_.compare_exchange_strong(
-                expected,
-                true,
-                std::memory_order_acq_rel)) {
-            return;
-        }
 
         const std::string vulkanResult =
             std::string("QTAV_OHOS_OHCODEC_VULKAN_RESULT ")
-            + (directPassed ? "PASS" : "UNSUPPORTED")
+            + (vulkanSampled ? "PASS" : "UNSUPPORTED")
+            + " mode="
+            + (statistics.forcedVkFormatLibplaceboImports != 0
+                    ? "forced-vkformat-libplacebo"
+                : statistics.forcedVkFormatNativeSamples != 0
+                    ? "forced-vkformat-native"
+                : directPassed ? "explicit-plane"
+                : opaqueSampledPassed ? "opaque-ycbcr-normalized"
+                                      : "unsupported")
             + " codecs=h264,hevc h264Rendered="
             + std::to_string(
                 ohCodecVulkanH264Rendered_.load(
@@ -3261,6 +3447,15 @@ private:
             + std::to_string(statistics.nativeBuffersImported)
             + " directPlanes="
             + std::to_string(statistics.directPlaneImports)
+            + " opaqueImports="
+            + std::to_string(statistics.opaqueExternalImports)
+            + " forcedVkFormatImports="
+            + std::to_string(statistics.forcedVkFormatImports)
+            + " forcedNativeSamples="
+            + std::to_string(statistics.forcedVkFormatNativeSamples)
+            + " forcedLibplacebo="
+            + std::to_string(
+                statistics.forcedVkFormatLibplaceboImports)
             + " codecQueued="
             + std::to_string(statistics.codecOutputsQueued)
             + " availableCallbacks="
@@ -3275,6 +3470,10 @@ private:
             + std::to_string(
                 static_cast<std::int32_t>(
                     statistics.lastVulkanFormat))
+            + " forcedVkFormat="
+            + std::to_string(
+                static_cast<std::int32_t>(
+                    statistics.lastForcedVulkanFormat))
             + " externalFormat="
             + std::to_string(statistics.lastExternalFormat)
             + " exactQueueMax="
@@ -3291,38 +3490,962 @@ private:
                     std::memory_order_relaxed))
             + " opaqueRejected="
             + std::to_string(statistics.opaqueFormatsRejected)
-            + " unsupportedRejected=0 normalization=0"
-              " cpuMap=0 transfer=0 staging=0 upload=0";
+            + " objectProbes="
+            + std::to_string(statistics.opaqueExternalObjectProbes)
+            + " objectProbeSuccesses="
+            + std::to_string(
+                statistics.opaqueExternalObjectProbeSuccesses)
+            + " unsupportedRejected=0 normalization="
+            + std::to_string(statistics.normalizationPasses)
+            + " cpuMap=0 transfer=0 staging=0 upload=0";
         logMessage(LOG_INFO, vulkanResult);
+        setDetail(
+            "Strict OHCodec/Vulkan validation completed; starting selector hardware-frame fallback validation");
+        startOHCodecFallbackPhase(
+            MobileHardwareFrameFallbackRoute::OpenGLESInterop);
+    }
 
+    void startOHCodecFallbackPhase(MobileHardwareFrameFallbackRoute route)
+    {
+        std::lock_guard<std::mutex> lock(pipelineMutex_);
+        if (!surfaceReady_ || !window_) {
+            fail("OHCodec selector fallback has no active XComponent surface");
+            return;
+        }
+        if (route != MobileHardwareFrameFallbackRoute::OpenGLESInterop &&
+            route != MobileHardwareFrameFallbackRoute::SoftwareDecode) {
+            fail("OHCodec selector fallback received an invalid route");
+            return;
+        }
+
+        ohCodecFallbackRoute_.store(route, std::memory_order_release);
+        ohCodecFallbackVulkanPresented_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackOpenGLPresented_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackSoftwarePresented_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackHardwareInputs_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackSoftwareInputs_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackSelectorDiscards_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackSchedulerDrops_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackMaximumScheduledFrames_.store(0,
+                                                     std::memory_order_relaxed);
+        ohCodecFallbackNextFrameSerial_.store(1, std::memory_order_relaxed);
+        ohCodecFallbackVulkanSelected_.store(false, std::memory_order_release);
+        ohCodecFallbackObserved_.store(false, std::memory_order_release);
+        ohCodecFallbackRouteApplied_.store(false, std::memory_order_release);
+        ohCodecFallbackRenderQueued_.store(false, std::memory_order_release);
+        ohCodecFallbackAbortQueued_.store(false, std::memory_order_release);
+        ohCodecFallbackFinishQueued_.store(false, std::memory_order_release);
+        ohCodecFallbackMediaOpenAtRebind_.store(0, std::memory_order_relaxed);
+        ohCodecFallbackVulkanSurfaceGeneration_.store(
+            0,
+            std::memory_order_release);
+        ohCodecFallbackOpenGLSurfaceGeneration_.store(
+            0,
+            std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> queueLock(ohCodecFallbackQueueMutex_);
+            ohCodecFallbackScheduledFrames_.clear();
+        }
+
+        phase_.store(ValidationPhase::OHCodecFallback,
+                     std::memory_order_release);
+        ohCodecFallbackPhase_.store(
+            route == MobileHardwareFrameFallbackRoute::OpenGLESInterop
+                ? OHCodecFallbackPhase::NativeInterop
+                : OHCodecFallbackPhase::SoftwareDecode,
+            std::memory_order_release);
+
+        MobileRendererSelectorConfig selectorConfig;
+        selectorConfig.maximumRecoveryAttempts = 0;
+        selectorConfig.vulkan = [this] {
+            auto context = std::make_unique<OHOSVulkanContext>();
+            std::string error;
+            if (!context->create(window_, error)) {
+                return MobileRendererCandidate{
+                    {},
+                    error.empty()
+                        ? "Could not create the OHCodec fallback Vulkan context"
+                        : std::move(error),
+                };
+            }
+            if (!context->nativeBufferExternalMemoryEnabled() ||
+                !context->foreignQueueFamilyEnabled() ||
+                !context->syncFdSemaphoreEnabled()) {
+                return MobileRendererCandidate{
+                    {},
+                    "The Vulkan device lacks the OHCodec native-buffer import "
+                    "contract",
+                };
+            }
+
+            OHCodecVulkanInteropConfig interopConfig;
+            interopConfig.width = 320;
+            interopConfig.height = 180;
+            interopConfig.ohosExternalMemoryEnabled = true;
+            interopConfig.foreignQueueFamilyEnabled = true;
+            interopConfig.syncFdSemaphoreEnabled = true;
+            interopConfig.samplerYcbcrConversionEnabled =
+                context->samplerYcbcrConversionEnabled();
+            interopConfig.externalFormatProbeMode =
+                externalFormatProbeMode();
+            auto interop = std::make_shared<OHCodecVulkanInterop>(
+                context->borrowed().device,
+                interopConfig);
+            if (!*interop) {
+                return MobileRendererCandidate{
+                    {},
+                    "Could not create the OHCodec fallback Vulkan interop: " +
+                        interop->lastError(),
+                };
+            }
+            auto renderer = std::make_shared<OHOSVulkanVideoRenderer>(
+                context->borrowed(),
+                VulkanOutputPreference::SdrOnly);
+            renderer->setHardwareFrameInterop(interop);
+            if (!renderer->setWindow(window_)) {
+                return MobileRendererCandidate{
+                    {},
+                    "Could not bind the OHCodec fallback Vulkan renderer",
+                };
+            }
+
+            const OHCodecSurface surface = interop->surface();
+            if (!surface) {
+                return MobileRendererCandidate{
+                    {},
+                    "OHCodec fallback Vulkan interop published no consumer "
+                    "surface",
+                };
+            }
+            ohCodecFallbackVulkanSurfaceGeneration_.store(
+                surface.generation(),
+                std::memory_order_release);
+            ohCodecFallbackVulkanInterop_ = interop;
+            ohCodecFallbackVulkanRenderer_ = renderer;
+            vulkanContext_ = std::move(context);
+            return MobileRendererCandidate{
+                std::make_shared<FatalAfterVideoRenderer>(
+                    renderer,
+                    InjectOHCodecFallbackAfterVulkanFrames),
+                "OHCodec Vulkan native interop with bounded fatal injection",
+            };
+        };
+        selectorConfig.openGLES = [this] {
+            // The selector closes the Vulkan renderer before this factory is
+            // entered. Keep the borrowed Vulkan device alive until the old
+            // interop is inspected and destroyed at phase finalization.
+            auto renderer = std::make_shared<OHOSOpenGLVideoRenderer>(
+                OpenGLOutputPreference::SdrOnly);
+            if (ohCodecFallbackRoute_.load(std::memory_order_acquire) ==
+                MobileHardwareFrameFallbackRoute::OpenGLESInterop) {
+                OHCodecOpenGLInteropConfig interopConfig;
+                interopConfig.maximumPendingFrames =
+                    static_cast<int>(OHCodecOpenGLMaximumPendingFrames);
+                auto interop =
+                    std::make_shared<OHCodecOpenGLInterop>(interopConfig);
+                renderer->setHardwareFrameInterop(interop);
+                ohCodecFallbackOpenGLInterop_ = interop;
+            }
+            if (!renderer->setWindow(window_)) {
+                ohCodecFallbackOpenGLInterop_.reset();
+                return MobileRendererCandidate{
+                    {},
+                    "Could not bind the OHCodec fallback OpenGL ES renderer",
+                };
+            }
+            ohCodecFallbackOpenGLRenderer_ = renderer;
+            return MobileRendererCandidate{
+                std::move(renderer),
+                ohCodecFallbackRoute_.load(std::memory_order_acquire) ==
+                        MobileHardwareFrameFallbackRoute::OpenGLESInterop
+                    ? "OHCodec OH_NativeImage external-OES fallback"
+                    : "OpenGL ES software-frame fallback",
+            };
+        };
+
+        auto selector = std::make_shared<MobileVideoRendererSelector>(
+            std::move(selectorConfig));
+        selector->setEventCallback([this](const VideoRenderEvent& event) {
+            if (event.type == VideoRenderEventType::RedrawRequested) {
+                requestOHCodecFallbackRender();
+                return;
+            }
+            if (phase_.load(std::memory_order_acquire) ==
+                ValidationPhase::OHCodecFallback) {
+                failOHCodecFallback(
+                    event.detail.empty()
+                        ? "OHCodec selector fallback renderer failed"
+                        : event.detail);
+            }
+        });
+        selector->setSelectionCallback(
+            [this](const MobileRendererSelectionEvent& event) {
+                lastSelectedAPI_.store(event.selectedAPI,
+                                       std::memory_order_release);
+                if (event.type == MobileRendererSelectionEventType::Selected &&
+                    event.selectedAPI == MobileRenderAPI::Vulkan) {
+                    ohCodecFallbackVulkanSelected_.store(
+                        true,
+                        std::memory_order_release);
+                }
+                if (event.type == MobileRendererSelectionEventType::FellBack &&
+                    event.previousAPI == MobileRenderAPI::Vulkan &&
+                    event.selectedAPI == MobileRenderAPI::OpenGLES) {
+                    ohCodecFallbackObserved_.store(true,
+                                                   std::memory_order_release);
+                }
+                logMessage(event.type ==
+                                   MobileRendererSelectionEventType::Unavailable
+                               ? LOG_ERROR
+                               : LOG_INFO,
+                           std::string("OHCodec fallback selector ") +
+                               mobileRenderAPIName(event.previousAPI) + " -> " +
+                               mobileRenderAPIName(event.selectedAPI) + ": " +
+                               event.detail);
+            });
+        selector->setHardwareFrameFallbackCallback(
+            [this](const MobileHardwareFrameFallbackEvent& event) {
+                return applyOHCodecFallbackRoute(event);
+            });
+        if (!selector->open(renderConfig_)) {
+            const std::string error = selector->lastError();
+            selector->close();
+            failOHCodecFallback(
+                error.empty() ? "Could not open the OHCodec fallback selector"
+                              : error);
+            return;
+        }
+        if (!ohCodecFallbackVulkanInterop_) {
+            selector->close();
+            failOHCodecFallback(
+                "OHCodec fallback selector opened without Vulkan interop");
+            return;
+        }
+
+        const OHCodecSurface surface = ohCodecFallbackVulkanInterop_->surface();
+        OHCodecHardwareDecodeOptions options;
+        options.allowSoftwareFallback = false;
+        options.extraHardwareFrames = 8;
+        const HardwareDecodeConfig decodeConfig =
+            ohCodecHardwareDecodeConfig(surface, options);
+        if (!decodeConfig.device ||
+            decodeConfig.deviceType != HardwareDeviceType::OHCodec ||
+            decodeConfig.decoderWrapper != "ohcodec") {
+            selector->close();
+            failOHCodecFallback("OHCodec fallback produced an invalid Vulkan "
+                                "decode configuration");
+            return;
+        }
+
+        ohCodecFallbackSelector_ = selector;
+        player_.setRenderCallback({})
+            .setVideoRenderAPI({})
+            .setVideoFrameScheduler(
+                [this](const VideoFrame& frame, int, std::int64_t) {
+                    return scheduleOHCodecFallbackFrame(frame);
+                })
+            .setHardwareDecodeConfig(decodeConfig);
+        mediaOpenCount_.fetch_add(1, std::memory_order_relaxed);
+        player_.setMedia(H264MediaPath);
+        player_.setState(State::Playing);
+
+        const std::string detail =
+            std::string(
+                "QTAV_OHOS_CHECKPOINT OHCODEC_FALLBACK_PHASE_READY route=") +
+            mobileHardwareFrameFallbackRouteName(route) +
+            " generation=" + std::to_string(surface.generation()) +
+            " injectedFatalAfter=" +
+            std::to_string(InjectOHCodecFallbackAfterVulkanFrames) +
+            " mediaOpen=" +
+            std::to_string(mediaOpenCount_.load(std::memory_order_relaxed));
+        setDetail(detail);
+        logMessage(LOG_INFO, detail);
+    }
+
+    MobileHardwareFrameFallbackDecision
+    applyOHCodecFallbackRoute(const MobileHardwareFrameFallbackEvent& event)
+    {
+        const MobileHardwareFrameFallbackRoute route =
+            ohCodecFallbackRoute_.load(std::memory_order_acquire);
+        if (event.previousAPI != MobileRenderAPI::Vulkan ||
+            event.selectedAPI != MobileRenderAPI::OpenGLES ||
+            event.sourceDevice != HardwareDeviceType::OHCodec ||
+            event.sourceSurfaceGeneration !=
+                ohCodecFallbackVulkanSurfaceGeneration_.load(
+                    std::memory_order_acquire)) {
+            return {
+                MobileHardwareFrameFallbackRoute::None,
+                "The OHCodec fallback event did not match the retired Vulkan "
+                "surface",
+            };
+        }
+
+        if (route == MobileHardwareFrameFallbackRoute::OpenGLESInterop) {
+            const auto interop = ohCodecFallbackOpenGLInterop_;
+            if (!interop || !*interop || !interop->surface()) {
+                return {
+                    MobileHardwareFrameFallbackRoute::None,
+                    "OpenGL ES did not publish an OHCodec native interop "
+                    "surface",
+                };
+            }
+            const OHCodecSurface surface = interop->surface();
+            if (surface.generation() == event.sourceSurfaceGeneration) {
+                return {
+                    MobileHardwareFrameFallbackRoute::None,
+                    "The OpenGL ES fallback reused the retired Vulkan surface "
+                    "generation",
+                };
+            }
+            OHCodecHardwareDecodeOptions options;
+            options.allowSoftwareFallback = false;
+            options.extraHardwareFrames = 6;
+            const HardwareDecodeConfig decodeConfig =
+                ohCodecHardwareDecodeConfig(surface, options);
+            if (!decodeConfig.device ||
+                decodeConfig.surfaceGeneration != surface.generation()) {
+                return {
+                    MobileHardwareFrameFallbackRoute::None,
+                    "OpenGL ES published an invalid OHCodec decode "
+                    "configuration",
+                };
+            }
+            ohCodecFallbackOpenGLSurfaceGeneration_.store(
+                surface.generation(),
+                std::memory_order_release);
+            ohCodecFallbackMediaOpenAtRebind_.store(
+                mediaOpenCount_.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            player_.setHardwareDecodeConfig(decodeConfig);
+        } else if (route == MobileHardwareFrameFallbackRoute::SoftwareDecode) {
+            ohCodecFallbackMediaOpenAtRebind_.store(
+                mediaOpenCount_.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            player_.setHardwareDecodeConfig({});
+        } else {
+            return {
+                MobileHardwareFrameFallbackRoute::None,
+                "No supported OHCodec fallback route was selected",
+            };
+        }
+
+        ohCodecFallbackRouteApplied_.store(true, std::memory_order_release);
+        return {
+            route,
+            route == MobileHardwareFrameFallbackRoute::OpenGLESInterop
+                ? "Rebound subsequent OHCodec output to the OpenGL ES native "
+                  "interop surface"
+                : "Disabled OHCodec so subsequent OpenGL ES input is "
+                  "software-decoded",
+        };
+    }
+
+    bool dropOHCodecFallbackFrame(const VideoFrame& frame, const char* reason)
+    {
+        if (!frame.hasHardwareFrame()) {
+            return true;
+        }
+        const HardwareFrame hardware = frame.hardwareFrame();
+        const NativeHandle handle =
+            hardware.nativeHandle(HardwareHandleType::Surface);
+        std::shared_ptr<OHCodecVulkanInterop> vulkanInterop;
+        std::shared_ptr<OHCodecOpenGLInterop> openGLInterop;
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            vulkanInterop = ohCodecFallbackVulkanInterop_;
+            openGLInterop = ohCodecFallbackOpenGLInterop_;
+        }
+        OHCodecSurface surface;
+        if (vulkanInterop &&
+            handle.subresource == vulkanInterop->surface().generation()) {
+            surface = vulkanInterop->surface();
+        } else if (openGLInterop && handle.subresource ==
+                                        openGLInterop->surface().generation()) {
+            surface = openGLInterop->surface();
+        }
+        OHCodecFrame output =
+            surface ? ohCodecFrame(frame, surface) : OHCodecFrame{};
+        if (!output || !output.drop()) {
+            failOHCodecFallback(
+                std::string("Could not drop an OHCodec fallback ") + reason +
+                " output");
+            return false;
+        }
+        ohCodecFallbackSchedulerDrops_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool scheduleOHCodecFallbackFrame(const VideoFrame& frame)
+    {
+        const OHCodecFallbackPhase fallbackPhase =
+            ohCodecFallbackPhase_.load(std::memory_order_acquire);
+        if (failed_.load(std::memory_order_acquire) ||
+            phase_.load(std::memory_order_acquire) !=
+                ValidationPhase::OHCodecFallback ||
+            (fallbackPhase != OHCodecFallbackPhase::NativeInterop &&
+             fallbackPhase != OHCodecFallbackPhase::SoftwareDecode)) {
+            return frame.hasHardwareFrame()
+                       ? dropOHCodecFallbackFrame(frame, "inactive-phase")
+                       : true;
+        }
+
+        if (frame.hasHardwareFrame()) {
+            const HardwareFrame hardware = frame.hardwareFrame();
+            if (hardware.deviceType() != HardwareDeviceType::OHCodec) {
+                failOHCodecFallback("OHCodec fallback scheduler received a "
+                                    "foreign hardware frame");
+                return true;
+            }
+            ohCodecFallbackHardwareInputs_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+        } else {
+            ohCodecFallbackSoftwareInputs_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+        }
+
+        bool queueFull = false;
+        {
+            std::lock_guard<std::mutex> queueLock(ohCodecFallbackQueueMutex_);
+            if (ohCodecFallbackScheduledFrames_.size() >=
+                OHCodecFallbackMaximumScheduledFrames) {
+                queueFull = true;
+            } else {
+                const std::uint64_t serial =
+                    ohCodecFallbackNextFrameSerial_.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                ohCodecFallbackScheduledFrames_.push_back({serial, frame});
+                updateMaximum(ohCodecFallbackMaximumScheduledFrames_,
+                              ohCodecFallbackScheduledFrames_.size());
+            }
+        }
+        if (queueFull) {
+            return frame.hasHardwareFrame()
+                       ? dropOHCodecFallbackFrame(frame, "queue-full")
+                       : true;
+        }
+        requestOHCodecFallbackRender();
+        return true;
+    }
+
+    void requestOHCodecFallbackRender()
+    {
+        if (phase_.load(std::memory_order_acquire) !=
+                ValidationPhase::OHCodecFallback ||
+            failed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        bool expected = false;
+        if (ohCodecFallbackRenderQueued_.compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel)) {
+            queueOHCodecControlAction(
+                OHCodecControlAction::RenderFallbackFrame);
+        }
+    }
+
+    void renderScheduledOHCodecFallbackFrame()
+    {
+        if (phase_.load(std::memory_order_acquire) !=
+            ValidationPhase::OHCodecFallback) {
+            return;
+        }
+        ScheduledOHCodecFallbackFrame scheduled;
+        {
+            std::lock_guard<std::mutex> queueLock(ohCodecFallbackQueueMutex_);
+            if (ohCodecFallbackScheduledFrames_.empty()) {
+                return;
+            }
+            scheduled = ohCodecFallbackScheduledFrames_.front();
+        }
+
+        std::shared_ptr<MobileVideoRendererSelector> selector;
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            selector = ohCodecFallbackSelector_;
+        }
+        if (!selector) {
+            failOHCodecFallback("OHCodec fallback render lost its selector");
+            return;
+        }
+
+        const bool hardware = scheduled.frame.hasHardwareFrame();
+        std::uint32_t generation = 0;
+        if (hardware) {
+            generation = scheduled.frame.hardwareFrame()
+                             .nativeHandle(HardwareHandleType::Surface)
+                             .subresource;
+        }
+        const VideoRenderAttemptResult result =
+            selector->renderDetailed(scheduled.frame);
+
+        bool hasAnother = false;
+        if (result.frameConsumed()) {
+            std::lock_guard<std::mutex> queueLock(ohCodecFallbackQueueMutex_);
+            if (!ohCodecFallbackScheduledFrames_.empty() &&
+                ohCodecFallbackScheduledFrames_.front().serial ==
+                    scheduled.serial) {
+                ohCodecFallbackScheduledFrames_.pop_front();
+                hasAnother = !ohCodecFallbackScheduledFrames_.empty();
+            }
+        }
+
+        if (result.status == VideoRenderAttemptStatus::Presented) {
+            const MobileRenderAPI api = selector->selectedAPI();
+            const OHCodecFallbackPhase fallbackPhase =
+                ohCodecFallbackPhase_.load(std::memory_order_acquire);
+            if (hardware && api == MobileRenderAPI::Vulkan &&
+                generation == ohCodecFallbackVulkanSurfaceGeneration_.load(
+                                  std::memory_order_acquire)) {
+                ohCodecFallbackVulkanPresented_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            } else if (fallbackPhase == OHCodecFallbackPhase::NativeInterop &&
+                       hardware && api == MobileRenderAPI::OpenGLES &&
+                       generation ==
+                           ohCodecFallbackOpenGLSurfaceGeneration_.load(
+                               std::memory_order_acquire)) {
+                const std::uint64_t presented =
+                    ohCodecFallbackOpenGLPresented_.fetch_add(
+                        1,
+                        std::memory_order_relaxed) +
+                    1;
+                if (presented >= RequiredOHCodecNativeFallbackFrames) {
+                    bool expected = false;
+                    if (ohCodecFallbackFinishQueued_.compare_exchange_strong(
+                            expected,
+                            true,
+                            std::memory_order_acq_rel)) {
+                        ohCodecFallbackPhase_.store(
+                            OHCodecFallbackPhase::NativeInteropFinalizing,
+                            std::memory_order_release);
+                        queueOHCodecControlAction(
+                            OHCodecControlAction::FinishNativeFallback);
+                    }
+                }
+            } else if (fallbackPhase == OHCodecFallbackPhase::SoftwareDecode &&
+                       !hardware && api == MobileRenderAPI::OpenGLES) {
+                const std::uint64_t presented =
+                    ohCodecFallbackSoftwarePresented_.fetch_add(
+                        1,
+                        std::memory_order_relaxed) +
+                    1;
+                if (presented >= RequiredOHCodecSoftwareFallbackFrames) {
+                    bool expected = false;
+                    if (ohCodecFallbackFinishQueued_.compare_exchange_strong(
+                            expected,
+                            true,
+                            std::memory_order_acq_rel)) {
+                        ohCodecFallbackPhase_.store(
+                            OHCodecFallbackPhase::SoftwareDecodeFinalizing,
+                            std::memory_order_release);
+                        queueOHCodecControlAction(
+                            OHCodecControlAction::FinishSoftwareFallback);
+                    }
+                }
+            }
+            if (hasAnother) {
+                requestOHCodecFallbackRender();
+            }
+            return;
+        }
+        if (result.status == VideoRenderAttemptStatus::Discarded) {
+            ohCodecFallbackSelectorDiscards_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            if (hasAnother) {
+                requestOHCodecFallbackRender();
+            }
+            return;
+        }
+        if (result.status == VideoRenderAttemptStatus::DeferredUntilRedraw ||
+            result.status == VideoRenderAttemptStatus::RetryAfterBackoff) {
+            if (result.retryAfterMilliseconds > 0) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(result.retryAfterMilliseconds));
+            }
+            requestOHCodecFallbackRender();
+            return;
+        }
+        failOHCodecFallback(
+            result.detail.empty()
+                ? "OHCodec selector fallback render attempt failed"
+                : result.detail);
+    }
+
+    void clearOHCodecFallbackFrames()
+    {
+        std::deque<ScheduledOHCodecFallbackFrame> pending;
+        {
+            std::lock_guard<std::mutex> queueLock(ohCodecFallbackQueueMutex_);
+            pending.swap(ohCodecFallbackScheduledFrames_);
+        }
+        for (const auto& scheduled : pending) {
+            if (scheduled.frame.hasHardwareFrame()) {
+                dropOHCodecFallbackFrame(scheduled.frame, "queued-teardown");
+            }
+        }
+        ohCodecFallbackRenderQueued_.store(false, std::memory_order_release);
+    }
+
+    void finalizeOHCodecNativeFallback()
+    {
+        std::shared_ptr<MobileVideoRendererSelector> selector;
+        std::shared_ptr<OHCodecVulkanInterop> vulkanInterop;
+        std::shared_ptr<OHCodecOpenGLInterop> openGLInterop;
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            selector = ohCodecFallbackSelector_;
+            vulkanInterop = ohCodecFallbackVulkanInterop_;
+            openGLInterop = ohCodecFallbackOpenGLInterop_;
+        }
+        if (!selector || !vulkanInterop || !openGLInterop) {
+            failOHCodecFallback("OHCodec native fallback finalization lost its "
+                                "selector or interop");
+            return;
+        }
+
+        player_.setState(State::Stopped);
+        if (!player_.waitFor(State::Stopped, 4'000)) {
+            failOHCodecFallback(
+                "OHCodec native fallback stop did not complete");
+            return;
+        }
+        clearOHCodecFallbackFrames();
+        player_.setRenderCallback({})
+            .setVideoRenderAPI({})
+            .setVideoFrameScheduler({})
+            .setHardwareDecodeConfig({});
+        const MobileRenderAPI selected = selector->selectedAPI();
+        const MobileHardwareFrameFallbackRoute appliedRoute =
+            selector->hardwareFrameFallbackRoute();
+        selector->setEventCallback({});
+        selector->setSelectionCallback({});
+        selector->setHardwareFrameFallbackCallback({});
+        selector->close();
+
+        const OHCodecVulkanInteropStatistics vulkanStatistics =
+            vulkanInterop->statistics();
+        const OHCodecOpenGLInteropStatistics openGLStatistics =
+            openGLInterop->statistics();
+        const std::uint64_t rendered =
+            ohCodecFallbackOpenGLPresented_.load(std::memory_order_relaxed);
+        const bool vulkanSourcePassed =
+            vulkanStatistics.nativeBuffersAcquired > 0 &&
+            (vulkanStatistics.directPlaneImports > 0 ||
+             vulkanStatistics.opaqueExternalImports > 0 ||
+             vulkanStatistics.opaqueFormatsRejected > 0) &&
+            vulkanStatistics.unsupportedFormatsRejected == 0 &&
+            vulkanStatistics.normalizationPasses <=
+                vulkanStatistics.opaqueExternalImports &&
+            vulkanStatistics.cpuMapCalls == 0 &&
+            vulkanStatistics.softwareTransferCalls == 0 &&
+            vulkanStatistics.stagingCopies == 0 &&
+            vulkanStatistics.rendererUploads == 0;
+        const bool passed =
+            selected == MobileRenderAPI::OpenGLES &&
+            appliedRoute == MobileHardwareFrameFallbackRoute::OpenGLESInterop &&
+            ohCodecFallbackVulkanSelected_.load(std::memory_order_acquire) &&
+            ohCodecFallbackObserved_.load(std::memory_order_acquire) &&
+            ohCodecFallbackRouteApplied_.load(std::memory_order_acquire) &&
+            ohCodecFallbackMediaOpenAtRebind_.load(std::memory_order_relaxed) ==
+                7 &&
+            mediaOpenCount_.load(std::memory_order_relaxed) == 7 &&
+            ohCodecFallbackVulkanSurfaceGeneration_.load(
+                std::memory_order_acquire) != 0 &&
+            ohCodecFallbackOpenGLSurfaceGeneration_.load(
+                std::memory_order_acquire) != 0 &&
+            ohCodecFallbackVulkanSurfaceGeneration_.load(
+                std::memory_order_acquire) !=
+                ohCodecFallbackOpenGLSurfaceGeneration_.load(
+                    std::memory_order_acquire) &&
+            ohCodecFallbackHardwareInputs_.load(std::memory_order_relaxed) >
+                0 &&
+            rendered >= RequiredOHCodecNativeFallbackFrames &&
+            ohCodecFallbackMaximumScheduledFrames_.load(
+                std::memory_order_relaxed) > 0 &&
+            ohCodecFallbackMaximumScheduledFrames_.load(
+                std::memory_order_relaxed) <=
+                OHCodecFallbackMaximumScheduledFrames &&
+            openGLStatistics.rawYcbcrImages >= rendered &&
+            openGLStatistics.implicitRgbImages == 0 &&
+            openGLStatistics.contextAttachments > 0 &&
+            openGLStatistics.contextDetaches ==
+                openGLStatistics.contextAttachments &&
+            openGLStatistics.framesReleased >= rendered &&
+            openGLStatistics.textureName == 0 &&
+            openGLStatistics.surfaceGeneration ==
+                ohCodecFallbackOpenGLSurfaceGeneration_.load(
+                    std::memory_order_acquire) &&
+            openGLStatistics.cpuMapCalls == 0 &&
+            openGLStatistics.softwareTransferCalls == 0 &&
+            openGLStatistics.stagingCopies == 0 &&
+            openGLStatistics.rendererUploads == 0 && vulkanSourcePassed &&
+            player_.state() == State::Stopped;
+        if (!passed) {
+            failOHCodecFallback("OHCodec native Vulkan-to-OpenGL ES fallback "
+                                "counters did not satisfy the required route");
+            return;
+        }
+
+        ohCodecFallbackOpenGLFinalStatistics_ = openGLStatistics;
+        const std::string result =
+            "QTAV_OHOS_OHCODEC_FALLBACK_RESULT PASS route=opengl-interop"
+            " vulkanRendered=" +
+            std::to_string(ohCodecFallbackVulkanPresented_.load(
+                std::memory_order_relaxed)) +
+            " glesRendered=" + std::to_string(rendered) + " hardwareInputs=" +
+            std::to_string(ohCodecFallbackHardwareInputs_.load(
+                std::memory_order_relaxed)) +
+            " oldGeneration=" +
+            std::to_string(ohCodecFallbackVulkanSurfaceGeneration_.load(
+                std::memory_order_relaxed)) +
+            " newGeneration=" +
+            std::to_string(ohCodecFallbackOpenGLSurfaceGeneration_.load(
+                std::memory_order_relaxed)) +
+            " vulkanImported=" +
+            std::to_string(vulkanStatistics.nativeBuffersImported) +
+            " opaqueRejected=" +
+            std::to_string(vulkanStatistics.opaqueFormatsRejected) +
+            " rawYcbcr=" + std::to_string(openGLStatistics.rawYcbcrImages) +
+            " released=" + std::to_string(openGLStatistics.framesReleased) +
+            " mediaOpen=7 cpuMap=0 transfer=0 staging=0 upload=0";
+        logMessage(LOG_INFO, result);
+
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            ohCodecFallbackSelector_.reset();
+            ohCodecFallbackVulkanRenderer_.reset();
+            ohCodecFallbackOpenGLRenderer_.reset();
+            ohCodecFallbackVulkanInterop_.reset();
+            ohCodecFallbackOpenGLInterop_.reset();
+            vulkanContext_.reset();
+        }
+        setDetail(
+            "OHCodec native interop fallback passed; starting independent "
+            "software-decode fallback");
+        startOHCodecFallbackPhase(
+            MobileHardwareFrameFallbackRoute::SoftwareDecode);
+    }
+
+    void finalizeOHCodecSoftwareFallback()
+    {
+        std::shared_ptr<MobileVideoRendererSelector> selector;
+        std::shared_ptr<OHCodecVulkanInterop> vulkanInterop;
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            selector = ohCodecFallbackSelector_;
+            vulkanInterop = ohCodecFallbackVulkanInterop_;
+        }
+        if (!selector || !vulkanInterop) {
+            failOHCodecFallback(
+                "OHCodec software fallback finalization lost its "
+                "selector or Vulkan interop");
+            return;
+        }
+
+        player_.setState(State::Stopped);
+        if (!player_.waitFor(State::Stopped, 4'000)) {
+            failOHCodecFallback(
+                "OHCodec software fallback stop did not complete");
+            return;
+        }
+        clearOHCodecFallbackFrames();
+        player_.setRenderCallback({})
+            .setVideoRenderAPI({})
+            .setVideoFrameScheduler({})
+            .setHardwareDecodeConfig({});
+        const MobileRenderAPI selected = selector->selectedAPI();
+        const MobileHardwareFrameFallbackRoute appliedRoute =
+            selector->hardwareFrameFallbackRoute();
+        selector->setEventCallback({});
+        selector->setSelectionCallback({});
+        selector->setHardwareFrameFallbackCallback({});
+        selector->close();
+        const OHCodecVulkanInteropStatistics vulkanStatistics =
+            vulkanInterop->statistics();
+        const std::uint64_t softwareRendered =
+            ohCodecFallbackSoftwarePresented_.load(std::memory_order_relaxed);
+        const bool passed =
+            selected == MobileRenderAPI::OpenGLES &&
+            appliedRoute == MobileHardwareFrameFallbackRoute::SoftwareDecode &&
+            ohCodecFallbackVulkanSelected_.load(std::memory_order_acquire) &&
+            ohCodecFallbackObserved_.load(std::memory_order_acquire) &&
+            ohCodecFallbackRouteApplied_.load(std::memory_order_acquire) &&
+            ohCodecFallbackMediaOpenAtRebind_.load(std::memory_order_relaxed) ==
+                8 &&
+            mediaOpenCount_.load(std::memory_order_relaxed) == 8 &&
+            ohCodecFallbackHardwareInputs_.load(std::memory_order_relaxed) >
+                0 &&
+            ohCodecFallbackSoftwareInputs_.load(std::memory_order_relaxed) >=
+                softwareRendered &&
+            softwareRendered >= RequiredOHCodecSoftwareFallbackFrames &&
+            ohCodecFallbackOpenGLInterop_ == nullptr &&
+            ohCodecFallbackMaximumScheduledFrames_.load(
+                std::memory_order_relaxed) > 0 &&
+            ohCodecFallbackMaximumScheduledFrames_.load(
+                std::memory_order_relaxed) <=
+                OHCodecFallbackMaximumScheduledFrames &&
+            vulkanStatistics.nativeBuffersAcquired > 0 &&
+            (vulkanStatistics.directPlaneImports > 0 ||
+             vulkanStatistics.opaqueExternalImports > 0 ||
+             vulkanStatistics.opaqueFormatsRejected > 0) &&
+            vulkanStatistics.unsupportedFormatsRejected == 0 &&
+            vulkanStatistics.normalizationPasses <=
+                vulkanStatistics.opaqueExternalImports &&
+            vulkanStatistics.cpuMapCalls == 0 &&
+            vulkanStatistics.softwareTransferCalls == 0 &&
+            vulkanStatistics.stagingCopies == 0 &&
+            vulkanStatistics.rendererUploads == 0 &&
+            player_.state() == State::Stopped;
+        if (!passed) {
+            failOHCodecFallback(
+                "OHCodec software-decode fallback counters did not "
+                "prove an independent route");
+            return;
+        }
+
+        const std::string fallbackResult =
+            "QTAV_OHOS_OHCODEC_SOFTWARE_FALLBACK_RESULT PASS"
+            " hardwareInputs=" +
+            std::to_string(ohCodecFallbackHardwareInputs_.load(
+                std::memory_order_relaxed)) +
+            " softwareInputs=" +
+            std::to_string(ohCodecFallbackSoftwareInputs_.load(
+                std::memory_order_relaxed)) +
+            " softwareRendered=" + std::to_string(softwareRendered) +
+            " selectorDiscards=" +
+            std::to_string(ohCodecFallbackSelectorDiscards_.load(
+                std::memory_order_relaxed)) +
+            " mediaOpen=8 cpuMap=0 transfer=0 staging=0 upload=0";
+        logMessage(LOG_INFO, fallbackResult);
+
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            ohCodecFallbackSelector_.reset();
+            ohCodecFallbackVulkanRenderer_.reset();
+            ohCodecFallbackOpenGLRenderer_.reset();
+            ohCodecFallbackVulkanInterop_.reset();
+            ohCodecFallbackOpenGLInterop_.reset();
+            vulkanContext_.reset();
+        }
+        ohCodecFallbackPhase_.store(OHCodecFallbackPhase::Complete,
+                                    std::memory_order_release);
+        phase_.store(ValidationPhase::Complete, std::memory_order_release);
+        passed_.store(true, std::memory_order_release);
+        bool expected = false;
+        if (!passLogged_.compare_exchange_strong(expected,
+                                                 true,
+                                                 std::memory_order_acq_rel)) {
+            return;
+        }
+
+        const bool directVulkan =
+            ohCodecVulkanDirectPassed_.load(std::memory_order_acquire);
         const std::string message =
-            "QTAV_OHOS_RESULT PASS software selector initialGLES="
-            + std::to_string(
-                initialFallbackFrames_.load(std::memory_order_relaxed))
-            + " fatalVulkan="
-            + std::to_string(InjectFatalAfterVulkanFrames)
-            + " fatalGLES="
-            + std::to_string(
-                fatalFallbackFrames_.load(std::memory_order_relaxed))
-            + " mediaOpen=6 ohcodecWrapper=ohcodec"
-              " ohcodecLifecycle=pass ohcodecOpenGLLifecycle=pass"
-              " ohcodecVulkanLifecycle="
-            + std::string(
-                  directPassed ? "pass" : "unsupported-opaque")
-            + " ohcodecVulkanDirectPlanes="
-            + std::to_string(statistics.directPlaneImports)
-            + " ohcodecVulkanReleasedAfterGpu="
-            + std::to_string(statistics.outputsReleasedAfterGpu)
-            + " ohcodecOpenGLRawYcbcr="
-            + std::to_string(
-                ohCodecOpenGLFinalStatistics_.rawYcbcrImages)
-            + " ohcodecDoviReleased="
-            + std::to_string(
-                ohCodecOpenGLFinalStatistics_
-                    .dolbyVisionFramesReleased)
-            + audioResultText();
+            "QTAV_OHOS_RESULT PASS software selector initialGLES=" +
+            std::to_string(
+                initialFallbackFrames_.load(std::memory_order_relaxed)) +
+            " fatalVulkan=" + std::to_string(InjectFatalAfterVulkanFrames) +
+            " fatalGLES=" +
+            std::to_string(
+                fatalFallbackFrames_.load(std::memory_order_relaxed)) +
+            " mediaOpen=8 ohcodecWrapper=ohcodec"
+            " ohcodecLifecycle=pass ohcodecOpenGLLifecycle=pass"
+            " ohcodecVulkanLifecycle=" +
+            std::string(directVulkan ? "pass" : "unsupported-opaque") +
+            " ohcodecVulkanDirectPlanes=" +
+            std::to_string(ohCodecVulkanFinalStatistics_.directPlaneImports) +
+            " ohcodecVulkanReleasedAfterGpu=" +
+            std::to_string(
+                ohCodecVulkanFinalStatistics_.outputsReleasedAfterGpu) +
+            " ohcodecOpenGLRawYcbcr=" +
+            std::to_string(ohCodecOpenGLFinalStatistics_.rawYcbcrImages) +
+            " ohcodecDoviReleased=" +
+            std::to_string(
+                ohCodecOpenGLFinalStatistics_.dolbyVisionFramesReleased) +
+            " ohcodecNativeFallback=pass"
+            " ohcodecSoftwareFallback=pass" +
+            audioResultText();
         setDetail(message);
         logMessage(LOG_INFO, message);
+    }
+
+    void failOHCodecFallback(std::string detail)
+    {
+        fail(std::move(detail));
+        if (phase_.load(std::memory_order_acquire) !=
+            ValidationPhase::OHCodecFallback) {
+            return;
+        }
+        bool expected = false;
+        if (ohCodecFallbackAbortQueued_.compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel)) {
+            queueOHCodecControlAction(OHCodecControlAction::AbortFallback);
+        }
+    }
+
+    void abortOHCodecFallbackValidation()
+    {
+        player_.setState(State::Stopped);
+        player_.waitFor(State::Stopped, 4'000);
+        clearOHCodecFallbackFrames();
+        std::lock_guard<std::mutex> lock(pipelineMutex_);
+        teardownOHCodecFallbackLocked();
+    }
+
+    void teardownOHCodecFallbackLocked()
+    {
+        player_.setRenderCallback({})
+            .setVideoRenderAPI({})
+            .setVideoFrameScheduler({})
+            .setHardwareDecodeConfig({});
+        if (ohCodecFallbackSelector_) {
+            ohCodecFallbackSelector_->setEventCallback({});
+            ohCodecFallbackSelector_->setSelectionCallback({});
+            ohCodecFallbackSelector_->setHardwareFrameFallbackCallback({});
+            ohCodecFallbackSelector_->close();
+        }
+        std::deque<ScheduledOHCodecFallbackFrame> pending;
+        {
+            std::lock_guard<std::mutex> queueLock(ohCodecFallbackQueueMutex_);
+            pending.swap(ohCodecFallbackScheduledFrames_);
+        }
+        for (const auto& scheduled : pending) {
+            if (!scheduled.frame.hasHardwareFrame()) {
+                continue;
+            }
+            const NativeHandle handle =
+                scheduled.frame.hardwareFrame().nativeHandle(
+                    HardwareHandleType::Surface);
+            OHCodecSurface surface;
+            if (ohCodecFallbackVulkanInterop_ &&
+                handle.subresource ==
+                    ohCodecFallbackVulkanInterop_->surface().generation()) {
+                surface = ohCodecFallbackVulkanInterop_->surface();
+            } else if (ohCodecFallbackOpenGLInterop_ &&
+                       handle.subresource ==
+                           ohCodecFallbackOpenGLInterop_->surface()
+                               .generation()) {
+                surface = ohCodecFallbackOpenGLInterop_->surface();
+            }
+            OHCodecFrame output = surface
+                                      ? ohCodecFrame(scheduled.frame, surface)
+                                      : OHCodecFrame{};
+            if (output) {
+                output.drop();
+            }
+        }
+        ohCodecFallbackRenderQueued_.store(false, std::memory_order_release);
+        ohCodecFallbackSelector_.reset();
+        ohCodecFallbackVulkanRenderer_.reset();
+        ohCodecFallbackOpenGLRenderer_.reset();
+        ohCodecFallbackVulkanInterop_.reset();
+        ohCodecFallbackOpenGLInterop_.reset();
+        vulkanContext_.reset();
     }
 
     void failOHCodecVulkan(std::string detail)
@@ -3457,7 +4580,9 @@ private:
         if (!surfaceReady_ && !selector_ && !vulkanContext_
             && !ohCodecSurface_ && !ohCodecOpenGLRenderer_
             && !ohCodecOpenGLInterop_ && !ohCodecVulkanRenderer_
-            && !ohCodecVulkanInterop_) {
+            && !ohCodecVulkanInterop_ && !ohCodecFallbackSelector_
+            && !ohCodecFallbackOpenGLInterop_
+            && !ohCodecFallbackVulkanInterop_) {
             return;
         }
         const bool ohCodecOpenGLActive =
@@ -3470,6 +4595,11 @@ private:
                 == ValidationPhase::OHCodecVulkan
             && ohCodecVulkanPhase_.load(std::memory_order_acquire)
                 != OHCodecVulkanPhase::Complete;
+        const bool ohCodecFallbackActive =
+            phase_.load(std::memory_order_acquire)
+                == ValidationPhase::OHCodecFallback
+            && ohCodecFallbackPhase_.load(std::memory_order_acquire)
+                != OHCodecFallbackPhase::Complete;
         const auto lifecycle = ohCodecLifecycle_.load(
             std::memory_order_acquire);
         const bool ohCodecSurfaceRecreation =
@@ -3494,6 +4624,11 @@ private:
         }
         if (ohCodecVulkanRenderer_ || ohCodecVulkanInterop_) {
             teardownOHCodecVulkanLocked();
+        }
+        if (ohCodecFallbackSelector_
+            || ohCodecFallbackOpenGLInterop_
+            || ohCodecFallbackVulkanInterop_) {
+            teardownOHCodecFallbackLocked();
         }
         if (selector_) {
             selector_->suspendSurface();
@@ -3529,6 +4664,9 @@ private:
         } else if (ohCodecVulkanActive) {
             failOHCodecVulkan(
                 "The XComponent surface was released during OHCodec/Vulkan interop validation");
+        } else if (ohCodecFallbackActive) {
+            failOHCodecFallback(
+                "The XComponent surface was released during OHCodec selector fallback validation");
         } else {
             setDetail("XComponent surface released; playback paused");
         }
@@ -3610,6 +4748,7 @@ private:
     std::mutex retainedOHCodecMutex_;
     std::mutex ohCodecOpenGLQueueMutex_;
     std::mutex ohCodecVulkanQueueMutex_;
+    std::mutex ohCodecFallbackQueueMutex_;
     std::condition_variable controlCondition_;
     std::thread controlWorker_;
     Player player_;
@@ -3619,16 +4758,31 @@ private:
     VideoFrame staleOHCodecFrame_;
     OHCodecOpenGLInteropStatistics ohCodecOpenGLH264Statistics_;
     OHCodecOpenGLInteropStatistics ohCodecOpenGLFinalStatistics_;
+    OHCodecOpenGLInteropStatistics
+        ohCodecFallbackOpenGLFinalStatistics_;
+    OHCodecVulkanInteropStatistics ohCodecVulkanFinalStatistics_;
     std::unique_ptr<OHOSVulkanContext> vulkanContext_;
     std::shared_ptr<MobileVideoRendererSelector> selector_;
     std::shared_ptr<OHCodecOpenGLInterop> ohCodecOpenGLInterop_;
     std::shared_ptr<OHOSOpenGLVideoRenderer> ohCodecOpenGLRenderer_;
     std::shared_ptr<OHCodecVulkanInterop> ohCodecVulkanInterop_;
     std::shared_ptr<OHOSVulkanVideoRenderer> ohCodecVulkanRenderer_;
+    std::shared_ptr<MobileVideoRendererSelector>
+        ohCodecFallbackSelector_;
+    std::shared_ptr<OHCodecOpenGLInterop>
+        ohCodecFallbackOpenGLInterop_;
+    std::shared_ptr<OHOSOpenGLVideoRenderer>
+        ohCodecFallbackOpenGLRenderer_;
+    std::shared_ptr<OHCodecVulkanInterop>
+        ohCodecFallbackVulkanInterop_;
+    std::shared_ptr<OHOSVulkanVideoRenderer>
+        ohCodecFallbackVulkanRenderer_;
     std::deque<ScheduledOHCodecOpenGLFrame>
         ohCodecOpenGLScheduledFrames_;
     std::deque<ScheduledOHCodecVulkanFrame>
         ohCodecVulkanScheduledFrames_;
+    std::deque<ScheduledOHCodecFallbackFrame>
+        ohCodecFallbackScheduledFrames_;
     OHNativeWindow* window_ = nullptr;
     VideoRenderConfig renderConfig_;
     MediaStatus mediaStatus_ = MediaStatus::NoMedia;
@@ -3691,6 +4845,21 @@ private:
     std::atomic<std::uint64_t> ohCodecVulkanSchedulerDrops_ { 0 };
     std::atomic<std::uint64_t> ohCodecVulkanRendererDiscards_ { 0 };
     std::atomic<std::uint32_t> ohCodecVulkanSurfaceGeneration_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackVulkanPresented_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackOpenGLPresented_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackSoftwarePresented_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackHardwareInputs_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackSoftwareInputs_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackSelectorDiscards_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackSchedulerDrops_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackNextFrameSerial_ { 1 };
+    std::atomic<std::uint64_t>
+        ohCodecFallbackMaximumScheduledFrames_ { 0 };
+    std::atomic<std::uint64_t> ohCodecFallbackMediaOpenAtRebind_ { 0 };
+    std::atomic<std::uint32_t>
+        ohCodecFallbackVulkanSurfaceGeneration_ { 0 };
+    std::atomic<std::uint32_t>
+        ohCodecFallbackOpenGLSurfaceGeneration_ { 0 };
     std::atomic<std::uint64_t> mediaOpenCount_ { 0 };
     std::atomic<ValidationPhase> phase_ {
         ValidationPhase::InitialFallback
@@ -3704,6 +4873,13 @@ private:
     std::atomic<OHCodecVulkanPhase> ohCodecVulkanPhase_ {
         OHCodecVulkanPhase::Inactive
     };
+    std::atomic<OHCodecFallbackPhase> ohCodecFallbackPhase_ {
+        OHCodecFallbackPhase::Inactive
+    };
+    std::atomic<MobileHardwareFrameFallbackRoute>
+        ohCodecFallbackRoute_ {
+            MobileHardwareFrameFallbackRoute::None
+        };
     std::atomic<MobileRenderAPI> lastSelectedAPI_ {
         MobileRenderAPI::None
     };
@@ -3719,6 +4895,13 @@ private:
     std::atomic<bool> ohCodecOpenGLRenderQueued_ { false };
     std::atomic<bool> ohCodecVulkanAbortQueued_ { false };
     std::atomic<bool> ohCodecVulkanRenderQueued_ { false };
+    std::atomic<bool> ohCodecVulkanDirectPassed_ { false };
+    std::atomic<bool> ohCodecFallbackVulkanSelected_ { false };
+    std::atomic<bool> ohCodecFallbackObserved_ { false };
+    std::atomic<bool> ohCodecFallbackRouteApplied_ { false };
+    std::atomic<bool> ohCodecFallbackAbortQueued_ { false };
+    std::atomic<bool> ohCodecFallbackRenderQueued_ { false };
+    std::atomic<bool> ohCodecFallbackFinishQueued_ { false };
     std::atomic<bool> audioLifecycleRequested_ { false };
     std::deque<OHCodecControlAction> ohCodecControlActions_;
     bool controlQuit_ = false;

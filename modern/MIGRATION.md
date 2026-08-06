@@ -95,8 +95,8 @@ already own a graphics context or require multiple/custom render targets:
   `OHNativeWindow` and move-only direct-surface present/drop/timed tokens;
 - optional OHOS OHCodec/Vulkan texture interop through
   `QtAV::InteropOHCodecVulkan`, using a private `OH_ConsumerSurface`, retained
-  `OHNativeWindowBuffer`/`OH_NativeBuffer` import, and strict rejection unless
-  Vulkan exposes an explicit sampled multi-plane format;
+  `OHNativeWindowBuffer`/`OH_NativeBuffer` import, explicit-plane direct wrap,
+  or opaque external-format YCbCr sampling into a GPU normalization image;
 - optional Android MediaCodec/Vulkan texture interop through
   `QtAV::InteropMediaCodecVulkan`, using a private GPU-sampled `AImageReader`,
   retained `AHardwareBuffer` external-format import, and acquire/release
@@ -277,14 +277,14 @@ interop remains separate from that direct-surface path. The independent
 presents exactly one retained OHCodec output into it, acquires and retains the
 corresponding `OHNativeWindowBuffer`/`OH_NativeBuffer`, imports its acquire
 sync fd, and keeps the buffer alive until the GPU completion timeline retires
-the texture. It passes only explicit sampled multi-plane `VkFormat` values to
-libplacebo and rejects opaque external formats without mapping, transfer,
-staging, upload, or GPU normalization. The 2026-08-06 connected Mate 60 Pro
-probe acquired real H.264 and HEVC buffers, but its driver exposed only
-`VK_FORMAT_UNDEFINED` plus external format `1000156003`; the harness therefore
-reported the expected strict `UNSUPPORTED` result. Direct sampling and
-GPU-completion release remain to be validated on a device that exposes an
-explicit multi-plane Vulkan format. The OpenGL ES fallback requires raw
+  the texture. Explicit sampled multi-plane `VkFormat` values go directly to
+  libplacebo. Opaque external formats use `VkExternalFormatOHOS`, imported
+  native memory, `VkSamplerYcbcrConversion`, and one GPU shader pass into
+  RGBA16F without decoded-source mapping, transfer, staging, or upload. The
+  2026-08-06 connected Mate 60 Pro run consumed 30 H.264 and 30 HEVC frames
+  through that path and emitted `PASS mode=opaque-ycbcr-normalized`. Direct
+  no-intermediate plane wrapping remains to be validated on a device or public
+  contract that exposes an explicit multi-plane Vulkan format. The OpenGL ES fallback requires raw
 `GL_EXT_YUV_target` sampling and RGBA16F GPU normalization, not implicit
 external-OES YUV-to-RGB conversion.
 
@@ -400,8 +400,8 @@ or pace playback. Decoded planar audio therefore normally uses
 ## Deliberately deferred
 
 - broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
-- OHOS explicit-multi-plane Vulkan device validation for the implemented
-  retained `OH_NativeBuffer` path, plus broader raw `GL_EXT_YUV_target`
+- OHOS explicit-multi-plane Vulkan device validation for strict no-intermediate
+  wrapping, plus broader raw `GL_EXT_YUV_target`
   OpenGL ES device coverage;
 - subtitle decoding and libass rendering;
 - active track switching after load;
@@ -414,16 +414,15 @@ or pace playback. Decoded planar audio therefore normally uses
 The Android and OHOS harnesses are integration checkpoints rather than a
 legacy QtAV API replacement. They prove cross-compilation, packaging, signing,
 connected-device logging, software decode, and platform presentation. The
-OHOS checkpoint now covers software-frame Vulkan, OpenGL ES, forced initial
+  OHOS checkpoint now covers software-frame Vulkan, OpenGL ES, forced initial
 OpenGL ES selection, recoverable native-window recreation, and fatal one-way
 Vulkan-to-OpenGL ES fallback without reopening media. It also covers OHAudio
 PCM delivery, device-master timing, pause/resume, seek/flush, and segment-end
 drain, plus the complete OHCodec H.264/HEVC direct-surface lifecycle matrix.
-Android covers the complete Vulkan/OpenGL ES native-buffer interop matrix
-below. OHOS additionally covers the strict Vulkan native-buffer capability
-gate with real H.264/HEVC outputs: the current device exposes only an opaque
-external format, so the expected `UNSUPPORTED` result is accepted while a
-direct-plane PASS remains pending on suitable hardware.
+  Android covers the complete Vulkan/OpenGL ES native-buffer interop matrix
+  below. OHOS additionally covers real H.264/HEVC retained NativeBuffer import
+  and opaque external-format shader sampling: the current device passed 60/60
+  frames while an explicit direct-plane result remains pending.
 `MobileVideoRendererSelector` now implements the accepted Android/OHOS policy:
 it prefers application-created Vulkan, performs bounded same-API recreation
 for recoverable surface loss, switches one-way to an application-created
@@ -475,9 +474,11 @@ outputs do not expose usable native memory through their callback
 `OH_AVBuffer`, so the interop presents the output into its private
 `OH_ConsumerSurface` and acquires the corresponding retained
 `OHNativeWindowBuffer`/`OH_NativeBuffer` from the consumer queue. It may claim
-strict source zero-copy only when an explicit `VkFormat` and plane mapping
-allow direct libplacebo wrapping. This strict target rejects an opaque external
-format rather than adding a GPU normalization texture. The GLES fallback must
+  strict source zero-copy only when an explicit `VkFormat` and plane mapping
+  allow direct libplacebo wrapping. An opaque external format is instead
+  imported and sampled through `VkSamplerYcbcrConversion` into a GPU
+  normalization texture, preserving zero-CPU-copy without claiming strict
+  no-intermediate source zero-copy. The GLES fallback must
 sample raw components through
 `GL_EXT_YUV_target` into RGBA16F before libplacebo and is therefore also not
 strict source zero-copy. Implicit external-OES conversion is not a target.
@@ -492,13 +493,35 @@ released. The consumer-surface bridge avoids the software-copying FFmpeg
 OHCodec buffer-output branch and leaves the generic core API free of OHOS
 types.
 
+The Mate 60 Pro additionally passed two diagnostic-only explicit-format
+experiments for H.264/NV12 and HEVC Main10/P010. Reinterpreting external IDs
+`1000156003` and `1000156013` as their numerically equal Vulkan multi-planar
+formats allowed both an application-owned Vulkan YCbCr shader and direct
+libplacebo 7.351.0 plane wrapping to render 30 frames per codec. The direct
+libplacebo run reported 60 direct-plane imports, no RGBA16F normalization, and
+no decoded-source CPU map, transfer, staging, or upload. This demonstrates
+working device and renderer capability, but the mapping stays behind a probe
+mode until Huawei documents it as a stable production contract.
+
+The OHOS HAP also connects `MobileVideoRendererSelector` to native OHCodec
+fallback. A Vulkan hardware-frame failure now prepares the OpenGL ES candidate
+first, then the synchronous policy callback either rebinds subsequent decoder
+output to its `OH_NativeImage` surface or independently disables hardware
+decode so later software frames continue through OpenGL ES. The triggering and
+late frames from the retired Vulkan surface are discarded without mapping;
+they are never retried through the new API. The connected Mate 60 Pro run
+validated generation 5 to 6 native rebind with 30 raw-YCbCr presentations and
+a separate 7-hardware-input to 39-software-input transition with 30 software
+presentations, without another application `setMedia()` at either rebind.
+
 Connected Profile 5 and Profile 8.4 runs on the Mate 60 Pro each rendered 45
 HEVC frames with `45/45/45` RPU queued/matched/released counts, raw YCbCr input,
 zero implicit-RGB images, and zero decoded-source map, transfer, staging, or
 upload calls. The repository libplacebo overlay corrects Profile 8 MMR GLSL
 integer indexing and third-order syntax for the device's strict GLES compiler.
-The Vulkan half remains explicitly unsupported on this device because its
-P010 output exposes only an opaque external format.
+  The opaque Vulkan path can sample P010, but the Dolby Vision half remains
+  incomplete because the driver-provided YCbCr conversion does not prove the
+  raw-component/10-bit contract required before RPU reshaping.
 The Vulkan renderer now imports the application device through libplacebo.
 `BorrowedVulkanDevice` therefore also requires its `VkInstance` and explicit
 confirmation that Vulkan 1.2 `timelineSemaphore` and `hostQueryReset` were
@@ -533,9 +556,9 @@ YCbCr/external-format sampling, one returned release fence per imported DOVI
 frame, bounded pending images, and zero decoded-source
 map/transfer/staging/upload counters. The DOVI phase retains parsed RPU
 metadata on all 100 output frames and renders 97 through libplacebo. OHOS
-direct-surface lifecycle coverage is complete. Its strict Vulkan native-buffer
-target is implemented and the fail-closed opaque-format path is connected-
-device validated; direct multi-plane sampling remains pending under the
+  direct-surface lifecycle coverage is complete. Its opaque Vulkan native-buffer
+  path is connected-device validated with 60 imported and shader-sampled
+  frames; strict direct multi-plane sampling remains pending under the
 responsibility and lifecycle boundaries in [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and

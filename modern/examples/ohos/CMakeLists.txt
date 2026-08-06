@@ -15,6 +15,26 @@ target_compile_features(
     qtav_ohos_xcomponent_example PRIVATE cxx_std_17)
 target_compile_definitions(
     qtav_ohos_xcomponent_example PRIVATE VK_USE_PLATFORM_OHOS)
+set(
+    QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE
+    "DISABLED"
+    CACHE STRING
+    "OHCodec opaque external-format diagnostic: DISABLED, NATIVE, or LIBPLACEBO")
+set_property(
+    CACHE QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE
+    PROPERTY STRINGS DISABLED NATIVE LIBPLACEBO)
+if(QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE STREQUAL "NATIVE")
+    target_compile_definitions(
+        qtav_ohos_xcomponent_example
+        PRIVATE QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE=1)
+elseif(QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE STREQUAL "LIBPLACEBO")
+    target_compile_definitions(
+        qtav_ohos_xcomponent_example
+        PRIVATE QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE=2)
+elseif(NOT QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE STREQUAL "DISABLED")
+    message(FATAL_ERROR
+        "QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE must be DISABLED, NATIVE, or LIBPLACEBO")
+endif()
 target_include_directories(
     qtav_ohos_xcomponent_example PRIVATE native)
 target_link_libraries(qtav_ohos_xcomponent_example

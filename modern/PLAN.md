@@ -848,18 +848,37 @@ track is OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
 lifecycle matrix, and raw-YCbCr `OH_NativeImage`/OpenGL ES/libplacebo
-hardware-frame path are complete. The OpenGL ES path performs no decoded-source
+hardware-frame path are complete. The OHCodec selector now also validates a
+real Vulkan-to-OpenGL ES native-surface rebind and an independent
+hardware-to-software decode fallback without reopening the selected media.
+The OpenGL ES path performs no decoded-source
 CPU map, transfer, staging, or upload, but deliberately uses one RGBA16F GPU
 representation-normalization pass per image and is not strict source zero copy.
-The retained `OH_NativeBuffer` Vulkan backend and its strict unsupported path
-are implemented, but the connected Maleoon device exposes decoded NV12 only as
-an opaque external format. Item 10 therefore remains open until an OHOS device
-provides an explicit multi-plane `VkFormat` that libplacebo can wrap directly.
+The retained `OH_NativeBuffer` Vulkan backend now imports the connected
+Maleoon device's opaque external format and shader-samples it through
+`VkSamplerYcbcrConversion`; H.264 and HEVC pass 60/60 frames without decoded-
+source CPU copies. A diagnostic reinterpretation of the returned external IDs
+as explicit NV12/P010 `VkFormat` values also passes both application-owned
+Vulkan sampling and libplacebo direct-plane wrapping for 60/60 frames. Item 10
+remains partial. AD-009 records this allowlisted external-ID guess as a
+workaround, not a final format-negotiation solution: device and libplacebo
+capability are proven, but Huawei has not confirmed the mapping as a stable
+production interface contract.
 The next Dolby Vision slice is partly complete: FFmpeg-parsed RPU metadata is
 now correlated to exact OHCodec outputs by normalized PTS, and Profile 5 plus
 Profile 8.4 pass through the raw OpenGL ES/libplacebo path. Its strict Vulkan
 half remains gated by the same missing explicit multi-plane device format as
 item 10.
+
+The immediate next local OHOS step is the item-10 confirmation gate, before
+further strict Vulkan or Dolby Vision implementation advances: obtain Huawei's
+written position on the mapping, its supported device/system and buffer-
+configuration scope, the meaning of returned format features after a guessed
+conversion, and the P010 raw-plane/10-bit guarantee. Where access permits,
+cross-check the stated scope on additional relevant configurations. Record the
+evidence in a follow-up architecture decision, then either promote a narrowly
+supported mapping, retain it as an explicitly opted-in workaround, or reject
+it and use the opaque/fallback paths.
 
 Active local OHOS execution order:
 
@@ -901,7 +920,7 @@ Active local OHOS execution order:
    The connected HAP passed with `rawYcbcr=93`, `implicitRgb=0`, and
    `ptsUsNormalized=91`; decoded-source CPU map, transfer, staging, and upload
    counters remained zero.
-10. [ ] Present each exact decoder output into a private `OH_ConsumerSurface`,
+10. [~] Present each exact decoder output into a private `OH_ConsumerSurface`,
     acquire and retain its `OHNativeWindowBuffer`/`OH_NativeBuffer` through GPU
     completion, import it with `VK_OHOS_external_memory`, and provide an
     explicit native format/plane contract that `pl_vulkan_wrap` can consume
@@ -909,8 +928,20 @@ Active local OHOS execution order:
     `av_image_copy2()`, CPU map/transfer/staging/upload, or RGBA normalization
     intermediate. Return the acquired consumer buffer only after GPU completion
     and report unsupported when direct wrapping cannot be proven. The backend,
-    package exports, H.264/HEVC capability probe, and opaque-format rejection
-    are implemented; explicit-plane import remains device-validation gated.
+    package exports, H.264/HEVC capability probe, opaque external-format import,
+    shader sampling, GPU-completion lifetime, and fallback integration are
+    connected-device validated. Diagnostic explicit NV12/P010 wrapping passes
+    through both the native Vulkan sampler and libplacebo with 60/60 rendered
+    frames and no normalization intermediate. Before this item or downstream
+    strict Vulkan work advances:
+    - [ ] Obtain Huawei's written confirmation or rejection of the
+      external-ID-to-`VkFormat` mapping as a supported application contract.
+    - [ ] Confirm the applicable device, system/driver, native format, usage,
+      modifier/compression, dataspace/HDR, and `formatFeatures` constraints.
+    - [ ] Confirm that the P010 mapping preserves standard raw Y/UV layout and
+      full 10-bit precision before Dolby Vision reshape.
+    - [ ] Record the result in a follow-up decision and choose the final policy:
+      supported narrow mapping, opt-in workaround with fallback, or rejection.
 11. [~] Correlate FFmpeg-parsed Dolby Vision RPU side data with the exact
     retained OHCodec output after timestamp-unit normalization. Validate Dolby
     Vision Profile 5 and supported Profile 8.x media through the raw OpenGL ES
@@ -919,7 +950,8 @@ Active local OHOS execution order:
     RPU or implicit-RGB input; enhancement-layer residual reconstruction and
     certification remain out of scope. Exact PTS attachment and both profiles
     pass through raw OpenGL ES with `45/45/45` queued/matched/released RPU
-    counts per run; strict Vulkan validation remains device-gated.
+    counts per run. Do not advance the strict Vulkan half until item 10's
+    external-format confirmation gate is resolved.
 
 The HAP/XComponent Vulkan slice completed on 2026-08-05. It adds the exported
 `QtAV::RenderVulkanOHOS` target, retains the active `OHNativeWindow`, owns the
@@ -1030,20 +1062,54 @@ memory, the interop first makes the one permitted present decision, waits for
 the consumer callback, acquires the exact `OHNativeWindowBuffer`, converts and
 retains its `OH_NativeBuffer`, imports any acquire sync fd into a Vulkan
 semaphore, and keeps the consumer buffer alive behind the renderer completion
-timeline. Explicit NV12/P010 two-/three-plane `VkFormat` values are imported
-through `VK_OHOS_external_memory` and handed to `pl_vulkan_wrap`; opaque-only
-external formats are rejected without mapping or GPU normalization. Shared and
+  timeline. Explicit NV12/P010 two-/three-plane `VkFormat` values are imported
+  through `VK_OHOS_external_memory` and handed to `pl_vulkan_wrap`; opaque
+  external formats use `VkExternalFormatOHOS`, `VkSamplerYcbcrConversion`, and
+  a GPU-only RGBA16F representation-normalization pass. Shared and
 static arm64/API 23 builds compiled all test/example targets, installed the new
 target, and separate installed-package consumers linked it. The signed
 `com.qtav.feasibility` HAP passed its complete existing regression plus H.264
 and HEVC strict capability probes. The Mate 60 Pro returned
 `nativeFormat=24`, `VkFormat=0`, and `externalFormat=1000156003` for both
-outputs, producing the expected `UNSUPPORTED` marker with `acquired=2`,
-`imported=0`, `directPlanes=0`, `opaqueRejected=2`, and zero CPU map, software
-transfer, staging, upload, or normalization. This validates the required
-fail-closed path but does not complete item 10: a device exposing an explicit
-multi-plane Vulkan format is still required to validate import, sampling, and
-GPU-completion release.
+  outputs. After Huawei clarified that `VK_SUCCESS` permits opaque consumption,
+  an independent raw Vulkan probe passed conversion, sampler, image creation,
+  native-memory import/bind, view, and immutable descriptor layout. The full
+  HAP then produced `PASS mode=opaque-ycbcr-normalized` for 30 H.264 plus 30
+  HEVC frames with `acquired=60`, `imported=60`, `opaqueImports=60`,
+  `normalization=60`, and zero CPU map, software transfer, staging, or upload.
+  The strict no-intermediate part of item 10 still requires an explicit plane
+  contract; opaque consumption itself is no longer device-gated.
+
+The OHCodec forced-`VkFormat` consultation checkpoint completed on 2026-08-06.
+Following Huawei's proposed experiment, the diagnostic HAP kept
+`VkExternalMemoryImageCreateInfo` and NativeBuffer memory import, omitted
+`VkExternalFormatOHOS`, and set `VkImageCreateInfo::format` by mapping external
+ID `1000156003` to explicit NV12 and `1000156013` to explicit P010. The first
+stage used the application's Vulkan YCbCr sampler and rendered 30 H.264/NV12
+plus 30 HEVC Main10/P010 frames. The second passed the same explicit images to
+libplacebo 7.351.0 and again rendered all 60 frames, reporting
+`directPlanes=60`, `normalization=0`, and zero decoded-source CPU map,
+transfer, staging, or upload. Thus the current hardware/driver and libplacebo
+can consume both forced explicit formats. The only remaining item-10 gate is
+whether Huawei formally supports this implementation-defined numeric mapping
+across the intended device, system, and driver matrix; probe mode remains off
+by default until that contract is confirmed.
+
+The Huawei final-consultation handoff was tightened on 2026-08-06. The
+consultation document now treats hardware consumption, opaque shader sampling,
+forced NV12/P010 sampling, and libplacebo acceptance as confirmed facts and
+asks only for the production mapping contract, its stability/scope, and the
+P010 raw-10-bit guarantee. For vendor handoff continuity it also retains the
+standard Vulkan/libplacebo direct-plane model, the opaque-format limitation,
+the full sequence of Huawei questions and follow-up probes, and the resulting
+production/fallback correction direction. The attachment is source-only: a
+standalone QtAVCore/FFmpeg-free NativeBuffer importer switches explicitly
+between opaque and forced-format `pNext` chains, while a separate minimal
+callback checks
+`pl_vulkan_wrap` two-plane acceptance. The probe compiles cleanly with the
+repository arm64/OHOS API 23 toolchain and libplacebo 7.351.0 under warnings as
+errors. No HAP is included. Item 10 remains diagnostic-only while awaiting
+Huawei's final interface-contract response.
 
 The OHCodec Dolby Vision raw-OpenGL checkpoint completed on 2026-08-06. The
 repository FFmpeg overlay now enables the HEVC parser and built-in RPU decoder
@@ -1057,10 +1123,31 @@ the checksum-pinned FFmpeg FATE Profile 8.4 sample with 45 HEVC renders and
 `implicitRgb=0`, and zero decoded-source map/transfer/staging/upload calls.
 Profile 8.4 initially exposed invalid libplacebo-generated GLES MMR integer
 indexing and third-order branch syntax; the repository libplacebo overlay now
-corrects both and the same device passes. P010 remained opaque to strict
-Vulkan (`nativeFormat=35`, `VkFormat=0`, external format `1000156013`), so this
+  corrects both and the same device passes. P010 remains opaque
+(`nativeFormat=35`, `VkFormat=0`, external format `1000156013`); generic opaque
+YCbCr sampling is available, but its implicit conversion cannot yet prove the
+raw-component contract required by Dolby Vision, so this
 completes the raw OpenGL half of item 11 without claiming the strict Vulkan
 half or completing Milestone 7.
+
+The OHCodec renderer-fallback checkpoint completed on 2026-08-06. After the
+opaque Vulkan sampling pass, the signed `com.qtav.feasibility` HAP opened
+H.264 on a private Vulkan consumer surface and let the shared mobile selector
+handle a bounded injected Vulkan failure after opaque-format sampling. Its
+synchronous fallback
+callback rebound subsequent OHCodec output from surface generation 5 to a new
+`OH_NativeImage`/OpenGL ES surface generation 6 without another `setMedia()`;
+30 raw-YCbCr frames rendered and all decoded-source map, transfer, staging, and
+upload counters stayed zero. A separate new-media session repeated the Vulkan
+failure, cleared the OHCodec configuration, and rendered 30 delivered software
+frames through the same OpenGL ES candidate. It discarded the retired hardware
+frame without mapping it and kept the application media-open count at 8 across
+the decoder reconfiguration. The exact markers were
+`QTAV_OHOS_OHCODEC_FALLBACK_RESULT PASS` and
+`QTAV_OHOS_OHCODEC_SOFTWARE_FALLBACK_RESULT PASS`. Deterministic selector
+tests continue to cover the explicit direct-surface and no-video alternatives.
+This completes the two OHOS fallback checklist items; explicit-plane strict
+wrapping and raw-component Vulkan Dolby Vision validation remain gated.
 
 The portable render-attempt slice completed on 2026-08-05. The public
 `VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
@@ -2355,9 +2442,10 @@ toolchain validation, portable render-result contract, Vulkan/OpenGL ES
 selector path, OHAudio sink, OHCodec H.264/HEVC direct-surface lifecycle matrix,
 and raw-YCbCr OHCodec/OpenGL ES/libplacebo path are complete and connected-
 device validated. Exact-PTS OHCodec Dolby Vision attachment and Profile 5/8.4
-raw-OpenGL validation are also complete. Retained `OH_NativeBuffer` Vulkan
-direct wrapping and the strict Vulkan half of Dolby Vision remain gated on a
-device exposing an explicit multi-plane format.
+raw-OpenGL validation are also complete. Retained `OH_NativeBuffer` opaque
+Vulkan import and shader sampling now pass 60/60 H.264/HEVC frames. Direct
+no-intermediate wrapping and the strict Vulkan half of Dolby Vision remain
+gated on an explicit raw multi-plane contract.
 
 Target clarification gate:
 
@@ -2455,6 +2543,10 @@ change.
 - [x] Present the exact decoder output into a private `OH_ConsumerSurface`,
   acquire and retain its `OHNativeWindowBuffer`/`OH_NativeBuffer`, and avoid
   `OH_AVBuffer_GetAddr()` and `av_image_copy2()`.
+- [x] Consume the device's opaque external format with
+  `VkSamplerYcbcrConversion`, a GPU-only normalization pass, and bounded
+  completion lifetime. The connected HAP passed 60 imports/samples with zero
+  decoded-source CPU map, transfer, staging, or upload.
 - [ ] Validate the implemented `VK_OHOS_external_memory` import, direct
   libplacebo wrapping of explicit format/planes, and release after GPU
   completion on a device that exposes a non-opaque multi-plane `VkFormat`.
@@ -2465,10 +2557,10 @@ change.
   through libplacebo. Profile 5 and Profile 8.4 pass through raw OpenGL ES with
   exact `45/45/45` queued/matched/released counts; the strict Vulkan route
   remains device-gated with the explicit-plane import item above.
-- [ ] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
+- [x] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
   interop for subsequent frames; otherwise follow an explicit direct-surface,
   software-decode, or no-video policy without implicit hardware-frame mapping.
-- [ ] Keep software decode fallback independent of Vulkan/OpenGL ES interop
+- [x] Keep software decode fallback independent of Vulkan/OpenGL ES interop
   fallback.
 
 Acceptance:
@@ -2486,10 +2578,11 @@ Acceptance:
   exact timestamp correlation, zero decoded-source CPU map, transfer, staging,
   or upload calls, and separately reports its single RGBA16F GPU normalization
   pass;
-- the OHOS Vulkan result proves strict source zero copy: the active decode path
-  calls neither `OH_AVBuffer_GetAddr()` nor `av_image_copy2()`, creates no
-  source-normalization intermediate, and presents a directly wrapped retained
-  native buffer; final-render-target readback for pixel validation is permitted;
+- the OHOS Vulkan opaque result proves zero-CPU-copy NativeBuffer consumption:
+  the active decode path calls neither `OH_AVBuffer_GetAddr()` nor
+  `av_image_copy2()`, imports the retained native buffer, and shader-samples it
+  through one reported GPU normalization pass. Only an explicit-plane route may
+  later claim strict no-intermediate source zero copy;
 - Dolby Vision validation proves exact normalized-PTS RPU/output correlation
   for Profile 5 and supported Profile 8.x frames, with raw components and RPU
   metadata reaching libplacebo before reshape and output color processing;

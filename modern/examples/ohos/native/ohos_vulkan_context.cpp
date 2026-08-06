@@ -52,6 +52,7 @@ void OHOSVulkanContext::reset() noexcept
     nativeBufferExternalMemoryEnabled_ = false;
     foreignQueueFamilyEnabled_ = false;
     syncFdSemaphoreEnabled_ = false;
+    samplerYcbcrConversionEnabled_ = false;
     deviceName_.clear();
 }
 
@@ -221,9 +222,13 @@ bool OHOSVulkanContext::create(
         return false;
     }
 
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures supportedYcbcrFeatures {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+    };
     VkPhysicalDeviceVulkan12Features supportedVulkan12Features {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
     };
+    supportedVulkan12Features.pNext = &supportedYcbcrFeatures;
     VkPhysicalDeviceFeatures2 supportedFeatures {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
     };
@@ -283,6 +288,14 @@ bool OHOSVulkanContext::create(
     };
     enabledVulkan12Features.timelineSemaphore = VK_TRUE;
     enabledVulkan12Features.hostQueryReset = VK_TRUE;
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures enabledYcbcrFeatures {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+    };
+    if (supportedYcbcrFeatures.samplerYcbcrConversion == VK_TRUE) {
+        enabledYcbcrFeatures.samplerYcbcrConversion = VK_TRUE;
+        enabledVulkan12Features.pNext = &enabledYcbcrFeatures;
+        samplerYcbcrConversionEnabled_ = true;
+    }
     VkDeviceCreateInfo deviceInfo {
         VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
     };
@@ -345,6 +358,11 @@ bool OHOSVulkanContext::foreignQueueFamilyEnabled() const noexcept
 bool OHOSVulkanContext::syncFdSemaphoreEnabled() const noexcept
 {
     return syncFdSemaphoreEnabled_;
+}
+
+bool OHOSVulkanContext::samplerYcbcrConversionEnabled() const noexcept
+{
+    return samplerYcbcrConversionEnabled_;
 }
 
 std::string OHOSVulkanContext::description() const

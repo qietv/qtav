@@ -26,6 +26,7 @@ public:
     bool nativeBufferExternalMemoryEnabled() const noexcept;
     bool foreignQueueFamilyEnabled() const noexcept;
     bool syncFdSemaphoreEnabled() const noexcept;
+    bool samplerYcbcrConversionEnabled() const noexcept;
     std::string description() const;
 
 private:
@@ -38,6 +39,7 @@ private:
     bool nativeBufferExternalMemoryEnabled_ = false;
     bool foreignQueueFamilyEnabled_ = false;
     bool syncFdSemaphoreEnabled_ = false;
+    bool samplerYcbcrConversionEnabled_ = false;
     std::string deviceName_;
 };
 
