@@ -454,9 +454,12 @@ because it hides the raw source representation and cannot support the required
 libplacebo/Dolby Vision ordering. OHCodec/NativeImage may propagate the codec
 PTS unchanged in microseconds, so the interop compares the observed value and
 its microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
-then stores and correlates the selected value in nanoseconds. The private
-consumer-surface bridge avoids FFmpeg's software-copying OHCodec buffer-output
-branch and keeps the SDK types in the optional backend. Exact format,
+then stores and correlates the selected value in nanoseconds. The FFmpeg
+OHCodec wrapper independently parses each HEVC RPU before submission, keys it
+by that same microsecond PTS, and attaches it only to the matching returned
+output. The private consumer-surface bridge avoids FFmpeg's software-copying
+OHCodec buffer-output branch and keeps the SDK types in the optional backend.
+Exact format,
 protected-content, lifetime, and fence support remain target-SDK/device gates.
 On 2026-08-06 the connected Mate 60 Pro acquired one real H.264 and one real
 HEVC buffer, both reported `NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP`, but Vulkan
@@ -465,6 +468,14 @@ therefore reported the expected strict `UNSUPPORTED` result with two opaque
 rejections and zero map/transfer/staging/upload/normalization counters. No OHOS
 texture-interop PASS is claimed until explicit-plane import, sampling, and
 post-GPU release execute on suitable hardware.
+
+On the same device, residual-disabled Profile 5 and Profile 8.4 each rendered
+45 HEVC frames through the raw OpenGL ES path with 45 RPU frames queued,
+timestamp-matched, and released. Both runs reported zero implicit-RGB images
+and zero decoded-source map/transfer/staging/upload calls. Profile 8.4 also
+validated MMR reshaping after the libplacebo overlay corrected generated GLES
+integer array indexing and third-order branch syntax. This is a zero-CPU-copy
+OpenGL result, not a strict source-zero-copy Vulkan result.
 
 When the active renderer changes from Vulkan to OpenGL ES, the implemented
 selector callback first permits the platform layer to reconfigure newly

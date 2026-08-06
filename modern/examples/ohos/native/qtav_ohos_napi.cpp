@@ -2350,6 +2350,9 @@ private:
             || statistics.redrawSignals < h264Rendered
             || statistics.transformQueries < h264Rendered
             || statistics.timestampMatches < h264Rendered
+            || statistics.dolbyVisionFramesQueued != 0
+            || statistics.dolbyVisionTimestampMatches != 0
+            || statistics.dolbyVisionFramesReleased != 0
             || statistics.framesReleased < h264Rendered
             || statistics.maximumPendingFrames == 0
             || statistics.maximumPendingFrames
@@ -2469,6 +2472,10 @@ private:
             && activeStatistics.timestampMatches
                     - ohCodecOpenGLH264Statistics_.timestampMatches
                 >= hevcRendered
+            && activeStatistics.dolbyVisionFramesQueued
+                >= activeStatistics.dolbyVisionTimestampMatches
+            && activeStatistics.dolbyVisionTimestampMatches
+                >= activeStatistics.dolbyVisionFramesReleased
             && activeStatistics.rawYcbcrImages >= totalRendered
             && activeStatistics.implicitRgbImages == 0
             && activeStatistics.maximumPendingFrames > 0
@@ -2530,6 +2537,10 @@ private:
                 == finalStatistics.contextAttachments
             && finalStatistics.textureName == 0
             && finalStatistics.surfaceGeneration == surfaceGeneration
+            && finalStatistics.dolbyVisionFramesQueued
+                >= finalStatistics.dolbyVisionTimestampMatches
+            && finalStatistics.dolbyVisionTimestampMatches
+                >= finalStatistics.dolbyVisionFramesReleased
             && finalStatistics.cpuMapCalls == 0
             && finalStatistics.softwareTransferCalls == 0
             && finalStatistics.stagingCopies == 0
@@ -2578,6 +2589,15 @@ private:
             + std::to_string(finalStatistics.transformQueries)
             + " timestampMatches="
             + std::to_string(finalStatistics.timestampMatches)
+            + " doviQueued="
+            + std::to_string(
+                finalStatistics.dolbyVisionFramesQueued)
+            + " doviMatched="
+            + std::to_string(
+                finalStatistics.dolbyVisionTimestampMatches)
+            + " doviReleased="
+            + std::to_string(
+                finalStatistics.dolbyVisionFramesReleased)
             + " ptsUsNormalized="
             + std::to_string(
                 finalStatistics.microsecondTimestampsNormalized)
@@ -3189,8 +3209,10 @@ private:
             && statistics.directPlaneImports == 0
             && statistics.outputsReleasedAfterGpu == 0
             && statistics.opaqueFormatsRejected >= 2
-            && statistics.lastNativeFormat
-                == NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP
+            && (statistics.lastNativeFormat
+                    == NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP
+                || statistics.lastNativeFormat
+                    == NATIVEBUFFER_PIXEL_FMT_YCBCR_P010)
             && statistics.lastVulkanFormat == VK_FORMAT_UNDEFINED
             && statistics.lastExternalFormat != 0;
         const bool passed = commonPassed
@@ -3294,6 +3316,10 @@ private:
             + " ohcodecOpenGLRawYcbcr="
             + std::to_string(
                 ohCodecOpenGLFinalStatistics_.rawYcbcrImages)
+            + " ohcodecDoviReleased="
+            + std::to_string(
+                ohCodecOpenGLFinalStatistics_
+                    .dolbyVisionFramesReleased)
             + audioResultText();
         setDetail(message);
         logMessage(LOG_INFO, message);

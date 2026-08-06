@@ -29,6 +29,12 @@ OHCodecOpenGLInteropStatistics {
     std::uint64_t redrawSignals = 0;
     std::uint64_t transformQueries = 0;
     std::uint64_t timestampMatches = 0;
+    // FFmpeg-attached RPU metadata stayed on the exact queued VideoFrame,
+    // survived normalized native-image timestamp matching, and remained
+    // present until the rendered image was released.
+    std::uint64_t dolbyVisionFramesQueued = 0;
+    std::uint64_t dolbyVisionTimestampMatches = 0;
+    std::uint64_t dolbyVisionFramesReleased = 0;
     // OHCodec surface producers may publish the AVCodec microsecond PTS
     // directly. These observations were normalized to nanoseconds before
     // exact frame association.

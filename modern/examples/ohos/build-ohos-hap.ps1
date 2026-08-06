@@ -5,6 +5,7 @@ param(
     [string]$MediaSource,
     [string]$H264MediaSource,
     [string]$HEVCMediaSource,
+    [int]$HEVCMediaDurationSeconds = 0,
     [int]$Parallel = [Environment]::ProcessorCount,
     [switch]$SkipQtAVBuild,
     [switch]$NoPackage
@@ -148,7 +149,8 @@ $PackagedHEVCMedia = Join-Path `
     $RawFileDirectory 'qtav-ohos-test-hevc.mp4'
 
 $Ffmpeg = $null
-if (-not $H264MediaSource -or -not $HEVCMediaSource) {
+if (-not $H264MediaSource -or -not $HEVCMediaSource -or
+    $HEVCMediaDurationSeconds -gt 0) {
     $Ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
     if (-not $Ffmpeg) {
         throw 'A host ffmpeg executable is required to generate HAP test media'
@@ -162,7 +164,8 @@ function Stage-QtAVOhosMedia {
         [string]$Destination,
         [Parameter(Mandatory)]
         [ValidateSet('H264', 'HEVC')]
-        [string]$Codec
+        [string]$Codec,
+        [int]$DurationSeconds = 0
     )
 
     if ($Source) {
@@ -170,7 +173,28 @@ function Stage-QtAVOhosMedia {
         if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
             throw "The requested $Codec test media does not exist: $Source"
         }
-        Copy-Item -Force -LiteralPath $Source -Destination $Destination
+        if ($DurationSeconds -le 0) {
+            Copy-Item -Force -LiteralPath $Source -Destination $Destination
+            return
+        }
+        if (-not $Ffmpeg) {
+            throw 'A host ffmpeg executable is required to trim HAP test media'
+        }
+        & $Ffmpeg.Source `
+            -hide_banner `
+            -loglevel error `
+            -y `
+            -i $Source `
+            -t $DurationSeconds `
+            -map '0:v:0' `
+            -map '0:a?' `
+            -c copy `
+            -strict unofficial `
+            -movflags '+faststart' `
+            $Destination
+        if ($LASTEXITCODE -ne 0) {
+            throw "Host FFmpeg could not trim the $Codec HAP test media"
+        }
         return
     }
 
@@ -225,7 +249,8 @@ Stage-QtAVOhosMedia `
 Stage-QtAVOhosMedia `
     -Source $HEVCMediaSource `
     -Destination $PackagedHEVCMedia `
-    -Codec HEVC
+    -Codec HEVC `
+    -DurationSeconds $HEVCMediaDurationSeconds
 
 if ($NoPackage) {
     return

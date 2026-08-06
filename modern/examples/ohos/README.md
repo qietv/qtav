@@ -34,7 +34,10 @@ sends HOME once and relaunches the ability after the page destroys its
 XComponent surface. The page reports foreground/background state to native
 code and creates a fresh XComponent without restarting `start()`. The native
 harness then replaces H.264 with HEVC, verifies bounded retained output across
-stop, and emits PASS only after the complete lifecycle succeeds. It then opens
+stop, and emits PASS only after the complete lifecycle succeeds. It next opens
+H.264 and HEVC through `QtAV::InteropOHCodecOpenGL`, requires exact normalized-
+PTS native-image association, samples raw Y/Cb/Cr, and tracks Dolby Vision RPU
+metadata from queued frame through matched image release. It finally opens
 H.264 and HEVC through `QtAV::InteropOHCodecVulkan`, presents exactly one
 output from each codec into the interop's private `OH_ConsumerSurface`, and
 exercises the native-buffer capability gate.
@@ -50,8 +53,9 @@ zero-copy. Implicit `OH_NativeImage` external-OES YUV-to-RGB conversion
 is not the target. OHCodec/NativeImage may propagate the codec PTS unchanged in
 microseconds, so the interop compares the observed value and its
 microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
-then stores and correlates the selected value in nanoseconds. This is a
-correlation rule, not an additional device-validation result.
+then stores and correlates the selected value in nanoseconds. Dolby Vision
+validation additionally requires the exact metadata-bearing frame to survive
+that match until image release.
 
 The 2026-08-06 Mate 60 Pro run acquired real H.264 and HEVC consumer buffers,
 but Vulkan exposed only `VK_FORMAT_UNDEFINED` with opaque external format
@@ -86,7 +90,9 @@ native type declarations, generated test media, and required arm64 libraries:
 By default the script generates six-second, seekable 320x180/30 fps H.264/AAC
 and HEVC/AAC clips. `-H264MediaSource` and `-HEVCMediaSource` can stage explicit
 fixtures; the older `-MediaSource` option remains an alias for
-`-H264MediaSource`.
+`-H264MediaSource`. `-HEVCMediaDurationSeconds` makes a bounded stream-copy
+fixture and passes `-strict unofficial` so FFmpeg preserves a Dolby Vision
+configuration record.
 
 Run the signed result on exactly one connected device and collect the native
 result marker with:
@@ -96,6 +102,33 @@ result marker with:
   -ProjectRoot C:/path/to/signed-project `
   -BundleName com.example.bundle
 ```
+
+For a residual-disabled base-layer Dolby Vision fixture, request a strict
+profile assertion. The runner uses `ffprobe` before building, then requires
+every rendered HEVC frame to complete the RPU queued/matched/released chain.
+Profile `84` means Profile 8 with compatibility id 4:
+
+```powershell
+./modern/examples/ohos/run-connected-device.ps1 `
+  -ProjectRoot C:/path/to/signed-project `
+  -BundleName com.example.bundle `
+  -HEVCMediaSource C:/media/profile5.mp4 `
+  -HEVCMediaDurationSeconds 6 `
+  -RequireDolbyVisionProfile 5
+
+./modern/examples/ohos/run-connected-device.ps1 `
+  -ProjectRoot C:/path/to/signed-project `
+  -BundleName com.example.bundle `
+  -HEVCMediaSource C:/media/profile84.mov `
+  -RequireDolbyVisionProfile 84
+```
+
+The 2026-08-06 Mate 60 Pro runs passed both profiles with 45 rendered HEVC
+frames and `doviQueued=45`, `doviMatched=45`, `doviReleased=45`. Both runs
+reported raw YCbCr input, zero implicit-RGB images, and zero decoded-source CPU
+map, software transfer, staging, or upload calls. The strict Vulkan phase
+remained explicitly `UNSUPPORTED` because the device exposed its P010 outputs
+only as an opaque external format.
 
 Installation is attempted once. If HarmonyOS asks for device-side approval,
 approve it manually and rerun instead of repeatedly retrying or bypassing the

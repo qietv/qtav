@@ -140,6 +140,9 @@ struct AtomicStatistics {
     std::atomic<std::uint64_t> redrawSignals { 0 };
     std::atomic<std::uint64_t> transformQueries { 0 };
     std::atomic<std::uint64_t> timestampMatches { 0 };
+    std::atomic<std::uint64_t> dolbyVisionFramesQueued { 0 };
+    std::atomic<std::uint64_t> dolbyVisionTimestampMatches { 0 };
+    std::atomic<std::uint64_t> dolbyVisionFramesReleased { 0 };
     std::atomic<std::uint64_t> microsecondTimestampsNormalized { 0 };
     std::atomic<std::uint64_t> staleFramesDropped { 0 };
     std::atomic<std::uint64_t> maximumPendingFrames { 0 };
@@ -460,6 +463,11 @@ public:
         statistics_.codecOutputsQueued.fetch_add(
             1,
             std::memory_order_relaxed);
+        if (frame.hasDolbyVisionMetadata()) {
+            statistics_.dolbyVisionFramesQueued.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         detail.clear();
         return OpenGLHardwareImportStatus::Pending;
     }
@@ -646,6 +654,11 @@ public:
                 }
 
                 if (matchedRequested) {
+                    if (matched.frame.hasDolbyVisionMetadata()) {
+                        statistics_.dolbyVisionTimestampMatches.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
                     currentFrame_.texture = texture_;
                     currentFrame_.transform = transform;
                     currentFrame_.rawYcbcr = true;
@@ -699,6 +712,11 @@ public:
             return false;
         }
         glFlush();
+        if (currentSource_.hasDolbyVisionMetadata()) {
+            statistics_.dolbyVisionFramesReleased.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         currentFrame_ = {};
         currentKey_ = {};
         currentSource_ = {};
@@ -776,6 +794,15 @@ public:
             std::memory_order_relaxed);
         result.timestampMatches = statistics_.timestampMatches.load(
             std::memory_order_relaxed);
+        result.dolbyVisionFramesQueued =
+            statistics_.dolbyVisionFramesQueued.load(
+                std::memory_order_relaxed);
+        result.dolbyVisionTimestampMatches =
+            statistics_.dolbyVisionTimestampMatches.load(
+                std::memory_order_relaxed);
+        result.dolbyVisionFramesReleased =
+            statistics_.dolbyVisionFramesReleased.load(
+                std::memory_order_relaxed);
         result.microsecondTimestampsNormalized =
             statistics_.microsecondTimestampsNormalized.load(
                 std::memory_order_relaxed);

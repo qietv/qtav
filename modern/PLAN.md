@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-05
+Last updated: 2026-08-06
 
 Status legend:
 
@@ -855,9 +855,11 @@ The retained `OH_NativeBuffer` Vulkan backend and its strict unsupported path
 are implemented, but the connected Maleoon device exposes decoded NV12 only as
 an opaque external format. Item 10 therefore remains open until an OHOS device
 provides an explicit multi-plane `VkFormat` that libplacebo can wrap directly.
-Afterward, FFmpeg-parsed Dolby Vision RPU metadata must be
-correlated to exact OHCodec outputs by normalized PTS and validated with Dolby
-Vision Profile 5 and supported Profile 8.x media.
+The next Dolby Vision slice is partly complete: FFmpeg-parsed RPU metadata is
+now correlated to exact OHCodec outputs by normalized PTS, and Profile 5 plus
+Profile 8.4 pass through the raw OpenGL ES/libplacebo path. Its strict Vulkan
+half remains gated by the same missing explicit multi-plane device format as
+item 10.
 
 Active local OHOS execution order:
 
@@ -909,13 +911,15 @@ Active local OHOS execution order:
     and report unsupported when direct wrapping cannot be proven. The backend,
     package exports, H.264/HEVC capability probe, and opaque-format rejection
     are implemented; explicit-plane import remains device-validation gated.
-11. [ ] Correlate FFmpeg-parsed Dolby Vision RPU side data with the exact
+11. [~] Correlate FFmpeg-parsed Dolby Vision RPU side data with the exact
     retained OHCodec output after timestamp-unit normalization. Validate Dolby
     Vision Profile 5 and supported Profile 8.x media through the raw OpenGL ES
     and strict Vulkan libplacebo routes, with libplacebo owning reshaping,
     color conversion, tone/gamut mapping, and output encoding. Reject unmatched
     RPU or implicit-RGB input; enhancement-layer residual reconstruction and
-    certification remain out of scope.
+    certification remain out of scope. Exact PTS attachment and both profiles
+    pass through raw OpenGL ES with `45/45/45` queued/matched/released RPU
+    counts per run; strict Vulkan validation remains device-gated.
 
 The HAP/XComponent Vulkan slice completed on 2026-08-05. It adds the exported
 `QtAV::RenderVulkanOHOS` target, retains the active `OHNativeWindow`, owns the
@@ -1040,6 +1044,23 @@ transfer, staging, upload, or normalization. This validates the required
 fail-closed path but does not complete item 10: a device exposing an explicit
 multi-plane Vulkan format is still required to validate import, sampling, and
 GPU-completion release.
+
+The OHCodec Dolby Vision raw-OpenGL checkpoint completed on 2026-08-06. The
+repository FFmpeg overlay now enables the HEVC parser and built-in RPU decoder
+for `hevc_ohcodec`, stores parsed metadata in a bounded exact-microsecond-PTS
+queue, attaches it to the matching reordered OHCodec output, and resets parser
+and queue state across flush/close. The OpenGL interop exposes per-frame Dolby
+Vision queued, normalized-timestamp-matched, and released counters. The signed
+Mate 60 Pro HAP passed both the supplied Profile 5 `wednesday.mp4` fixture and
+the checksum-pinned FFmpeg FATE Profile 8.4 sample with 45 HEVC renders and
+`doviQueued=45 doviMatched=45 doviReleased=45` per run, `rawYcbcr=93`,
+`implicitRgb=0`, and zero decoded-source map/transfer/staging/upload calls.
+Profile 8.4 initially exposed invalid libplacebo-generated GLES MMR integer
+indexing and third-order branch syntax; the repository libplacebo overlay now
+corrects both and the same device passes. P010 remained opaque to strict
+Vulkan (`nativeFormat=35`, `VkFormat=0`, external format `1000156013`), so this
+completes the raw OpenGL half of item 11 without claiming the strict Vulkan
+half or completing Milestone 7.
 
 The portable render-attempt slice completed on 2026-08-05. The public
 `VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
@@ -2333,9 +2354,10 @@ fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
 toolchain validation, portable render-result contract, Vulkan/OpenGL ES
 selector path, OHAudio sink, OHCodec H.264/HEVC direct-surface lifecycle matrix,
 and raw-YCbCr OHCodec/OpenGL ES/libplacebo path are complete and connected-
-device validated. The next local slice is retained `OH_NativeBuffer` Vulkan
-direct wrapping with strict source zero copy, followed by exact-PTS Dolby
-Vision RPU attachment and Profile 5/Profile 8.x validation.
+device validated. Exact-PTS OHCodec Dolby Vision attachment and Profile 5/8.4
+raw-OpenGL validation are also complete. Retained `OH_NativeBuffer` Vulkan
+direct wrapping and the strict Vulkan half of Dolby Vision remain gated on a
+device exposing an explicit multi-plane format.
 
 Target clarification gate:
 
@@ -2365,7 +2387,8 @@ Target clarification gate:
   runner. Local signed-HAP XComponent Vulkan/OpenGL ES presentation and
   one-way selector fallback, OHAudio output, the complete H.264/HEVC OHCodec
   direct-output lifecycle matrix, and raw-YCbCr OpenGL ES/libplacebo interop
-  are now validated; CI execution remains pending.
+  plus Profile 5/8.4 exact-PTS Dolby Vision attachment are now validated; CI
+  execution remains pending.
 
 Windows toolchain validation on 2026-08-05 rebuilt the complete target
 dependency closure locally from source in 17 minutes and passed
@@ -2437,9 +2460,11 @@ change.
   completion on a device that exposes a non-opaque multi-plane `VkFormat`.
   Strict source zero copy forbids a GPU normalization intermediate;
   unsupported native formats remain unavailable rather than silently copied.
-- [ ] Attach FFmpeg-parsed Dolby Vision RPU metadata to the exact OHCodec output
+- [~] Attach FFmpeg-parsed Dolby Vision RPU metadata to the exact OHCodec output
   using normalized PTS and validate Profile 5 plus supported Profile 8.x media
-  through libplacebo.
+  through libplacebo. Profile 5 and Profile 8.4 pass through raw OpenGL ES with
+  exact `45/45/45` queued/matched/released counts; the strict Vulkan route
+  remains device-gated with the explicit-plane import item above.
 - [ ] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
   interop for subsequent frames; otherwise follow an explicit direct-surface,
   software-decode, or no-video policy without implicit hardware-frame mapping.
@@ -2506,11 +2531,13 @@ Acceptance:
   mapping or native HDR output. Connected-device validation covers both GPU
   backends without decoded-source CPU copies. Enhancement-layer residual
   reconstruction and product certification remain out of scope.
-- [ ] OHOS OHCodec Dolby Vision Profile 5 and supported Profile 8.x
+- [~] OHOS OHCodec Dolby Vision Profile 5 and supported Profile 8.x
   application-rendered playback through exact normalized-PTS RPU attachment,
   raw-component native-buffer interop, and libplacebo reshape/color/tone/output
   processing. Implicit-RGB input, unmatched RPU, enhancement-layer residual
-  reconstruction, and certification are not accepted as completion.
+  reconstruction, and certification are not accepted as completion. Raw
+  OpenGL ES Profile 5/8.4 validation passes; strict Vulkan is still pending on
+  explicit-plane-capable hardware.
 - [ ] Licensing and certification review before product claims.
 
 Codec decoding must never be described as Dolby certification or Atmos

@@ -484,9 +484,21 @@ strict source zero-copy. Implicit external-OES conversion is not a target.
 OHCodec/NativeImage may propagate the codec PTS unchanged in microseconds, so
 the interop compares the observed value and its microsecond-to-nanosecond
 candidate against the exact queued-frame PTS set, then stores and correlates
-the selected value in nanoseconds. The consumer-surface bridge avoids the
-software-copying FFmpeg OHCodec buffer-output branch and leaves the generic
-core API free of OHOS types.
+the selected value in nanoseconds. The FFmpeg OHCodec wrapper now parses HEVC
+RPU NAL units before submission and attaches the result only to the returned
+output with the exact matching microsecond PTS. Public OpenGL interop
+statistics expose the metadata-bearing frames queued, timestamp-matched, and
+released. The consumer-surface bridge avoids the software-copying FFmpeg
+OHCodec buffer-output branch and leaves the generic core API free of OHOS
+types.
+
+Connected Profile 5 and Profile 8.4 runs on the Mate 60 Pro each rendered 45
+HEVC frames with `45/45/45` RPU queued/matched/released counts, raw YCbCr input,
+zero implicit-RGB images, and zero decoded-source map, transfer, staging, or
+upload calls. The repository libplacebo overlay corrects Profile 8 MMR GLSL
+integer indexing and third-order syntax for the device's strict GLES compiler.
+The Vulkan half remains explicitly unsupported on this device because its
+P010 output exposes only an opaque external format.
 The Vulkan renderer now imports the application device through libplacebo.
 `BorrowedVulkanDevice` therefore also requires its `VkInstance` and explicit
 confirmation that Vulkan 1.2 `timelineSemaphore` and `hostQueryReset` were

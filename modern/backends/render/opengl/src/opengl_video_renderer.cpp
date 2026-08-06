@@ -771,7 +771,10 @@ public:
         }
         auto* self = static_cast<Impl*>(privateData);
         std::lock_guard<std::mutex> lock(self->logMutex_);
-        self->lastLogError_ = message;
+        if (!self->lastLogError_.empty()) {
+            self->lastLogError_ += " | ";
+        }
+        self->lastLogError_ += message;
     }
 
     std::string takeLogError(std::string fallback)

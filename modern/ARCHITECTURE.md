@@ -197,9 +197,12 @@ FFmpeg parses Dolby Vision RPU data into frame side data. libdovi is not
 required or enabled. QtAVCore passes metadata to libplacebo only for the
 base-layer, residual-disabled case (`disable_residual_flag`); it does not
 reconstruct an enhancement layer. Android correlates MediaCodec output with
-the parsed RPU by presentation timestamp; Windows retains FFmpeg's RPU on the
-decoded D3D11VA-backed `VideoFrame`. Dolby licensing and certification are
-outside the project scope.
+the parsed RPU by presentation timestamp; OHOS does the same in the FFmpeg
+OHCodec wrapper using the exact microsecond PTS submitted to and returned by
+the codec, then retains that metadata-bearing `VideoFrame` through normalized
+NativeImage timestamp matching. Windows retains FFmpeg's RPU on the decoded
+D3D11VA-backed `VideoFrame`. Dolby licensing and certification are outside the
+project scope.
 
 Profile 5 has no conventional HDR10-compatible base layer. Its raw base-layer
 components must reach libplacebo before ordinary color conversion:
@@ -320,6 +323,16 @@ ID for real H.264 and HEVC outputs. Its strict `UNSUPPORTED` result validates
 the fail-closed gate; a texture-interop success remains unclaimed until an
 explicit multi-plane format is imported, sampled, and released after GPU
 completion on suitable hardware.
+
+The connected Profile 5 and Profile 8.4 OpenGL ES runs each rendered 45 HEVC
+frames with `45/45/45` Dolby Vision queued/timestamp-matched/released counts,
+zero implicit-RGB images, and zero decoded-source map, transfer, staging, or
+upload calls. Profile 8.4 exercises MMR reshaping; the repository libplacebo
+overlay corrects its generated GLES array-index types and third-order branch
+syntax so the strict Maleoon shader compiler accepts that path. This validates
+the raw OpenGL ES half of the Dolby Vision route. The strict Vulkan half stays
+open because this device reports the P010 consumer buffer only as
+`VK_FORMAT_UNDEFINED` plus an opaque external-format ID.
 
 ## Audio architecture
 

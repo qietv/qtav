@@ -799,6 +799,36 @@ separate `QtAV::InteropOHCodecVulkan` target now implements strict retained
 raw-component OpenGL ES route. The latter exposes raw components through
 `GL_EXT_YUV_target` and does not rely on implicit external-OES conversion.
 
+### OHCodec OpenGL ES raw-component interop
+
+Link `QtAV::HWOHCodec`, `QtAV::RenderOpenGLOHOS`, and
+`QtAV::InteropOHCodecOpenGL`. The interop supplies an `OH_NativeImage`
+producer window to OHCodec, retains the exact scheduled `VideoFrame`, and
+matches each image timestamp against the queued presentation timestamp after
+checking the device's observed microsecond and nanosecond forms. It samples
+raw Y/Cb/Cr through `GL_EXT_YUV_target` into an RGBA16F representation texture;
+libplacebo remains responsible for Dolby Vision reshaping, color conversion,
+tone/gamut mapping, scaling, and output encoding.
+
+The repository FFmpeg overlay enables the HEVC parser and built-in RPU decoder
+for `hevc_ohcodec`. It parses RPU NAL units before packet submission, keys the
+result by the exact microsecond PTS passed to OHCodec, and attaches
+`AV_FRAME_DATA_DOVI_METADATA` only to the output carrying that PTS. Seek,
+decoder flush, media replacement, and close clear both the parser state and
+the bounded pending-metadata queue.
+
+`OHCodecOpenGLInteropStatistics` reports
+`dolbyVisionFramesQueued`, `dolbyVisionTimestampMatches`, and
+`dolbyVisionFramesReleased`. These counters prove that the same metadata-
+bearing frame survived native-image association and stayed alive until image
+release; a profile validation fails when any rendered HEVC frame lacks that
+chain. On 2026-08-06 the signed Mate 60 Pro HAP passed Profile 5 and the
+checksum-pinned FFmpeg FATE Profile 8.4 sample with 45 rendered HEVC frames per
+run and `45/45/45` queued/matched/released RPU counts. Both runs used raw YCbCr,
+zero implicit-RGB images, and zero decoded-source CPU map, software transfer,
+staging, or renderer upload calls. The Profile 8.4 MMR path also exercises the
+repository libplacebo GLES shader-index correction.
+
 ### OHCodec Vulkan strict native-buffer interop
 
 Link `QtAV::HWOHCodec`, `QtAV::RenderVulkanOHOS`, and
@@ -1233,9 +1263,10 @@ only residual-disabled base-layer metadata, applies base-layer reshaping, and
 tone maps to the selected target. The repository FFmpeg overlay makes the HEVC
 MediaCodec wrapper run FFmpeg's own RPU parser before submitting each access
 unit, correlates the result with the reordered hardware output timestamp, and
-attaches the same
-frame side data used by the software decoder. MediaCodec frames then enter the
-same libplacebo DOVI path after zero-CPU-copy external-image normalization.
+attaches the same frame side data used by the software decoder. The OHCodec
+wrapper uses the corresponding exact microsecond-PTS queue for OHOS hardware
+outputs. MediaCodec and OHCodec frames then enter the same libplacebo DOVI path
+after zero-CPU-copy external-image normalization.
 This does not require libdovi: the optional raw-RPU parser remains disabled.
 RPUs that require a residual enhancement layer are rejected by this
 base-layer-only path; compressed passthrough, Dolby certification, and
@@ -1953,6 +1984,9 @@ The OHOS HAP then verifies OHCodec H.264/HEVC direct-surface outputs with
 explicit timed present/drop, seek/flush, media replacement, stop, real
 background/foreground surface-generation replacement, stale-token rejection,
 bounded retained output, and decoder/output lifetime through shutdown.
+Its raw OpenGL ES phase additionally validates exact normalized-PTS Dolby
+Vision attachment for Profile 5 and Profile 8.4 with per-frame
+queued/matched/released counters and no implicit-RGB input.
 The connected Android harness separately verifies MediaCodec H.264/HEVC
 direct-surface outputs with explicit present/drop, seek/flush, media
 replacement, stop, surface-generation replacement, stale-token rejection,

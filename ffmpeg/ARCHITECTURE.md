@@ -153,6 +153,9 @@ project-specific behavior:
   Python glad generator, receives pinned glslang discovery, and normalizes
   Windows system library flags for FFmpeg's pkg-config probes. The optional
   external `libdovi` raw-RPU parser is not part of the dependency closure.
+  The overlay also corrects generated Dolby Vision MMR GLES shaders to use
+  integer array indices and valid third-order branch syntax; this is required
+  by the strict Maleoon compiler exercised by the OHOS Profile 8.4 run.
   QtAVCore exposes only libplacebo's D3D11 path on Windows, not its installed
   OpenGL or Vulkan capabilities. The static shader-translation closure is
   governed by [FD-002](DECISIONS.md).
@@ -160,12 +163,16 @@ project-specific behavior:
   HEVC MediaCodec wrapper and PTS-correlates parsed Dolby Vision metadata with
   hardware output frames before QtAVCore receives them.
 - the OHOS FFmpeg overlay requires the native H.264 and HEVC OHCodec wrappers;
-  configure failure is fatal. It also exposes a narrow opaque OHCodec surface
-  output token with explicit render, timed-render, and drop decisions. An
-  undecided final frame release is always a drop, never an implicit present.
-  The verifier checks both decoder symbols, the public header, and both release
-  symbols in the installed `libavcodec.a` archive. The compatibility boundary
-  is governed by [FD-004](DECISIONS.md).
+  configure failure is fatal. Its HEVC wrapper enables FFmpeg's built-in RPU
+  parser, keeps a bounded metadata queue keyed by the exact microsecond packet
+  PTS submitted to OHCodec, and attaches the result to the returned output with
+  the same PTS. Flush and close clear the queue and parser state. The overlay
+  also exposes a narrow opaque OHCodec surface output token with explicit
+  render, timed-render, and drop decisions. An undecided final frame release is
+  always a drop, never an implicit present. The verifier checks both decoder
+  symbols, the public header, and both release symbols in the installed
+  `libavcodec.a` archive. The compatibility boundary is governed by
+  [FD-004](DECISIONS.md).
 - libsmb2 supplies the missing private Winsock link metadata required by a
   static Windows consumer.
 
