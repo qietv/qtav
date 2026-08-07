@@ -766,6 +766,7 @@ public:
             frame->generation,
             attempt.retryAfterMilliseconds,
             std::move(attempt.detail),
+            attempt.retryReason,
         };
     }
 

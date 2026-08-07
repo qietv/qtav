@@ -169,7 +169,8 @@ built yet.
   Dragging previews the position locally and submits one seek on release;
   keyboard or other value changes are debounced for 180 ms.
 - **Debug** opens or closes the separate diagnostics window. Closing that
-  window also clears the toggle.
+  window also clears the toggle and disables continuous D3D11 statistics and
+  cadence clocks. Opening it enables timing diagnostics for the new interval.
 
 URL playback depends on the protocols and TLS support enabled in the linked
 FFmpeg build. HTTP(S) inputs receive bounded I/O timeout and reconnect
@@ -192,6 +193,11 @@ The Debug window keeps the most recent 1,000 lines and reports:
   and terminal frames, D3D11 context-owner and handoff counts, gaps over 80 ms,
   and maximum render-stage times. `render-skipped` is the compatibility mirror
   of terminal drops; a recovered retry is not counted as skipped.
+
+The player opens its D3D11 output with `D3D11StatisticsMode::Off`. Debug
+temporarily selects `Timing`; closing the window returns to `Off`. Retry and
+resource-lifetime behavior use structured render results and remain identical
+in both modes.
 
 The cadence line helps distinguish decode or network starvation from a slow
 render/driver stage. It is diagnostic evidence, not a stable machine-readable

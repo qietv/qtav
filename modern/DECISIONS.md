@@ -375,11 +375,11 @@ position until flushed output is submitted and presented.
 ### Context
 
 Repeated seeks exposed stalls when a render attempt waited behind Player or
-D3D11 locks, synchronous swap-chain backpressure, or a per-frame GPU completion
-query. The completion query extended the lifetime of scarce D3D11VA decoder
-surfaces and serialized CPU submission behind driver completion. Recreating
-interop output textures without bounded reuse also made transient GPU memory
-look like a process leak.
+D3D11 locks, synchronous swap-chain backpressure, or a synchronous per-frame
+GPU-completion wait. The wait serialized CPU submission behind driver
+completion; retained D3D11VA decoder surfaces therefore also needed an explicit
+bounded lifetime. Recreating interop output textures without bounded reuse made
+transient GPU memory look like a process leak.
 
 ### Decision
 
@@ -400,9 +400,11 @@ look like a process leak.
    successful imported-frame submission asynchronous. Decoder, interop, and
    renderer submissions also share the QtAVCore recursive context guard.
 5. Interop retains the decoder's raw NV12/P010 slice and owns no conversion
-   texture pool. Per-frame libplacebo wrappers are released after submission;
-   libplacebo's renderer owns its bounded reusable shader/render caches and
-   teardown performs the only explicit GPU drain.
+   texture pool. AD-010 refines the later lifetime: default-copy plane wrappers
+   persist on the bounded ordinary-resource ring, while direct wrappers and all
+   imported source frames remain retained through GPU completion. Renderer-
+   owned wrappers are then destroyed before source/import references move to
+   the bounded recycler. Explicit GPU drains remain lifecycle-only operations.
 6. Retry attempts, terminal drops, compositor-busy presents, and maximum render
    stage durations are counted without per-frame logging. AD-008 defines the
    reason-level counters and compatibility `skippedRenders` semantics.
@@ -419,7 +421,7 @@ look like a process leak.
   frame or per seek.
 - A future design that submits decoder reuse and rendering on different
   immediate contexts, devices, or unordered queues must add an explicit GPU
-  synchronization contract before using the same early-release rule.
+  synchronization contract before using the same completion-retention rule.
 
 ### Windows validation
 
@@ -719,6 +721,8 @@ remain unchanged.
 ## AD-008: Windows retries transient rendering with a bounded D3D11 handoff
 
 - Date: 2026-08-04
+- Amended: 2026-08-08 to carry transient busy reasons in render results and
+  make statistics optional
 - Status: Accepted
 - Scope: Core render snapshots, Windows D3D11 context scheduling, composition
   output retry semantics, and cadence diagnostics
@@ -755,7 +759,7 @@ reacquire the recursive immediate-context lock before a timer-only retry.
 3. Let `D3D11VideoOutput` retain only one latest retryable frame. A later frame
    supersedes the pending sequence; detach, stop, or a connection-generation
    change cancels it. `NoFrame` is not timer-retried, and a backend failure with
-   no recorded transient lock/capacity reason is terminal.
+   no structured transient lock/capacity reason is terminal.
 4. Preserve recursive immediate-context serialization and the required native
    `ID3D10Multithread` protection, but make FFmpeg/internal acquisitions honor
    render-thread reservations. A reservation owns no D3D11 context and does not
@@ -765,11 +769,14 @@ reacquire the recursive immediate-context lock before a timer-only retry.
    yielding priority back to FFmpeg. Failures return to bounded
    1/2/4/8/16-ms timer backoff without busy spinning.
 5. Hold the acquired handoff guard only through the renderer call, never
-   through statistics collection or `Present()`. All waits run on the private
-   output thread, not the WinUI dispatcher or a Player worker.
-6. Report attempt reason, renderer state/serialization/context/in-flight
-   contention, reservation-aware versus unreserved context owner, handoff
-   wait/timeout, retry wakeup, supersession, and terminal drop separately.
+   through retry classification, statistics reads, or `Present()`. All waits
+   run on the private output thread, not the WinUI dispatcher or a Player
+   worker.
+6. Carry renderer state/serialization/context/in-flight contention and the
+   reservation-aware versus unreserved owner class in
+   `VideoRenderRetryReason`, independently of optional statistics. Report
+   handoff wait/timeout, retry wakeup, supersession, and terminal drop
+   separately.
    Retain `skippedRenders` as a compatibility mirror of terminal drops; a
    recovered retry is not a skipped frame.
 
@@ -786,9 +793,11 @@ reacquire the recursive immediate-context lock before a timer-only retry.
 - The new public result and Windows statistics are additive API. Existing code
   using `renderVideo()` and `skippedRenders` continues to compile, with the
   clarified terminal-drop meaning for the latter.
-- The Radeon correction does not establish Intel performance equivalence; the
-  same-build Intel workload and full two-device matrix remain open in
-  `PLAN.md`.
+- D3D11 statistics use `Off`, `Counters`, or `Timing`. The high-level output no
+  longer reads, clears, and re-aggregates renderer atomics after every frame;
+  retry behavior remains identical when statistics are off.
+- The correction was subsequently validated across the recorded Intel,
+  NVIDIA, and AMD policy matrices in `PLAN.md`.
 
 ### Windows validation
 
@@ -949,7 +958,10 @@ including opaque Vulkan sampling and Vulkan-to-OpenGL/software fallbacks.
 ## AD-010: Windows copies the visible decoder region by default
 
 - Date: 2026-08-06
-- Status: Accepted; native cross-vendor regression is tracked in `PLAN.md`
+- Amended: 2026-08-07 to retain imported source frames through GPU completion
+  and release them on the bounded recycler
+- Status: Accepted and complete; the native cross-vendor policy matrix passed,
+  and the user waived repeating it after diagnostic-only probe cleanup
 - Scope: Windows D3D11VA decoder-surface lifetime, libplacebo source wrapping,
   post-seek cadence, deterministic shutdown, and direct-sampling policy
 - Supersedes: AD-006 item 4 and AD-007's default direct decoder-slice sampling;
@@ -1003,9 +1015,11 @@ sampling only as an opt-in and warns that D3D11 does not guarantee this use.
    `CopySubresourceRegion1()` with `D3D11_COPY_DISCARD`; a compatibility context
    uses `CopySubresourceRegion()` with the identical box.
 3. Persistent libplacebo plane wrappers belong only to ordinary ring textures.
-   The decoder frame can be released after the ordered copy and draw commands
-   are submitted; the selected ring entry, borrowed target, and completion
-   query remain alive until GPU completion.
+   The decoder frame and imported interop wrapper remain alive with the selected
+   ring entry, borrowed target, and completion query until GPU completion. The
+   renderer then destroys its GPU wrappers and transfers the source frame plus
+   interop reference to a bounded release worker, keeping final FFmpeg/driver
+   destruction off the output render thread.
 4. The copy and libplacebo draw remain asynchronous on the natively protected,
    reservation-aware immediate context. Successful frames retain fast render
    parameters and add no per-frame `pl_gpu_finish()`.
@@ -1024,8 +1038,9 @@ sampling only as an opt-in and warns that D3D11 does not guarantee this use.
 
 ### Consequences
 
-- The default avoids shader views on decoder-array slices and returns scarce
-  decoder surfaces after submission instead of after draw completion.
+- The default avoids shader views on decoder-array slices. It still retains the
+  source slice until the ordered copy and draw complete, then releases the
+  interop wrapper before the source frame on the dedicated recycler.
 - The cost is one device-local raw visible-region copy per submitted hardware
   frame. Decoder padding is not copied and the discard flag permits the driver
   to avoid preserving prior destination contents.
@@ -1034,8 +1049,12 @@ sampling only as an opt-in and warns that D3D11 does not guarantee this use.
 - Direct mode is useful for controlled performance A/B testing, but is not
   automatically selected by vendor and retains its documented seek, shutdown,
   padding, and driver-compatibility risk.
-- Static/shared CTest, WinUI Release, repeated NVIDIA seek/close, and same-build
-  AMD and Intel cadence runs are acceptance gates recorded in `PLAN.md`.
+- Static/shared CTest and WinUI Release remain build gates. The native policy
+  matrix passed on the same Release revision on NVIDIA and AMD with
+  `directDecoderTextureSampling` both off and on, using only `legend.mkv`, as
+  recorded in `PLAN.md`. On 2026-08-08 the user waived repeating those cells
+  after removal of investigation-only probes because that cleanup changed only
+  diagnostics and their presentation, not playback behavior.
 
 ### Primary references
 
@@ -1044,3 +1063,94 @@ sampling only as an opt-in and warns that D3D11 does not guarantee this use.
 - [Microsoft D3D11 copy flags](https://learn.microsoft.com/en-us/windows/win32/api/d3d11_1/ne-d3d11_1-d3d11_copy_flags)
 - [mpv D3D11VA hardware interop](https://github.com/mpv-player/mpv/blob/master/video/out/d3d11/hwdec_d3d11va.c)
 - [mpv `d3d11va-zero-copy` option](https://github.com/mpv-player/mpv/blob/master/DOCS/man/options.rst#d3d11va-zero-copyyesno)
+
+## AD-011: Windows reuses compatible D3D11VA frames contexts and decoders
+
+- Date: 2026-08-07
+- Status: Accepted and complete; the NVIDIA/AMD sampling-policy regression
+  passed, and its post-probe-cleanup repetition was waived by the user
+- Scope: Core FFmpeg hardware-format selection, Windows D3D11VA decoder
+  lifetime, the repository FFmpeg overlay ABI, and shared-device teardown
+- Extends: AD-010 resource lifetime; the dependency-side decision and patch
+  retirement contract are recorded in
+  [FFmpeg FD-005](../ffmpeg/DECISIONS.md#fd-005-reuse-a-compatible-d3d11va-decoder-with-its-frames-context)
+
+### Context
+
+HEVC may invoke `get_format` again after an SPS update even when the selected
+D3D11 device, D3D11/NV12-or-P010 formats, dimensions, and required fixed pool
+remain unchanged. Stock FFmpeg 8.1.2 uninitializes the hardware accelerator at
+that boundary. Reinstalling the same initialized `AVHWFramesContext` preserves
+the texture array, but stock libavcodec still creates a new
+`ID3D11VideoDecoder` and every decoder output view.
+
+Each outstanding frame retains the previous libavcodec decoder. Intel Iris Xe
+ETW showed the last old-frame release entering Intel DXVA allocation teardown
+from the renderer's frame recycler and serializing the shared D3D11 device.
+libplacebo GPU work remained below one millisecond; thermal load amplified the
+stall but did not create the redundant decoder lifetime. Moving the release to
+another thread protected the render thread from ordinary destruction cost, but
+could not prevent a driver-wide shared-device serialization.
+
+### Decision
+
+1. During D3D11 hardware pixel-format selection, Player obtains FFmpeg's
+   required hardware-frames parameters and retains one successfully initialized
+   frames context on the active video decoder.
+2. Player reuses that context only when the native hardware-device identity,
+   hardware and software pixel formats, allocation width and height, and fixed
+   pool capacity remain compatible. The retained pool must satisfy FFmpeg's
+   requested pool plus its three automatic fixed-pool surfaces. Any mismatch or
+   initialization failure follows the ordinary new-context path.
+3. `QtAV::HWD3D11VA` enables the repository FFmpeg extension
+   `AVD3D11VADeviceContext::reuse_decoder`. The extension binds the compatible
+   decoder, all output views, and the texture reference to the frames context;
+   FFmpeg additionally compares the texture, array size, decoder profile,
+   sample dimensions, output format, and complete decoder configuration before
+   reuse.
+4. The retained frames context belongs to the active Core decoder and is
+   released on decoder reset, media replacement, or shutdown. No FFmpeg or
+   D3D11 type is exposed through the public Core API.
+5. Renderer lifetime remains a separate responsibility. Both default GPU-copy
+   and direct-sampling modes retain imported frames through GPU completion.
+   Final imported-wrapper and source-frame destruction runs on the renderer's
+   fixed-capacity recycler; flush and teardown drain it synchronously.
+
+### Rejected alternatives
+
+- Reusing only the frames context leaves stock libavcodec's decoder and output
+  views on the redundant create/destroy path and did not remove the Intel
+  teardown stack.
+- Relying only on the frame recycler moves ordinary destruction off the render
+  thread but cannot prevent the driver from serializing the shared device.
+- Enabling decoder reuse for every FFmpeg consumer would change upstream
+  behavior and could retain an incompatible decoder. The overlay remains an
+  explicit QtAVCore opt-in.
+- Software decode or a decoded-pixel CPU copy avoids this lifetime by giving up
+  the required D3D11VA zero-map pipeline.
+
+### Consequences
+
+- Supported Windows builds must use the paired repository FFmpeg package. Its
+  installed headers contain a small overlay ABI that
+  `cmake/verify-install.cmake` verifies; an arbitrary stock FFmpeg binary is not
+  compatible with this backend build.
+- Compatible repeated format selection keeps one texture pool, decoder, and
+  output-view set. An incompatible device, format, size, pool requirement,
+  profile, texture, or decoder configuration still reconstructs the resources.
+- Android and OHOS behavior is unchanged. The reusable-context policy is
+  private to Core's D3D11 decoder path and the FFmpeg extension defaults off.
+- The renderer recycler remains bounded independently of decoder reuse. If it
+  cannot accept another completed frame, normal rendering applies bounded
+  in-flight backpressure rather than releasing that frame on the render thread.
+- The directly affected Windows FFmpeg build, install verifier, fresh static
+  and shared QtAVCore 37/37 CTest runs, WinUI Release build, lifecycle tests,
+  and cooled Intel ETW/cadence evidence are recorded in `PLAN.md`.
+
+### Retirement condition
+
+Retire the overlay only when the pinned upstream FFmpeg provides equivalent
+compatible decoder retention or no longer uninitializes unchanged D3D11VA
+state. Remove Core's opt-in, rebuild and verify the Windows dependency package,
+run static/shared tests, and repeat the cold Intel seek/ETW regression before
+adopting the upstream replacement.

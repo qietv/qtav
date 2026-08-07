@@ -333,7 +333,20 @@ failures, keeps only the latest pending frame, and retries on its private
 thread. For immediate-context contention it reserves priority over new
 FFmpeg-side acquisitions, performs an immediate bounded handoff wait, and only
 then applies bounded backoff; recovered retries are not counted as terminal
-drops.
+drops. The public D3D11 statistics retain stable cadence, retry, lifecycle,
+Present, gap, decoder-copy, and coarse color/interop/buffer/draw measurements.
+Investigation-only completion-query, clear, `pl_render_image()`, retention,
+and asynchronous libplacebo pass/GPU/callback fields have been removed; code
+that consumed those temporary fields must rebuild and stop depending on them.
+Collection is now tiered through `D3D11StatisticsMode`: `Counters` is the
+low-cost default, `Timing` enables the per-frame clock measurements, and `Off`
+removes continuous statistics work. `D3D11VideoOutput::setStatisticsMode()` may
+change the mode at runtime. Output retry no longer consumes and resets renderer
+statistics on every frame; `VideoRenderRetryReason` carries the exact transient
+busy cause through `VideoRenderAttemptResult` and `VideoRenderResult`, so
+disabling statistics does not change recovery or context-reservation policy.
+The added result/options fields change public C++ structure layouts; consumers
+must rebuild against the matching QtAVCore binaries.
 
 Opaque video players may additionally select
 `D3D11HdrPresentationMode::HDR10` and `DXGI_ALPHA_MODE_IGNORE` in
@@ -640,7 +653,8 @@ implementation.
   presented, deferred until a backend redraw, timer-backoff retry, terminally
   discarded, surface-lost, or fatal. `VideoRenderResult` maps those outcomes
   to Player-facing statuses and includes frame sequence, presentation
-  generation, optional retry delay, and detail. A generation change during the
+  generation, optional retry delay, structured retry reason, and detail. A
+  generation change during the
   backend call returns a terminal `FrameDiscarded` completion;
 - compatibility `renderVideo()` returns a negative value for every non-rendered
   result and therefore cannot distinguish a missing frame from retryable

@@ -112,11 +112,24 @@ enum class VideoRenderAttemptStatus {
     FatalError,
 };
 
+// Structured cause for a timer-backoff attempt. Applications may use this to
+// preserve backend retry policy without consulting optional statistics.
+enum class VideoRenderRetryReason {
+    Unspecified,
+    StateBusy,
+    SerializationBusy,
+    DeviceContextBusyReservationAware,
+    DeviceContextBusyUnreserved,
+    InFlightCapacity,
+};
+
 struct QTAV_CORE_EXPORT VideoRenderAttemptResult {
     VideoRenderAttemptStatus status =
         VideoRenderAttemptStatus::RetryAfterBackoff;
     std::uint32_t retryAfterMilliseconds = 0;
     std::string detail;
+    VideoRenderRetryReason retryReason =
+        VideoRenderRetryReason::Unspecified;
 
     bool presented() const noexcept
     {

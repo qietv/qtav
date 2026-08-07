@@ -91,6 +91,13 @@ int main(int argc, char** argv)
     }
     assert(opened);
     assert(output.isOpen());
+    assert(
+        output.statisticsMode()
+        == qtav::D3D11StatisticsMode::Counters);
+    output.setStatisticsMode(qtav::D3D11StatisticsMode::Timing);
+    assert(
+        output.statisticsMode()
+        == qtav::D3D11StatisticsMode::Timing);
     assert(output.deviceAccess());
     const auto initialColorInfo = output.colorInfo();
     assert(
@@ -127,7 +134,11 @@ int main(int argc, char** argv)
     player.setState(qtav::State::Paused);
     assert(player.waitFor(qtav::State::Paused, 5'000));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    static_cast<void>(output.takeStatistics());
+    const auto initialStatistics = output.takeStatistics();
+    assert(initialStatistics.presentedFrames >= 2);
+    assert(initialStatistics.maximumRenderMicroseconds > 0);
+    assert(initialStatistics.maximumPresentMicroseconds >= 0);
+    assert(initialStatistics.maximumDrawMicroseconds > 0);
 
     const auto deviceAccess = output.deviceAccess();
     assert(deviceAccess);
@@ -166,6 +177,48 @@ int main(int argc, char** argv)
     assert(recoveredStatistics.presentedFrames > 0);
     assert(recoveredStatistics.skippedRenders == 0);
     assert(recoveredStatistics.terminalRenderDrops == 0);
+
+    output.setStatisticsMode(qtav::D3D11StatisticsMode::Off);
+    assert(
+        output.statisticsMode()
+        == qtav::D3D11StatisticsMode::Off);
+    static_cast<void>(output.takeStatistics());
+    int presentedBeforeDisabledRetry = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        presentedBeforeDisabledRetry = presentedFrames;
+    }
+    {
+        auto contextGuard = deviceAccess->contextGuard();
+        output.requestRender();
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        const auto disabledStatistics = output.takeStatistics();
+        assert(disabledStatistics.renderRequests == 0);
+        assert(disabledStatistics.renderPasses == 0);
+        assert(disabledStatistics.rendererBusyRenderAttempts == 0);
+        assert(disabledStatistics.retryWakeups == 0);
+        assert(disabledStatistics.decoderSurfaceCopies == 0);
+        assert(disabledStatistics.maximumRenderMicroseconds == 0);
+        std::lock_guard<std::mutex> lock(mutex);
+        assert(presentedFrames == presentedBeforeDisabledRetry);
+    }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] {
+                return presentedFrames > presentedBeforeDisabledRetry;
+            }));
+    }
+    const auto disabledRecoveryStatistics = output.takeStatistics();
+    assert(disabledRecoveryStatistics.presentedFrames == 0);
+    assert(disabledRecoveryStatistics.rendererBusyRenderAttempts == 0);
+    output.setStatisticsMode(qtav::D3D11StatisticsMode::Counters);
+    assert(
+        output.statisticsMode()
+        == qtav::D3D11StatisticsMode::Counters);
+    static_cast<void>(output.takeStatistics());
 
     int presentedBeforeResume = 0;
     {
@@ -297,6 +350,13 @@ int main(int argc, char** argv)
         == previousHardwareConfig.deviceType);
 
     const auto statistics = output.takeStatistics();
+    assert(statistics.maximumRenderGapMicroseconds == 0);
+    assert(statistics.maximumRenderMicroseconds == 0);
+    assert(statistics.maximumPresentMicroseconds == 0);
+    assert(statistics.maximumColorSetupMicroseconds == 0);
+    assert(statistics.maximumInteropMicroseconds == 0);
+    assert(statistics.maximumBufferUpdateMicroseconds == 0);
+    assert(statistics.maximumDrawMicroseconds == 0);
     const auto totalRenderRequests =
         busyStatistics.renderRequests
         + recoveredStatistics.renderRequests

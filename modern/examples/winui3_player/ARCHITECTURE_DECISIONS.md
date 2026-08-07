@@ -164,6 +164,8 @@ terminate and join every worker before resources are released.
 
 - **Status:** Accepted
 - **Date:** 2026-08-03
+- **Amended:** 2026-08-08 to disable cadence/timing collection while Debug is
+  closed
 
 ### Context
 
@@ -173,14 +175,19 @@ logging can itself create the symptoms under investigation.
 
 ### Decision
 
-Always collect bounded atomic cadence counters and one-time stream metadata.
-Aggregate and format cadence on the UI every five seconds. Keep the log in
-memory, cap it at 1,000 lines, and show it only in the separately toggled Debug
-window. Treat the text format as diagnostic, not as a public API.
+Always collect only one-time stream metadata. Opening Debug enables bounded
+atomic cadence counters and `D3D11StatisticsMode::Timing`; closing it selects
+`Off` and stops callback clocks, output clocks, and five-second formatting.
+Keep the log in memory, cap it at 1,000 lines, and show it only in the
+separately toggled Debug window. Treat the text format as diagnostic, not as a
+public API. Retry classification uses `VideoRenderRetryReason`, never optional
+statistics.
 
 ### Consequences
 
-- Opening Debug does not insert synchronous work into audio/video workers.
+- Debug adds only bounded atomic cadence work to audio/video callbacks; closing
+  it restores the uninstrumented callback path apart from one relaxed flag
+  load.
 - Long sessions have bounded log history.
 - Diagnostics are easy to copy visually but are not persisted automatically.
 - Stable telemetry or automated performance analysis should use a separate
@@ -280,8 +287,8 @@ render retry.
 
 Use `Player::renderVideoDetailed()` on the output's private render thread. The
 Player publishes immutable frame and renderer-binding snapshots atomically,
-returns a frame sequence and presentation generation, and rechecks generation
-after rendering. The output retries only classified busy results in a
+returns a frame sequence, presentation generation, and structured retry reason,
+and rechecks generation after rendering. The output retries only classified busy results in a
 latest-frame mailbox; a newer sequence supersedes the older pending frame.
 
 Before every output pass makes its first non-blocking D3D11 context attempt, it
@@ -291,7 +298,9 @@ uncontended attempt proceeds immediately; a contended attempt waits for at most
 1/2/4/8/16-ms backoff rather than spinning. Ordinary public context users are
 not blocked by the reservation, and every wait stays on the private output
 thread. The context guard is released when rendering returns and is never held
-through statistics collection or swap-chain presentation. Detach, stop, and
+through retry classification, statistics reads, or swap-chain presentation.
+Statistics are read only on application request, not after every render.
+Detach, stop, and
 connection-generation changes cancel both pending retry and reservation.
 
 Diagnostics report attempt reason, renderer lock stage, context-owner class,
@@ -327,6 +336,8 @@ are no longer reported as missing frames.
 
 - **Status:** Accepted
 - **Date:** 2026-08-06
+- **Amended:** 2026-08-07 for completion-retained source frames and bounded
+  off-render-thread release
 
 ### Context
 
@@ -356,5 +367,11 @@ Processor conversion, or per-frame GPU drain is introduced.
   allocation teardown cannot execute on the output render thread.
 - Advanced applications can opt into direct sampling for an A/B performance
   test, but must accept the documented driver/lifetime risks.
-- NVIDIA, AMD, and Intel regression must cover cold start, sustained cadence,
-  repeated seek, media replacement, and close while playing for this policy.
+- The remaining native policy gate uses the same Release revision on NVIDIA and
+  AMD, `legend.mkv` only, with
+  `D3D11VideoOutputOptions::directDecoderTextureSampling` both off and on.
+  `decoder-copies` is auxiliary path evidence, not the tested switch.
+- Compatible frames-context and decoder reuse is an independent shared-device
+  lifetime decision governed by
+  [QtAVCore AD-011](../../DECISIONS.md#ad-011-windows-reuses-compatible-d3d11va-frames-contexts-and-decoders)
+  and [FFmpeg FD-005](../../../ffmpeg/DECISIONS.md#fd-005-reuse-a-compatible-d3d11va-decoder-with-its-frames-context).

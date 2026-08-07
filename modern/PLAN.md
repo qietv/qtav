@@ -18,11 +18,16 @@ matrix or roadmap. A macOS development machine may still act only as a
 cross-compilation host for Android/OHOS; 64-bit Windows is also a supported
 OHOS cross-compilation host through the DevEco native SDK.
 
-OHOS remains the active platform-development target. The user has temporarily
-prioritized a Windows D3D11VA seek/shutdown hotfix recorded in AD-010. It
-replaces direct decoder-slice sampling as the default with an mpv-style visible-
-region GPU copy and keeps direct sampling as an explicit option. AD-007's native
-context protection and bounded asynchronous submission remain binding.
+OHOS remains the strategic active platform-development target, but its item-10
+production decision is waiting for Huawei's written external-format contract.
+While that reply is pending, a Windows D3D11VA-to-Vulkan zero-copy backend is
+inserted as the immediate implementation checkpoint and must complete before
+further OHOS item-10 development resumes. The earlier Windows D3D11VA
+seek/shutdown hotfix recorded in AD-010 is complete. It replaces direct
+decoder-slice sampling as the default D3D11-renderer policy with an mpv-style
+visible-region GPU copy and keeps direct sampling as an explicit option.
+AD-007's native context protection and bounded asynchronous submission remain
+binding.
 
 The user's separate AMD integrated-GPU 4K frame-loss report is objectively
 located, corrected, and fully verified by reason-aware render retry plus
@@ -174,8 +179,10 @@ Continuation checkpoint:
   D3D11 backend. FFmpeg-parsed Dolby Vision metadata, Dolby Vision reshaping,
   transfer handling, gamut conversion, HDR tone mapping, and target encoding
   are owned by libplacebo; QtAVCore has no alternate native Windows shader for
-  those operations. Windows exposes only the QtAVCore D3D11 renderer and does
-  not build its OpenGL or Vulkan renderer targets;
+  those operations. The current implementation exposes only the QtAVCore D3D11
+  renderer on Windows. The inserted checkpoint in `Next task` adds a Vulkan
+  renderer/output and D3D11VA-to-Vulkan interop without changing this completed
+  baseline until that work is implemented and validated;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
@@ -846,15 +853,19 @@ Android/OHOS render-result follow-up and Milestone 7 OHOS work are now active:
 
 ## Next task
 
-There are now two explicit work tracks. The immediate user-prioritized track is
-the final AD-010 Windows policy gate. The pre-cleanup NVIDIA/AMD four-cell
-`C:\\test\\legend.mkv` matrix is complete on the same `fa640e5` Release
-revision. The next step is item 8: remove the investigation-only probes, rebuild
-the final binaries, and repeat those four cells before closing AD-010. The Intel
-investigation and regression record below are complete and are not part of this
-remaining gate; no separate H.264/NV12 or Dolby Vision workload is required.
-After that gate, the active
-platform track returns to OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
+The AD-010 Windows policy track is complete. The pre-cleanup NVIDIA/AMD
+four-cell `C:\\test\\legend.mkv` matrix passed on the same `fa640e5` Release
+revision, and the subsequent investigation-only probe removal, documentation
+cleanup, and local final-binary validation are complete. On 2026-08-08 the user
+explicitly waived repeating the four hardware cells because the cleanup only
+deleted diagnostic measurements and text, without changing decode, copy,
+render, presentation, resource-lifetime, or shutdown behavior. AD-010 is
+closed. The active platform track remains OHOS strategically, but Huawei's
+written response now gates further item-10 production work. While that response
+is pending, the immediate implementation track is the inserted Windows
+D3D11VA-to-Vulkan checkpoint defined below. Its completion is required before
+resuming OHOS item 10. The completed OHOS work includes its Milestone 7
+target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
 lifecycle matrix, and raw-YCbCr `OH_NativeImage`/OpenGL ES/libplacebo
@@ -890,14 +901,17 @@ AD-010 Windows visible-copy checkpoint:
    decoder bind flags, aligned allocation cropping, and zero CPU mapping.
 5. [x] Pass full shared/static Release CTest, WinUI Release build,
    all-backends-disabled coverage, install consumers, `git diff --check`, and
-   the Qt dependency scan on the final revision.
+   the Qt dependency scan on the final revision. Record the durable default-
+   copy, completion/recycler lifetime, compatible frames-context, and paired
+   FFmpeg decoder-reuse contracts in AD-010, AD-011, FD-005, and the WinUI
+   architecture documentation.
 6. [x] On NVIDIA, run only `legend.mkv` with both switch states from the same
    final Release build: `directDecoderTextureSampling = false` (off, default
    GPU copy), then `directDecoderTextureSampling = true` (on, direct sampling).
 7. [x] On AMD, repeat the same two `legend.mkv` switch states from that exact
    revision and Release configuration. Do not substitute prior default-only,
    different-media, Intel, or different-revision evidence for either cell.
-8. [ ] After items 6 and 7 pass and their raw evidence is recorded, remove the
+8. [x] After items 6 and 7 pass and their raw evidence is recorded, remove the
    investigation-only fine-grained performance probes. Retain the stable
    `decoderSurfaceCopies`/`decoder-copies` contract counter and the low-cost
    cadence, retry, lifecycle, Present, gap, and coarse stage statistics. Remove
@@ -905,19 +919,50 @@ AD-010 Windows visible-copy checkpoint:
    maxima, asynchronous libplacebo pass/GPU/callback probes, corresponding
    WinUI Debug text, test assertions, and documentation. Because this cleanup
    changes the final binary and public Windows-backend statistics structs, update
-   `README.md` and `MIGRATION.md`, rebuild the shared/static Release suites and
-   WinUI example, then repeat the same four NVIDIA/AMD `legend.mkv` cells on the
-   cleaned artifact before closing AD-010. Do not remove the probes before the
-   pre-cleanup evidence is secured.
+   `README.md` and `MIGRATION.md`, then rebuild the shared/static Release suites
+   and WinUI example. The initially planned repetition of the four NVIDIA/AMD
+   `legend.mkv` cells was explicitly waived by the user because this cleanup
+   only deletes observability code and does not alter playback behavior. Do not
+   remove the probes before the pre-cleanup evidence is secured.
+9. [x] Follow up the cleanup with an explicit Windows diagnostics cost policy.
+   Add shared `Off`, `Counters`, and `Timing` modes; keep reusable D3D11
+   backends at the low-cost `Counters` default, run the WinUI player at `Off`
+   while its Debug window is closed, and enable `Timing` only while that window
+   is open. Make renderer retry reasons part of the render-result contract so
+   retry control never reads or depends on statistics, and remove the output's
+   per-frame renderer-statistics drain and aggregation. Preserve on-demand
+   decoder-copy, retry, lifecycle, Present, gap, and coarse-stage diagnostics
+   in the appropriate mode without changing decode, copy, presentation, or
+   resource-lifetime behavior.
 
-For each item 6/7 policy cell, record the exact adapter/PCI ID and driver,
+Cleanup status on 2026-08-08: the investigation-only detailed renderer timings
+and asynchronous libplacebo pass/GPU/callback probes are removed from the public
+renderer/output statistics, their implementations, the WinUI Debug text, and
+documentation. The retained diagnostics are now tiered: counters remain the
+reusable-backend default, timing samples are opt-in, and WinUI disables both
+statistics and cadence collection whenever its Debug window is closed. Retry
+classification uses the structured render-result reason independently of
+statistics, and the output no longer drains and re-aggregates renderer
+statistics on every frame. Stable decoder-copy, cadence, retry, lifecycle,
+Present, gap, color, interop, buffer, and draw diagnostics remain available on
+demand. The shared and static Windows Release trees each rebuilt and passed
+37/37 CTest; the WinUI Release player rebuilt with zero warnings and errors.
+Both trees installed successfully, and their external Windows consumers rebuilt
+against the refreshed packages. The removed-probe and Qt-dependency scans,
+UTF-8/LF checks, and `git diff --check` pass.
+The user explicitly waived the post-cleanup NVIDIA/AMD four-cell `legend.mkv`
+repetition because only investigation probes and their presentation were
+removed. The already completed pre-cleanup policy matrix remains the native
+acceptance evidence, and AD-010 is closed.
+
+The completed item 6/7 policy cells record the exact adapter/PCI ID and driver,
 Windows/build revision, display/HDR and power/thermal conditions. Confirm HEVC
 Main10/P010 D3D11VA, RGB10/PQ, zero decoded-source CPU map/transfer, positive
 `decoder-copies` tracking submitted frames in default mode, exactly zero in direct mode,
 settled source-rate cadence before the exact 22:48 seek, at least 90 seconds of
 post-seek playback, no persistent busy/terminal/gap regression, and clean close
-while playing. The historical results below remain useful context but do not
-satisfy this new same-revision two-policy acceptance matrix.
+while playing. The results below are the retained same-revision two-policy
+acceptance record.
 
 Current AD-010 Windows validation on 2026-08-06:
 
@@ -1040,7 +1085,8 @@ NVIDIA GeForce RTX 3050 final two-policy regression on 2026-08-07:
   `C:\\QtAVRegression\\fa640e5\\nvidia-default` and `nvidia-direct`, and the
   workspace player was rebuilt back to the default option. This completes
   AD-010 item 6; together with the Radeon result, the pre-cleanup four-cell
-  gate is complete and item 8 is now the next Windows step.
+  gate passed. Item 8 cleanup subsequently completed, its hardware repetition
+  was waived by the user, and AD-010 is closed.
 
 Intel UHD Graphics 770 follow-up on 2026-08-07, using the same revision:
 
@@ -1205,15 +1251,83 @@ Profile 8.4 pass through the raw OpenGL ES/libplacebo path. Its strict Vulkan
 half remains gated by the same missing explicit multi-plane device format as
 item 10.
 
-The immediate next local OHOS step is the item-10 confirmation gate, before
-further strict Vulkan or Dolby Vision implementation advances: obtain Huawei's
+The next OHOS step remains the item-10 confirmation gate: obtain Huawei's
 written position on the mapping, its supported device/system and buffer-
 configuration scope, the meaning of returned format features after a guessed
 conversion, and the P010 raw-plane/10-bit guarantee. Where access permits,
 cross-check the stated scope on additional relevant configurations. Record the
 evidence in a follow-up architecture decision, then either promote a narrowly
 supported mapping, retain it as an explicitly opted-in workaround, or reject
-it and use the opaque/fallback paths.
+it and use the opaque/fallback paths. Huawei's response is still pending.
+
+Inserted Windows Vulkan checkpoint (complete before further OHOS item-10
+development):
+
+1. [ ] Define the Windows responsibility split and public targets without
+   combining hardware decode, cross-API interop, rendering, or presentation.
+   Reuse `QtAV::HWD3D11VA`, `D3D11DeviceAccess`, the portable
+   `QtAV::RenderVulkan` engine, the shared FFmpeg/libplacebo bridge, detailed
+   render-result semantics, and the existing Windows output scheduling and
+   diagnostics policies. Add narrowly scoped Windows Vulkan surface/output and
+   D3D11VA-to-Vulkan interop targets and record their names and ownership in an
+   architecture decision before stabilizing public headers.
+2. [ ] Add the Windows Vulkan capability and adapter-identity gate. Match the
+   Vulkan physical device to the D3D11VA DXGI adapter by LUID, require the
+   necessary Win32 surface, external-memory, external-synchronization,
+   multi-plane format, swapchain, and color-space capabilities, and reject
+   cross-adapter or unproven handle combinations explicitly. Do not infer
+   native-device support from WARP or software Vulkan.
+3. [ ] Implement the strict D3D11VA-to-Vulkan zero-copy route. Export retained
+   NV12/P010 decoder resources through supported Win32 handles, import the exact
+   texture-array slice and visible crop into Vulkan, preserve native Y/UV plane
+   layout and bit depth, and keep the source alive through GPU completion.
+   Strict zero copy permits no `Map()`, CPU transfer, staging/upload,
+   `CopySubresourceRegion*`, Vulkan transfer copy, or RGBA representation-
+   normalization intermediate. Probe the actual D3D11/Vulkan external-image
+   contract rather than assuming decoder surfaces are shareable or importable.
+4. [ ] Establish explicit cross-API synchronization and bounded lifetime.
+   Select a capability-proven shared-fence/semaphore or keyed-mutex contract,
+   transfer ownership without polling frame pixels on the CPU, and release the
+   decoder slice/handle only after Vulkan/libplacebo completion. Cover seek,
+   flush, media replacement, device/surface recreation, stale generations,
+   stop, and close-while-playing without leaking handles or recycling an
+   in-flight decoder surface.
+5. [ ] Make libplacebo the Windows Vulkan image and color-pipeline authority.
+   Reuse the portable Vulkan/libplacebo path for native multi-plane sampling,
+   crop, rotation, scaling, chroma reconstruction, transfer/gamut conversion,
+   HDR tone mapping, output encoding, and FFmpeg-parsed Dolby Vision RPU
+   reshaping. Do not add a parallel handwritten Dolby Vision, YUV conversion,
+   tone-mapping, or output shader. Any unavoidable representation conversion
+   must be isolated, justified, counted, and treated as a non-strict fallback.
+6. [ ] Add Windows Vulkan presentation and Player integration, starting with a
+   native `HWND` surface and a Vulkan swapchain on the matched adapter. Reuse
+   the existing Vulkan SDR/HDR10/extended-linear selection where Windows WSI
+   supports it, submit HDR metadata when supported, and preserve the Windows
+   display/HDR-generation, render retry, resize, suspend/recreate, and
+   application-owned render-thread contracts. Wire an explicit backend choice
+   into the Windows player/example without replacing the completed D3D11 path.
+7. [ ] Define fallback truthfully. If direct decoder-resource import is not
+   supported, prefer an explicit one-way fallback to the existing D3D11 output
+   or software decode. A separately measured GPU-only copy into an exportable
+   texture may be offered as a compatibility path, but it must not be reported
+   as strict zero copy; no fallback may silently map or upload the retired
+   hardware frame.
+8. [ ] Add deterministic and native validation for H.264/NV12 and HEVC
+   Main10/P010, exact texture slice/crop, adapter matching, handle and
+   synchronization lifetime, bounded retained frames, retries, resize/surface
+   recreation, seek/flush/replacement/stop/shutdown, SDR and HDR10 output, and
+   fallback selection. Validate Dolby Vision Profile 5 and supported Profile
+   8.x metadata through libplacebo. The strict route must report zero CPU map,
+   transfer, staging, upload, D3D11 copy, Vulkan transfer copy, and
+   representation-normalization operations.
+9. [ ] Build and test Windows static/shared Release configurations, the WinUI
+   or dedicated Windows Vulkan example, install/export packages, and external
+   CMake consumers using the repository Windows FFmpeg/Vulkan/libplacebo
+   dependency prefix. Run native hardware playback on the available Windows
+   adapters and record adapter/driver/extension evidence; do not reuse D3D11
+   renderer results as Vulkan acceptance evidence. Update README, MIGRATION,
+   architecture decisions, testing instructions, and this PLAN when each
+   meaningful subtask completes.
 
 Active local OHOS execution order:
 
@@ -2583,11 +2697,12 @@ Following platform slice:
 1. [~] External Windows machine: complete the Intel administrator trace,
    evidence-backed correction, and same-commit matrix described in `Next task`;
    AMD repair and NVIDIA verification are complete.
-2. [~] This machine: the portable render-result contract, target/toolchain
-   gate, HAP/XComponent Vulkan and OpenGL ES adapters, shared-selector fallback,
-   OHAudio output, and OHCodec direct-surface lifecycle matrix are complete;
-   continue with OHOS `OH_NativeImage`/OpenGL ES native hardware-frame interop
-   without waiting for the external Intel trace.
+2. [~] This machine: the portable render-result contract and the completed OHOS
+   target/toolchain, HAP/XComponent, Vulkan/OpenGL ES, selector, OHAudio,
+   OHCodec lifecycle, raw OpenGL ES, and diagnostic Vulkan import work are
+   retained. Huawei's production-contract reply for OHOS item 10 remains
+   pending. Complete the inserted Windows D3D11VA-to-Vulkan checkpoint before
+   resuming further OHOS item-10 or strict Dolby Vision Vulkan development.
 
 Platform implementation order after the contracts are stable:
 
@@ -2595,6 +2710,10 @@ Platform implementation order after the contracts are stable:
 2. Android production path with connected-device validation.
 3. Android playback performance/regression work.
 4. OHOS production path with connected-device validation (active local slice).
+
+The inserted Windows Vulkan checkpoint is an explicit temporary return to the
+Windows reference path while the external OHOS item-10 contract is blocked. It
+does not reopen the completed AD-010 D3D11 policy matrix.
 
 ## Milestone 3 — Portable reference backends
 

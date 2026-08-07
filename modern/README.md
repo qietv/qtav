@@ -1202,7 +1202,10 @@ hot render path does not take the Player control mutex. The backend-level
 `RendererDeferred`, `RendererBusy`, `FrameDiscarded`, `SurfaceLost`, and
 `RendererError`, while retaining `NoFrame` and the reserved
 `PlayerStateBusy`. It also carries the frame sequence, presentation generation,
-optional retry delay, and diagnostic detail. Retain and retry the exact frame
+optional retry delay, structured `VideoRenderRetryReason`, and diagnostic
+detail. The retry reason distinguishes state, serialization, reservation-aware
+or unreserved device-context contention, and in-flight capacity without using
+optional statistics as a control channel. Retain and retry the exact frame
 only for `RendererDeferred` (after the backend raises `RedrawRequested`) or
 `RendererBusy` (after bounded timer backoff); terminal discarded/no-frame
 results wait for a newly published frame. Player rechecks the generation after
@@ -1608,21 +1611,29 @@ for a decode-side owner to yield. Only a failed handoff enters the one-frame
 retry mailbox and bounded 1/2/4/8/16 ms backoff. There is no busy spin and the
 WinUI thread does not wait for this exchange.
 
+`D3D11StatisticsMode` controls collection for both the low-level renderer and
+high-level output. `Off` removes continuous counter and clock work, `Counters`
+is the low-cost default, and `Timing` additionally enables per-frame cadence,
+Present, gap, and coarse color/interop/buffer/draw clocks. Runtime changes use
+`D3D11VideoOutput::setStatisticsMode()` or
+`D3D11VideoRenderer::setStatisticsMode()` and never change retry or lifetime
+behavior. The high-level output consumes the structured render retry reason and
+reads renderer statistics only when the application calls `takeStatistics()`;
+it no longer clears and re-aggregates renderer atomics after every frame.
+
 `takeStatistics()` returns and resets render requests/passes, presented frames,
 coalesced requests, busy presents, reason-level no-frame/Player/renderer-busy
 attempts, retry wakeups, superseded and terminal frames, renderer lock-stage
 contention, reservation-aware versus unreserved context ownership, handoff
 waits/timeouts, the retained decoder-surface-copy diagnostic counter, long
 gaps, render/present maxima, and the renderer's color, interop, buffer-update,
-and draw-stage maxima. Detailed D3D11 fields split completion-query retirement
-and acquisition, render-target clear, `pl_render_image()`, completion `End()`,
-and retained-resource insertion. They also expose libplacebo pass count and
-pass-graph changes plus asynchronous rolling GPU pass/frame samples and CPU
-callback boundaries. The GPU samples may describe an earlier completed pass,
-so they correlate CPU and GPU behavior over an interval rather than identifying
-the same maximum frame. `skippedRenders` is retained for compatibility and now
-mirrors `terminalRenderDrops`; a recovered retry is not a skipped frame. The
-copy counter remains zero under the current direct decoder-surface policy.
+and draw-stage maxima. Investigation-only completion-query, clear,
+`pl_render_image()`, retained-resource, and asynchronous libplacebo pass/GPU/
+callback probes are not part of the stable statistics surface.
+`skippedRenders` is retained for compatibility and now mirrors
+`terminalRenderDrops`; a recovered retry is not a skipped frame. The copy
+counter remains zero under explicit direct decoder-texture sampling and
+increments for the default visible-region GPU-copy policy.
 
 ### D3D11 renderer (advanced external-context path)
 
@@ -1687,11 +1698,13 @@ releases those retained references. `D3D11VideoOutput` performs this drain
 automatically before `ResizeBuffers()`.
 
 The renderer uses `tryContextGuard()` and a non-blocking render lock while
-issuing immediate-context calls. If either is busy, `render()` returns false
-without emitting a backend error. `Player::renderVideoDetailed()` reports this
-as `RendererBusy`, allowing a custom scheduler to retry it without confusing it
-with `NoFrame`; the compatibility `renderVideo()` still returns a negative
-value. Applications using that immediate context from another thread must
+issuing immediate-context calls. If either is busy, `renderDetailed()` returns
+timer backoff plus the exact `VideoRenderRetryReason` without emitting a backend
+error. `Player::renderVideoDetailed()` preserves that reason with
+`RendererBusy`, allowing a custom scheduler to retry it without consulting
+statistics or confusing it with `NoFrame`; the compatibility `render()` and
+`renderVideo()` wrappers retain their boolean/negative behavior. Applications
+using that immediate context from another thread must
 acquire `contextGuard()` (or provide equivalent external serialization):
 
 ```cpp

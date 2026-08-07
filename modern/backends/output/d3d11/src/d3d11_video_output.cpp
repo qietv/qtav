@@ -153,6 +153,9 @@ public:
         bool stopping = false;
         Player* player = nullptr;
         std::uint64_t generation = 0;
+        std::atomic<D3D11StatisticsMode> statisticsMode {
+            D3D11StatisticsMode::Counters
+        };
         std::atomic<std::uint64_t> renderRequests { 0 };
         std::atomic<std::uint64_t> coalescedRenderRequests { 0 };
         std::atomic<std::uint64_t> renderPasses { 0 };
@@ -176,35 +179,11 @@ public:
         std::atomic<std::uint64_t> contextHandoffWaits { 0 };
         std::atomic<std::uint64_t> contextHandoffTimeouts { 0 };
         std::atomic<std::uint64_t> rendererInFlightBusyRenderAttempts { 0 };
-        std::atomic<std::uint64_t> decoderSurfaceCopies { 0 };
         std::atomic<std::uint64_t> longRenderGaps { 0 };
         std::atomic<std::int64_t> previousRenderMicroseconds { 0 };
         std::atomic<std::int64_t> maximumRenderGapMicroseconds { 0 };
         std::atomic<std::int64_t> maximumRenderMicroseconds { 0 };
         std::atomic<std::int64_t> maximumPresentMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumColorSetupMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumInteropMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumBufferUpdateMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumDrawMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumRetireCompletedMicroseconds { 0 };
-        std::atomic<std::int64_t>
-            maximumCompletionQueryAcquireMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumClearMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumPlRenderImageMicroseconds { 0 };
-        std::atomic<std::int64_t>
-            maximumCompletionQueryEndMicroseconds { 0 };
-        std::atomic<std::int64_t>
-            maximumInFlightRetentionMicroseconds { 0 };
-        std::atomic<std::int64_t> maximumLibplaceboPassesPerRender { 0 };
-        std::atomic<std::uint64_t> libplaceboPassGraphChanges { 0 };
-        std::atomic<std::int64_t>
-            maximumLibplaceboGpuFrameMicroseconds { 0 };
-        std::atomic<std::int64_t>
-            maximumLibplaceboGpuPassMicroseconds { 0 };
-        std::atomic<std::int64_t>
-            maximumLibplaceboCallbackArrivalMicroseconds { 0 };
-        std::atomic<std::int64_t>
-            maximumLibplaceboPostCallbackMicroseconds { 0 };
     };
 
     ~Impl()
@@ -222,6 +201,47 @@ public:
     {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         framePresentedCallback_ = std::move(callback);
+    }
+
+    void setStatisticsMode(D3D11StatisticsMode mode) noexcept
+    {
+        std::shared_ptr<D3D11VideoRenderer> renderer;
+        std::shared_ptr<RenderState> state;
+        {
+            std::lock_guard<std::mutex> lock(graphicsMutex_);
+            options_.statisticsMode = mode;
+            renderer = renderer_;
+            state = renderState_;
+        }
+        if (state) {
+            const auto previousMode = state->statisticsMode.exchange(
+                mode,
+                std::memory_order_relaxed);
+            if (mode == D3D11StatisticsMode::Timing
+                && previousMode != D3D11StatisticsMode::Timing) {
+                state->previousRenderMicroseconds.store(
+                    0,
+                    std::memory_order_relaxed);
+            }
+        }
+        if (renderer) {
+            renderer->setStatisticsMode(mode);
+        }
+    }
+
+    D3D11StatisticsMode statisticsMode() const noexcept
+    {
+        std::shared_ptr<RenderState> state;
+        D3D11StatisticsMode mode = D3D11StatisticsMode::Counters;
+        {
+            std::lock_guard<std::mutex> lock(graphicsMutex_);
+            state = renderState_;
+            mode = options_.statisticsMode;
+        }
+        if (state) {
+            return state->statisticsMode.load(std::memory_order_relaxed);
+        }
+        return mode;
     }
 
     bool open(
@@ -339,6 +359,7 @@ public:
             options_.allowSoftwareMappingFallback);
         renderer_->setDirectDecoderTextureSamplingEnabled(
             options_.directDecoderTextureSampling);
+        renderer_->setStatisticsMode(options_.statisticsMode);
 
         VideoRenderConfig renderConfig;
         renderConfig.surfaceSize = surface_.size;
@@ -350,6 +371,9 @@ public:
         }
 
         renderState_ = std::make_shared<RenderState>();
+        renderState_->statisticsMode.store(
+            options_.statisticsMode,
+            std::memory_order_relaxed);
         open_.store(true, std::memory_order_release);
         renderThread_ = std::thread([this, state = renderState_] {
             runRenderThread(std::move(state));
@@ -623,10 +647,19 @@ public:
     D3D11VideoOutputStatistics takeStatistics() noexcept
     {
         D3D11VideoOutputStatistics result;
-        const auto state = renderState_;
+        std::shared_ptr<RenderState> state;
+        std::shared_ptr<D3D11VideoRenderer> renderer;
+        {
+            std::lock_guard<std::mutex> lock(graphicsMutex_);
+            state = renderState_;
+            renderer = renderer_;
+        }
         if (!state) {
             return result;
         }
+        const auto rendererStatistics = renderer
+            ? renderer->takeStatistics()
+            : D3D11VideoRendererStatistics {};
         result.renderRequests =
             state->renderRequests.exchange(0);
         result.coalescedRenderRequests =
@@ -663,7 +696,7 @@ public:
         result.rendererInFlightBusyRenderAttempts =
             state->rendererInFlightBusyRenderAttempts.exchange(0);
         result.decoderSurfaceCopies =
-            state->decoderSurfaceCopies.exchange(0);
+            rendererStatistics.decoderSurfaceCopies;
         result.longRenderGaps = state->longRenderGaps.exchange(0);
         result.maximumRenderGapMicroseconds =
             state->maximumRenderGapMicroseconds.exchange(0);
@@ -672,37 +705,13 @@ public:
         result.maximumPresentMicroseconds =
             state->maximumPresentMicroseconds.exchange(0);
         result.maximumColorSetupMicroseconds =
-            state->maximumColorSetupMicroseconds.exchange(0);
+            rendererStatistics.maximumColorSetupMicroseconds;
         result.maximumInteropMicroseconds =
-            state->maximumInteropMicroseconds.exchange(0);
+            rendererStatistics.maximumInteropMicroseconds;
         result.maximumBufferUpdateMicroseconds =
-            state->maximumBufferUpdateMicroseconds.exchange(0);
+            rendererStatistics.maximumBufferUpdateMicroseconds;
         result.maximumDrawMicroseconds =
-            state->maximumDrawMicroseconds.exchange(0);
-        result.maximumRetireCompletedMicroseconds =
-            state->maximumRetireCompletedMicroseconds.exchange(0);
-        result.maximumCompletionQueryAcquireMicroseconds =
-            state->maximumCompletionQueryAcquireMicroseconds.exchange(0);
-        result.maximumClearMicroseconds =
-            state->maximumClearMicroseconds.exchange(0);
-        result.maximumPlRenderImageMicroseconds =
-            state->maximumPlRenderImageMicroseconds.exchange(0);
-        result.maximumCompletionQueryEndMicroseconds =
-            state->maximumCompletionQueryEndMicroseconds.exchange(0);
-        result.maximumInFlightRetentionMicroseconds =
-            state->maximumInFlightRetentionMicroseconds.exchange(0);
-        result.maximumLibplaceboPassesPerRender =
-            state->maximumLibplaceboPassesPerRender.exchange(0);
-        result.libplaceboPassGraphChanges =
-            state->libplaceboPassGraphChanges.exchange(0);
-        result.maximumLibplaceboGpuFrameMicroseconds =
-            state->maximumLibplaceboGpuFrameMicroseconds.exchange(0);
-        result.maximumLibplaceboGpuPassMicroseconds =
-            state->maximumLibplaceboGpuPassMicroseconds.exchange(0);
-        result.maximumLibplaceboCallbackArrivalMicroseconds =
-            state->maximumLibplaceboCallbackArrivalMicroseconds.exchange(0);
-        result.maximumLibplaceboPostCallbackMicroseconds =
-            state->maximumLibplaceboPostCallbackMicroseconds.exchange(0);
+            rendererStatistics.maximumDrawMicroseconds;
         return result;
     }
 
@@ -713,13 +722,18 @@ private:
         if (!state) {
             return;
         }
-        state->renderRequests.fetch_add(1, std::memory_order_relaxed);
+        const bool collectCounters =
+            state->statisticsMode.load(std::memory_order_relaxed)
+            != D3D11StatisticsMode::Off;
+        if (collectCounters) {
+            state->renderRequests.fetch_add(1, std::memory_order_relaxed);
+        }
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             if (state->stopping || !state->player) {
                 return;
             }
-            if (state->requested) {
+            if (state->requested && collectCounters) {
                 state->coalescedRenderRequests.fetch_add(
                     1,
                     std::memory_order_relaxed);
@@ -917,15 +931,20 @@ private:
         std::optional<D3D11ContextReservation> contextReservation;
 
         const auto recordTerminalDrop = [&] {
-            state->terminalRenderDrops.fetch_add(
-                1,
-                std::memory_order_relaxed);
+            if (state->statisticsMode.load(std::memory_order_relaxed)
+                != D3D11StatisticsMode::Off) {
+                state->terminalRenderDrops.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
         };
         const auto finishPendingBusy = [&](bool superseded) {
             if (!pendingBusy.active) {
                 return;
             }
-            if (superseded) {
+            if (superseded
+                && state->statisticsMode.load(std::memory_order_relaxed)
+                    != D3D11StatisticsMode::Off) {
                 state->supersededRenderFrames.fetch_add(
                     1,
                     std::memory_order_relaxed);
@@ -992,7 +1011,13 @@ private:
                 player = state->player;
                 generation = state->generation;
             }
-            if (retryWakeup) {
+            const auto statisticsMode =
+                state->statisticsMode.load(std::memory_order_relaxed);
+            const bool collectCounters =
+                statisticsMode != D3D11StatisticsMode::Off;
+            const bool collectTiming =
+                statisticsMode == D3D11StatisticsMode::Timing;
+            if (retryWakeup && collectCounters) {
                 state->retryWakeups.fetch_add(
                     1,
                     std::memory_order_relaxed);
@@ -1012,9 +1037,11 @@ private:
                     frameLatencyWaitMilliseconds,
                     FALSE);
                 if (waitStatus == WAIT_TIMEOUT) {
-                    state->busyPresents.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
+                    if (collectCounters) {
+                        state->busyPresents.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
                     requestRender(state);
                     continue;
                 }
@@ -1026,11 +1053,14 @@ private:
                 }
                 waitForPresentationCapacity = false;
             }
-            state->renderPasses.fetch_add(
-                1,
-                std::memory_order_relaxed);
+            if (collectCounters) {
+                state->renderPasses.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
 
-            const auto renderStarted = steadyMicroseconds();
+            const auto renderStarted =
+                collectTiming ? steadyMicroseconds() : 0;
             VideoRenderResult renderResult;
             HRESULT presentStatus = S_OK;
             bool requiredHdrUnavailable = false;
@@ -1060,150 +1090,98 @@ private:
                 handoffGuard.emplace(
                     deviceAccess_->tryContextGuard());
                 if (!*handoffGuard) {
-                    state->contextHandoffWaits.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
+                    if (collectCounters) {
+                        state->contextHandoffWaits.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
                     handoffGuard.emplace(
                         deviceAccess_->tryContextGuardFor(
                             contextHandoffWait));
                     if (!*handoffGuard) {
-                        state->contextHandoffTimeouts.fetch_add(
-                            1,
-                            std::memory_order_relaxed);
+                        if (collectCounters) {
+                            state->contextHandoffTimeouts.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                        }
                     }
                 }
                 renderResult = player->renderVideoDetailed();
                 // The renderer has finished using the immediate context. Keep
-                // the reservation, when present, until the result is
-                // classified below, but do not hold the context itself across
-                // statistics collection or swap-chain presentation.
+                // the reservation, when present, until the structured retry
+                // reason is classified below, but do not hold the context
+                // itself across classification or swap-chain presentation.
                 handoffGuard.reset();
-                if (renderer_) {
-                    const auto rendererStatistics =
-                        renderer_->takeStatistics();
-                    rendererReportedRetryableBusy =
-                        rendererStatistics.stateBusyRenderAttempts > 0
-                        || rendererStatistics
-                               .serializationBusyRenderAttempts
-                            > 0
-                        || rendererStatistics
-                               .deviceContextBusyRenderAttempts
-                            > 0
-                        || rendererStatistics.inFlightBusyRenderAttempts > 0;
-                    rendererDeviceContextBusy = rendererStatistics
-                        .deviceContextBusyRenderAttempts > 0;
-                    state->decoderSurfaceCopies.fetch_add(
-                        rendererStatistics.decoderSurfaceCopies,
-                        std::memory_order_relaxed);
-                    state->rendererStateBusyRenderAttempts.fetch_add(
-                        rendererStatistics.stateBusyRenderAttempts,
-                        std::memory_order_relaxed);
-                    state->rendererSerializationBusyRenderAttempts.fetch_add(
-                        rendererStatistics.serializationBusyRenderAttempts,
-                        std::memory_order_relaxed);
-                    state->rendererDeviceContextBusyRenderAttempts.fetch_add(
-                        rendererStatistics.deviceContextBusyRenderAttempts,
-                        std::memory_order_relaxed);
-                    state->rendererReservationAwareContextBusyRenderAttempts
-                        .fetch_add(
-                            rendererStatistics
-                                .reservationAwareContextBusyRenderAttempts,
+                rendererReportedRetryableBusy =
+                    renderResult.retryReason
+                    != VideoRenderRetryReason::Unspecified;
+                rendererDeviceContextBusy =
+                    renderResult.retryReason
+                        == VideoRenderRetryReason::
+                            DeviceContextBusyReservationAware
+                    || renderResult.retryReason
+                        == VideoRenderRetryReason::
+                            DeviceContextBusyUnreserved;
+                if (collectCounters) {
+                    switch (renderResult.retryReason) {
+                    case VideoRenderRetryReason::StateBusy:
+                        state->rendererStateBusyRenderAttempts.fetch_add(
+                            1,
                             std::memory_order_relaxed);
-                    state->rendererUnreservedContextBusyRenderAttempts
-                        .fetch_add(
-                            rendererStatistics
-                                .unreservedContextBusyRenderAttempts,
+                        break;
+                    case VideoRenderRetryReason::SerializationBusy:
+                        state->rendererSerializationBusyRenderAttempts
+                            .fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case VideoRenderRetryReason::
+                            DeviceContextBusyReservationAware:
+                        state->rendererDeviceContextBusyRenderAttempts
+                            .fetch_add(1, std::memory_order_relaxed);
+                        state->rendererReservationAwareContextBusyRenderAttempts
+                            .fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case VideoRenderRetryReason::
+                            DeviceContextBusyUnreserved:
+                        state->rendererDeviceContextBusyRenderAttempts
+                            .fetch_add(1, std::memory_order_relaxed);
+                        state->rendererUnreservedContextBusyRenderAttempts
+                            .fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case VideoRenderRetryReason::InFlightCapacity:
+                        state->rendererInFlightBusyRenderAttempts.fetch_add(
+                            1,
                             std::memory_order_relaxed);
-                    state->rendererInFlightBusyRenderAttempts.fetch_add(
-                        rendererStatistics.inFlightBusyRenderAttempts,
-                        std::memory_order_relaxed);
-                    updateMaximum(
-                        state->maximumColorSetupMicroseconds,
-                        rendererStatistics
-                            .maximumColorSetupMicroseconds);
-                    updateMaximum(
-                        state->maximumInteropMicroseconds,
-                        rendererStatistics
-                            .maximumInteropMicroseconds);
-                    updateMaximum(
-                        state->maximumBufferUpdateMicroseconds,
-                        rendererStatistics
-                            .maximumBufferUpdateMicroseconds);
-                    updateMaximum(
-                        state->maximumDrawMicroseconds,
-                        rendererStatistics
-                            .maximumDrawMicroseconds);
-                    updateMaximum(
-                        state->maximumRetireCompletedMicroseconds,
-                        rendererStatistics
-                            .maximumRetireCompletedMicroseconds);
-                    updateMaximum(
-                        state->maximumCompletionQueryAcquireMicroseconds,
-                        rendererStatistics
-                            .maximumCompletionQueryAcquireMicroseconds);
-                    updateMaximum(
-                        state->maximumClearMicroseconds,
-                        rendererStatistics.maximumClearMicroseconds);
-                    updateMaximum(
-                        state->maximumPlRenderImageMicroseconds,
-                        rendererStatistics
-                            .maximumPlRenderImageMicroseconds);
-                    updateMaximum(
-                        state->maximumCompletionQueryEndMicroseconds,
-                        rendererStatistics
-                            .maximumCompletionQueryEndMicroseconds);
-                    updateMaximum(
-                        state->maximumInFlightRetentionMicroseconds,
-                        rendererStatistics
-                            .maximumInFlightRetentionMicroseconds);
-                    updateMaximum(
-                        state->maximumLibplaceboPassesPerRender,
-                        rendererStatistics
-                            .maximumLibplaceboPassesPerRender);
-                    state->libplaceboPassGraphChanges.fetch_add(
-                        rendererStatistics.libplaceboPassGraphChanges,
-                        std::memory_order_relaxed);
-                    updateMaximum(
-                        state->maximumLibplaceboGpuFrameMicroseconds,
-                        rendererStatistics
-                            .maximumLibplaceboGpuFrameMicroseconds);
-                    updateMaximum(
-                        state->maximumLibplaceboGpuPassMicroseconds,
-                        rendererStatistics
-                            .maximumLibplaceboGpuPassMicroseconds);
-                    updateMaximum(
-                        state->maximumLibplaceboCallbackArrivalMicroseconds,
-                        rendererStatistics
-                            .maximumLibplaceboCallbackArrivalMicroseconds);
-                    updateMaximum(
-                        state->maximumLibplaceboPostCallbackMicroseconds,
-                        rendererStatistics
-                            .maximumLibplaceboPostCallbackMicroseconds);
+                        break;
+                    case VideoRenderRetryReason::Unspecified:
+                        break;
+                    }
                 }
                 if (renderResult.status
                     != VideoRenderStatus::Rendered) {
-                    switch (renderResult.status) {
-                    case VideoRenderStatus::NoFrame:
-                        state->noFrameRenderAttempts.fetch_add(
-                            1,
-                            std::memory_order_relaxed);
-                        break;
-                    case VideoRenderStatus::PlayerStateBusy:
-                        state->playerBusyRenderAttempts.fetch_add(
-                            1,
-                            std::memory_order_relaxed);
-                        break;
-                    case VideoRenderStatus::RendererBusy:
-                        state->rendererBusyRenderAttempts.fetch_add(
-                            1,
-                            std::memory_order_relaxed);
-                        break;
-                    case VideoRenderStatus::RendererDeferred:
-                    case VideoRenderStatus::FrameDiscarded:
-                    case VideoRenderStatus::SurfaceLost:
-                    case VideoRenderStatus::RendererError:
-                    case VideoRenderStatus::Rendered:
-                        break;
+                    if (collectCounters) {
+                        switch (renderResult.status) {
+                        case VideoRenderStatus::NoFrame:
+                            state->noFrameRenderAttempts.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                            break;
+                        case VideoRenderStatus::PlayerStateBusy:
+                            state->playerBusyRenderAttempts.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                            break;
+                        case VideoRenderStatus::RendererBusy:
+                            state->rendererBusyRenderAttempts.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                            break;
+                        case VideoRenderStatus::RendererDeferred:
+                        case VideoRenderStatus::FrameDiscarded:
+                        case VideoRenderStatus::SurfaceLost:
+                        case VideoRenderStatus::RendererError:
+                        case VideoRenderStatus::Rendered:
+                            break;
+                        }
                     }
 
                     if (renderResult.status == VideoRenderStatus::NoFrame) {
@@ -1288,7 +1266,8 @@ private:
                     }
                 }
                 contextReservation.reset();
-                renderCompleted = steadyMicroseconds();
+                renderCompleted =
+                    collectTiming ? steadyMicroseconds() : 0;
                 if (options_.outputPreference
                         == D3D11OutputPreference::RequireHdr
                     && (!renderer_
@@ -1302,7 +1281,8 @@ private:
                 }
             }
 
-            const auto presentCompleted = steadyMicroseconds();
+            const auto presentCompleted =
+                collectTiming ? steadyMicroseconds() : 0;
             if (requiredHdrUnavailable) {
                 if (!hdrRequirementFailed_.exchange(
                         true,
@@ -1320,15 +1300,19 @@ private:
             if (presentStatus == DXGI_ERROR_WAS_STILL_DRAWING) {
                 waitForPresentationCapacity =
                     frameLatencyWaitableObject_ != nullptr;
-                state->busyPresents.fetch_add(
-                    1,
-                    std::memory_order_relaxed);
-                updateMaximum(
-                    state->maximumRenderMicroseconds,
-                    renderCompleted - renderStarted);
-                updateMaximum(
-                    state->maximumPresentMicroseconds,
-                    presentCompleted - renderCompleted);
+                if (collectCounters) {
+                    state->busyPresents.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                }
+                if (collectTiming) {
+                    updateMaximum(
+                        state->maximumRenderMicroseconds,
+                        renderCompleted - renderStarted);
+                    updateMaximum(
+                        state->maximumPresentMicroseconds,
+                        presentCompleted - renderCompleted);
+                }
                 requestRender(state);
                 continue;
             }
@@ -1344,30 +1328,34 @@ private:
             waitForPresentationCapacity =
                 frameLatencyWaitableObject_ != nullptr;
 
-            const auto previous =
-                state->previousRenderMicroseconds.exchange(
-                    presentCompleted,
-                    std::memory_order_relaxed);
-            if (previous > 0) {
-                const auto gap = presentCompleted - previous;
-                updateMaximum(
-                    state->maximumRenderGapMicroseconds,
-                    gap);
-                if (gap > 80'000) {
-                    state->longRenderGaps.fetch_add(
-                        1,
+            if (collectTiming) {
+                const auto previous =
+                    state->previousRenderMicroseconds.exchange(
+                        presentCompleted,
                         std::memory_order_relaxed);
+                if (previous > 0) {
+                    const auto gap = presentCompleted - previous;
+                    updateMaximum(
+                        state->maximumRenderGapMicroseconds,
+                        gap);
+                    if (gap > 80'000) {
+                        state->longRenderGaps.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
                 }
+                updateMaximum(
+                    state->maximumRenderMicroseconds,
+                    renderCompleted - renderStarted);
+                updateMaximum(
+                    state->maximumPresentMicroseconds,
+                    presentCompleted - renderCompleted);
             }
-            updateMaximum(
-                state->maximumRenderMicroseconds,
-                renderCompleted - renderStarted);
-            updateMaximum(
-                state->maximumPresentMicroseconds,
-                presentCompleted - renderCompleted);
-            state->presentedFrames.fetch_add(
-                1,
-                std::memory_order_relaxed);
+            if (collectCounters) {
+                state->presentedFrames.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
 
             FramePresentedCallback callback;
             {
@@ -1538,6 +1526,19 @@ D3D11VideoOutput::setFramePresentedCallback(
 {
     impl_->setFramePresentedCallback(std::move(callback));
     return *this;
+}
+
+D3D11VideoOutput& D3D11VideoOutput::setStatisticsMode(
+    D3D11StatisticsMode mode) noexcept
+{
+    impl_->setStatisticsMode(mode);
+    return *this;
+}
+
+D3D11StatisticsMode
+D3D11VideoOutput::statisticsMode() const noexcept
+{
+    return impl_->statisticsMode();
 }
 
 bool D3D11VideoOutput::open(

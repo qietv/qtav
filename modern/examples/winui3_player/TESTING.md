@@ -74,11 +74,9 @@ For regressions, repeat a representative scenario for at least several minutes
 and include multiple seeks. A short successful startup is not enough evidence
 for queue growth, cadence, or shutdown behavior.
 
-For the remaining AD-010 cross-vendor gate, use only `C:\\test\\legend.mkv`
-and the same final Release revision on NVIDIA and AMD. No H.264/NV12 control or
-Dolby Vision file is required for this gate. Record the exact adapter, PCI ID,
-driver, Windows/build configuration, display/HDR mode, power state, and thermal
-conditions, then run this four-cell matrix:
+The completed AD-010 cross-vendor gate used only `C:\\test\\legend.mkv` and
+the same Release revision on NVIDIA and AMD. The user waived repeating it after
+diagnostic-only cleanup. Its retained four-cell record is:
 
 | Adapter | Switch state | Mode | Expected path diagnostic |
 | --- | --- | --- | --- |
@@ -90,7 +88,7 @@ conditions, then run this four-cell matrix:
 The test variable is `directDecoderTextureSampling`; `decoder-copies` is only
 an auxiliary sanity check that the requested resource path was actually used.
 
-For every cell, confirm HEVC Main10/P010 D3D11VA, RGB10/PQ output, zero
+Every completed cell confirmed HEVC Main10/P010 D3D11VA, RGB10/PQ output, zero
 decoded-source CPU map/transfer, source-rate settled cadence before the seek,
 the exact 22:48 seek followed by at least 90 seconds of playback, and clean
 close while playing. Record scheduled/rendered cadence, coalescing, Present
@@ -101,8 +99,9 @@ stall is. Do not infer one vendor or policy result from another.
 
 ## Diagnosing cadence and stalls
 
-Capture at least two consecutive five-second cadence lines after startup has
-settled. Also record source frame rate, codec, resolution, audio format, output
+Open Debug, then capture at least two consecutive five-second cadence lines
+after startup has settled. Closing Debug disables cadence and D3D11 timing
+collection. Also record source frame rate, codec, resolution, audio format, output
 color mode, seek history, network/local source, CPU/GPU utilization, and audio
 endpoint changes.
 
@@ -129,12 +128,6 @@ Interpret the main fields together:
   mirrors `terminal`; transient busy attempts that later render do not count as
   skipped.
 - `max-stage-ms(color/interop/buffer/draw)` localizes a long render operation.
-- `max-render-detail-ms(retire/query/clear/pl-render/end/retain)` splits the
-  D3D11 draw path without adding a GPU wait. The libplacebo pass count/graph
-  change fields detect pipeline changes; its GPU values are asynchronous
-  rolling samples and may describe an earlier completed pass. The CPU
-  to-callback/after-callback split brackets libplacebo pass execution but does
-  not identify the individual D3D11 call inside that pass.
 - High `>80ms gaps(video/render)` with low CPU can indicate blocking I/O, clock
   starvation, driver waits, or a queue/lifetime bug rather than insufficient
   decode throughput.

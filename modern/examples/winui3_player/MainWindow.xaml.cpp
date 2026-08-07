@@ -195,6 +195,7 @@ struct UiBridge final : std::enable_shared_from_this<UiBridge> {
 };
 
 struct CallbackState final {
+    std::atomic<bool> cadenceEnabled { false };
     std::atomic<bool> firstVideoFrame { false };
     std::atomic<bool> firstAudioFrame { false };
     std::atomic<bool> firstPresentedFrame { false };
@@ -204,16 +205,21 @@ struct CallbackState final {
     std::atomic<std::int64_t> maximumVideoGapMicroseconds { 0 };
     std::atomic<std::uint64_t> longVideoGaps { 0 };
 
+    void resetCadence()
+    {
+        videoCallbacks.store(0, std::memory_order_relaxed);
+        audioCallbacks.store(0, std::memory_order_relaxed);
+        previousVideoMicroseconds.store(0, std::memory_order_relaxed);
+        maximumVideoGapMicroseconds.store(0, std::memory_order_relaxed);
+        longVideoGaps.store(0, std::memory_order_relaxed);
+    }
+
     void reset()
     {
         firstVideoFrame.store(false);
         firstAudioFrame.store(false);
         firstPresentedFrame.store(false);
-        videoCallbacks.store(0);
-        audioCallbacks.store(0);
-        previousVideoMicroseconds.store(0);
-        maximumVideoGapMicroseconds.store(0);
-        longVideoGaps.store(0);
+        resetCadence();
     }
 };
 
@@ -312,11 +318,18 @@ struct MainWindowPrivate final {
                 [bridge, callbackState](
                     const qtav::VideoFrame& frame,
                     int track) {
-                    recordCadence(
-                        callbackState->videoCallbacks,
-                        callbackState->previousVideoMicroseconds,
-                        callbackState->maximumVideoGapMicroseconds,
-                        callbackState->longVideoGaps);
+                    if (callbackState->cadenceEnabled.load(
+                            std::memory_order_relaxed)) {
+                        recordCadence(
+                            callbackState->videoCallbacks,
+                            callbackState->previousVideoMicroseconds,
+                            callbackState->maximumVideoGapMicroseconds,
+                            callbackState->longVideoGaps);
+                    }
+                    if (callbackState->firstVideoFrame.load(
+                            std::memory_order_relaxed)) {
+                        return;
+                    }
                     if (callbackState->firstVideoFrame.exchange(true)) {
                         return;
                     }
@@ -348,9 +361,16 @@ struct MainWindowPrivate final {
                 [bridge, callbackState](
                     const qtav::AudioFrame& frame,
                     int track) {
-                    callbackState->audioCallbacks.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
+                    if (callbackState->cadenceEnabled.load(
+                            std::memory_order_relaxed)) {
+                        callbackState->audioCallbacks.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
+                    if (callbackState->firstAudioFrame.load(
+                            std::memory_order_relaxed)) {
+                        return;
+                    }
                     if (callbackState->firstAudioFrame.exchange(true)) {
                         return;
                     }
@@ -808,6 +828,10 @@ struct MainWindowPrivate final {
 
     void ReportCadenceMetrics()
     {
+        if (!callbackState_->cadenceEnabled.load(
+                std::memory_order_relaxed)) {
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed =
             std::chrono::duration<double>(now - cadenceReportAt_).count();
@@ -878,30 +902,6 @@ struct MainWindowPrivate final {
             outputStatistics.maximumBufferUpdateMicroseconds;
         const auto maximumDraw =
             outputStatistics.maximumDrawMicroseconds;
-        const auto maximumRetire =
-            outputStatistics.maximumRetireCompletedMicroseconds;
-        const auto maximumQueryAcquire =
-            outputStatistics.maximumCompletionQueryAcquireMicroseconds;
-        const auto maximumClear =
-            outputStatistics.maximumClearMicroseconds;
-        const auto maximumPlRender =
-            outputStatistics.maximumPlRenderImageMicroseconds;
-        const auto maximumQueryEnd =
-            outputStatistics.maximumCompletionQueryEndMicroseconds;
-        const auto maximumRetention =
-            outputStatistics.maximumInFlightRetentionMicroseconds;
-        const auto maximumLibplaceboPasses =
-            outputStatistics.maximumLibplaceboPassesPerRender;
-        const auto libplaceboPassGraphChanges =
-            outputStatistics.libplaceboPassGraphChanges;
-        const auto maximumLibplaceboGpuFrame =
-            outputStatistics.maximumLibplaceboGpuFrameMicroseconds;
-        const auto maximumLibplaceboGpuPass =
-            outputStatistics.maximumLibplaceboGpuPassMicroseconds;
-        const auto maximumLibplaceboCallbackArrival =
-            outputStatistics.maximumLibplaceboCallbackArrivalMicroseconds;
-        const auto maximumLibplaceboPostCallback =
-            outputStatistics.maximumLibplaceboPostCallbackMicroseconds;
         if (video == 0 && audio == 0 && requests == 0
             && passes == 0 && rendered == 0) {
             return;
@@ -952,31 +952,7 @@ struct MainWindowPrivate final {
             << L'/'
             << static_cast<double>(maximumBufferUpdate) / 1'000.0
             << L'/'
-            << static_cast<double>(maximumDraw) / 1'000.0
-            << L", max-render-detail-ms(retire/query/clear/pl-render/end/retain)="
-            << static_cast<double>(maximumRetire) / 1'000.0
-            << L'/'
-            << static_cast<double>(maximumQueryAcquire) / 1'000.0
-            << L'/'
-            << static_cast<double>(maximumClear) / 1'000.0
-            << L'/'
-            << static_cast<double>(maximumPlRender) / 1'000.0
-            << L'/'
-            << static_cast<double>(maximumQueryEnd) / 1'000.0
-            << L'/'
-            << static_cast<double>(maximumRetention) / 1'000.0
-            << L", libplacebo-pass(max/graph-change)="
-            << maximumLibplaceboPasses
-            << L'/'
-            << libplaceboPassGraphChanges
-            << L", max-libplacebo-gpu-ms(frame/pass)="
-            << static_cast<double>(maximumLibplaceboGpuFrame) / 1'000.0
-            << L'/'
-            << static_cast<double>(maximumLibplaceboGpuPass) / 1'000.0
-            << L", max-libplacebo-cpu-ms(to-callback/after-callback)="
-            << static_cast<double>(maximumLibplaceboCallbackArrival) / 1'000.0
-            << L'/'
-            << static_cast<double>(maximumLibplaceboPostCallback) / 1'000.0;
+            << static_cast<double>(maximumDraw) / 1'000.0;
         AppendLog(message.str());
     }
 
@@ -987,6 +963,7 @@ struct MainWindowPrivate final {
 
     void ShowDebugWindow()
     {
+        SetDiagnosticsEnabled(true);
         if (debugWindow_) {
             debugWindow_.Activate();
             return;
@@ -1011,6 +988,7 @@ struct MainWindowPrivate final {
 
     void CloseDebugWindow()
     {
+        SetDiagnosticsEnabled(false);
         if (!debugWindow_) {
             return;
         }
@@ -1021,6 +999,7 @@ struct MainWindowPrivate final {
 
     void DebugWindowClosed()
     {
+        SetDiagnosticsEnabled(false);
         debugWindow_ = nullptr;
         owner_.DebugToggle().IsChecked(
             box_value(false).as<
@@ -1044,6 +1023,30 @@ struct MainWindowPrivate final {
                 debugWindow_.AppendLine(message);
             }
         }
+    }
+
+    void SetDiagnosticsEnabled(bool enabled)
+    {
+        if (!enabled) {
+            callbackState_->cadenceEnabled.store(
+                false,
+                std::memory_order_relaxed);
+        }
+        callbackState_->resetCadence();
+        if (enabled) {
+            callbackState_->cadenceEnabled.store(
+                true,
+                std::memory_order_relaxed);
+        }
+        cadenceReportAt_ = std::chrono::steady_clock::now();
+        if (!videoOutput_) {
+            return;
+        }
+        videoOutput_->setStatisticsMode(
+            enabled
+            ? qtav::D3D11StatisticsMode::Timing
+            : qtav::D3D11StatisticsMode::Off);
+        static_cast<void>(videoOutput_->takeStatistics());
     }
 
     hstring AllDebugText() const
@@ -1114,6 +1117,10 @@ struct MainWindowPrivate final {
                 })
             .setFramePresentedCallback(
                 [bridge, callbackState](double timestamp) {
+                    if (callbackState->firstPresentedFrame.load(
+                            std::memory_order_relaxed)) {
+                        return;
+                    }
                     if (callbackState->firstPresentedFrame.exchange(
                             true)) {
                         return;
@@ -1166,6 +1173,9 @@ struct MainWindowPrivate final {
         outputOptions.hdrPresentationMode =
             qtav::D3D11HdrPresentationMode::HDR10;
         outputOptions.alphaMode = DXGI_ALPHA_MODE_IGNORE;
+        outputOptions.statisticsMode = debugWindow_
+            ? qtav::D3D11StatisticsMode::Timing
+            : qtav::D3D11StatisticsMode::Off;
         if (!output->open(std::move(surface), outputOptions)
             || !output->attach(*player_)) {
             SetStatus(L"D3D11 输出初始化失败；请查看 Debug 窗口");
