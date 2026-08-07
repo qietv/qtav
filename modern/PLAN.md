@@ -893,7 +893,7 @@ AD-010 Windows visible-copy checkpoint:
 6. [ ] On NVIDIA, run only `legend.mkv` with both switch states from the same
    final Release build: `directDecoderTextureSampling = false` (off, default
    GPU copy), then `directDecoderTextureSampling = true` (on, direct sampling).
-7. [ ] On AMD, repeat the same two `legend.mkv` switch states from that exact
+7. [x] On AMD, repeat the same two `legend.mkv` switch states from that exact
    revision and Release configuration. Do not substitute prior default-only,
    different-media, Intel, or different-revision evidence for either cell.
 8. [ ] After items 6 and 7 pass and their raw evidence is recorded, remove the
@@ -955,6 +955,46 @@ Current AD-010 Windows validation on 2026-08-06:
   210 ms. A separate 1920x1080 H.264/NV12 control sustained about 29.8-30.1 fps
   with positive copy counts and closed while playing in 173 ms. No run reported
   software decode or a decoded-source mapping fallback.
+
+AMD Radeon 880M final two-policy regression on 2026-08-07:
+
+- commit `fa640e5ffbe02054621caa01f31bebee9e10cf87` ran on the
+  display-driving Radeon 880M
+  (`PCI\\VEN_1002&DEV_150E&SUBSYS_380217AA&REV_C4`, driver
+  `32.0.22029.9039`) in a Lenovo 83LR with Ryzen AI 9 H 365, 31.3 GiB RAM,
+  Windows 11 Home build 26200, the balanced power plan, and a
+  2880x1800/120 Hz internal display. The user reported an unloaded,
+  well-cooled machine and explicitly waived CPU/GPU utilization and
+  temperature-counter collection. Playback reported active RGB10/PQ output,
+  240-nit SDR white, and a 400-nit display peak;
+- the repository Windows FFmpeg package was rebuilt as 8.1.2 port revision 7
+  with the compatible D3D11VA decoder-reuse overlay and passed
+  `cmake/verify-install.cmake`. Freshly reconfigured Visual Studio 2026
+  ClangCL/lld shared and static Release trees each built all targets and passed
+  37/37 CTest. The WinUI 3 Release player rebuilt against the shared tree with
+  zero warnings and errors before the default run, for the explicit-direct
+  run, and again after restoring its default option;
+- default GPU-copy mode retained 3840x2160 HEVC Main10/P010 D3D11VA and active
+  RGB10/PQ. Before the seek, settled windows scheduled/rendered 24.8-25.1 fps
+  and copied 128-129 decoder frames per 5.1-5.2 seconds. The exact 22:48 seek
+  had the expected one-window generation transition, then more than 115
+  seconds of settled playback held 24.8-25.2 fps with 128-130 copies per
+  window. Stable windows had zero coalescing, `Present()` busy, render skips,
+  retry/superseded/terminal results, or greater-than-80-ms gaps; warm draw
+  maxima were about 19.2-25.0 ms. Close while playing exited in 255 ms;
+- the explicit direct-sampling build used the same library revision and
+  Release configuration. It retained the same D3D11VA Main10/P010 and
+  RGB10/PQ paths while `decoder-copies` remained exactly zero. Pre-seek
+  cadence held 24.9-25.1 fps; after the exact 22:48 seek and its expected
+  transition window, more than 102 seconds held 24.9-25.2 fps. Stable windows
+  again had zero coalescing, `Present()` busy, render skips,
+  retry/superseded/terminal results, or greater-than-80-ms gaps; warm draw
+  maxima were about 19.5-30.7 ms. Close while playing exited in 235 ms;
+- neither policy emitted software-decode or decoded-source mapping-fallback
+  diagnostics, and the Application log contained no `QtAVWinUI3.exe`
+  Application Error or Windows Error Reporting event. This completes AD-010
+  item 7. Item 6 remains required on NVIDIA before the probe cleanup and
+  cleaned-binary four-cell rerun in item 8 can begin.
 
 Intel UHD Graphics 770 follow-up on 2026-08-07, using the same revision:
 
