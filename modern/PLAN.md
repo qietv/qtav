@@ -847,12 +847,13 @@ Android/OHOS render-result follow-up and Milestone 7 OHOS work are now active:
 ## Next task
 
 There are now two explicit work tracks. The immediate user-prioritized track is
-the final AD-010 Windows policy gate. On the same final Release revision, use
-only `C:\\test\\legend.mkv` for the NVIDIA and AMD four-cell matrix: each
-adapter with `directDecoderTextureSampling` off (`false`, default GPU copy) and
-on (`true`, direct sampling). The Intel investigation and regression
-record below are complete and are not part of this remaining gate; no separate
-H.264/NV12 or Dolby Vision workload is required. After that gate, the active
+the final AD-010 Windows policy gate. The pre-cleanup NVIDIA/AMD four-cell
+`C:\\test\\legend.mkv` matrix is complete on the same `fa640e5` Release
+revision. The next step is item 8: remove the investigation-only probes, rebuild
+the final binaries, and repeat those four cells before closing AD-010. The Intel
+investigation and regression record below are complete and are not part of this
+remaining gate; no separate H.264/NV12 or Dolby Vision workload is required.
+After that gate, the active
 platform track returns to OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
@@ -890,7 +891,7 @@ AD-010 Windows visible-copy checkpoint:
 5. [x] Pass full shared/static Release CTest, WinUI Release build,
    all-backends-disabled coverage, install consumers, `git diff --check`, and
    the Qt dependency scan on the final revision.
-6. [ ] On NVIDIA, run only `legend.mkv` with both switch states from the same
+6. [x] On NVIDIA, run only `legend.mkv` with both switch states from the same
    final Release build: `directDecoderTextureSampling = false` (off, default
    GPU copy), then `directDecoderTextureSampling = true` (on, direct sampling).
 7. [x] On AMD, repeat the same two `legend.mkv` switch states from that exact
@@ -993,8 +994,53 @@ AMD Radeon 880M final two-policy regression on 2026-08-07:
 - neither policy emitted software-decode or decoded-source mapping-fallback
   diagnostics, and the Application log contained no `QtAVWinUI3.exe`
   Application Error or Windows Error Reporting event. This completes AD-010
-  item 7. Item 6 remains required on NVIDIA before the probe cleanup and
-  cleaned-binary four-cell rerun in item 8 can begin.
+  item 7.
+
+NVIDIA GeForce RTX 3050 final two-policy regression on 2026-08-07:
+
+- commit `fa640e5ffbe02054621caa01f31bebee9e10cf87` ran on the
+  display-driving GeForce RTX 3050
+  (`PCI\\VEN_10DE&DEV_2584&SUBSYS_184610DE&REV_A1`, driver
+  `32.0.15.9186`) with Windows 11 Enterprise build 26200, the balanced power
+  plan, and a 3840x2160/59 Hz display. The user reported stable power,
+  temperature, and CPU/GPU load and explicitly waived their sampling.
+  Playback reported active RGB10/PQ output, 240-nit SDR white, and a 1405-nit
+  display peak. The only playback media was `C:\\test\\legend.mkv`, SHA-256
+  `7AA3229DF0F6E0609DB7A89F3719B9E3E3457A659AC285196B968B8A538431BD`;
+- the repository Windows FFmpeg 8.1.2 port revision 7 was rebuilt locally with
+  the compatible D3D11VA decoder-reuse overlay and passed
+  `cmake/verify-install.cmake`. A freshly reconfigured shared ClangCL/lld
+  Release tree passed 37/37 CTest. The static tree first reported 36/37 when
+  `qtav_interop_d3d11_direct_decoder_sampling` exited once with `0xc0000409`;
+  five isolated repeats passed, then the next complete static run passed
+  37/37. This transient native-test signal is retained rather than hidden.
+  The WinUI 3 Release player rebuilt with zero warnings and errors for default
+  mode, explicit direct mode, and again after restoring its default option;
+- default GPU-copy mode retained 3840x2160 HEVC Main10/P010 D3D11VA and active
+  RGB10/PQ. Before the seek, settled windows rendered 24.9-25.2 fps and copied
+  127-129 decoder frames per roughly 5.1 seconds. The exact 22:48 seek produced
+  one expected transition window, then the remainder of a 100.2-second
+  post-seek observation held 24.9-25.1 fps. Stable windows had zero
+  coalescing, `Present()` busy, render skips, retry/superseded/terminal results,
+  handoff timeouts, or greater-than-80-ms gaps; warm draw maxima were about
+  13.4-21.4 ms. Close while playing exited in 146 ms;
+- the explicit direct-sampling build used the same libraries and Release
+  configuration. It retained the same D3D11VA Main10/P010 and RGB10/PQ paths
+  while `decoder-copies` remained exactly zero. Pre-seek cadence held
+  24.9-25.1 fps; after the exact 22:48 seek and its expected transition window,
+  the remainder of a 100.2-second observation held 24.8-25.2 fps. Stable
+  windows again had zero coalescing, `Present()` busy, render skips,
+  retry/superseded/terminal results, handoff timeouts, or greater-than-80-ms
+  gaps; warm draw maxima were about 13.1-17.5 ms. Close while playing exited
+  in 143 ms;
+- neither policy emitted software-decode or decoded-source mapping/transfer
+  fallback diagnostics, no `QtAVWinUI3` process remained after close, and the
+  Application log contained no matching Application Error or Windows Error
+  Reporting event. The default and direct test bundles were retained under
+  `C:\\QtAVRegression\\fa640e5\\nvidia-default` and `nvidia-direct`, and the
+  workspace player was rebuilt back to the default option. This completes
+  AD-010 item 6; together with the Radeon result, the pre-cleanup four-cell
+  gate is complete and item 8 is now the next Windows step.
 
 Intel UHD Graphics 770 follow-up on 2026-08-07, using the same revision:
 
