@@ -1758,9 +1758,11 @@ paths explicitly drain both. By default every imported D3D11VA frame is copied
 with its even-aligned visible source box into a same-format, single-slice
 shader-readable texture. D3D11.1 uses `CopySubresourceRegion1()` with
 `D3D11_COPY_DISCARD`; older contexts use the same visible box with
-`CopySubresourceRegion()`. The decoder slice can be released once the ordered
-copy and draw are submitted, while the copied texture remains retained until
-completion.
+`CopySubresourceRegion()`. The decoder slice and copied texture remain retained
+until completion. Renderer-owned wrappers are destroyed on the render thread,
+then the source frame and interop wrapper move to a fixed-capacity recycler for
+final FFmpeg/D3D11VA release. This keeps vendor allocation teardown off the
+latency-sensitive output/render thread without adding a per-frame GPU wait.
 
 Every successfully imported D3D11VA frame uses libplacebo's fast sampling
 policy without the optional GPU histogram peak-detection pass. Successful
@@ -1815,6 +1817,16 @@ device initialization, codec capability, pixel-format negotiation, or decoder
 open fails, the default policy reports `decoder.hardware.fallback` and
 continues in software; disabling fallback makes the failure terminal.
 
+The helper also enables the compatible decoder cache supplied by this
+repository's Windows FFmpeg package. Player retains an initialized D3D11
+hardware-frames context across repeated format selection when its device,
+formats, dimensions, and pool capacity still match. FFmpeg then reuses the
+matching `ID3D11VideoDecoder` and output views only after checking the texture,
+array size, decoder descriptor, and configuration. This keeps repeated HEVC
+SPS format callbacks from tearing down an unchanged decoder through the shared
+Intel D3D11 device. A Windows QtAVCore build must therefore use the paired
+repository FFmpeg package rather than a stock binary.
+
 Decoded D3D11 frames expose NV12 or P010 `ID3D11Texture2D` array slices through
 `D3D11VAFrame`. A copied view retains the underlying FFmpeg frame, pool,
 hardware device, COM resources, and lock state. `HardwareFrame::map()` remains
@@ -1854,6 +1866,37 @@ configures both for the high-level output. Direct mode requires
 `decoderSurfaceCopies`, and retains the decoder frame and transient plane
 wrappers through completion. The default reports one decoder-surface copy for
 each successfully submitted raw D3D11VA frame.
+
+The WinUI Debug field `decoder-copies` displays
+`D3D11VideoOutputStatistics::decoderSurfaceCopies`; it is a reset-on-read
+same-GPU copy counter, not a CPU-copy counter or an independent switch. The
+actual high-level mode switch is
+`D3D11VideoOutputOptions::directDecoderTextureSampling`. Set it to `false` for
+the off/default visible-region GPU-copy policy:
+
+```cpp
+qtav::D3D11VideoOutputOptions options;
+options.directDecoderTextureSampling = false; // default GPU-copy mode
+output.open(std::move(surface), options);
+output.attach(player);
+```
+
+Set the same switch to `true` to turn on explicit direct decoder-texture
+sampling:
+
+```cpp
+qtav::D3D11VideoOutputOptions options;
+options.directDecoderTextureSampling = true; // direct-sampling mode
+output.open(std::move(surface), options);
+output.attach(player);
+```
+
+Use the default for normal cross-vendor playback. Treat direct mode as an
+application opt-in after adapter/driver qualification, or as an A/B diagnostic
+when isolating copy cost from decoder-surface lifetime behavior. A zero count is
+valid evidence only while D3D11VA input and rendered-frame progress are also
+confirmed. See [D3D11VA](D3D11VA.md#directdecodertexturesampling-modes-and-copy-diagnostics) for
+the low-level two-ended configuration and validation caveats.
 
 `VideoFrame::colorSpaceInfo()` returns structured range, primaries, transfer,
 matrix, and chroma location. `masteringDisplayMetadata()` and

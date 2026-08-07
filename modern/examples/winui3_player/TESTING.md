@@ -74,18 +74,30 @@ For regressions, repeat a representative scenario for at least several minutes
 and include multiple seeks. A short successful startup is not enough evidence
 for queue growth, cadence, or shutdown behavior.
 
-For cross-vendor D3D11 handoff, record the adapter PCI vendor and driver
-version. Every vendor enables native immediate-context multithread protection,
-uses fast parameters for imported D3D11VA frames, and leaves successful per-
-frame submission asynchronous. Exercise ordinary H.264/NV12, HDR10/P010, and
-Dolby Vision when supported, including cold starts, a sustained run, repeated
-seeks, and close while playing. In the default policy, `decoder-copies` must
-increase with successfully rendered hardware frames while CPU map/transfer
-counters remain zero. Also run the explicit direct decoder-texture policy as an
-A/B check: it must keep `decoder-copies` at zero and request shader-readable
-decoder resources. Record cadence and render-stage maxima for both policies;
-do not infer one vendor's performance from another. Software frames and the
-explicit software-mapping fallback retain their default render parameters.
+For the remaining AD-010 cross-vendor gate, use only `C:\\test\\legend.mkv`
+and the same final Release revision on NVIDIA and AMD. No H.264/NV12 control or
+Dolby Vision file is required for this gate. Record the exact adapter, PCI ID,
+driver, Windows/build configuration, display/HDR mode, power state, and thermal
+conditions, then run this four-cell matrix:
+
+| Adapter | Switch state | Mode | Expected path diagnostic |
+| --- | --- | --- | --- |
+| NVIDIA | `directDecoderTextureSampling = false` (off) | Default GPU copy | `decoder-copies` is positive and tracks submitted D3D11VA frames. |
+| NVIDIA | `directDecoderTextureSampling = true` (on) | Direct sampling | `decoder-copies` is exactly zero. |
+| AMD | `directDecoderTextureSampling = false` (off) | Default GPU copy | `decoder-copies` is positive and tracks submitted D3D11VA frames. |
+| AMD | `directDecoderTextureSampling = true` (on) | Direct sampling | `decoder-copies` is exactly zero. |
+
+The test variable is `directDecoderTextureSampling`; `decoder-copies` is only
+an auxiliary sanity check that the requested resource path was actually used.
+
+For every cell, confirm HEVC Main10/P010 D3D11VA, RGB10/PQ output, zero
+decoded-source CPU map/transfer, source-rate settled cadence before the seek,
+the exact 22:48 seek followed by at least 90 seconds of playback, and clean
+close while playing. Record scheduled/rendered cadence, coalescing, Present
+busy, terminal drops, render gaps, and stage maxima. The expected discontinuity
+at seek is not a failure, but persistent post-seek cadence loss, repeated busy
+or terminal results, a software fallback, the wrong copy count, or a shutdown
+stall is. Do not infer one vendor or policy result from another.
 
 ## Diagnosing cadence and stalls
 

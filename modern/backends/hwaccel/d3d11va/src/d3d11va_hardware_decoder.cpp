@@ -95,6 +95,12 @@ HardwareDecodeDevice createDecodeDevice(
     native->lock = &lockD3D11Device;
     native->unlock = &unlockD3D11Device;
     native->lock_ctx = lifetime;
+    // QtAVCore keeps compatible initialized frames contexts across FFmpeg
+    // format reselection. Ask the repository FFmpeg overlay to retain the
+    // matching video decoder/output views as well; otherwise Intel's driver
+    // can serialize the shared device while each redundant decoder is torn
+    // down from the last frame that references it.
+    native->reuse_decoder = 1;
     if (directDecoderTextureSampling) {
         // FFmpeg combines this device-wide flag with D3D11_BIND_DECODER when
         // it creates each codec frames context. The default copy path does

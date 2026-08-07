@@ -36,6 +36,7 @@ extern "C" {
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -281,6 +282,151 @@ private:
     std::shared_ptr<qtav::D3D11TextureFrame> imported_;
     bool importSucceeds_ = true;
     int importCalls_ = 0;
+};
+
+struct ReleaseProbe {
+    void released() noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        releaseThread = std::this_thread::get_id();
+        complete = true;
+    }
+
+    bool completedOffThread(std::thread::id caller) const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return complete && releaseThread != caller;
+    }
+
+    mutable std::mutex mutex;
+    std::thread::id releaseThread;
+    bool complete = false;
+};
+
+class ProbedHardwareFrameData final : public qtav::HardwareFrameData {
+public:
+    explicit ProbedHardwareFrameData(std::shared_ptr<ReleaseProbe> probe)
+        : probe_(std::move(probe))
+    {
+    }
+
+    ~ProbedHardwareFrameData() override
+    {
+        probe_->released();
+    }
+
+    qtav::HardwareDeviceType deviceType() const noexcept override
+    {
+        return qtav::HardwareDeviceType::D3D11;
+    }
+    int width() const noexcept override { return 8; }
+    int height() const noexcept override { return 8; }
+    qtav::PixelFormat softwareFormat() const noexcept override
+    {
+        return qtav::PixelFormat::NV12;
+    }
+    qtav::NativeHandle nativeHandle(
+        qtav::HardwareHandleType type) const noexcept override
+    {
+        return { type, 0, 0 };
+    }
+    bool isMappable(qtav::HardwareMapMode) const noexcept override
+    {
+        return false;
+    }
+    std::shared_ptr<qtav::HardwareFrameMapping> map(
+        qtav::HardwareMapMode) const override
+    {
+        return {};
+    }
+
+private:
+    std::shared_ptr<ReleaseProbe> probe_;
+};
+
+class ProbedNv12TextureFrame final : public qtav::D3D11TextureFrame {
+public:
+    ProbedNv12TextureFrame(
+        ComPtr<ID3D11Texture2D> texture,
+        std::shared_ptr<ReleaseProbe> probe)
+        : texture_(std::move(texture))
+        , probe_(std::move(probe))
+    {
+    }
+
+    ~ProbedNv12TextureFrame() override
+    {
+        probe_->released();
+    }
+
+    int width() const noexcept override { return 8; }
+    int height() const noexcept override { return 8; }
+    qtav::PixelFormat format() const noexcept override
+    {
+        return qtav::PixelFormat::NV12;
+    }
+    ID3D11Texture2D* texture() const noexcept override
+    {
+        return texture_.Get();
+    }
+    ID3D11ShaderResourceView*
+    shaderResourceView() const noexcept override
+    {
+        return nullptr;
+    }
+
+private:
+    ComPtr<ID3D11Texture2D> texture_;
+    std::shared_ptr<ReleaseProbe> probe_;
+};
+
+class ProbedHardwareFrameInterop final
+    : public qtav::D3D11HardwareFrameInterop {
+public:
+    ProbedHardwareFrameInterop(
+        std::shared_ptr<qtav::D3D11DeviceAccess> deviceAccess,
+        ComPtr<ID3D11Texture2D> texture,
+        std::shared_ptr<ReleaseProbe> probe)
+        : deviceAccess_(std::move(deviceAccess))
+        , texture_(std::move(texture))
+        , probe_(std::move(probe))
+    {
+    }
+
+    std::shared_ptr<qtav::D3D11DeviceAccess>
+    deviceAccess() const noexcept override
+    {
+        return deviceAccess_;
+    }
+
+    qtav::HardwareInteropCapabilities capabilities() const override
+    {
+        return {
+            { qtav::HardwareDeviceType::D3D11 },
+            qtav::HardwareDeviceType::D3D11,
+            true,
+            false,
+        };
+    }
+
+    bool supports(
+        const qtav::HardwareFrame& frame) const noexcept override
+    {
+        return frame.deviceType() == qtav::HardwareDeviceType::D3D11;
+    }
+
+    std::shared_ptr<qtav::D3D11TextureFrame> importFrame(
+        const qtav::HardwareFrame& frame) override
+    {
+        return supports(frame)
+            ? std::make_shared<ProbedNv12TextureFrame>(texture_, probe_)
+            : std::shared_ptr<qtav::D3D11TextureFrame> {};
+    }
+
+private:
+    std::shared_ptr<qtav::D3D11DeviceAccess> deviceAccess_;
+    ComPtr<ID3D11Texture2D> texture_;
+    std::shared_ptr<ReleaseProbe> probe_;
 };
 
 DeviceResources makeDevice()
@@ -771,6 +917,60 @@ void testHdrPresentation(
     renderer->close();
 }
 
+void testHardwareFrameReleaseWorker(
+    const DeviceResources& d3d,
+    const std::shared_ptr<qtav::D3D11DeviceAccess>& deviceAccess)
+{
+    D3D11_TEXTURE2D_DESC sourceDescription {};
+    sourceDescription.Width = 8;
+    sourceDescription.Height = 8;
+    sourceDescription.MipLevels = 1;
+    sourceDescription.ArraySize = 1;
+    sourceDescription.Format = DXGI_FORMAT_NV12;
+    sourceDescription.SampleDesc.Count = 1;
+    sourceDescription.Usage = D3D11_USAGE_DEFAULT;
+
+    ComPtr<ID3D11Texture2D> sourceTexture;
+    assert(SUCCEEDED(d3d.device->CreateTexture2D(
+        &sourceDescription,
+        nullptr,
+        &sourceTexture)));
+
+    Target target = makeTarget(d3d.device.Get(), 8, 8);
+    auto renderer = std::make_shared<qtav::D3D11VideoRenderer>(
+        deviceAccess,
+        [&] {
+            return qtav::D3D11RenderTarget { target.view.Get() };
+        });
+    const auto importedProbe = std::make_shared<ReleaseProbe>();
+    const auto sourceProbe = std::make_shared<ReleaseProbe>();
+    renderer->setHardwareFrameInterop(
+        std::make_shared<ProbedHardwareFrameInterop>(
+            deviceAccess,
+            sourceTexture,
+            importedProbe));
+
+    qtav::VideoRenderConfig config;
+    config.surfaceSize = { 8, 8 };
+    config.aspectRatio = qtav::VideoAspectRatioMode::Stretch;
+    assert(renderer->open(config));
+
+    const std::thread::id renderThread = std::this_thread::get_id();
+    {
+        const qtav::VideoFrame video =
+            qtav::detail::FrameFactory::hardware(qtav::HardwareFrame(
+                std::make_shared<ProbedHardwareFrameData>(sourceProbe)));
+        assert(renderer->render(video));
+    }
+    assert(!importedProbe->completedOffThread(renderThread));
+    assert(!sourceProbe->completedOffThread(renderThread));
+
+    renderer->flush();
+    assert(importedProbe->completedOffThread(renderThread));
+    assert(sourceProbe->completedOffThread(renderThread));
+    renderer->close();
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -807,6 +1007,7 @@ int main(int argc, char** argv)
         borrowedContext);
     assert(deviceAccess);
     testHdrPresentation(d3d, deviceAccess);
+    testHardwareFrameReleaseWorker(d3d, deviceAccess);
 
     Target importedTarget = makeTarget(d3d.device.Get(), 8, 8);
     std::vector<Pixel> importedPixels(64);

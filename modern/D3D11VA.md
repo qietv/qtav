@@ -15,8 +15,10 @@ contracts shared by `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`,
   OpenGL renderer targets are not built on Windows.
 - Core public headers expose neither Windows SDK nor FFmpeg types.
 - A copied frame retains its FFmpeg frame, decoder array slice, frames context,
-  hardware device, COM resources, and synchronization lifetime until the
-  renderer has submitted its same-device copy or direct draw.
+  hardware device, COM resources, and synchronization lifetime through GPU
+  completion of the same-device copy or direct draw. Final source-frame and
+  interop-wrapper release runs on a dedicated bounded recycler, never on the
+  latency-sensitive output/render thread.
 - The default path performs one GPU-local, same-format copy of the even-aligned
   visible NV12/P010 rectangle into a bounded shader-readable texture ring. It
   performs no decoded-source CPU map, transfer, staging copy, upload, RGB
@@ -73,6 +75,9 @@ The repository FFmpeg package supplies libplacebo 7.351.0 with
 `PL_HAVE_D3D11=1`, built-in Dolby Vision mapping, glslang, and the complete
 static SPIRV-Cross closure. QtAVCore consumes that package with clang-cl/lld-link
 on Windows; a system or independently downloaded FFmpeg is not a fallback.
+The same Windows package exposes the repository's opt-in compatible D3D11VA
+decoder cache. QtAVCore depends on that package ABI and enables it when it
+creates the hardware device; see [FFmpeg decision FD-005](../ffmpeg/DECISIONS.md#fd-005-reuse-a-compatible-d3d11va-decoder-with-its-frames-context).
 
 ## Selected device and decoder resources
 
@@ -82,10 +87,19 @@ shared with FFmpeg.
 
 `d3d11vaHardwareDecodeConfig()` allocates an FFmpeg D3D11VA device context,
 installs the retained device/context and lock callbacks, initializes the
-context, and returns an opaque core `HardwareDecodeDevice`. By default it does
-not add `D3D11_BIND_SHADER_RESOURCE` to FFmpeg's fixed NV12/P010 decoder array.
+context, enables compatible decoder reuse, and returns an opaque core
+`HardwareDecodeDevice`. By default it does not add
+`D3D11_BIND_SHADER_RESOURCE` to FFmpeg's fixed NV12/P010 decoder array.
 Setting `D3D11VAHardwareDecodeOptions::directDecoderTextureSampling` adds that
 bind flag for the optional direct path.
+
+Core retains an initialized D3D11 hardware-frames context across repeated
+FFmpeg format selection when device identity, hardware/software formats,
+dimensions, and required pool size still match. The FFmpeg overlay binds the
+matching `ID3D11VideoDecoder` and all output views to that frames context and
+also checks the texture, array size, decoder profile, output format, and full
+decoder configuration before reuse. An incompatible selection creates a new
+pool and decoder through the normal path.
 
 The bounded `extraHardwareFrames` setting is copied to
 `AVCodecContext::extra_hw_frames`. Retaining more decoder frames than the
@@ -102,9 +116,10 @@ size, and NV12/P010 software format are consistent. The borrowed native
 pointers remain valid while a copy of the strong frame view or source
 `HardwareFrame` is alive.
 
-Seek, decoder flush, replacement, and stop release player-owned references but
-do not invalidate application copies. An old decoder pool survives until its
-last retained frame is released.
+Seek and an otherwise compatible HEVC format reselection keep the current pool
+and decoder. Decoder replacement and stop release player-owned references but
+do not invalidate application copies; an incompatible old pool survives until
+its last retained frame is released.
 
 ## Raw-plane interop and Dolby ordering
 
@@ -124,8 +139,11 @@ single-slice texture of the same NV12/P010 format. On a D3D11.1 immediate
 context it uses `ID3D11DeviceContext1::CopySubresourceRegion1()` with
 `D3D11_COPY_DISCARD`; the compatibility fallback uses
 `CopySubresourceRegion()` with the same source box. This mirrors mpv's default
-D3D11VA policy: discard the old destination contents, exclude decoder padding,
-and release the scarce decoder-array slice after the copy command is submitted.
+copy geometry and destination-discard policy: discard the old destination
+contents and exclude decoder padding. QtAVCore retains the scarce decoder-array
+slice until its completion query retires, then releases it on the renderer's
+frame-recycler worker so vendor allocation teardown cannot block the
+output/render thread.
 
 The renderer wraps plane-specific views from that copied texture, or from the
 decoder slice when direct sampling is opted in, through `pl_d3d11_wrap()`:
@@ -174,13 +192,15 @@ FFmpeg decode callbacks and QtAVCore D3D11 rendering share the recursive
 both renderer state and immediate-context ownership; contention declines the
 render so the output can retry instead of blocking its render/UI thread.
 
-The copied texture, persistent libplacebo plane wrappers, and borrowed target
-remain alive in a completion-query queue bounded at three submissions. The
-copy ring is likewise bounded at three entries and is reused only after its
-completion query retires. The original decoder frame need not remain retained
-after the visible-region copy and draw commands have been submitted. In direct
-mode, the decoder frame and its transient plane wrappers remain alive through
-completion instead.
+The copied texture, persistent libplacebo plane wrappers, borrowed target, and
+original decoder frame remain alive in a completion-query queue bounded at
+three submissions. The copy ring is likewise bounded at three entries and is
+reused only after its completion query retires. Direct mode additionally keeps
+its transient decoder-plane wrappers through completion. After renderer-owned
+wrappers are destroyed, both modes move the source frame and interop wrapper to
+a fixed-capacity recycler queue. That worker performs their final destruction;
+normal rendering applies bounded in-flight backpressure rather than releasing a
+frame on the render thread if the recycler cannot accept it.
 
 Decode and render calls share a natively multithread-protected immediate
 context and the QtAVCore recursive guard. Successfully imported D3D11VA frames
@@ -204,6 +224,50 @@ renderer.setDirectDecoderTextureSamplingEnabled(true);
 `D3D11VideoOutputOptions::directDecoderTextureSampling` configures both when
 the high-level output owns the decoder/renderer wiring. The option is false by
 default and is not selected automatically by adapter vendor.
+
+### `directDecoderTextureSampling` modes and copy diagnostics
+
+`decoder-copies` is the WinUI Debug label for the accumulated
+`D3D11VideoOutputStatistics::decoderSurfaceCopies` counter. It is not a
+separate boolean setting. The counter is reset whenever the application calls
+`D3D11VideoOutput::takeStatistics()` and counts same-GPU decoder-surface copies,
+not CPU copies or global D3D11 Copy-engine utilization.
+
+The high-level mode switch is
+`D3D11VideoOutputOptions::directDecoderTextureSampling`:
+
+| Switch state | Mode | Resource policy | Expected `decoder-copies` diagnostic |
+| --- | --- | --- | --- |
+| `directDecoderTextureSampling = false` (off) | Default GPU-copy mode | Copy the visible NV12/P010 region into the bounded shader-readable ring. | Positive in active sampling windows and tracks successfully submitted D3D11VA frames. |
+| `directDecoderTextureSampling = true` (on) | Direct-sampling mode | Shader-sample the retained decoder texture-array slice directly. | Exactly zero. |
+
+Use the default copy policy for production playback and cross-vendor
+compatibility unless an application has separately qualified the direct path
+on every supported adapter and driver:
+
+```cpp
+qtav::D3D11VideoOutputOptions options;
+options.directDecoderTextureSampling = false; // default GPU-copy mode
+output.open(std::move(surface), options);
+output.attach(player);
+```
+
+The direct path is an explicit performance/power experiment or a controlled
+A/B diagnostic. It must be selected before `open()`/`attach()` so the decoder
+array is created shader-readable:
+
+```cpp
+qtav::D3D11VideoOutputOptions options;
+options.directDecoderTextureSampling = true; // direct-sampling mode
+output.open(std::move(surface), options);
+output.attach(player);
+```
+
+For a low-level integration, enabling direct mode still requires both flags in
+the preceding example. A zero counter alone does not prove zero-copy rendering:
+it can also mean that no video frame was submitted or that hardware decoding
+was not active. Always confirm D3D11VA NV12/P010 input, a progressing rendered-
+frame count, and the absence of software mapping/decoded-source CPU transfer.
 
 ## Fallback and failure policy
 
@@ -235,6 +299,8 @@ Deterministic WARP tests cover:
 - proof that import does not wait on or submit to the immediate context;
 - default renderer policy, visible-size copy accounting, and direct-policy
   selection;
+- GPU-completion retention plus off-render-thread destruction of both the
+  source hardware frame and imported texture wrapper;
 - software-frame color/geometry rendering through libplacebo D3D11;
 - synthetic PQ, HLG, HDR-to-SDR, HDR10, scRGB, and Dolby Vision RPU rendering;
 - retryable context contention, explicit software mapping fallback, target

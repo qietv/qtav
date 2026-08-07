@@ -173,8 +173,9 @@ public:
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
 
-    // Completes submitted rendering and releases references to borrowed
-    // targets and decoder slices. Call before resizing or replacing a target.
+    // Completes submitted rendering and drains the background release of
+    // borrowed targets and decoder slices. Call before resizing or replacing
+    // a target.
     void flush() noexcept;
 
     BorrowedD3D11Device device() const noexcept;

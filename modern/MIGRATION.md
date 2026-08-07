@@ -343,7 +343,12 @@ composition and alpha blending.
 
 `d3d11vaHardwareDecodeConfig()` creates FFmpeg's D3D11VA device on the same
 retained device access, installs callbacks for the shared recursive lock, and
-requests a bounded number of extra decoder surfaces. Decoder arrays do not
+requests a bounded number of extra decoder surfaces. It also enables the
+repository Windows FFmpeg extension that retains a compatible
+`ID3D11VideoDecoder` and its output views with a reused initialized hardware-
+frames context. This removes redundant decoder teardown during repeated HEVC
+format selection; stock FFmpeg binaries do not provide the required opt-in
+field. Decoder arrays do not
 request `D3D11_BIND_SHADER_RESOURCE` unless
 `D3D11VAHardwareDecodeOptions::directDecoderTextureSampling` is enabled.
 `D3D11VAFrame` retains a
@@ -380,15 +385,18 @@ console test passes with an active WASAPI render endpoint and audible output,
 while sessions without an endpoint report a CTest skip. The retained-resource
 contract remains documented in [D3D11VA.md](D3D11VA.md).
 
-Default copied textures, their persistent plane wrappers, and borrowed targets
-are retained until a D3D11 completion event reports that the libplacebo draw
-has finished. The original decoder frame can be released after the ordered
-copy and draw are submitted. Direct mode instead retains the decoder frame and
-its transient wrappers through completion. The renderer bounds both its
-completion queue and copy ring at three submissions, and
+Default copied textures, their persistent plane wrappers, borrowed targets,
+and original decoder frames are retained until a D3D11 completion event reports
+that the libplacebo draw has finished. Direct mode additionally retains its
+transient decoder-plane wrappers through completion. Both modes then hand the
+source frame and interop wrapper to a fixed-capacity recycler so FFmpeg/D3D11VA
+final release and vendor allocation teardown do not execute on the real-time
+render thread. The renderer bounds both its completion queue and copy ring at
+three submissions, and
 `D3D11VideoRenderer::flush()` explicitly drains it before target resize or
-replacement. Decoder, interop, and renderer submissions share a natively
-multithread-protected immediate context plus QtAVCore's recursive guard.
+replacement, including the recycler. Decoder, interop, and renderer submissions
+share a natively multithread-protected immediate context plus QtAVCore's
+recursive guard.
 Every successfully imported D3D11VA frame uses libplacebo's fast sampling
 policy without the optional GPU histogram peak-detection pass. Successful
 per-frame submission remains asynchronous, without `pl_gpu_finish()`, and
@@ -398,9 +406,10 @@ failure cleanup, and teardown still perform the explicit drains required by
 their lifecycles. Changes to this policy require fresh NVIDIA, Intel, and AMD
 seek, shutdown, cadence, and stage-timing regression. A separately reported
 visual 4K cadence issue on an AMD integrated GPU remains a performance
-investigation rather than an imported-frame correctness regression. Closure
-requires a same-build Intel performance regression and exact hardware, driver,
-and objective cadence/stage data from both final test devices.
+investigation rather than an imported-frame correctness regression. The Intel
+Iris Xe same-build investigation localized and removed redundant decoder
+teardown; the remaining final-device work is the Radeon regression recorded in
+`PLAN.md`.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock

@@ -29,6 +29,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cwchar>
 #include <deque>
@@ -37,6 +38,7 @@ extern "C" {
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -812,6 +814,11 @@ public:
         pl_tex targetTexture = nullptr;
     };
 
+    struct DeferredFrameRelease {
+        VideoFrame source;
+        std::shared_ptr<D3D11TextureFrame> imported;
+    };
+
     struct RenderPassProbe {
         std::uint64_t graphHash = 14695981039346656037ULL;
         std::uint64_t passCount = 0;
@@ -823,6 +830,7 @@ public:
     };
 
     static constexpr std::size_t maximumInFlightRenders = 3;
+    static constexpr std::size_t maximumDeferredFrameReleases = 64;
 
     Impl(
         std::shared_ptr<D3D11DeviceAccess> deviceAccess,
@@ -841,11 +849,13 @@ public:
         scRgbOutputHook_.input = PL_HOOK_SIG_COLOR;
         scRgbOutputHook_.hook = &Impl::scaleScRgbOutput;
         scRgbOutputHook_.signature = 0x7174617653435247ULL;
+        frameReleaseWorker_ = std::thread([this] { releaseFrames(); });
     }
 
     ~Impl()
     {
         close();
+        stopFrameReleaseWorker();
     }
 
     void notify(VideoRenderEventType type, std::string detail)
@@ -977,8 +987,142 @@ public:
         return true;
     }
 
-    void destroyInFlightRender(InFlightRender& render) noexcept
+    bool hasDeferredFrameRelease(
+        const InFlightRender& render) const noexcept
     {
+        return render.imported || render.source.hasHardwareFrame();
+    }
+
+    bool canDeferFrameRelease(
+        const InFlightRender& render) const noexcept
+    {
+        if (!hasDeferredFrameRelease(render)) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(frameReleaseMutex_);
+        return !frameReleaseStopping_
+            && deferredFrameReleaseCount_
+                < maximumDeferredFrameReleases;
+    }
+
+    bool deferFrameRelease(
+        InFlightRender& render,
+        bool waitForCapacity) noexcept
+    {
+        if (!hasDeferredFrameRelease(render)) {
+            render.imported.reset();
+            render.source = {};
+            return true;
+        }
+
+        std::unique_lock<std::mutex> lock(frameReleaseMutex_);
+        if (waitForCapacity) {
+            frameReleaseSpace_.wait(
+                lock,
+                [this] {
+                    return frameReleaseStopping_
+                        || deferredFrameReleaseCount_
+                            < maximumDeferredFrameReleases;
+                });
+        }
+        if (frameReleaseStopping_
+            || deferredFrameReleaseCount_
+                >= maximumDeferredFrameReleases) {
+            return false;
+        }
+
+        const std::size_t tail =
+            (deferredFrameReleaseHead_ + deferredFrameReleaseCount_)
+            % maximumDeferredFrameReleases;
+        deferredFrameReleases_[tail].source = std::move(render.source);
+        deferredFrameReleases_[tail].imported =
+            std::move(render.imported);
+        ++deferredFrameReleaseCount_;
+        lock.unlock();
+        frameReleaseChanged_.notify_one();
+        return true;
+    }
+
+    void releaseFrames() noexcept
+    {
+        (void)::SetThreadDescription(
+            ::GetCurrentThread(),
+            L"QtAV D3D11 frame recycler");
+        while (true) {
+            DeferredFrameRelease release;
+            {
+                std::unique_lock<std::mutex> lock(frameReleaseMutex_);
+                frameReleaseChanged_.wait(
+                    lock,
+                    [this] {
+                        return frameReleaseStopping_
+                            || deferredFrameReleaseCount_ > 0;
+                    });
+                if (deferredFrameReleaseCount_ == 0) {
+                    if (frameReleaseStopping_) {
+                        break;
+                    }
+                    continue;
+                }
+
+                frameReleaseActive_ = true;
+                release = std::move(
+                    deferredFrameReleases_[deferredFrameReleaseHead_]);
+                deferredFrameReleases_[deferredFrameReleaseHead_] = {};
+                deferredFrameReleaseHead_ =
+                    (deferredFrameReleaseHead_ + 1)
+                    % maximumDeferredFrameReleases;
+                --deferredFrameReleaseCount_;
+            }
+            frameReleaseSpace_.notify_all();
+
+            // Drop the interop wrapper before the source frame so any final
+            // FFmpeg/D3D11VA reference is released on this worker as well.
+            release.imported.reset();
+            release.source = {};
+
+            {
+                std::lock_guard<std::mutex> lock(frameReleaseMutex_);
+                frameReleaseActive_ = false;
+                if (deferredFrameReleaseCount_ == 0) {
+                    frameReleaseDrained_.notify_all();
+                }
+            }
+        }
+    }
+
+    void waitForFrameReleases() noexcept
+    {
+        std::unique_lock<std::mutex> lock(frameReleaseMutex_);
+        frameReleaseDrained_.wait(
+            lock,
+            [this] {
+                return deferredFrameReleaseCount_ == 0
+                    && !frameReleaseActive_;
+            });
+    }
+
+    void stopFrameReleaseWorker() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(frameReleaseMutex_);
+            frameReleaseStopping_ = true;
+        }
+        frameReleaseChanged_.notify_all();
+        frameReleaseSpace_.notify_all();
+        if (frameReleaseWorker_.joinable()) {
+            frameReleaseWorker_.join();
+        }
+    }
+
+    bool destroyInFlightRender(
+        InFlightRender& render,
+        bool waitForReleaseCapacity) noexcept
+    {
+        if (!waitForReleaseCapacity
+            && !canDeferFrameRelease(render)) {
+            return false;
+        }
         for (pl_tex& texture : render.sourceTextures) {
             if (texture && d3d11_) {
                 pl_tex_destroy(d3d11_->gpu, &texture);
@@ -988,15 +1132,17 @@ public:
             pl_tex_destroy(d3d11_->gpu, &render.targetTexture);
         }
         render.decoderSourceCopy.reset();
-        render.imported.reset();
-        render.source = {};
+        if (!deferFrameRelease(render, waitForReleaseCapacity)) {
+            return false;
+        }
         render.target.Reset();
+        return true;
     }
 
     void destroyInFlightRenders() noexcept
     {
         for (InFlightRender& render : inFlightRenders_) {
-            destroyInFlightRender(render);
+            (void)destroyInFlightRender(render, true);
         }
         inFlightRenders_.clear();
         availableCompletionQueries_.clear();
@@ -1137,9 +1283,11 @@ public:
                         result);
                     return false;
                 }
+                if (!destroyInFlightRender(render, false)) {
+                    break;
+                }
                 ComPtr<ID3D11Query> completion =
                     std::move(render.completion);
-                destroyInFlightRender(render);
                 inFlightRenders_.pop_front();
                 availableCompletionQueries_.push_back(
                     std::move(completion));
@@ -1214,14 +1362,17 @@ public:
             open_ = false;
             config_ = {};
         }
-        std::lock_guard<std::mutex> renderLock(renderMutex_);
-        if (!deviceAccess_) {
-            destroyCommon();
-            return;
+        {
+            std::lock_guard<std::mutex> renderLock(renderMutex_);
+            if (!deviceAccess_) {
+                destroyCommon();
+            } else {
+                auto contextGuard = deviceAccess_->contextGuard();
+                (void)contextGuard;
+                destroyCommon();
+            }
         }
-        auto contextGuard = deviceAccess_->contextGuard();
-        (void)contextGuard;
-        destroyCommon();
+        waitForFrameReleases();
     }
 
     bool wrapTarget(
@@ -1505,6 +1656,17 @@ public:
     std::vector<std::shared_ptr<DecoderSourceCopy>> decoderSourceCopies_;
     std::deque<InFlightRender> inFlightRenders_;
     std::vector<ComPtr<ID3D11Query>> availableCompletionQueries_;
+    mutable std::mutex frameReleaseMutex_;
+    std::condition_variable frameReleaseChanged_;
+    std::condition_variable frameReleaseSpace_;
+    std::condition_variable frameReleaseDrained_;
+    std::array<DeferredFrameRelease, maximumDeferredFrameReleases>
+        deferredFrameReleases_;
+    std::size_t deferredFrameReleaseHead_ = 0;
+    std::size_t deferredFrameReleaseCount_ = 0;
+    bool frameReleaseActive_ = false;
+    bool frameReleaseStopping_ = false;
+    std::thread frameReleaseWorker_;
     std::string lastLogError_;
 
     std::atomic<std::uint64_t> decoderSurfaceCopies_ { 0 };
@@ -2014,9 +2176,14 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             inFlight.completion = std::move(completion);
             inFlight.target = std::move(targetTextureNative);
             inFlight.decoderSourceCopy = std::move(decoderSourceCopy);
-            if (!inFlight.decoderSourceCopy) {
+            if (imported) {
+                // Keep the decoder frame alive until the copy/direct draw is
+                // complete, then release it on the dedicated recycler rather
+                // than the latency-sensitive output thread.
                 inFlight.source = frame;
                 inFlight.imported = std::move(imported);
+            }
+            if (!inFlight.decoderSourceCopy) {
                 inFlight.sourceTextures = hardwareTextures;
                 hardwareTextures = {};
             }
@@ -2106,15 +2273,17 @@ void D3D11VideoRenderer::flush() noexcept
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
-    if (!impl_->deviceAccess_ || !impl_->d3d11_) {
-        return;
+    {
+        std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+        if (impl_->deviceAccess_ && impl_->d3d11_) {
+            auto contextGuard = impl_->deviceAccess_->contextGuard();
+            (void)contextGuard;
+            pl_gpu_finish(impl_->d3d11_->gpu);
+            impl_->destroyInFlightRenders();
+            impl_->destroyDecoderSourceCopies();
+        }
     }
-    auto contextGuard = impl_->deviceAccess_->contextGuard();
-    (void)contextGuard;
-    pl_gpu_finish(impl_->d3d11_->gpu);
-    impl_->destroyInFlightRenders();
-    impl_->destroyDecoderSourceCopies();
+    impl_->waitForFrameReleases();
 }
 
 BorrowedD3D11Device D3D11VideoRenderer::device() const noexcept

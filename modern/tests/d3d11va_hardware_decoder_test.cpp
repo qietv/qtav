@@ -412,6 +412,8 @@ void testPlayerLifecycle(
     std::atomic<int> videoFrames { 0 };
     std::atomic<int> hardwareFrames { 0 };
     std::atomic<bool> softwareFallback { false };
+    ID3D11Texture2D* initialPoolTexture = nullptr;
+    bool reusedPoolAfterSeek = false;
     std::mutex mutex;
     std::condition_variable changed;
     int stage = 0;
@@ -460,6 +462,18 @@ void testPlayerLifecycle(
                     if (description.BindFlags
                         & D3D11_BIND_SHADER_RESOURCE) {
                         std::abort();
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (stage == 0) {
+                            initialPoolTexture = native.texture();
+                        } else if (stage == 2) {
+                            if (native.texture() != initialPoolTexture) {
+                                std::abort();
+                            }
+                            reusedPoolAfterSeek = true;
+                        }
                     }
 
                     if (hardwareFrames.fetch_add(1) == 0) {
@@ -530,6 +544,9 @@ void testPlayerLifecycle(
         std::abort();
     }
     if (!softwareFallback.load() && hardwareFrames.load() == 0) {
+        std::abort();
+    }
+    if (!softwareFallback.load() && !reusedPoolAfterSeek) {
         std::abort();
     }
     if (softwareFallback.load()) {

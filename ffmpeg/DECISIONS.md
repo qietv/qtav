@@ -260,3 +260,82 @@ Remove the patch when the pinned upstream FFmpeg OHCodec decoder exposes an
 equivalent retained, single-decision surface-output API. Re-run the dependency
 build and verifier, QtAVCore shared/static consumption, and the connected
 present/drop lifecycle matrix before adopting that replacement.
+
+## FD-005: Reuse a compatible D3D11VA decoder with its frames context
+
+- Date: 2026-08-07
+- Status: Accepted
+- Scope: Windows x64 FFmpeg 8.1.2 D3D11VA decoder lifetime
+
+### Context
+
+HEVC can call `ff_get_format()` again when an active SPS changes even when the
+selected D3D11 device, pixel format, dimensions, decoder texture, and required
+configuration remain unchanged. FFmpeg 8.1.2 first calls
+`ff_hwaccel_uninit()`, then creates a new `ID3D11VideoDecoder` and a complete
+set of output views. Reusing only QtAVCore's initialized
+`AVHWFramesContext` therefore reuses the texture array but not the decoder.
+
+Each decoded frame retains the old libavcodec decoder reference. ETW on Intel
+Iris Xe showed the final old-frame release entering
+`igd11dxva64.dll`/`igddxvacommon64.dll` allocation teardown from QtAVCore's
+frame recycler. That teardown serialized the shared D3D11 device while the
+renderer itself used less than one millisecond of GPU time. High temperature
+amplified the duration, but the decoder reconstruction and release sequence
+also reproduced in a cold, non-throttled sample.
+
+### Decision
+
+Patch the Windows D3D11VA path with an opt-in
+`AVD3D11VADeviceContext::reuse_decoder` field. When enabled, libavcodec stores
+an `AVBufferRef`-owned decoder resource on the initialized
+`AVD3D11VAFramesContext`. The resource owns the `ID3D11VideoDecoder`, every
+output view, and a texture reference. It is reused only when the texture,
+array size, profile GUID, sample dimensions, output format, and complete
+decoder configuration still match. The normal FFmpeg path is unchanged when
+the field is zero.
+
+QtAVCore enables the extension only for its repository-built D3D11VA device
+and also retains a compatible initialized frames context across repeated format
+selection. The policy is implemented by
+[`0057-d3d11va-reuse-compatible-decoder.patch`](ports/ffmpeg/0057-d3d11va-reuse-compatible-decoder.patch),
+and the installed-package verifier requires the public opt-in field.
+
+### Rejected alternatives
+
+- Reusing only the frames context does not retain libavcodec's decoder or
+  output views and did not remove the Intel driver teardown.
+- Moving final frame destruction to another QtAVCore thread keeps the render
+  thread responsive to ordinary release cost but cannot prevent a driver-wide
+  serialization on the shared device.
+- Forcing software decoding or a decoded-pixel CPU copy would avoid the driver
+  path by giving up the required D3D11VA zero-map pipeline.
+- Enabling decoder reuse unconditionally would change upstream behavior for
+  unrelated FFmpeg consumers and could preserve an incompatible decoder.
+
+### Consequences and validation
+
+The Windows package carries a small public overlay ABI and must stay paired
+with the QtAVCore D3D11VA backend. A compatible decoder now lives until the
+frames context is destroyed; an incompatible descriptor or configuration still
+creates a new decoder. Android and OHOS packages do not enable this path.
+
+Validation completed with `scripts/build-windows.ps1` and
+`cmake/verify-install.cmake`, followed by fresh QtAVCore static and shared
+Release builds and 37/37 CTest in each tree. The D3D11VA lifecycle test proves
+that a seek retains the same decoder texture. Post-fix Iris Xe ETW no longer
+contained the recycler-to-`igd11dxva64.dll` decoder teardown stack; remaining
+QtAV process allocation events resolved to WinUI/DirectComposition. In a
+separate cold run, CPU Package peaked at 72 degrees Celsius with no thermal,
+critical-temperature, or power-limit flags. After one seek the renderer
+returned from three transient 5-second windows to 24.8-25.2 fps and then held
+that cadence with zero coalescing and zero greater-than-80-ms gaps.
+
+### Retirement condition
+
+Remove the patch when the pinned upstream FFmpeg version retains an equivalent
+compatible D3D11VA decoder across repeated format selection, or no longer
+uninitializes unchanged hardware acceleration in that path. Rebuild and verify
+the Windows dependency package, remove the QtAVCore opt-in, pass static/shared
+tests, and repeat the cold Intel seek/ETW matrix before adopting the upstream
+replacement.

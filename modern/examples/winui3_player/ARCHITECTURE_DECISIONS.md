@@ -317,9 +317,11 @@ are no longer reported as missing frames.
   Separate high draw times after prolonged build/UI-capture load disappeared
   in a controlled cold rerun, which restored both supplied files to source
   cadence and zero steady coalescing.
-- The same-build Intel performance regression remains required; this decision
-  corrects generic retry semantics but does not claim cross-device performance
-  equivalence.
+- The same-build Iris Xe regression later localized a separate persistent
+  post-seek stall to redundant FFmpeg D3D11VA decoder teardown. Compatible
+  frames-context and decoder reuse removed that teardown; the generic retry
+  policy here remains independent and still does not claim cross-device
+  performance equivalence.
 
 ## ADR-010: Copy the visible decoder region by default
 
@@ -349,8 +351,9 @@ Processor conversion, or per-frame GPU drain is introduced.
 
 - The default path incurs one same-device GPU copy per rendered hardware frame
   and reports it in `decoder-copies`.
-- Decoder textures return to FFmpeg after ordered copy/draw submission instead
-  of remaining retained through GPU completion.
+- Decoder textures remain retained through GPU completion. Their source-frame
+  and interop references then move to a bounded recycler so Intel/other vendor
+  allocation teardown cannot execute on the output render thread.
 - Advanced applications can opt into direct sampling for an A/B performance
   test, but must accept the documented driver/lifetime risks.
 - NVIDIA, AMD, and Intel regression must cover cold start, sustained cadence,

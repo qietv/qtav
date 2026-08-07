@@ -25,6 +25,7 @@ vcpkg_from_github(
         0054-fix-clang-cl-mlp-lto-labels.patch
         0055-ohcodec-explicit-surface-release.patch
         0056-ohcodec-dovi-metadata.patch
+        0057-d3d11va-reuse-compatible-decoder.patch
 )
 
 file(COPY
