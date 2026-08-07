@@ -891,10 +891,12 @@ AD-010 Windows visible-copy checkpoint:
 6. [x] On NVIDIA, repeat the exact `legend.mkv` 22:48 seek, sustained playback,
    media replacement, and close-while-playing case in default mode; record
    cadence, stage maxima, copy count, zero-map status, and shutdown latency.
-7. [ ] Run the same Release revision and representative H.264/NV12,
+7. [~] Run the same Release revision and representative H.264/NV12,
    HDR10/P010, and Dolby Vision workloads on Radeon 880M and Intel Iris Xe.
-   Record objective cadence and lifecycle evidence for the default policy;
-   compare direct mode only as an explicit A/B, never as automatic fallback.
+   A same-revision Intel UHD Graphics 770 regression is complete; the specified
+   Radeon 880M and original Iris Xe systems remain pending. Record objective
+   cadence and lifecycle evidence for the default policy; compare direct mode
+   only as an explicit A/B, never as automatic fallback.
 
 Current AD-010 Windows validation on 2026-08-06:
 
@@ -933,6 +935,45 @@ Current AD-010 Windows validation on 2026-08-06:
   210 ms. A separate 1920x1080 H.264/NV12 control sustained about 29.8-30.1 fps
   with positive copy counts and closed while playing in 173 ms. No run reported
   software decode or a decoded-source mapping fallback.
+
+Intel UHD Graphics 770 follow-up on 2026-08-07, using the same revision:
+
+- The display-driving device was Intel UHD Graphics 770
+  (`PCI\\VEN_8086&DEV_4680&SUBSYS_0D181028`, driver `32.0.101.7085`) at
+  3840x2160/59 Hz. The GeForce RTX 3050 reported PnP problem/code 22 and was
+  disabled, while the Intel adapter reported code 0/OK. The Dell Pro Tower
+  QCT1250 used a Core i5-14500, 31.7 GiB RAM, Windows 11 Enterprise build
+  26200, and the balanced power plan. Playback reported active RGB10/PQ output,
+  240-nit SDR white, and a 1405-nit display peak.
+- The existing shared Release tree at commit `45fe72f1d366a8beac249d540fd917cf583b5986`
+  rebuilt successfully. One first full run reported 36/37 when the explicit
+  direct-decoder-sampling test aborted after FFmpeg could not initially infer
+  the generated stream pixel format. Three immediate isolated repetitions of
+  that direct test passed, and the next complete run passed 37/37, including
+  both default GPU copy and explicit direct decoder sampling. The one-off
+  probe/startup signal is retained rather than classified as an Intel backend
+  incompatibility.
+- The 1920x1080 H.264/NV12 control retained D3D11VA and settled at about
+  29.8-30.0 rendered fps. Each 5.2-second window copied about 155-157 decoder
+  frames; `present-busy`, `render-skipped`, and terminal results remained zero.
+  After first-pass shader warm-up, draw maxima were about 11.7-15.5 ms.
+- `legend.mkv` retained 3840x2160 HEVC Main10/P010 D3D11VA and RGB10/PQ output.
+  Before and for 90 seconds after the exact 22:48 seek, settled windows rendered
+  about 24.7-25.2 fps with about 128-131 visible-region GPU copies per
+  5.2 seconds. Warm draw maxima stayed about 12.2-14.7 ms with zero stable-window
+  busy, skipped, or terminal results. The initial seek-transition window had one
+  expected retired-generation terminal result and one skip; later windows
+  recovered immediately. Some settled windows recorded isolated roughly
+  80-98-ms video/render cadence gaps, but without rising draw cost, cadence loss,
+  or accumulating backpressure. Further seeks to 05:00, 12:00, and 22:48 each
+  resumed source cadence in the next settled window.
+- In the same process, replacing the HDR10 file with 3840x2160 Dolby Vision
+  Profile 5 `wednesday.mp4` settled at about 23.8-24.0 rendered fps and about
+  124-126 copies per 5.2 seconds, with zero busy, skipped, or terminal results.
+  Closing the main window while playback was active exited the process and its
+  debug window in 189 ms. No run selected software decode or decoded-source CPU
+  mapping. This establishes the available UHD 770 checkpoint only; it does not
+  substitute for the requested Radeon 880M or original Iris Xe regressions.
 
 The next Dolby Vision slice is partly complete: FFmpeg-parsed RPU metadata is
 now correlated to exact OHCodec outputs by normalized PTS, and Profile 5 plus
