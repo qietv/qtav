@@ -38,8 +38,7 @@ bool supportedSource(
         && description.SampleDesc.Count == 1
         && frame.arraySlice() < description.ArraySize
         && static_cast<UINT>(frame.width()) <= description.Width
-        && static_cast<UINT>(frame.height()) <= description.Height
-        && (description.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+        && static_cast<UINT>(frame.height()) <= description.Height;
 }
 
 class ImportedD3D11DecoderFrame final : public D3D11TextureFrame {
@@ -72,9 +71,10 @@ public:
     ID3D11ShaderResourceView*
     shaderResourceView() const noexcept override
     {
-        // libplacebo creates plane-specific SRVs directly from the retained
-        // NV12/P010 array slice. A pre-converted RGB view would destroy the
-        // raw Profile 5 base-layer representation.
+        // The renderer creates plane-specific views over either its ordinary
+        // same-format copy or, when explicitly enabled, this retained decoder
+        // slice. A pre-converted RGB view would destroy the raw Profile 5
+        // base-layer representation.
         return nullptr;
     }
 
@@ -183,8 +183,8 @@ D3D11FrameInterop::importFrame(
 
 void D3D11FrameInterop::flush() noexcept
 {
-    // The interop owns no conversion textures or queued work. libplacebo
-    // wraps each retained decoder slice only for command submission.
+    // The interop owns no conversion textures or queued work. Copy resources
+    // and optional direct plane wrappers belong to the renderer.
 }
 
 } // namespace qtav

@@ -11,6 +11,7 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/shaders/custom.h>
 
+#include <d3d11_1.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -28,6 +29,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cwchar>
 #include <deque>
@@ -36,6 +38,7 @@ extern "C" {
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -793,26 +796,31 @@ D3D11HardwareFrameInterop::importFrame(
 
 class D3D11VideoRenderer::Impl {
 public:
+    struct DecoderSourceCopy {
+        ComPtr<ID3D11Texture2D> texture;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        int width = 0;
+        int height = 0;
+        std::array<pl_tex, 2> planes {};
+    };
+
     struct InFlightRender {
         ComPtr<ID3D11Query> completion;
         ComPtr<ID3D11Texture2D> target;
         VideoFrame source;
         std::shared_ptr<D3D11TextureFrame> imported;
+        std::shared_ptr<DecoderSourceCopy> decoderSourceCopy;
         std::array<pl_tex, 2> sourceTextures {};
         pl_tex targetTexture = nullptr;
     };
 
-    struct RenderPassProbe {
-        std::uint64_t graphHash = 14695981039346656037ULL;
-        std::uint64_t passCount = 0;
-        std::uint64_t gpuFrameNanoseconds = 0;
-        std::uint64_t maximumGpuPassNanoseconds = 0;
-        std::int64_t cpuStartedMicroseconds = 0;
-        std::int64_t firstCallbackMicroseconds = 0;
-        std::int64_t lastCallbackMicroseconds = 0;
+    struct DeferredFrameRelease {
+        VideoFrame source;
+        std::shared_ptr<D3D11TextureFrame> imported;
     };
 
     static constexpr std::size_t maximumInFlightRenders = 3;
+    static constexpr std::size_t maximumDeferredFrameReleases = 64;
 
     Impl(
         std::shared_ptr<D3D11DeviceAccess> deviceAccess,
@@ -824,15 +832,20 @@ public:
                                  : BorrowedD3D11DeviceContext {})
         , currentTarget_(std::move(currentTarget))
     {
+        if (context_) {
+            context_.get()->QueryInterface(IID_PPV_ARGS(&context1_));
+        }
         scRgbOutputHook_.stages = PL_HOOK_OUTPUT;
         scRgbOutputHook_.input = PL_HOOK_SIG_COLOR;
         scRgbOutputHook_.hook = &Impl::scaleScRgbOutput;
         scRgbOutputHook_.signature = 0x7174617653435247ULL;
+        frameReleaseWorker_ = std::thread([this] { releaseFrames(); });
     }
 
     ~Impl()
     {
         close();
+        stopFrameReleaseWorker();
     }
 
     void notify(VideoRenderEventType type, std::string detail)
@@ -858,34 +871,6 @@ public:
         auto* self = static_cast<Impl*>(privateData);
         std::lock_guard<std::mutex> lock(self->logMutex_);
         self->lastLogError_ = message;
-    }
-
-    static void renderInfoCallback(
-        void* privateData,
-        const pl_render_info* info) noexcept
-    {
-        if (!privateData || !info || !info->pass) {
-            return;
-        }
-        auto* probe = static_cast<RenderPassProbe*>(privateData);
-        const auto callbackMicroseconds = steadyMicroseconds();
-        if (probe->firstCallbackMicroseconds == 0) {
-            probe->firstCallbackMicroseconds = callbackMicroseconds;
-        }
-        probe->lastCallbackMicroseconds = callbackMicroseconds;
-        const auto mixHash = [&probe](std::uint64_t value) {
-            probe->graphHash ^= value;
-            probe->graphHash *= 1099511628211ULL;
-        };
-        mixHash(info->pass->signature);
-        mixHash(static_cast<std::uint64_t>(info->stage));
-        mixHash(static_cast<std::uint64_t>(info->index));
-        mixHash(static_cast<std::uint64_t>(info->count));
-        ++probe->passCount;
-        probe->gpuFrameNanoseconds += info->pass->last;
-        probe->maximumGpuPassNanoseconds = std::max(
-            probe->maximumGpuPassNanoseconds,
-            info->pass->last);
     }
 
     static pl_hook_res scaleScRgbOutput(
@@ -964,8 +949,142 @@ public:
         return true;
     }
 
-    void destroyInFlightRender(InFlightRender& render) noexcept
+    bool hasDeferredFrameRelease(
+        const InFlightRender& render) const noexcept
     {
+        return render.imported || render.source.hasHardwareFrame();
+    }
+
+    bool canDeferFrameRelease(
+        const InFlightRender& render) const noexcept
+    {
+        if (!hasDeferredFrameRelease(render)) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(frameReleaseMutex_);
+        return !frameReleaseStopping_
+            && deferredFrameReleaseCount_
+                < maximumDeferredFrameReleases;
+    }
+
+    bool deferFrameRelease(
+        InFlightRender& render,
+        bool waitForCapacity) noexcept
+    {
+        if (!hasDeferredFrameRelease(render)) {
+            render.imported.reset();
+            render.source = {};
+            return true;
+        }
+
+        std::unique_lock<std::mutex> lock(frameReleaseMutex_);
+        if (waitForCapacity) {
+            frameReleaseSpace_.wait(
+                lock,
+                [this] {
+                    return frameReleaseStopping_
+                        || deferredFrameReleaseCount_
+                            < maximumDeferredFrameReleases;
+                });
+        }
+        if (frameReleaseStopping_
+            || deferredFrameReleaseCount_
+                >= maximumDeferredFrameReleases) {
+            return false;
+        }
+
+        const std::size_t tail =
+            (deferredFrameReleaseHead_ + deferredFrameReleaseCount_)
+            % maximumDeferredFrameReleases;
+        deferredFrameReleases_[tail].source = std::move(render.source);
+        deferredFrameReleases_[tail].imported =
+            std::move(render.imported);
+        ++deferredFrameReleaseCount_;
+        lock.unlock();
+        frameReleaseChanged_.notify_one();
+        return true;
+    }
+
+    void releaseFrames() noexcept
+    {
+        (void)::SetThreadDescription(
+            ::GetCurrentThread(),
+            L"QtAV D3D11 frame recycler");
+        while (true) {
+            DeferredFrameRelease release;
+            {
+                std::unique_lock<std::mutex> lock(frameReleaseMutex_);
+                frameReleaseChanged_.wait(
+                    lock,
+                    [this] {
+                        return frameReleaseStopping_
+                            || deferredFrameReleaseCount_ > 0;
+                    });
+                if (deferredFrameReleaseCount_ == 0) {
+                    if (frameReleaseStopping_) {
+                        break;
+                    }
+                    continue;
+                }
+
+                frameReleaseActive_ = true;
+                release = std::move(
+                    deferredFrameReleases_[deferredFrameReleaseHead_]);
+                deferredFrameReleases_[deferredFrameReleaseHead_] = {};
+                deferredFrameReleaseHead_ =
+                    (deferredFrameReleaseHead_ + 1)
+                    % maximumDeferredFrameReleases;
+                --deferredFrameReleaseCount_;
+            }
+            frameReleaseSpace_.notify_all();
+
+            // Drop the interop wrapper before the source frame so any final
+            // FFmpeg/D3D11VA reference is released on this worker as well.
+            release.imported.reset();
+            release.source = {};
+
+            {
+                std::lock_guard<std::mutex> lock(frameReleaseMutex_);
+                frameReleaseActive_ = false;
+                if (deferredFrameReleaseCount_ == 0) {
+                    frameReleaseDrained_.notify_all();
+                }
+            }
+        }
+    }
+
+    void waitForFrameReleases() noexcept
+    {
+        std::unique_lock<std::mutex> lock(frameReleaseMutex_);
+        frameReleaseDrained_.wait(
+            lock,
+            [this] {
+                return deferredFrameReleaseCount_ == 0
+                    && !frameReleaseActive_;
+            });
+    }
+
+    void stopFrameReleaseWorker() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(frameReleaseMutex_);
+            frameReleaseStopping_ = true;
+        }
+        frameReleaseChanged_.notify_all();
+        frameReleaseSpace_.notify_all();
+        if (frameReleaseWorker_.joinable()) {
+            frameReleaseWorker_.join();
+        }
+    }
+
+    bool destroyInFlightRender(
+        InFlightRender& render,
+        bool waitForReleaseCapacity) noexcept
+    {
+        if (!waitForReleaseCapacity
+            && !canDeferFrameRelease(render)) {
+            return false;
+        }
         for (pl_tex& texture : render.sourceTextures) {
             if (texture && d3d11_) {
                 pl_tex_destroy(d3d11_->gpu, &texture);
@@ -974,18 +1093,136 @@ public:
         if (render.targetTexture && d3d11_) {
             pl_tex_destroy(d3d11_->gpu, &render.targetTexture);
         }
-        render.imported.reset();
-        render.source = {};
+        render.decoderSourceCopy.reset();
+        if (!deferFrameRelease(render, waitForReleaseCapacity)) {
+            return false;
+        }
         render.target.Reset();
+        return true;
     }
 
     void destroyInFlightRenders() noexcept
     {
         for (InFlightRender& render : inFlightRenders_) {
-            destroyInFlightRender(render);
+            (void)destroyInFlightRender(render, true);
         }
         inFlightRenders_.clear();
         availableCompletionQueries_.clear();
+    }
+
+    void destroyDecoderSourceCopy(DecoderSourceCopy& copy) noexcept
+    {
+        if (d3d11_) {
+            for (pl_tex& plane : copy.planes) {
+                if (plane) {
+                    pl_tex_destroy(d3d11_->gpu, &plane);
+                }
+            }
+        }
+        copy.planes = {};
+        copy.texture.Reset();
+        copy.format = DXGI_FORMAT_UNKNOWN;
+        copy.width = 0;
+        copy.height = 0;
+    }
+
+    void destroyDecoderSourceCopies() noexcept
+    {
+        for (const auto& copy : decoderSourceCopies_) {
+            if (copy) {
+                destroyDecoderSourceCopy(*copy);
+            }
+        }
+        decoderSourceCopies_.clear();
+    }
+
+    std::shared_ptr<DecoderSourceCopy> acquireDecoderSourceCopy(
+        DXGI_FORMAT format,
+        int width,
+        int height,
+        bool tenBit,
+        std::string& error)
+    {
+        for (const auto& candidate : decoderSourceCopies_) {
+            if (candidate && candidate.use_count() == 1
+                && candidate->format == format
+                && candidate->width == width
+                && candidate->height == height) {
+                return candidate;
+            }
+        }
+
+        std::shared_ptr<DecoderSourceCopy> copy;
+        for (const auto& candidate : decoderSourceCopies_) {
+            if (candidate && candidate.use_count() == 1) {
+                copy = candidate;
+                break;
+            }
+        }
+        if (!copy) {
+            if (decoderSourceCopies_.size() >= maximumInFlightRenders) {
+                error = "The D3D11 decoder-source copy ring is busy";
+                return {};
+            }
+            copy = std::make_shared<DecoderSourceCopy>();
+            decoderSourceCopies_.push_back(copy);
+        } else {
+            destroyDecoderSourceCopy(*copy);
+        }
+
+        D3D11_TEXTURE2D_DESC description {};
+        description.Width = static_cast<UINT>(width);
+        description.Height = static_cast<UINT>(height);
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = format;
+        description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const HRESULT createResult = device_.get()->CreateTexture2D(
+            &description,
+            nullptr,
+            &copy->texture);
+        if (FAILED(createResult)) {
+            error = hresultText(
+                "Creating a shader-readable D3D11 decoder-source copy",
+                createResult);
+            destroyDecoderSourceCopy(*copy);
+            return {};
+        }
+
+        copy->format = format;
+        copy->width = width;
+        copy->height = height;
+        const std::array<DXGI_FORMAT, 2> planeFormats {
+            tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
+            tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM,
+        };
+        const std::array<int, 2> planeWidths {
+            width,
+            width / 2,
+        };
+        const std::array<int, 2> planeHeights {
+            height,
+            height / 2,
+        };
+        for (std::size_t plane = 0; plane < copy->planes.size(); ++plane) {
+            pl_d3d11_wrap_params params {};
+            params.tex = copy->texture.Get();
+            params.array_slice = 0;
+            params.fmt = planeFormats[plane];
+            params.w = planeWidths[plane];
+            params.h = planeHeights[plane];
+            copy->planes[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
+            if (!copy->planes[plane]
+                || !copy->planes[plane]->params.sampleable) {
+                error = takeLogError(
+                    "libplacebo cannot wrap a D3D11 decoder-source copy plane");
+                destroyDecoderSourceCopy(*copy);
+                return {};
+            }
+        }
+        return copy;
     }
 
     bool retireCompletedRenders(std::string& error)
@@ -1008,9 +1245,11 @@ public:
                         result);
                     return false;
                 }
+                if (!destroyInFlightRender(render, false)) {
+                    break;
+                }
                 ComPtr<ID3D11Query> completion =
                     std::move(render.completion);
-                destroyInFlightRender(render);
                 inFlightRenders_.pop_front();
                 availableCompletionQueries_.push_back(
                     std::move(completion));
@@ -1061,6 +1300,7 @@ public:
             pl_gpu_finish(d3d11_->gpu);
         }
         destroyInFlightRenders();
+        destroyDecoderSourceCopies();
         for (pl_tex& texture : uploadTextures_) {
             if (texture && d3d11_) {
                 pl_tex_destroy(d3d11_->gpu, &texture);
@@ -1084,14 +1324,17 @@ public:
             open_ = false;
             config_ = {};
         }
-        std::lock_guard<std::mutex> renderLock(renderMutex_);
-        if (!deviceAccess_) {
-            destroyCommon();
-            return;
+        {
+            std::lock_guard<std::mutex> renderLock(renderMutex_);
+            if (!deviceAccess_) {
+                destroyCommon();
+            } else {
+                auto contextGuard = deviceAccess_->contextGuard();
+                (void)contextGuard;
+                destroyCommon();
+            }
         }
-        auto contextGuard = deviceAccess_->contextGuard();
-        (void)contextGuard;
-        destroyCommon();
+        waitForFrameReleases();
     }
 
     bool wrapTarget(
@@ -1132,6 +1375,8 @@ public:
         const VideoFrame& source,
         const std::shared_ptr<D3D11TextureFrame>& imported,
         std::array<pl_tex, 2>& textures,
+        std::shared_ptr<DecoderSourceCopy>& decoderSourceCopy,
+        bool directDecoderTextureSampling,
         pl_frame& frame,
         pl_dovi_metadata& dovi,
         std::string& error)
@@ -1151,10 +1396,9 @@ public:
             || description.SampleDesc.Count != 1
             || imported->arraySlice() >= description.ArraySize
             || static_cast<UINT>(source.width()) > description.Width
-            || static_cast<UINT>(source.height()) > description.Height
-            || !(description.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+            || static_cast<UINT>(source.height()) > description.Height) {
             error =
-                "The imported D3D11 texture is not a shader-readable default resource";
+                "The imported D3D11 texture is not a compatible default resource";
             return false;
         }
 
@@ -1188,24 +1432,95 @@ public:
                 static_cast<int>(description.Height),
                 static_cast<int>((description.Height + 1U) / 2U),
             };
-            for (std::size_t plane = 0; plane < textures.size(); ++plane) {
-                pl_d3d11_wrap_params params {};
-                params.tex = imported->texture();
-                params.array_slice =
-                    static_cast<int>(imported->arraySlice());
-                params.fmt = planeFormats[plane];
-                params.w = widths[plane];
-                params.h = heights[plane];
-                textures[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
-                if (!textures[plane] || !textures[plane]->params.sampleable) {
-                    error = takeLogError(
-                        "libplacebo cannot wrap a D3D11 decoder plane");
+            const std::array<pl_tex, 2>* sampledPlanes = &textures;
+            if (directDecoderTextureSampling) {
+                if (!(description.BindFlags
+                      & D3D11_BIND_SHADER_RESOURCE)) {
+                    error =
+                        "Direct D3D11 decoder-texture sampling requires shader-resource binding";
                     return false;
                 }
+                for (std::size_t plane = 0; plane < textures.size(); ++plane) {
+                    pl_d3d11_wrap_params params {};
+                    params.tex = imported->texture();
+                    params.array_slice =
+                        static_cast<int>(imported->arraySlice());
+                    params.fmt = planeFormats[plane];
+                    params.w = widths[plane];
+                    params.h = heights[plane];
+                    textures[plane] = pl_d3d11_wrap(d3d11_->gpu, &params);
+                    if (!textures[plane]
+                        || !textures[plane]->params.sampleable) {
+                        error = takeLogError(
+                            "libplacebo cannot directly wrap a D3D11 decoder plane");
+                        return false;
+                    }
+                }
+            } else {
+                const int copyWidth = (source.width() + 1) & ~1;
+                const int copyHeight = (source.height() + 1) & ~1;
+                if (copyWidth <= 0 || copyHeight <= 0
+                    || static_cast<UINT>(copyWidth) > description.Width
+                    || static_cast<UINT>(copyHeight) > description.Height) {
+                    error =
+                        "The visible D3D11 decoder region exceeds its allocation";
+                    return false;
+                }
+                decoderSourceCopy = acquireDecoderSourceCopy(
+                    description.Format,
+                    copyWidth,
+                    copyHeight,
+                    tenBit,
+                    error);
+                if (!decoderSourceCopy) {
+                    return false;
+                }
+
+                const D3D11_BOX sourceBox {
+                    0,
+                    0,
+                    0,
+                    static_cast<UINT>(copyWidth),
+                    static_cast<UINT>(copyHeight),
+                    1,
+                };
+                const UINT sourceSubresource = D3D11CalcSubresource(
+                    0,
+                    imported->arraySlice(),
+                    description.MipLevels);
+                if (context1_) {
+                    context1_->CopySubresourceRegion1(
+                        decoderSourceCopy->texture.Get(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        imported->texture(),
+                        sourceSubresource,
+                        &sourceBox,
+                        D3D11_COPY_DISCARD);
+                } else {
+                    context_.get()->CopySubresourceRegion(
+                        decoderSourceCopy->texture.Get(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        imported->texture(),
+                        sourceSubresource,
+                        &sourceBox);
+                }
+                if (statisticsMode_.load(std::memory_order_relaxed)
+                    != D3D11StatisticsMode::Off) {
+                    decoderSurfaceCopies_.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                }
+                sampledPlanes = &decoderSourceCopy->planes;
             }
             frame.num_planes = 2;
-            initializePlane(frame.planes[0], textures[0], 1, 0);
-            initializePlane(frame.planes[1], textures[1], 2, 1);
+            initializePlane(frame.planes[0], (*sampledPlanes)[0], 1, 0);
+            initializePlane(frame.planes[1], (*sampledPlanes)[1], 2, 1);
             frame.crop = {
                 0.0F,
                 0.0F,
@@ -1227,6 +1542,11 @@ public:
                 return false;
             }
         } else {
+            if (!(description.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+                error =
+                    "The imported D3D11 texture is not shader-readable";
+                return false;
+            }
             pl_d3d11_wrap_params params {};
             params.tex = imported->texture();
             params.array_slice = static_cast<int>(imported->arraySlice());
@@ -1283,12 +1603,14 @@ public:
     std::shared_ptr<D3D11DeviceAccess> deviceAccess_;
     BorrowedD3D11Device device_;
     BorrowedD3D11DeviceContext context_;
+    ComPtr<ID3D11DeviceContext1> context1_;
     D3D11CurrentTargetCallback currentTarget_;
     std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop_;
     EventCallback eventCallback_;
     VideoRenderConfig config_;
     D3D11AdvancedColorInfo advancedColorInfo_;
     bool allowSoftwareMappingFallback_ = false;
+    bool directDecoderTextureSamplingEnabled_ = false;
     bool open_ = false;
 
     pl_log log_ = nullptr;
@@ -1296,10 +1618,25 @@ public:
     pl_renderer renderer_ = nullptr;
     pl_hook scRgbOutputHook_ {};
     std::array<pl_tex, 4> uploadTextures_ {};
+    std::vector<std::shared_ptr<DecoderSourceCopy>> decoderSourceCopies_;
     std::deque<InFlightRender> inFlightRenders_;
     std::vector<ComPtr<ID3D11Query>> availableCompletionQueries_;
+    mutable std::mutex frameReleaseMutex_;
+    std::condition_variable frameReleaseChanged_;
+    std::condition_variable frameReleaseSpace_;
+    std::condition_variable frameReleaseDrained_;
+    std::array<DeferredFrameRelease, maximumDeferredFrameReleases>
+        deferredFrameReleases_;
+    std::size_t deferredFrameReleaseHead_ = 0;
+    std::size_t deferredFrameReleaseCount_ = 0;
+    bool frameReleaseActive_ = false;
+    bool frameReleaseStopping_ = false;
+    std::thread frameReleaseWorker_;
     std::string lastLogError_;
 
+    std::atomic<D3D11StatisticsMode> statisticsMode_ {
+        D3D11StatisticsMode::Counters
+    };
     std::atomic<std::uint64_t> decoderSurfaceCopies_ { 0 };
     std::atomic<std::uint64_t> stateBusyRenderAttempts_ { 0 };
     std::atomic<std::uint64_t> serializationBusyRenderAttempts_ { 0 };
@@ -1312,27 +1649,6 @@ public:
     std::atomic<std::int64_t> maximumInteropMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumBufferUpdateMicroseconds_ { 0 };
     std::atomic<std::int64_t> maximumDrawMicroseconds_ { 0 };
-    std::atomic<std::int64_t> maximumRetireCompletedMicroseconds_ { 0 };
-    std::atomic<std::int64_t>
-        maximumCompletionQueryAcquireMicroseconds_ { 0 };
-    std::atomic<std::int64_t> maximumClearMicroseconds_ { 0 };
-    std::atomic<std::int64_t> maximumPlRenderImageMicroseconds_ { 0 };
-    std::atomic<std::int64_t>
-        maximumCompletionQueryEndMicroseconds_ { 0 };
-    std::atomic<std::int64_t> maximumInFlightRetentionMicroseconds_ { 0 };
-    std::atomic<std::int64_t> maximumLibplaceboPassesPerRender_ { 0 };
-    std::atomic<std::uint64_t> libplaceboPassGraphChanges_ { 0 };
-    std::atomic<std::int64_t>
-        maximumLibplaceboGpuFrameMicroseconds_ { 0 };
-    std::atomic<std::int64_t>
-        maximumLibplaceboGpuPassMicroseconds_ { 0 };
-    std::atomic<std::int64_t>
-        maximumLibplaceboCallbackArrivalMicroseconds_ { 0 };
-    std::atomic<std::int64_t>
-        maximumLibplaceboPostCallbackMicroseconds_ { 0 };
-    std::uint64_t previousLibplaceboPassGraphHash_ = 0;
-    std::uint64_t previousLibplaceboPassCount_ = 0;
-    bool havePreviousLibplaceboPassGraph_ = false;
 };
 
 D3D11VideoRenderer::D3D11VideoRenderer(
@@ -1481,24 +1797,42 @@ bool D3D11VideoRenderer::configure(const VideoRenderConfig& config)
     return configured;
 }
 
-bool D3D11VideoRenderer::render(const VideoFrame& frame)
+bool D3D11VideoRenderer::renderFrame(
+    const VideoFrame& frame,
+    VideoRenderRetryReason* retryReason)
 {
+    if (retryReason) {
+        *retryReason = VideoRenderRetryReason::Unspecified;
+    }
     if (!impl_ || !frame) {
         return false;
     }
+
+    const auto statisticsMode =
+        impl_->statisticsMode_.load(std::memory_order_relaxed);
+    const bool collectCounters =
+        statisticsMode != D3D11StatisticsMode::Off;
+    const bool collectTiming =
+        statisticsMode == D3D11StatisticsMode::Timing;
 
     VideoRenderConfig config;
     D3D11CurrentTargetCallback currentTarget;
     std::shared_ptr<D3D11HardwareFrameInterop> hardwareInterop;
     bool allowSoftwareMappingFallback = false;
+    bool directDecoderTextureSampling = false;
     {
         std::unique_lock<std::mutex> lock(
             impl_->stateMutex_,
             std::try_to_lock);
         if (!lock.owns_lock()) {
-            impl_->stateBusyRenderAttempts_.fetch_add(
-                1,
-                std::memory_order_relaxed);
+            if (retryReason) {
+                *retryReason = VideoRenderRetryReason::StateBusy;
+            }
+            if (collectCounters) {
+                impl_->stateBusyRenderAttempts_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
             return false;
         }
         if (impl_->open_) {
@@ -1507,6 +1841,8 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             hardwareInterop = impl_->hardwareInterop_;
             allowSoftwareMappingFallback =
                 impl_->allowSoftwareMappingFallback_;
+            directDecoderTextureSampling =
+                impl_->directDecoderTextureSamplingEnabled_;
         }
     }
     if (!currentTarget) {
@@ -1528,21 +1864,35 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         impl_->renderMutex_,
         std::try_to_lock);
     if (!renderLock.owns_lock()) {
-        impl_->serializationBusyRenderAttempts_.fetch_add(
-            1,
-            std::memory_order_relaxed);
+        if (retryReason) {
+            *retryReason = VideoRenderRetryReason::SerializationBusy;
+        }
+        if (collectCounters) {
+            impl_->serializationBusyRenderAttempts_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         return false;
     }
     auto contextGuard = impl_->deviceAccess_->tryContextGuard();
     if (!contextGuard) {
-        impl_->deviceContextBusyRenderAttempts_.fetch_add(
-            1,
-            std::memory_order_relaxed);
-        auto& detailedCounter =
-            contextGuard.contendedByReservationAwareOwner()
-            ? impl_->reservationAwareContextBusyRenderAttempts_
-            : impl_->unreservedContextBusyRenderAttempts_;
-        detailedCounter.fetch_add(1, std::memory_order_relaxed);
+        const bool reservationAware =
+            contextGuard.contendedByReservationAwareOwner();
+        if (retryReason) {
+            *retryReason = reservationAware
+                ? VideoRenderRetryReason::
+                    DeviceContextBusyReservationAware
+                : VideoRenderRetryReason::DeviceContextBusyUnreserved;
+        }
+        if (collectCounters) {
+            impl_->deviceContextBusyRenderAttempts_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            auto& detailedCounter = reservationAware
+                ? impl_->reservationAwareContextBusyRenderAttempts_
+                : impl_->unreservedContextBusyRenderAttempts_;
+            detailedCounter.fetch_add(1, std::memory_order_relaxed);
+        }
         return false;
     }
 
@@ -1561,11 +1911,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
         error = hresultText("The D3D11 device was removed", removedReason);
     }
     if (error.empty()) {
-        const auto retireStarted = steadyMicroseconds();
         const bool retired = impl_->retireCompletedRenders(error);
-        updateMaximum(
-            impl_->maximumRetireCompletedMicroseconds_,
-            steadyMicroseconds() - retireStarted);
         if (!retired) {
             errorType = detail::d3d11FailureEvent(
                 impl_->device_.get()->GetDeviceRemovedReason());
@@ -1574,13 +1920,19 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     if (error.empty()
         && impl_->inFlightRenders_.size()
             >= impl_->maximumInFlightRenders) {
-        impl_->inFlightBusyRenderAttempts_.fetch_add(
-            1,
-            std::memory_order_relaxed);
+        if (retryReason) {
+            *retryReason = VideoRenderRetryReason::InFlightCapacity;
+        }
+        if (collectCounters) {
+            impl_->inFlightBusyRenderAttempts_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         return false;
     }
 
-    const auto colorSetupStarted = steadyMicroseconds();
+    const auto colorSetupStarted =
+        collectTiming ? steadyMicroseconds() : 0;
     ComPtr<ID3D11Texture2D> targetTextureNative;
     D3D11_TEXTURE2D_DESC targetDescriptor {};
     DXGI_FORMAT targetFormat = DXGI_FORMAT_UNKNOWN;
@@ -1611,9 +1963,11 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             advancedColorInfo,
             error);
     }
-    updateMaximum(
-        impl_->maximumColorSetupMicroseconds_,
-        steadyMicroseconds() - colorSetupStarted);
+    if (collectTiming) {
+        updateMaximum(
+            impl_->maximumColorSetupMicroseconds_,
+            steadyMicroseconds() - colorSetupStarted);
+    }
 
     pl_tex targetTexture = nullptr;
     pl_frame targetFrame {};
@@ -1632,6 +1986,7 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
     pl_frame image {};
     std::array<pl_tex, 2> hardwareTextures {};
+    std::shared_ptr<Impl::DecoderSourceCopy> decoderSourceCopy;
     std::shared_ptr<D3D11TextureFrame> imported;
     std::shared_ptr<HardwareFrameMapping> mappedFrame;
     std::unique_ptr<AVFrame, AVFrameDeleter> mappedNative;
@@ -1639,25 +1994,30 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     bool mappedSoftware = false;
     ComPtr<ID3D11Query> completion;
 
-    const auto sourceStarted = steadyMicroseconds();
+    const auto sourceStarted = collectTiming ? steadyMicroseconds() : 0;
     if (error.empty() && frame.hasHardwareFrame()) {
         const HardwareFrame hardwareFrame = frame.hardwareFrame();
         const bool compatibleInterop = hardwareInterop
             && hardwareInterop->deviceAccess() == impl_->deviceAccess_
             && hardwareInterop->supports(hardwareFrame);
         if (compatibleInterop) {
-            const auto interopStarted = steadyMicroseconds();
+            const auto interopStarted =
+                collectTiming ? steadyMicroseconds() : 0;
             imported = hardwareInterop->importFrame(
                 hardwareFrame,
                 frame.colorSpaceInfo());
-            updateMaximum(
-                impl_->maximumInteropMicroseconds_,
-                steadyMicroseconds() - interopStarted);
+            if (collectTiming) {
+                updateMaximum(
+                    impl_->maximumInteropMicroseconds_,
+                    steadyMicroseconds() - interopStarted);
+            }
             if (!imported
                 || !impl_->wrapHardwareSource(
                     frame,
                     imported,
                     hardwareTextures,
+                    decoderSourceCopy,
+                    directDecoderTextureSampling,
                     image,
                     dovi,
                     error)) {
@@ -1703,17 +2063,15 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             mappedSoftware = true;
         }
     }
-    updateMaximum(
-        impl_->maximumBufferUpdateMicroseconds_,
-        steadyMicroseconds() - sourceStarted);
+    if (collectTiming) {
+        updateMaximum(
+            impl_->maximumBufferUpdateMicroseconds_,
+            steadyMicroseconds() - sourceStarted);
+    }
 
     if (error.empty()) {
-        const auto queryStarted = steadyMicroseconds();
         const bool acquired =
             impl_->acquireCompletionQuery(completion, error);
-        updateMaximum(
-            impl_->maximumCompletionQueryAcquireMicroseconds_,
-            steadyMicroseconds() - queryStarted);
         if (!acquired) {
             errorType = detail::d3d11FailureEvent(
                 impl_->device_.get()->GetDeviceRemovedReason());
@@ -1722,15 +2080,12 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
 
     if (error.empty()) {
         applyGeometry(image, targetFrame, config);
-        const auto drawStarted = steadyMicroseconds();
+        const auto drawStarted =
+            collectTiming ? steadyMicroseconds() : 0;
         constexpr float clearColor[] { 0.0F, 0.0F, 0.0F, 1.0F };
-        const auto clearStarted = steadyMicroseconds();
         impl_->context_.get()->ClearRenderTargetView(
             target.view,
             clearColor);
-        updateMaximum(
-            impl_->maximumClearMicroseconds_,
-            steadyMicroseconds() - clearStarted);
         const bool useHardwareImportFastParams =
             detail::d3d11ShouldUseHardwareImportFastParams(
                 static_cast<bool>(imported));
@@ -1742,78 +2097,37 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
             renderParams.hooks = outputHooks;
             renderParams.num_hooks = 1;
         }
-        Impl::RenderPassProbe passProbe;
-        renderParams.info_callback = &Impl::renderInfoCallback;
-        renderParams.info_priv = &passProbe;
-        const auto plRenderStarted = steadyMicroseconds();
-        passProbe.cpuStartedMicroseconds = plRenderStarted;
         rendered = pl_render_image(
             impl_->renderer_,
             &image,
             &targetFrame,
             &renderParams);
-        const auto plRenderFinished = steadyMicroseconds();
-        updateMaximum(
-            impl_->maximumPlRenderImageMicroseconds_,
-            plRenderFinished - plRenderStarted);
         if (rendered) {
-            updateMaximum(
-                impl_->maximumLibplaceboPassesPerRender_,
-                static_cast<std::int64_t>(passProbe.passCount));
-            updateMaximum(
-                impl_->maximumLibplaceboGpuFrameMicroseconds_,
-                static_cast<std::int64_t>(
-                    passProbe.gpuFrameNanoseconds / 1'000));
-            updateMaximum(
-                impl_->maximumLibplaceboGpuPassMicroseconds_,
-                static_cast<std::int64_t>(
-                    passProbe.maximumGpuPassNanoseconds / 1'000));
-            if (passProbe.firstCallbackMicroseconds != 0) {
-                updateMaximum(
-                    impl_->maximumLibplaceboCallbackArrivalMicroseconds_,
-                    passProbe.firstCallbackMicroseconds
-                        - passProbe.cpuStartedMicroseconds);
-                updateMaximum(
-                    impl_->maximumLibplaceboPostCallbackMicroseconds_,
-                    plRenderFinished
-                        - passProbe.lastCallbackMicroseconds);
-            }
-            if (!impl_->havePreviousLibplaceboPassGraph_
-                || impl_->previousLibplaceboPassGraphHash_
-                    != passProbe.graphHash
-                || impl_->previousLibplaceboPassCount_
-                    != passProbe.passCount) {
-                impl_->libplaceboPassGraphChanges_.fetch_add(
-                    1,
-                    std::memory_order_relaxed);
-                impl_->previousLibplaceboPassGraphHash_ =
-                    passProbe.graphHash;
-                impl_->previousLibplaceboPassCount_ = passProbe.passCount;
-                impl_->havePreviousLibplaceboPassGraph_ = true;
-            }
-            const auto completionEndStarted = steadyMicroseconds();
             impl_->context_.get()->End(completion.Get());
-            updateMaximum(
-                impl_->maximumCompletionQueryEndMicroseconds_,
-                steadyMicroseconds() - completionEndStarted);
-            const auto retentionStarted = steadyMicroseconds();
             Impl::InFlightRender inFlight;
             inFlight.completion = std::move(completion);
             inFlight.target = std::move(targetTextureNative);
-            inFlight.source = frame;
-            inFlight.imported = std::move(imported);
-            inFlight.sourceTextures = hardwareTextures;
-            hardwareTextures = {};
+            inFlight.decoderSourceCopy = std::move(decoderSourceCopy);
+            if (imported) {
+                // Keep the decoder frame alive until the copy/direct draw is
+                // complete, then release it on the dedicated recycler rather
+                // than the latency-sensitive output thread.
+                inFlight.source = frame;
+                inFlight.imported = std::move(imported);
+            }
+            if (!inFlight.decoderSourceCopy) {
+                inFlight.sourceTextures = hardwareTextures;
+                hardwareTextures = {};
+            }
             inFlight.targetTexture = targetTexture;
             targetTexture = nullptr;
             impl_->inFlightRenders_.push_back(std::move(inFlight));
-            updateMaximum(
-                impl_->maximumInFlightRetentionMicroseconds_,
-                steadyMicroseconds() - retentionStarted);
         }
-        updateMaximum(
-            impl_->maximumDrawMicroseconds_,
-            steadyMicroseconds() - drawStarted);
+        if (collectTiming) {
+            updateMaximum(
+                impl_->maximumDrawMicroseconds_,
+                steadyMicroseconds() - drawStarted);
+        }
         if (!rendered) {
             error = impl_->takeLogError(
                 "libplacebo could not render the D3D11 video frame");
@@ -1878,6 +2192,35 @@ bool D3D11VideoRenderer::render(const VideoFrame& frame)
     return rendered;
 }
 
+bool D3D11VideoRenderer::render(const VideoFrame& frame)
+{
+    return renderFrame(frame, nullptr);
+}
+
+VideoRenderAttemptResult D3D11VideoRenderer::renderDetailed(
+    const VideoFrame& frame)
+{
+    VideoRenderRetryReason retryReason =
+        VideoRenderRetryReason::Unspecified;
+    if (renderFrame(frame, &retryReason)) {
+        return { VideoRenderAttemptStatus::Presented, 0, {}, retryReason };
+    }
+    if (retryReason != VideoRenderRetryReason::Unspecified) {
+        return {
+            VideoRenderAttemptStatus::RetryAfterBackoff,
+            1,
+            "The D3D11 renderer is temporarily busy",
+            retryReason,
+        };
+    }
+    return {
+        VideoRenderAttemptStatus::FatalError,
+        0,
+        "The D3D11 renderer could not present the frame",
+        retryReason,
+    };
+}
+
 void D3D11VideoRenderer::close() noexcept
 {
     if (impl_) {
@@ -1890,14 +2233,17 @@ void D3D11VideoRenderer::flush() noexcept
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
-    if (!impl_->deviceAccess_ || !impl_->d3d11_) {
-        return;
+    {
+        std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
+        if (impl_->deviceAccess_ && impl_->d3d11_) {
+            auto contextGuard = impl_->deviceAccess_->contextGuard();
+            (void)contextGuard;
+            pl_gpu_finish(impl_->d3d11_->gpu);
+            impl_->destroyInFlightRenders();
+            impl_->destroyDecoderSourceCopies();
+        }
     }
-    auto contextGuard = impl_->deviceAccess_->contextGuard();
-    (void)contextGuard;
-    pl_gpu_finish(impl_->d3d11_->gpu);
-    impl_->destroyInFlightRenders();
+    impl_->waitForFrameReleases();
 }
 
 BorrowedD3D11Device D3D11VideoRenderer::device() const noexcept
@@ -1980,6 +2326,41 @@ bool D3D11VideoRenderer::allowSoftwareMappingFallback() const noexcept
     return impl_->allowSoftwareMappingFallback_;
 }
 
+void D3D11VideoRenderer::setDirectDecoderTextureSamplingEnabled(
+    bool enabled) noexcept
+{
+    if (!impl_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    impl_->directDecoderTextureSamplingEnabled_ = enabled;
+}
+
+bool D3D11VideoRenderer::directDecoderTextureSamplingEnabled() const noexcept
+{
+    if (!impl_) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+    return impl_->directDecoderTextureSamplingEnabled_;
+}
+
+void D3D11VideoRenderer::setStatisticsMode(
+    D3D11StatisticsMode mode) noexcept
+{
+    if (impl_) {
+        impl_->statisticsMode_.store(mode, std::memory_order_relaxed);
+    }
+}
+
+D3D11StatisticsMode
+D3D11VideoRenderer::statisticsMode() const noexcept
+{
+    return impl_
+        ? impl_->statisticsMode_.load(std::memory_order_relaxed)
+        : D3D11StatisticsMode::Off;
+}
+
 D3D11AdvancedColorInfo
 D3D11VideoRenderer::advancedColorInfo() const noexcept
 {
@@ -2019,30 +2400,6 @@ D3D11VideoRenderer::takeStatistics() noexcept
         impl_->maximumBufferUpdateMicroseconds_.exchange(0);
     result.maximumDrawMicroseconds =
         impl_->maximumDrawMicroseconds_.exchange(0);
-    result.maximumRetireCompletedMicroseconds =
-        impl_->maximumRetireCompletedMicroseconds_.exchange(0);
-    result.maximumCompletionQueryAcquireMicroseconds =
-        impl_->maximumCompletionQueryAcquireMicroseconds_.exchange(0);
-    result.maximumClearMicroseconds =
-        impl_->maximumClearMicroseconds_.exchange(0);
-    result.maximumPlRenderImageMicroseconds =
-        impl_->maximumPlRenderImageMicroseconds_.exchange(0);
-    result.maximumCompletionQueryEndMicroseconds =
-        impl_->maximumCompletionQueryEndMicroseconds_.exchange(0);
-    result.maximumInFlightRetentionMicroseconds =
-        impl_->maximumInFlightRetentionMicroseconds_.exchange(0);
-    result.maximumLibplaceboPassesPerRender =
-        impl_->maximumLibplaceboPassesPerRender_.exchange(0);
-    result.libplaceboPassGraphChanges =
-        impl_->libplaceboPassGraphChanges_.exchange(0);
-    result.maximumLibplaceboGpuFrameMicroseconds =
-        impl_->maximumLibplaceboGpuFrameMicroseconds_.exchange(0);
-    result.maximumLibplaceboGpuPassMicroseconds =
-        impl_->maximumLibplaceboGpuPassMicroseconds_.exchange(0);
-    result.maximumLibplaceboCallbackArrivalMicroseconds =
-        impl_->maximumLibplaceboCallbackArrivalMicroseconds_.exchange(0);
-    result.maximumLibplaceboPostCallbackMicroseconds =
-        impl_->maximumLibplaceboPostCallbackMicroseconds_.exchange(0);
     return result;
 }
 

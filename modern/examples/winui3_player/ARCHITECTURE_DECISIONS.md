@@ -18,6 +18,7 @@ remain with a link to their replacement.
 | [ADR-007](#adr-007-coalesce-progress-interaction-into-one-asynchronous-seek) | Coalesce progress interaction into one asynchronous seek | Accepted |
 | [ADR-008](#adr-008-use-opaque-rgb10pq-video-presentation) | Use opaque RGB10/PQ video presentation | Accepted |
 | [ADR-009](#adr-009-retry-transient-render-contention-with-bounded-context-handoff) | Retry transient render contention with bounded context handoff | Accepted |
+| [ADR-010](#adr-010-copy-the-visible-decoder-region-by-default) | Copy the visible decoder region by default | Accepted |
 
 ## ADR-001: Unpackaged, self-contained WinUI 3 application
 
@@ -163,6 +164,8 @@ terminate and join every worker before resources are released.
 
 - **Status:** Accepted
 - **Date:** 2026-08-03
+- **Amended:** 2026-08-08 to disable cadence/timing collection while Debug is
+  closed
 
 ### Context
 
@@ -172,14 +175,19 @@ logging can itself create the symptoms under investigation.
 
 ### Decision
 
-Always collect bounded atomic cadence counters and one-time stream metadata.
-Aggregate and format cadence on the UI every five seconds. Keep the log in
-memory, cap it at 1,000 lines, and show it only in the separately toggled Debug
-window. Treat the text format as diagnostic, not as a public API.
+Always collect only one-time stream metadata. Opening Debug enables bounded
+atomic cadence counters and `D3D11StatisticsMode::Timing`; closing it selects
+`Off` and stops callback clocks, output clocks, and five-second formatting.
+Keep the log in memory, cap it at 1,000 lines, and show it only in the
+separately toggled Debug window. Treat the text format as diagnostic, not as a
+public API. Retry classification uses `VideoRenderRetryReason`, never optional
+statistics.
 
 ### Consequences
 
-- Opening Debug does not insert synchronous work into audio/video workers.
+- Debug adds only bounded atomic cadence work to audio/video callbacks; closing
+  it restores the uninstrumented callback path apart from one relaxed flag
+  load.
 - Long sessions have bounded log history.
 - Diagnostics are easy to copy visually but are not persisted automatically.
 - Stable telemetry or automated performance analysis should use a separate
@@ -279,8 +287,8 @@ render retry.
 
 Use `Player::renderVideoDetailed()` on the output's private render thread. The
 Player publishes immutable frame and renderer-binding snapshots atomically,
-returns a frame sequence and presentation generation, and rechecks generation
-after rendering. The output retries only classified busy results in a
+returns a frame sequence, presentation generation, and structured retry reason,
+and rechecks generation after rendering. The output retries only classified busy results in a
 latest-frame mailbox; a newer sequence supersedes the older pending frame.
 
 Before every output pass makes its first non-blocking D3D11 context attempt, it
@@ -290,7 +298,9 @@ uncontended attempt proceeds immediately; a contended attempt waits for at most
 1/2/4/8/16-ms backoff rather than spinning. Ordinary public context users are
 not blocked by the reservation, and every wait stays on the private output
 thread. The context guard is released when rendering returns and is never held
-through statistics collection or swap-chain presentation. Detach, stop, and
+through retry classification, statistics reads, or swap-chain presentation.
+Statistics are read only on application request, not after every render.
+Detach, stop, and
 connection-generation changes cancel both pending retry and reservation.
 
 Diagnostics report attempt reason, renderer lock stage, context-owner class,
@@ -316,6 +326,52 @@ are no longer reported as missing frames.
   Separate high draw times after prolonged build/UI-capture load disappeared
   in a controlled cold rerun, which restored both supplied files to source
   cadence and zero steady coalescing.
-- The same-build Intel performance regression remains required; this decision
-  corrects generic retry semantics but does not claim cross-device performance
-  equivalence.
+- The same-build Iris Xe regression later localized a separate persistent
+  post-seek stall to redundant FFmpeg D3D11VA decoder teardown. Compatible
+  frames-context and decoder reuse removed that teardown; the generic retry
+  policy here remains independent and still does not claim cross-device
+  performance equivalence.
+
+## ADR-010: Copy the visible decoder region by default
+
+- **Status:** Accepted
+- **Date:** 2026-08-06
+- **Amended:** 2026-08-07 for completion-retained source frames and bounded
+  off-render-thread release
+
+### Context
+
+Directly sampling an FFmpeg D3D11VA texture array removes one GPU-local copy,
+but forces shader-resource usage onto decoder allocations and retains scarce
+decoder slices until the asynchronous draw completes. The policy is sensitive
+to driver handling of decoder padding, seek/flush lifetime, and shutdown.
+mpv's current D3D11VA backend uses a visible-region same-format copy by default
+and exposes direct sampling only as a user opt-in with compatibility warnings.
+
+### Decision
+
+The example keeps `D3D11VideoOutputOptions::directDecoderTextureSampling`
+disabled. QtAVCore copies the even-aligned visible NV12/P010 rectangle into a
+bounded three-entry shader-readable ring. A D3D11.1 context uses
+`CopySubresourceRegion1()` with `D3D11_COPY_DISCARD`; the fallback uses the same
+source box without the flag. The source stays raw, so libplacebo remains the
+only Dolby Vision and color authority. No CPU map, RGB intermediate, Video
+Processor conversion, or per-frame GPU drain is introduced.
+
+### Consequences
+
+- The default path incurs one same-device GPU copy per rendered hardware frame
+  and reports it in `decoder-copies`.
+- Decoder textures remain retained through GPU completion. Their source-frame
+  and interop references then move to a bounded recycler so Intel/other vendor
+  allocation teardown cannot execute on the output render thread.
+- Advanced applications can opt into direct sampling for an A/B performance
+  test, but must accept the documented driver/lifetime risks.
+- The remaining native policy gate uses the same Release revision on NVIDIA and
+  AMD, `legend.mkv` only, with
+  `D3D11VideoOutputOptions::directDecoderTextureSampling` both off and on.
+  `decoder-copies` is auxiliary path evidence, not the tested switch.
+- Compatible frames-context and decoder reuse is an independent shared-device
+  lifetime decision governed by
+  [QtAVCore AD-011](../../DECISIONS.md#ad-011-windows-reuses-compatible-d3d11va-frames-contexts-and-decoders)
+  and [FFmpeg FD-005](../../../ffmpeg/DECISIONS.md#fd-005-reuse-a-compatible-d3d11va-decoder-with-its-frames-context).

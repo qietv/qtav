@@ -169,6 +169,15 @@ inline-assembly exception, and libplacebo preserves 16-byte allocation
 alignment across its Windows x64 public/private boundary. These are intentional
 compatibility contracts; see [FD-001 and FD-003](DECISIONS.md).
 
+The Windows FFmpeg package also carries an opt-in D3D11VA decoder-reuse
+extension. When QtAVCore reselects the same initialized hardware-frames context,
+the extension retains a compatible video decoder and its output views instead
+of making the Intel driver tear them down and recreate them after a repeated
+HEVC format callback. The default FFmpeg behavior is unchanged unless
+`AVD3D11VADeviceContext::reuse_decoder` is enabled. Because this is a public
+overlay ABI, the Windows package and QtAVCore D3D11VA backend must remain paired;
+see [FD-005](DECISIONS.md).
+
 ## Outputs and parent-project consumption
 
 The default install root is:

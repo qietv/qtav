@@ -100,6 +100,15 @@ if(TRIPLET MATCHES "windows"
    AND NOT EXISTS "${PREFIX}/include/spirv_cross/spirv_cross_c.h")
     message(FATAL_ERROR "Windows libplacebo is missing its SPIRV-Cross dependency")
 endif()
+if(TRIPLET MATCHES "windows")
+    file(READ "${PREFIX}/include/libavutil/hwcontext_d3d11va.h"
+         FFMPEG_D3D11VA_HEADER)
+    if(NOT FFMPEG_D3D11VA_HEADER MATCHES "int[ \t]+reuse_decoder;")
+        message(FATAL_ERROR
+            "Windows FFmpeg is missing compatible D3D11VA decoder reuse support"
+        )
+    endif()
+endif()
 if(LIBPLACEBO_CONFIG MATCHES "#define PL_HAVE_LIBDOVI 1")
     message(FATAL_ERROR "libdovi must remain disabled; FFmpeg supplies parsed RPU metadata")
 endif()

@@ -13,6 +13,7 @@
 
 #include <qtav/d3d11_export.h>
 #include <qtav/d3d11_device_access.h>
+#include <qtav/d3d11_statistics.h>
 #include <qtav/video_render_api.h>
 
 namespace qtav {
@@ -49,7 +50,8 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11AdvancedColorInfo {
 };
 
 struct QTAV_RENDER_D3D11_EXPORT D3D11VideoRendererStatistics {
-    // Per-stage maxima accumulated since the previous takeStatistics() call.
+    // Counters and coarse per-stage maxima accumulated since the previous
+    // takeStatistics() call.
     std::uint64_t decoderSurfaceCopies = 0;
     // Mutually exclusive reasons for render() returning false because a
     // transient renderer resource was busy.
@@ -65,26 +67,6 @@ struct QTAV_RENDER_D3D11_EXPORT D3D11VideoRendererStatistics {
     std::int64_t maximumInteropMicroseconds = 0;
     std::int64_t maximumBufferUpdateMicroseconds = 0;
     std::int64_t maximumDrawMicroseconds = 0;
-    // Detailed CPU wall-clock maxima for work that is otherwise folded into
-    // render() or maximumDrawMicroseconds. These values do not wait for GPU
-    // completion.
-    std::int64_t maximumRetireCompletedMicroseconds = 0;
-    std::int64_t maximumCompletionQueryAcquireMicroseconds = 0;
-    std::int64_t maximumClearMicroseconds = 0;
-    std::int64_t maximumPlRenderImageMicroseconds = 0;
-    std::int64_t maximumCompletionQueryEndMicroseconds = 0;
-    std::int64_t maximumInFlightRetentionMicroseconds = 0;
-    // libplacebo's GPU timings are asynchronous rolling samples. They help
-    // distinguish GPU workload from CPU/driver time inside pl_render_image(),
-    // but do not necessarily describe the same frame as the CPU maximum.
-    std::int64_t maximumLibplaceboPassesPerRender = 0;
-    std::uint64_t libplaceboPassGraphChanges = 0;
-    std::int64_t maximumLibplaceboGpuFrameMicroseconds = 0;
-    std::int64_t maximumLibplaceboGpuPassMicroseconds = 0;
-    // CPU wall time from pl_render_image() entry to the first successful-pass
-    // callback, and from the last callback until pl_render_image() returns.
-    std::int64_t maximumLibplaceboCallbackArrivalMicroseconds = 0;
-    std::int64_t maximumLibplaceboPostCallbackMicroseconds = 0;
 };
 
 // The view and optional swap chain remain application-owned and must stay
@@ -171,10 +153,13 @@ public:
     bool open(const VideoRenderConfig& config) override;
     bool configure(const VideoRenderConfig& config) override;
     bool render(const VideoFrame& frame) override;
+    VideoRenderAttemptResult renderDetailed(
+        const VideoFrame& frame) override;
     void close() noexcept override;
 
-    // Completes submitted rendering and releases references to borrowed
-    // targets and decoder slices. Call before resizing or replacing a target.
+    // Completes submitted rendering and drains the background release of
+    // borrowed targets and decoder slices. Call before resizing or replacing
+    // a target.
     void flush() noexcept;
 
     BorrowedD3D11Device device() const noexcept;
@@ -187,11 +172,27 @@ public:
     hardwareFrameInterop() const noexcept;
     void setAllowSoftwareMappingFallback(bool allow) noexcept;
     bool allowSoftwareMappingFallback() const noexcept;
+    // Bypasses the default decoder-to-shader GPU copy and samples compatible
+    // shader-bound NV12/P010 decoder texture-array slices directly. This is
+    // an explicitly unsafe compatibility/performance option: D3D11 does not
+    // guarantee decoder-surface sampling, and drivers may expose padding,
+    // throughput, seek, or resource-lifetime failures. Keep disabled unless
+    // the exact adapter, driver, codec, seek, and shutdown matrix is accepted.
+    void setDirectDecoderTextureSamplingEnabled(bool enabled) noexcept;
+    bool directDecoderTextureSamplingEnabled() const noexcept;
+    // Counters is the low-cost default. Timing additionally enables per-frame
+    // steady-clock sampling for the coarse render stages.
+    void setStatisticsMode(D3D11StatisticsMode mode) noexcept;
+    D3D11StatisticsMode statisticsMode() const noexcept;
     D3D11AdvancedColorInfo advancedColorInfo() const noexcept;
     // Atomically returns and resets the accumulated render-stage maxima.
     D3D11VideoRendererStatistics takeStatistics() noexcept;
 
 private:
+    bool renderFrame(
+        const VideoFrame& frame,
+        VideoRenderRetryReason* retryReason);
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

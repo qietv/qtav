@@ -17,6 +17,7 @@
 #include <string>
 
 #include <qtav/output_d3d11_export.h>
+#include <qtav/d3d11_statistics.h>
 #include <qtav/video_render_api.h>
 
 namespace qtav {
@@ -71,6 +72,15 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputOptions {
     bool allowWarpFallback = true;
     bool allowSoftwareMappingFallback = true;
     bool configureHardwareDecoding = true;
+    // Unsafe opt-in matching D3D11VideoRenderer's direct decoder-texture
+    // sampling mode. The default performs one visible-region same-GPU copy
+    // into an ordinary shader resource. Direct sampling may be faster or use
+    // less power, but D3D11 does not guarantee it and driver-specific padding,
+    // performance, seek, and shutdown failures have been observed.
+    bool directDecoderTextureSampling = false;
+    // Counters is the low-cost production default. Timing additionally
+    // enables per-frame cadence, Present, gap, and coarse renderer clocks.
+    D3D11StatisticsMode statisticsMode = D3D11StatisticsMode::Counters;
 };
 
 enum class D3D11PresentationColorSpace {
@@ -152,21 +162,6 @@ struct QTAV_OUTPUT_D3D11_EXPORT D3D11VideoOutputStatistics {
     std::int64_t maximumInteropMicroseconds = 0;
     std::int64_t maximumBufferUpdateMicroseconds = 0;
     std::int64_t maximumDrawMicroseconds = 0;
-    // Detailed renderer CPU wall-clock maxima. Completion-query timings cover
-    // submission bookkeeping only and do not wait for GPU completion.
-    std::int64_t maximumRetireCompletedMicroseconds = 0;
-    std::int64_t maximumCompletionQueryAcquireMicroseconds = 0;
-    std::int64_t maximumClearMicroseconds = 0;
-    std::int64_t maximumPlRenderImageMicroseconds = 0;
-    std::int64_t maximumCompletionQueryEndMicroseconds = 0;
-    std::int64_t maximumInFlightRetentionMicroseconds = 0;
-    // Asynchronous rolling libplacebo GPU samples and pass-graph diagnostics.
-    std::int64_t maximumLibplaceboPassesPerRender = 0;
-    std::uint64_t libplaceboPassGraphChanges = 0;
-    std::int64_t maximumLibplaceboGpuFrameMicroseconds = 0;
-    std::int64_t maximumLibplaceboGpuPassMicroseconds = 0;
-    std::int64_t maximumLibplaceboCallbackArrivalMicroseconds = 0;
-    std::int64_t maximumLibplaceboPostCallbackMicroseconds = 0;
 };
 
 // High-level composition-surface output for ordinary Windows playback.
@@ -201,6 +196,8 @@ public:
     D3D11VideoOutput& setEventCallback(EventCallback callback);
     D3D11VideoOutput& setFramePresentedCallback(
         FramePresentedCallback callback);
+    D3D11VideoOutput& setStatisticsMode(D3D11StatisticsMode mode) noexcept;
+    D3D11StatisticsMode statisticsMode() const noexcept;
 
     bool open(
         D3D11CompositionSurface surface,

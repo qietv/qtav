@@ -282,6 +282,7 @@ public:
         MediaType type = MediaType::Unknown;
         HardwareDeviceType hardwareDeviceType = HardwareDeviceType::Unknown;
         AVPixelFormat hardwarePixelFormat = AV_PIX_FMT_NONE;
+        AVBufferRef* reusableHardwareFramesContext = nullptr;
         std::uintptr_t hardwareNativeIdentity = 0;
         std::uint32_t hardwareSurfaceGeneration = 0;
         bool allowSoftwareFallback = false;
@@ -299,6 +300,7 @@ public:
 
         void reset()
         {
+            av_buffer_unref(&reusableHardwareFramesContext);
             context = nullptr;
             contextLifetime.reset();
             stream = nullptr;
@@ -764,6 +766,7 @@ public:
             frame->generation,
             attempt.retryAfterMilliseconds,
             std::move(attempt.detail),
+            attempt.retryReason,
         };
     }
 
@@ -910,6 +913,14 @@ private:
         for (const auto* format = formats; *format != AV_PIX_FMT_NONE;
              ++format) {
             if (*format == decoder->hardwarePixelFormat) {
+                if (decoder->hardwareDeviceType
+                        == HardwareDeviceType::D3D11
+                    && context->hw_device_ctx) {
+                    configureReusableHardwareFramesContext(
+                        context,
+                        *decoder,
+                        *format);
+                }
                 return *format;
             }
         }
@@ -924,6 +935,76 @@ private:
             }
         }
         return AV_PIX_FMT_NONE;
+    }
+
+    static bool hardwareFramesContextsAreCompatible(
+        const AVBufferRef* initializedReference,
+        const AVBufferRef* requiredReference) noexcept
+    {
+        if (!initializedReference || !initializedReference->data
+            || !requiredReference || !requiredReference->data) {
+            return false;
+        }
+        const auto* initialized = reinterpret_cast<const AVHWFramesContext*>(
+            initializedReference->data);
+        const auto* required = reinterpret_cast<const AVHWFramesContext*>(
+            requiredReference->data);
+        const int requiredPoolSize = required->initial_pool_size > 0
+            ? required->initial_pool_size + 3
+            : 0;
+        return initialized->device_ref && required->device_ref
+            && initialized->device_ref->data == required->device_ref->data
+            && initialized->format == required->format
+            && initialized->sw_format == required->sw_format
+            && initialized->width == required->width
+            && initialized->height == required->height
+            && initialized->initial_pool_size >= requiredPoolSize;
+    }
+
+    static void configureReusableHardwareFramesContext(
+        AVCodecContext* context,
+        Decoder& decoder,
+        AVPixelFormat hardwarePixelFormat)
+    {
+        AVBufferRef* requiredReference = nullptr;
+        const int parametersError = avcodec_get_hw_frames_parameters(
+            context,
+            context->hw_device_ctx,
+            hardwarePixelFormat,
+            &requiredReference);
+        if (parametersError < 0 || !requiredReference) {
+            return;
+        }
+
+        if (hardwareFramesContextsAreCompatible(
+                decoder.reusableHardwareFramesContext,
+                requiredReference)) {
+            context->hw_frames_ctx =
+                av_buffer_ref(decoder.reusableHardwareFramesContext);
+            av_buffer_unref(&requiredReference);
+            return;
+        }
+
+        auto* required = reinterpret_cast<AVHWFramesContext*>(
+            requiredReference->data);
+        if (required->initial_pool_size > 0) {
+            // Match ff_decode_get_hw_frames_ctx(): the public parameters API
+            // guarantees one work surface and FFmpeg's automatic path adds
+            // three more before initializing a fixed-size decoder pool.
+            required->initial_pool_size += 3;
+        }
+        if (av_hwframe_ctx_init(requiredReference) < 0) {
+            av_buffer_unref(&requiredReference);
+            return;
+        }
+
+        context->hw_frames_ctx = requiredReference;
+        requiredReference = nullptr;
+        auto* retainedReference = av_buffer_ref(context->hw_frames_ctx);
+        if (retainedReference) {
+            av_buffer_unref(&decoder.reusableHardwareFramesContext);
+            decoder.reusableHardwareFramesContext = retainedReference;
+        }
     }
 
     void run()

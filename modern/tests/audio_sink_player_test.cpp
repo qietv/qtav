@@ -674,6 +674,7 @@ void testPresentationDoesNotWaitForBlockedSinkWrite(const char* media)
             assert(frame);
             ++videoFrames;
         });
+    player.setLoop(-1);
     player.setMedia(media);
     player.setState(qtav::State::Playing);
 

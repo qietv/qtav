@@ -28,11 +28,13 @@ flowchart LR
     Audio["AudioResample + AudioWASAPI\nPCM conversion and device output"]
     Output["OutputD3D11\nprivate render thread"]
     GPU["D3D11 renderer + D3D11VA + interop\ncomposition swap chain"]
+    Recycler["D3D11 frame recycler\nbounded deferred release"]
 
     UI -->|"setMedia / setState / seek"| Player
     Player -->|"bounded audio path"| Audio
     Player -->|"scheduled video + redraw request"| Output
     Output -->|"renderVideo + non-blocking Present"| GPU
+    GPU -->|"completed imported-frame release"| Recycler
     UI -->|"HWND, SetSwapChain, resize"| Output
     Player -->|"state, status, event, frame metadata"| Bridge
     Output -->|"event, presented frame"| Bridge
@@ -67,6 +69,7 @@ correct if callback routing changes later.
 | Player video decode worker | Decodes video packets and feeds the bounded presentation path. | Present directly to the SwapChainPanel. |
 | Player presentation worker | Applies playback timing, drops late video, publishes frame callbacks, and requests rendering. | Submit device audio or synchronously invoke the UI. |
 | D3D11 output render thread | Coalesces redraws, calls `Player::renderVideoDetailed()`, retries classified transient contention, performs hardware interop or software fallback, tracks display color, and presents. | Access XAML controls or destroy/detach itself from its callback. |
+| D3D11 frame-recycler worker | Releases completed imported wrappers and source hardware frames after renderer-owned GPU wrappers are destroyed. | Submit draws, access XAML, or outlive the renderer. |
 
 All UI-bound notifications use this pattern:
 
@@ -95,7 +98,12 @@ dispatcher from applying backpressure to audio or video delivery.
 
 `D3D11VideoOutput::attach()` exclusively owns Player's default render API and
 render callback while attached. By default it also configures D3D11VA using
-the same D3D11 device required by the renderer and interop path.
+the same D3D11 device required by the renderer and interop path. Core retains a
+compatible initialized D3D11 hardware-frames context across repeated FFmpeg
+format selection, and the paired repository FFmpeg package retains the matching
+decoder and output views with that context. A changed device, format, size,
+pool requirement, profile, texture, or decoder configuration creates a new
+context/decoder through the ordinary path.
 
 ### Audio path and master clock
 
@@ -132,17 +140,30 @@ frame-latency cap, and non-blocking presentation all live on the private output
 thread, so neither context contention nor a busy compositor stalls WASAPI or
 the WinUI dispatcher.
 
-Hardware frames normally remain on the selected D3D11 device. Their raw
-NV12/P010 planes pass through libplacebo color processing and rendering
-without a CPU map. Submitted decoder slices and swap-chain back buffers stay
-retained until GPU completion; output resize drains those submissions before
-replacing the buffers. Every successfully imported D3D11VA frame uses fast
-libplacebo parameters and remains in the bounded completion-query queue until
-its decoder resources can be recycled, regardless of adapter vendor. Dolby
-Vision raw NV12/P010 imports sample the retained decoder texture-array slice
-directly; there is no intermediate GPU copy. Software frames remain outside
-this imported-frame policy. Unsupported media or devices fall back through
-QtAVCore's software decode/render path rather than an application-side decoder.
+Hardware frames remain on the selected D3D11 device. Their raw NV12/P010
+planes pass through libplacebo color processing and rendering without a CPU
+map. By default the renderer copies only the even-aligned visible rectangle
+into a bounded same-format ring and uses `D3D11_COPY_DISCARD` on D3D11.1. The
+decoder slice, imported wrapper, copied texture, borrowed target, and swap-chain
+back buffer stay retained until GPU completion. The renderer then destroys its
+GPU wrappers and transfers the imported wrapper plus source frame to a bounded
+64-entry recycler; the recycler drops the interop reference before the source
+frame so final FFmpeg/D3D11VA destruction does not execute on the output render
+thread. If the recycler is full, the three-entry completion queue applies
+bounded render backpressure rather than releasing a frame inline. Flush,
+resize, replacement, and teardown drain both stages in order.
+
+Every successfully imported D3D11VA frame uses fast libplacebo parameters. The
+high-level `D3D11VideoOutputOptions::directDecoderTextureSampling` switch is
+off (`false`) for the default GPU-copy mode. Turning it on (`true`) removes that
+copy, requests shader-readable decoder arrays, and directly samples the retained
+decoder slice; it does not change the completion/recycler lifetime. Software
+frames remain outside this imported-frame policy. Unsupported media or devices
+fall back through QtAVCore's software decode/render path rather than an
+application-side decoder. The durable contracts are recorded in
+[QtAVCore AD-010](../../DECISIONS.md#ad-010-windows-copies-the-visible-decoder-region-by-default),
+[QtAVCore AD-011](../../DECISIONS.md#ad-011-windows-reuses-compatible-d3d11va-frames-contexts-and-decoders),
+and [FFmpeg FD-005](../../../ffmpeg/DECISIONS.md#fd-005-reuse-a-compatible-d3d11va-decoder-with-its-frames-context).
 
 ### Seek and progress
 
@@ -169,20 +190,22 @@ Windows is presenting an HDR layer.
 ## Diagnostics
 
 The in-memory log is capped at 1,000 lines. Opening the Debug window displays
-the existing history; closing it does not disable lightweight counter
-collection.
+the existing history, enables callback cadence and
+`D3D11StatisticsMode::Timing`, and starts a fresh measurement interval. Closing
+it disables callback cadence and selects `D3D11StatisticsMode::Off`.
 
-Every five seconds during activity, the UI exchanges the atomic frame counters
-and calls `D3D11VideoOutput::takeStatistics()`, which atomically returns and
-resets output counters. Important interpretations are:
+Every five seconds while Debug is open, the UI exchanges the atomic frame
+counters and calls `D3D11VideoOutput::takeStatistics()`, which atomically
+returns and resets output counters. Important interpretations are:
 
 - low scheduled-video cadence usually points before the renderer: input,
   decode, clock, or Player presentation scheduling;
 - normal scheduled cadence with low rendered cadence points at render
   contention, surface state, or the graphics driver;
 - `present-busy` means non-blocking `Present()` found compositor backpressure;
-- `decoder-copies` is a retained compatibility counter and remains zero while
-  the renderer samples Dolby Vision decoder slices directly;
+- `decoder-copies` counts default raw NV12/P010 visible-region GPU copies and
+  should rise with rendered hardware frames; it remains zero only in explicit
+  direct decoder-texture mode or when hardware frames are not rendered;
 - `coalesced` means multiple redraw notifications were intentionally combined;
 - `no-frame/player-busy/renderer-busy` classifies unsuccessful attempts, while
   `renderer-busy(state/serialize/context/in-flight)` locates backend
@@ -219,8 +242,9 @@ Closing the main window invokes an idempotent ordered shutdown:
 2. stop progress and seek timers;
 3. close the Debug window;
 4. request `State::Stopped`, which also makes active media I/O obsolete;
-5. detach and close `D3D11VideoOutput`, stopping its render thread and releasing
-   its Player render slot before either borrowed object disappears;
+5. detach and close `D3D11VideoOutput`, draining GPU completion and the frame
+   recycler, stopping its render/recycler workers, and releasing its Player
+   render slot before either borrowed object disappears;
 6. destroy Player, which signals its condition variables, interrupts FFmpeg
    I/O, joins control/demux, audio decode/output, video decode, and presentation
    workers, then closes the audio sink and media resources.

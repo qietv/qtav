@@ -60,7 +60,8 @@ void freeD3D11Device(AVHWDeviceContext* context) noexcept
 }
 
 HardwareDecodeDevice createDecodeDevice(
-    const std::shared_ptr<D3D11DeviceAccess>& deviceAccess) noexcept
+    const std::shared_ptr<D3D11DeviceAccess>& deviceAccess,
+    bool directDecoderTextureSampling) noexcept
 {
     if (!deviceAccess || !deviceAccess->device()
         || !deviceAccess->immediateContext()) {
@@ -94,10 +95,19 @@ HardwareDecodeDevice createDecodeDevice(
     native->lock = &lockD3D11Device;
     native->unlock = &unlockD3D11Device;
     native->lock_ctx = lifetime;
-    // libplacebo's D3D11 backend samples the decoder's NV12/P010 planes
-    // directly. FFmpeg combines this device-wide flag with
-    // D3D11_BIND_DECODER when it creates each codec frames context.
-    native->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    // QtAVCore keeps compatible initialized frames contexts across FFmpeg
+    // format reselection. Ask the repository FFmpeg overlay to retain the
+    // matching video decoder/output views as well; otherwise Intel's driver
+    // can serialize the shared device while each redundant decoder is torn
+    // down from the last frame that references it.
+    native->reuse_decoder = 1;
+    if (directDecoderTextureSampling) {
+        // FFmpeg combines this device-wide flag with D3D11_BIND_DECODER when
+        // it creates each codec frames context. The default copy path does
+        // not request it because D3D11 does not guarantee shader views over a
+        // decoder texture array.
+        native->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    }
 
     if (av_hwdevice_ctx_init(reference) < 0) {
         av_buffer_unref(&reference);
@@ -130,7 +140,9 @@ HardwareDecodeConfig d3d11vaHardwareDecodeConfig(
     result.deviceType = HardwareDeviceType::D3D11;
     result.allowSoftwareFallback =
         options.allowSoftwareFallback;
-    result.device = createDecodeDevice(deviceAccess);
+    result.device = createDecodeDevice(
+        deviceAccess,
+        options.directDecoderTextureSampling);
     result.extraHardwareFrames = std::clamp(
         options.extraHardwareFrames,
         0,

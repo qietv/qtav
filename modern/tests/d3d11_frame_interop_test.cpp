@@ -548,34 +548,38 @@ float halfToFloat(std::uint16_t value)
     return result;
 }
 
-void testNativeZeroCopy(
+void testNativeD3D11(
     const char* media,
     qtav::PixelFormat expectedFormat,
     bool exerciseLifecycle,
     bool requireDolbyVision = false,
-    int stopAfterRenderedFrames = 0)
+    int stopAfterRenderedFrames = 0,
+    bool directDecoderTextureSampling = false)
 {
     const auto resources = makeDevice(D3D_DRIVER_TYPE_HARDWARE);
     if (!resources.device || !resources.context) {
         std::cout
-            << "No hardware D3D11 adapter; native zero-copy test skipped\n";
+            << "No hardware D3D11 adapter; native D3D11 test skipped\n";
         return;
     }
     if (expectedFormat == qtav::PixelFormat::P010
         && !supportsHevcMain10(resources.device.Get())) {
         std::cout
             << "Adapter exposes no HEVC Main10/P010 D3D11VA "
-               "profile; Main10 zero-copy test skipped\n";
+               "profile; Main10 D3D11 test skipped\n";
         return;
     }
     const auto access = makeAccess(resources);
     assert(access);
+    qtav::D3D11VAHardwareDecodeOptions decodeOptions;
+    decodeOptions.directDecoderTextureSampling =
+        directDecoderTextureSampling;
     const auto decodeConfig =
-        qtav::d3d11vaHardwareDecodeConfig(access);
+        qtav::d3d11vaHardwareDecodeConfig(access, decodeOptions);
     if (!decodeConfig.device) {
         std::cout
             << "D3D11VA selected-device creation unavailable; "
-               "native zero-copy test skipped\n";
+               "native D3D11 test skipped\n";
         return;
     }
 
@@ -625,6 +629,11 @@ void testNativeZeroCopy(
                 };
             });
     renderer->setHardwareFrameInterop(interop);
+    renderer->setDirectDecoderTextureSamplingEnabled(
+        directDecoderTextureSampling);
+    assert(
+        renderer->directDecoderTextureSamplingEnabled()
+        == directDecoderTextureSampling);
     qtav::VideoRenderConfig renderConfig;
     renderConfig.surfaceSize = { width, height };
     renderConfig.aspectRatio =
@@ -708,8 +717,10 @@ void testNativeZeroCopy(
                 }
                 D3D11_TEXTURE2D_DESC decoderDescription {};
                 native.texture()->GetDesc(&decoderDescription);
-                if (!(decoderDescription.BindFlags
-                      & D3D11_BIND_SHADER_RESOURCE)) {
+                const bool shaderReadable =
+                    (decoderDescription.BindFlags
+                     & D3D11_BIND_SHADER_RESOURCE) != 0;
+                if (shaderReadable != directDecoderTextureSampling) {
                     std::abort();
                 }
                 const bool retainThisFrame = requireDolbyVision
@@ -846,7 +857,7 @@ void testNativeZeroCopy(
         }
         std::cout
             << "Adapter/codec D3D11VA path unavailable; "
-               "native zero-copy test skipped\n";
+               "native D3D11 test skipped\n";
         return;
     }
     if (hardwareFrames.load() == 0) {
@@ -965,11 +976,20 @@ void testNativeZeroCopy(
         assert(leftRed > leftBlue * 2);
         assert(rightBlue > rightRed * 2);
     }
+    const auto statistics = renderer->takeStatistics();
+    if (directDecoderTextureSampling) {
+        assert(statistics.decoderSurfaceCopies == 0);
+    } else {
+        assert(statistics.decoderSurfaceCopies > 0);
+    }
+
     std::cout
         << (expectedFormat == qtav::PixelFormat::P010
                 ? "HEVC Main10/P010"
                 : "H.264/NV12")
-        << " zero-CPU-map frames rendered: "
+        << (directDecoderTextureSampling
+                ? " direct decoder-sampled frames rendered: "
+                : " decoder-to-shader copied frames rendered: ")
         << hardwareFrames.load();
     if (requireDolbyVision) {
         std::cout
@@ -983,7 +1003,12 @@ void testNativeZeroCopy(
 
 int main(int argc, char** argv)
 {
-    if (argc < 1 || argc > 3) {
+    if (argc < 1 || argc > 4) {
+        return 2;
+    }
+    const bool directDecoderTextureSampling = argc == 4
+        && std::string_view(argv[3]) == "--direct-decoder-sampling";
+    if (argc == 4 && !directDecoderTextureSampling) {
         return 2;
     }
     testWarpContracts();
@@ -991,29 +1016,36 @@ int main(int argc, char** argv)
         const std::string_view first = argv[1];
         if (first.rfind("https://", 0) == 0
             || first.rfind("http://", 0) == 0) {
-            testNativeZeroCopy(
+            testNativeD3D11(
                 argv[1],
                 qtav::PixelFormat::P010,
                 false,
                 true,
-                48);
+                48,
+                directDecoderTextureSampling);
         } else {
-            testNativeZeroCopy(
+            testNativeD3D11(
                 argv[1],
                 qtav::PixelFormat::NV12,
-                true);
+                true,
+                false,
+                0,
+                directDecoderTextureSampling);
         }
     }
-    if (argc == 3) {
+    if (argc >= 3) {
         if (std::filesystem::exists(argv[2])) {
-            testNativeZeroCopy(
+            testNativeD3D11(
                 argv[2],
                 qtav::PixelFormat::P010,
-                false);
+                false,
+                false,
+                0,
+                directDecoderTextureSampling);
         } else {
             std::cout
                 << "HEVC Main10 test media unavailable; "
-                   "Main10 zero-copy test skipped\n";
+                   "Main10 D3D11 test skipped\n";
         }
     }
     return 0;

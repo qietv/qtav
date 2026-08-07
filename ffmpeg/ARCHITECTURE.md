@@ -135,6 +135,14 @@ libplacebo allocator must preserve 16-byte alignment across its Windows x64
 public/private object boundary. The evidence, rejected alternatives, and patch
 retirement criteria are recorded in [FD-001 and FD-003](DECISIONS.md).
 
+The Windows FFmpeg overlay additionally exposes an opt-in D3D11VA decoder
+cache on the device context. QtAVCore keeps a compatible initialized frames
+context across repeated HEVC format selection; the cache binds the matching
+decoder, output views, and texture lifetime to that frames context. This avoids
+destroying and recreating an unchanged decoder through Intel's shared D3D11
+device. The overlay ABI and retirement criteria are governed by
+[FD-005](DECISIONS.md).
+
 ## Overlay design
 
 The upstream vcpkg submodule stays immutable. Overlays contain every
@@ -143,7 +151,9 @@ project-specific behavior:
 - FFmpeg imports the libsmb2 protocol integration, preserves the player
   feature policy, fixes pinned Windows/target portability issues, and keeps
   LTO working with clang-cl/lld-link apart from the single incompatible MLP
-  inline-assembly label optimization described above.
+  inline-assembly label optimization described above. On Windows it also
+  carries the opt-in compatible D3D11VA decoder cache described above; the
+  upstream default remains unchanged for consumers that do not enable it.
 - libass avoids desktop system-font discovery on mobile/OHOS, so the
   application must provide subtitle fonts explicitly.
 - libplacebo enables its Vulkan and OpenGL backends, including OpenGL ES/EGL
@@ -209,6 +219,8 @@ The verifier checks:
 - required FFmpeg 8/libavcodec 62 headers and metadata;
 - H.264/HEVC OHCodec decoder symbols plus the explicit surface-output header
   and release symbols in the OHOS archive;
+- the opt-in D3D11VA decoder-reuse field in the installed Windows FFmpeg
+  header;
 - OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES/Dolby Vision
   reshaping, dav1d, and Vulkan, plus libplacebo D3D11/SPIRV-Cross on Windows;
 - the required FFmpeg feature records;

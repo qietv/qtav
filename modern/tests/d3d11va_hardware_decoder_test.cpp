@@ -282,6 +282,7 @@ void testDeviceConfig(
     assert(native->lock);
     assert(native->unlock);
     assert(native->lock_ctx);
+    assert(!(native->BindFlags & D3D11_BIND_SHADER_RESOURCE));
 
     std::mutex mutex;
     std::condition_variable changed;
@@ -313,6 +314,20 @@ void testDeviceConfig(
     assert(acquired.load());
     av_buffer_unref(&reference);
 
+    qtav::D3D11VAHardwareDecodeOptions directOptions;
+    directOptions.directDecoderTextureSampling = true;
+    const auto direct = qtav::d3d11vaHardwareDecodeConfig(
+        access,
+        directOptions);
+    assert(direct.device);
+    reference = qtav::detail::HardwareDecodeDevicePrivate::contextRef(
+        direct.device);
+    assert(reference);
+    context = reinterpret_cast<AVHWDeviceContext*>(reference->data);
+    native = static_cast<AVD3D11VADeviceContext*>(context->hwctx);
+    assert(native);
+    assert(native->BindFlags & D3D11_BIND_SHADER_RESOURCE);
+    av_buffer_unref(&reference);
 }
 
 void testRetainedTextureFrame(ID3D11Device* device)
@@ -397,6 +412,8 @@ void testPlayerLifecycle(
     std::atomic<int> videoFrames { 0 };
     std::atomic<int> hardwareFrames { 0 };
     std::atomic<bool> softwareFallback { false };
+    ID3D11Texture2D* initialPoolTexture = nullptr;
+    bool reusedPoolAfterSeek = false;
     std::mutex mutex;
     std::condition_variable changed;
     int stage = 0;
@@ -442,9 +459,21 @@ void testPlayerLifecycle(
                     }
                     D3D11_TEXTURE2D_DESC description {};
                     native.texture()->GetDesc(&description);
-                    if (!(description.BindFlags
-                          & D3D11_BIND_SHADER_RESOURCE)) {
+                    if (description.BindFlags
+                        & D3D11_BIND_SHADER_RESOURCE) {
                         std::abort();
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (stage == 0) {
+                            initialPoolTexture = native.texture();
+                        } else if (stage == 2) {
+                            if (native.texture() != initialPoolTexture) {
+                                std::abort();
+                            }
+                            reusedPoolAfterSeek = true;
+                        }
                     }
 
                     if (hardwareFrames.fetch_add(1) == 0) {
@@ -515,6 +544,9 @@ void testPlayerLifecycle(
         std::abort();
     }
     if (!softwareFallback.load() && hardwareFrames.load() == 0) {
+        std::abort();
+    }
+    if (!softwareFallback.load() && !reusedPoolAfterSeek) {
         std::abort();
     }
     if (softwareFallback.load()) {

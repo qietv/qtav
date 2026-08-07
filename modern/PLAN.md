@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 
 Status legend:
 
@@ -18,9 +18,16 @@ matrix or roadmap. A macOS development machine may still act only as a
 cross-compilation host for Android/OHOS; 64-bit Windows is also a supported
 OHOS cross-compilation host through the DevEco native SDK.
 
-OHOS is now the active local development target. AD-007 is closed after the
-current vendor-neutral D3D11VA/libplacebo policy was accepted on NVIDIA, Intel,
-and AMD platforms.
+OHOS remains the strategic active platform-development target, but its item-10
+production decision is waiting for Huawei's written external-format contract.
+While that reply is pending, a Windows D3D11VA-to-Vulkan zero-copy backend is
+inserted as the immediate implementation checkpoint and must complete before
+further OHOS item-10 development resumes. The earlier Windows D3D11VA
+seek/shutdown hotfix recorded in AD-010 is complete. It replaces direct
+decoder-slice sampling as the default D3D11-renderer policy with an mpv-style
+visible-region GPU copy and keeps direct sampling as an explicit option.
+AD-007's native context protection and bounded asynchronous submission remain
+binding.
 
 The user's separate AMD integrated-GPU 4K frame-loss report is objectively
 located, corrected, and fully verified by reason-aware render retry plus
@@ -63,7 +70,7 @@ Continuation checkpoint:
 - the D3D11VA device/frame/interop design and supplied-device core bridge are
   complete; the native `qtav_hw_d3d11va` decoder backend and
   raw `qtav_interop_d3d11` texture/slice path are complete, including
-  same-device validation, shader-readable NV12/P010 decoder surfaces, native
+  same-device validation, decoder-only NV12/P010 surfaces by default, native
   H.264/NV12 and PQ/BT.2020 HEVC Main10/P010 zero-CPU-map rendering through
   libplacebo's D3D11 backend to SDR BGRA8, HDR RGB10, or FP16 scRGB targets,
   Windows Advanced Color swap-chain/display tracking, lifecycle coverage,
@@ -83,20 +90,23 @@ Continuation checkpoint:
   freeze the fallback clock until recovery, and
   HTTP(S) inputs use bounded read-timeout/reconnect defaults instead of
   immediately converting a recoverable disconnect into `Invalid`;
-  D3D11 interop now retains only the decoder texture and exact array slice;
-  it performs no Video Processor conversion, output-texture pooling, context
-  submission, or wait before libplacebo samples the raw NV12/P010 planes;
+  D3D11 interop retains only the decoder texture and exact array slice. The
+  renderer defaults to a bounded same-format ring, copies only the even-aligned
+  visible region, and uses `D3D11_COPY_DISCARD` on D3D11.1; optional direct
+  decoder-texture sampling restores shader-readable decoder allocation and
+  transient direct plane wrapping. Neither path performs a CPU map, Video
+  Processor RGB conversion, or per-frame GPU drain;
   Player render attempts now use atomically published immutable frame/binding
   snapshots and reason-aware results. Before the high-level D3D11 output makes
   its first non-blocking context attempt, it creates a render-thread
   reservation; contention uses a bounded handoff before timer backoff. The
   output keeps one latest retryable frame and preserves the imminent queued
   presentation frame under
-  pressure and retains imported hardware frames plus borrowed targets through
-  a bounded GPU-completion queue; the immediate context enables native
+  pressure and retains copied resources plus borrowed targets through a bounded
+  GPU-completion queue; the immediate context enables native
   multithread protection before decoder/render sharing, imported frames retain
   libplacebo's fast parameters, and successful per-frame submissions remain
-  asynchronous without a Dolby decoder-surface copy;
+  asynchronous;
   `QtAV::OutputD3D11` now owns the Windows device, composition swap chain,
   render target, display/HDR tracking, render scheduling thread,
   D3D11VA/interop wiring, `renderVideoDetailed()`, `Present()`, resize, and
@@ -169,8 +179,10 @@ Continuation checkpoint:
   D3D11 backend. FFmpeg-parsed Dolby Vision metadata, Dolby Vision reshaping,
   transfer handling, gamut conversion, HDR tone mapping, and target encoding
   are owned by libplacebo; QtAVCore has no alternate native Windows shader for
-  those operations. Windows exposes only the QtAVCore D3D11 renderer and does
-  not build its OpenGL or Vulkan renderer targets;
+  those operations. The current implementation exposes only the QtAVCore D3D11
+  renderer on Windows. The inserted checkpoint in `Next task` adds a Vulkan
+  renderer/output and D3D11VA-to-Vulkan interop without changing this completed
+  baseline until that work is implemented and validated;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
@@ -841,10 +853,19 @@ Android/OHOS render-result follow-up and Milestone 7 OHOS work are now active:
 
 ## Next task
 
-There are now two explicit work tracks. The Intel Windows track remains open
-and is transferred to another Intel machine for administrator-only GPU tracing,
-root-cause confirmation, repair, and cross-vendor regression. The active local
-track is OHOS: its Milestone 7 target/toolchain gate, portable Android/OHOS
+The AD-010 Windows policy track is complete. The pre-cleanup NVIDIA/AMD
+four-cell `C:\\test\\legend.mkv` matrix passed on the same `fa640e5` Release
+revision, and the subsequent investigation-only probe removal, documentation
+cleanup, and local final-binary validation are complete. On 2026-08-08 the user
+explicitly waived repeating the four hardware cells because the cleanup only
+deleted diagnostic measurements and text, without changing decode, copy,
+render, presentation, resource-lifetime, or shutdown behavior. AD-010 is
+closed. The active platform track remains OHOS strategically, but Huawei's
+written response now gates further item-10 production work. While that response
+is pending, the immediate implementation track is the inserted Windows
+D3D11VA-to-Vulkan checkpoint defined below. Its completion is required before
+resuming OHOS item 10. The completed OHOS work includes its Milestone 7
+target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
 lifecycle matrix, and raw-YCbCr `OH_NativeImage`/OpenGL ES/libplacebo
@@ -864,21 +885,449 @@ remains partial. AD-009 records this allowlisted external-ID guess as a
 workaround, not a final format-negotiation solution: device and libplacebo
 capability are proven, but Huawei has not confirmed the mapping as a stable
 production interface contract.
+
+AD-010 Windows visible-copy checkpoint:
+
+1. [x] Create `codex/d3d11va-mpv-copy-option` directly from current `main` and
+   exclude the abandoned Intel investigation branch.
+2. [x] Default decoder allocation to decoder-only resources; copy the even-
+   aligned visible NV12/P010 rectangle into a bounded three-entry shader-
+   readable ring, using `CopySubresourceRegion1()` plus
+   `D3D11_COPY_DISCARD` when available.
+3. [x] Add explicit direct decoder-texture sampling to the low-level decoder
+   and renderer APIs and one high-level output option that configures both.
+4. [x] Add native H.264/NV12 and HEVC Main10/P010 integration assertions for
+   default positive copy accounting, explicit direct zero-copy accounting,
+   decoder bind flags, aligned allocation cropping, and zero CPU mapping.
+5. [x] Pass full shared/static Release CTest, WinUI Release build,
+   all-backends-disabled coverage, install consumers, `git diff --check`, and
+   the Qt dependency scan on the final revision. Record the durable default-
+   copy, completion/recycler lifetime, compatible frames-context, and paired
+   FFmpeg decoder-reuse contracts in AD-010, AD-011, FD-005, and the WinUI
+   architecture documentation.
+6. [x] On NVIDIA, run only `legend.mkv` with both switch states from the same
+   final Release build: `directDecoderTextureSampling = false` (off, default
+   GPU copy), then `directDecoderTextureSampling = true` (on, direct sampling).
+7. [x] On AMD, repeat the same two `legend.mkv` switch states from that exact
+   revision and Release configuration. Do not substitute prior default-only,
+   different-media, Intel, or different-revision evidence for either cell.
+8. [x] After items 6 and 7 pass and their raw evidence is recorded, remove the
+   investigation-only fine-grained performance probes. Retain the stable
+   `decoderSurfaceCopies`/`decoder-copies` contract counter and the low-cost
+   cadence, retry, lifecycle, Present, gap, and coarse stage statistics. Remove
+   the detailed retire/query/clear/libplacebo-render/retention wall-clock
+   maxima, asynchronous libplacebo pass/GPU/callback probes, corresponding
+   WinUI Debug text, test assertions, and documentation. Because this cleanup
+   changes the final binary and public Windows-backend statistics structs, update
+   `README.md` and `MIGRATION.md`, then rebuild the shared/static Release suites
+   and WinUI example. The initially planned repetition of the four NVIDIA/AMD
+   `legend.mkv` cells was explicitly waived by the user because this cleanup
+   only deletes observability code and does not alter playback behavior. Do not
+   remove the probes before the pre-cleanup evidence is secured.
+9. [x] Follow up the cleanup with an explicit Windows diagnostics cost policy.
+   Add shared `Off`, `Counters`, and `Timing` modes; keep reusable D3D11
+   backends at the low-cost `Counters` default, run the WinUI player at `Off`
+   while its Debug window is closed, and enable `Timing` only while that window
+   is open. Make renderer retry reasons part of the render-result contract so
+   retry control never reads or depends on statistics, and remove the output's
+   per-frame renderer-statistics drain and aggregation. Preserve on-demand
+   decoder-copy, retry, lifecycle, Present, gap, and coarse-stage diagnostics
+   in the appropriate mode without changing decode, copy, presentation, or
+   resource-lifetime behavior.
+
+Cleanup status on 2026-08-08: the investigation-only detailed renderer timings
+and asynchronous libplacebo pass/GPU/callback probes are removed from the public
+renderer/output statistics, their implementations, the WinUI Debug text, and
+documentation. The retained diagnostics are now tiered: counters remain the
+reusable-backend default, timing samples are opt-in, and WinUI disables both
+statistics and cadence collection whenever its Debug window is closed. Retry
+classification uses the structured render-result reason independently of
+statistics, and the output no longer drains and re-aggregates renderer
+statistics on every frame. Stable decoder-copy, cadence, retry, lifecycle,
+Present, gap, color, interop, buffer, and draw diagnostics remain available on
+demand. The shared and static Windows Release trees each rebuilt and passed
+37/37 CTest; the WinUI Release player rebuilt with zero warnings and errors.
+Both trees installed successfully, and their external Windows consumers rebuilt
+against the refreshed packages. The removed-probe and Qt-dependency scans,
+UTF-8/LF checks, and `git diff --check` pass.
+The user explicitly waived the post-cleanup NVIDIA/AMD four-cell `legend.mkv`
+repetition because only investigation probes and their presentation were
+removed. The already completed pre-cleanup policy matrix remains the native
+acceptance evidence, and AD-010 is closed.
+
+The completed item 6/7 policy cells record the exact adapter/PCI ID and driver,
+Windows/build revision, display/HDR and power/thermal conditions. Confirm HEVC
+Main10/P010 D3D11VA, RGB10/PQ, zero decoded-source CPU map/transfer, positive
+`decoder-copies` tracking submitted frames in default mode, exactly zero in direct mode,
+settled source-rate cadence before the exact 22:48 seek, at least 90 seconds of
+post-seek playback, no persistent busy/terminal/gap regression, and clean close
+while playing. The results below are the retained same-revision two-policy
+acceptance record.
+
+Current AD-010 Windows validation on 2026-08-06:
+
+- Visual Studio 2026 ClangCL/lld shared and static Release trees each rebuilt
+  all targets and passed 37/37 CTest. Both default GPU-copy and explicit direct
+  decoder-sampling tests passed native H.264/NV12 and HEVC Main10/P010, including
+  default decoder-only versus direct shader-readable bind flags, positive versus
+  zero `decoderSurfaceCopies`, aligned 160x96 allocation with a 160x90 visible
+  region, and zero decoded-source CPU mapping. The independent all-backends-
+  disabled tree passed 11/11; shared/static install and external consumption of
+  `QtAV::RenderD3D11`, `QtAV::HWD3D11VA`, `QtAV::InteropD3D11`, and
+  `QtAV::OutputD3D11` passed. The Release WinUI player rebuilt with zero warnings
+  and zero errors. `git diff --check`, Qt-dependency, UTF-8 BOM, and LF scans
+  passed.
+- One first shared full run reported 36/37 because
+  `qtav_core_audio_sink_player` aborted after 7.69 seconds. An isolated repeat
+  passed twice and reproduced the same test timeout on its third run; the next
+  full shared run passed 37/37. This test does not link the changed D3D11
+  renderer, decoder, interop, or output targets, but the intermittent signal is
+  retained rather than hidden.
+- Native validation used Windows 11 Enterprise build 26200, Core i5-14500,
+  31.7 GiB RAM, balanced power, and the display-driving GeForce RTX 3050
+  (`PCI\\VEN_10DE&DEV_2584&SUBSYS_184610DE`, driver `32.0.15.9186`) at
+  3840x2160. The installed UHD Graphics 770 was not selected by
+  `D3D11CreateDevice()` and therefore is not an Intel result.
+- Default-mode `legend.mkv` retained 3840x2160 HEVC Main10/P010 D3D11VA and
+  active RGB10/PQ. Settled windows scheduled/rendered about 24.9-25.1 fps,
+  `decoder-copies` tracked submitted hardware frames at about 130-132 per
+  5.2-second window, warm draw maxima were usually about 11.5-17.5 ms, and
+  `Present()` busy plus terminal drops were zero outside the expected seek
+  transition windows. The exact 22:48 scene ran for more than 90 seconds,
+  followed by 05:00 and 22:48 seeks without a decode stall.
+- The same process replaced `legend.mkv` with 3840x2160 Dolby Vision Profile 5
+  `wednesday.mp4`; settled windows rendered about 23.8-24.1 fps with positive
+  copy counts and zero terminal drops. Closing while it played exited in
+  210 ms. A separate 1920x1080 H.264/NV12 control sustained about 29.8-30.1 fps
+  with positive copy counts and closed while playing in 173 ms. No run reported
+  software decode or a decoded-source mapping fallback.
+
+AMD Radeon 880M final two-policy regression on 2026-08-07:
+
+- commit `fa640e5ffbe02054621caa01f31bebee9e10cf87` ran on the
+  display-driving Radeon 880M
+  (`PCI\\VEN_1002&DEV_150E&SUBSYS_380217AA&REV_C4`, driver
+  `32.0.22029.9039`) in a Lenovo 83LR with Ryzen AI 9 H 365, 31.3 GiB RAM,
+  Windows 11 Home build 26200, the balanced power plan, and a
+  2880x1800/120 Hz internal display. The user reported an unloaded,
+  well-cooled machine and explicitly waived CPU/GPU utilization and
+  temperature-counter collection. Playback reported active RGB10/PQ output,
+  240-nit SDR white, and a 400-nit display peak;
+- the repository Windows FFmpeg package was rebuilt as 8.1.2 port revision 7
+  with the compatible D3D11VA decoder-reuse overlay and passed
+  `cmake/verify-install.cmake`. Freshly reconfigured Visual Studio 2026
+  ClangCL/lld shared and static Release trees each built all targets and passed
+  37/37 CTest. The WinUI 3 Release player rebuilt against the shared tree with
+  zero warnings and errors before the default run, for the explicit-direct
+  run, and again after restoring its default option;
+- default GPU-copy mode retained 3840x2160 HEVC Main10/P010 D3D11VA and active
+  RGB10/PQ. Before the seek, settled windows scheduled/rendered 24.8-25.1 fps
+  and copied 128-129 decoder frames per 5.1-5.2 seconds. The exact 22:48 seek
+  had the expected one-window generation transition, then more than 115
+  seconds of settled playback held 24.8-25.2 fps with 128-130 copies per
+  window. Stable windows had zero coalescing, `Present()` busy, render skips,
+  retry/superseded/terminal results, or greater-than-80-ms gaps; warm draw
+  maxima were about 19.2-25.0 ms. Close while playing exited in 255 ms;
+- the explicit direct-sampling build used the same library revision and
+  Release configuration. It retained the same D3D11VA Main10/P010 and
+  RGB10/PQ paths while `decoder-copies` remained exactly zero. Pre-seek
+  cadence held 24.9-25.1 fps; after the exact 22:48 seek and its expected
+  transition window, more than 102 seconds held 24.9-25.2 fps. Stable windows
+  again had zero coalescing, `Present()` busy, render skips,
+  retry/superseded/terminal results, or greater-than-80-ms gaps; warm draw
+  maxima were about 19.5-30.7 ms. Close while playing exited in 235 ms;
+- neither policy emitted software-decode or decoded-source mapping-fallback
+  diagnostics, and the Application log contained no `QtAVWinUI3.exe`
+  Application Error or Windows Error Reporting event. This completes AD-010
+  item 7.
+
+NVIDIA GeForce RTX 3050 final two-policy regression on 2026-08-07:
+
+- commit `fa640e5ffbe02054621caa01f31bebee9e10cf87` ran on the
+  display-driving GeForce RTX 3050
+  (`PCI\\VEN_10DE&DEV_2584&SUBSYS_184610DE&REV_A1`, driver
+  `32.0.15.9186`) with Windows 11 Enterprise build 26200, the balanced power
+  plan, and a 3840x2160/59 Hz display. The user reported stable power,
+  temperature, and CPU/GPU load and explicitly waived their sampling.
+  Playback reported active RGB10/PQ output, 240-nit SDR white, and a 1405-nit
+  display peak. The only playback media was `C:\\test\\legend.mkv`, SHA-256
+  `7AA3229DF0F6E0609DB7A89F3719B9E3E3457A659AC285196B968B8A538431BD`;
+- the repository Windows FFmpeg 8.1.2 port revision 7 was rebuilt locally with
+  the compatible D3D11VA decoder-reuse overlay and passed
+  `cmake/verify-install.cmake`. A freshly reconfigured shared ClangCL/lld
+  Release tree passed 37/37 CTest. The static tree first reported 36/37 when
+  `qtav_interop_d3d11_direct_decoder_sampling` exited once with `0xc0000409`;
+  five isolated repeats passed, then the next complete static run passed
+  37/37. This transient native-test signal is retained rather than hidden.
+  The WinUI 3 Release player rebuilt with zero warnings and errors for default
+  mode, explicit direct mode, and again after restoring its default option;
+- default GPU-copy mode retained 3840x2160 HEVC Main10/P010 D3D11VA and active
+  RGB10/PQ. Before the seek, settled windows rendered 24.9-25.2 fps and copied
+  127-129 decoder frames per roughly 5.1 seconds. The exact 22:48 seek produced
+  one expected transition window, then the remainder of a 100.2-second
+  post-seek observation held 24.9-25.1 fps. Stable windows had zero
+  coalescing, `Present()` busy, render skips, retry/superseded/terminal results,
+  handoff timeouts, or greater-than-80-ms gaps; warm draw maxima were about
+  13.4-21.4 ms. Close while playing exited in 146 ms;
+- the explicit direct-sampling build used the same libraries and Release
+  configuration. It retained the same D3D11VA Main10/P010 and RGB10/PQ paths
+  while `decoder-copies` remained exactly zero. Pre-seek cadence held
+  24.9-25.1 fps; after the exact 22:48 seek and its expected transition window,
+  the remainder of a 100.2-second observation held 24.8-25.2 fps. Stable
+  windows again had zero coalescing, `Present()` busy, render skips,
+  retry/superseded/terminal results, handoff timeouts, or greater-than-80-ms
+  gaps; warm draw maxima were about 13.1-17.5 ms. Close while playing exited
+  in 143 ms;
+- neither policy emitted software-decode or decoded-source mapping/transfer
+  fallback diagnostics, no `QtAVWinUI3` process remained after close, and the
+  Application log contained no matching Application Error or Windows Error
+  Reporting event. The default and direct test bundles were retained under
+  `C:\\QtAVRegression\\fa640e5\\nvidia-default` and `nvidia-direct`, and the
+  workspace player was rebuilt back to the default option. This completes
+  AD-010 item 6; together with the Radeon result, the pre-cleanup four-cell
+  gate passed. Item 8 cleanup subsequently completed, its hardware repetition
+  was waived by the user, and AD-010 is closed.
+
+Intel UHD Graphics 770 follow-up on 2026-08-07, using the same revision:
+
+- The display-driving device was Intel UHD Graphics 770
+  (`PCI\\VEN_8086&DEV_4680&SUBSYS_0D181028`, driver `32.0.101.7085`) at
+  3840x2160/59 Hz. The GeForce RTX 3050 reported PnP problem/code 22 and was
+  disabled, while the Intel adapter reported code 0/OK. The Dell Pro Tower
+  QCT1250 used a Core i5-14500, 31.7 GiB RAM, Windows 11 Enterprise build
+  26200, and the balanced power plan. Playback reported active RGB10/PQ output,
+  240-nit SDR white, and a 1405-nit display peak.
+- The existing shared Release tree at commit `45fe72f1d366a8beac249d540fd917cf583b5986`
+  rebuilt successfully. One first full run reported 36/37 when the explicit
+  direct-decoder-sampling test aborted after FFmpeg could not initially infer
+  the generated stream pixel format. Three immediate isolated repetitions of
+  that direct test passed, and the next complete run passed 37/37, including
+  both default GPU copy and explicit direct decoder sampling. The one-off
+  probe/startup signal is retained rather than classified as an Intel backend
+  incompatibility.
+- The 1920x1080 H.264/NV12 control retained D3D11VA and settled at about
+  29.8-30.0 rendered fps. Each 5.2-second window copied about 155-157 decoder
+  frames; `present-busy`, `render-skipped`, and terminal results remained zero.
+  After first-pass shader warm-up, draw maxima were about 11.7-15.5 ms.
+- `legend.mkv` retained 3840x2160 HEVC Main10/P010 D3D11VA and RGB10/PQ output.
+  Before and for 90 seconds after the exact 22:48 seek, settled windows rendered
+  about 24.7-25.2 fps with about 128-131 visible-region GPU copies per
+  5.2 seconds. Warm draw maxima stayed about 12.2-14.7 ms with zero stable-window
+  busy, skipped, or terminal results. The initial seek-transition window had one
+  expected retired-generation terminal result and one skip; later windows
+  recovered immediately. Some settled windows recorded isolated roughly
+  80-98-ms video/render cadence gaps, but without rising draw cost, cadence loss,
+  or accumulating backpressure. Further seeks to 05:00, 12:00, and 22:48 each
+  resumed source cadence in the next settled window.
+- In the same process, replacing the HDR10 file with 3840x2160 Dolby Vision
+  Profile 5 `wednesday.mp4` settled at about 23.8-24.0 rendered fps and about
+  124-126 copies per 5.2 seconds, with zero busy, skipped, or terminal results.
+  Closing the main window while playback was active exited the process and its
+  debug window in 189 ms. No run selected software decode or decoded-source CPU
+  mapping. This establishes the available UHD 770 checkpoint only; it does not
+  substitute for the requested Radeon 880M or original Iris Xe regressions.
+
+Intel Iris Xe Graphics regression rerun on 2026-08-07, at commit
+`0df05e881d93ac1b4f14827f69f3795f24572f61`:
+
+- This was the original Lenovo 21HW class of test system with Intel Iris Xe
+  Graphics (`PCI\\VEN_8086&DEV_A7A0&SUBSYS_3C4817AA&REV_04`, driver
+  `32.0.101.7088`), Core i5-13500H, 31.9 GiB RAM, Windows 11 Pro build 26200,
+  balanced power, and AC power. Playback selected D3D11VA, retained positive
+  visible-region GPU-copy accounting, reported active RGB10/PQ output, and did
+  not report decoded-source CPU mapping or software decode.
+- Fresh Visual Studio 2026 ClangCL/lld shared and static Release trees rebuilt
+  all targets from the repository FFmpeg 8.1.2 package and each passed 37/37
+  CTest. The WinUI 3 player then rebuilt against the fresh shared tree with zero
+  warnings and zero errors.
+- The 1920x1080 H.264/NV12 control settled at about 29.8-30.1 scheduled and
+  rendered fps. Stable windows had zero cadence gaps, terminal results, or
+  `Present()` busy results, with warm draw maxima normally about 13.7-18.9 ms.
+  The 3840x2160 Dolby Vision Profile 5 `wednesday.mp4` control likewise settled
+  at about 23.8-24.1 scheduled and 23.9-24.0 rendered fps, normally with zero
+  stable-window gaps, busy results, or terminal results and about 12.7-22.1 ms
+  warm draw maxima.
+- A clean, cold `legend.mkv` run remained at about 24.8-25.2 scheduled and
+  24.9-25.1 rendered fps before the seek, with no cadence gaps and about
+  17.0-20.7 ms warm draw maxima. Exactly one progress-slider seek to 22:48 then
+  reproduced the defect for more than 90 seconds: scheduling remained about
+  24.9-25.1 fps, while rendering repeatedly fell to about 23.4-24.7 fps.
+  Settled windows commonly coalesced 1-8 redraws, reported 0-12 `Present()` busy
+  results, and each contained a greater-than-80-ms video/render gap; observed
+  maxima reached about 246/242 ms.
+- The default visible-copy path removed the former persistent 48-60-ms
+  libplacebo/D3D11 CPU submission cost: most post-seek draw maxima were only
+  about 16.1-21.7 ms and GPU pass maxima about 0.7-0.9 ms. A 12-second sample
+  also averaged only 5.93% D3D 3D and 11.81% video-decode utilization. The
+  remaining cadence loss is therefore not fixed and is not explained by GPU
+  saturation; the original Iris Xe acceptance item stays open.
+- Close while playing exited in about 277 ms for the control/media-replacement
+  process and 342 ms for the isolated post-seek process. The Application log
+  contained no QtAVWinUI3 Application Error or Windows Error Reporting events.
+  `C:\\test` did not contain `suzume.mkv`, so its planned 1:00:00 and 1:40:00
+  checkpoints could not be repeated in this rerun.
+
+Intel Iris Xe root cause, repair, and cooled follow-up on 2026-08-07:
+
+- Administrator ETW localized the long post-seek draw callback to final
+  D3D11VA lifetime release, not libplacebo GPU work. `DxgKrnl` stacks entered
+  `igd11dxva64.dll`, `igddxvacommon64.dll`, `igd10um64xe.dll`, D3D11, and the
+  kernel memory manager from QtAVCore's frame recycler. HEVC had repeated
+  `get_format`; FFmpeg's `ff_get_format()` unconditionally uninitialized the
+  hardware accelerator, and its D3D11VA path recreated an
+  `ID3D11VideoDecoder` plus every output view even though QtAVCore supplied the
+  same initialized frames context and texture. The last old frame retained the
+  old decoder reference, so its eventual release serialized Intel's shared
+  D3D11 device.
+- Core now retains an initialized compatible D3D11 hardware-frames context
+  across repeated format callbacks. The repository FFmpeg 8.1.2 Windows overlay
+  adds opt-in compatible decoder/output-view reuse, keyed by texture, array
+  size, profile, dimensions, output format, and the complete decoder
+  configuration. `QtAV::HWD3D11VA` enables that extension. Stock FFmpeg
+  behavior remains unchanged for other consumers.
+- `ffmpeg/scripts/build-windows.ps1` rebuilt FFmpeg 8.1.2 port revision 7 and
+  passed `cmake/verify-install.cmake`. Fresh shared and static QtAVCore Release
+  builds each passed 37/37 CTest; the WinUI 3 Release example rebuilt with zero
+  warnings and errors. The seek lifecycle test now asserts reuse of the same
+  decoder texture. A pre-existing short-media timing race in the blocked audio-
+  sink test was made deterministic by looping that test's media; 20 consecutive
+  direct static runs passed.
+- The post-fix GPU WPR trace is
+  `C:\\QtAVTraces\\qtav-irisxe-decoder-reuse-fix-20260807-185310.etl`.
+  It recorded 16 QtAV `TerminateAllocation` events around two seeks, but their
+  stacks resolve to WinUI/DirectComposition (`Microsoft.UI.Xaml.dll`,
+  `dcompi.dll`, `dcomp.dll`, and `igd10um64xe.dll`), not the former
+  recycler-to-Intel-DXVA decoder teardown. The full WPR plus subsequent xperf
+  decoding drove CPU Package to 98 degrees Celsius and did record thermal
+  throttling, so that trace is retained as lifetime evidence and is not used as
+  the final cadence measurement.
+- A separate HWiNFO-reset run omitted WPR/xperf. It began at 36 degrees Celsius
+  core and 39 degrees Package. During playback Package peaked at 72 degrees;
+  thermal throttling, critical temperature, and power-limit flags all stayed
+  false. Before seek, the 4K HEVC Main10/PQ sample held 24.8-25.2 rendered fps
+  with zero coalescing and no greater-than-80-ms gaps. One seek at 19:14:29
+  produced three transient 5-second windows at 18.0, 17.6, and 19.2 fps, then
+  recovered to 24.8-25.2 fps for about 75 seconds with zero coalescing and zero
+  greater-than-80-ms gaps. Opening the separate WinUI Debug window later
+  immediately created another DirectComposition-correlated transient and is
+  excluded from the seek result.
+- The data separates two effects: redundant FFmpeg decoder teardown was the
+  code root cause of the persistent Intel stall and is repaired; high
+  temperature and unrelated DirectComposition allocation churn amplify the
+  observed delay. The original multi-minute post-seek failure no longer
+  reproduces cold, but the first approximately 15 seconds after seek are not
+  yet a strict zero-transient pass, so the Iris acceptance item remains open.
+- A later same-machine cooled rerun explicitly enabled direct decoder-texture
+  sampling instead of the default visible-region GPU copy. The 4K HEVC
+  Main10/PQ input remained D3D11VA-backed with RGB10/PQ output and
+  `decoder-copies=0` throughout. The first exact 22:48 seek recovered after its
+  expected discontinuity window and then held 24.6-25.2 rendered fps for 24
+  five-second windows. It had one isolated coalesced request and one 104.1-ms
+  render gap at about 96 seconds, with `Present()` busy and terminal results
+  still zero; the draw callback reached 90.7 ms while the libplacebo GPU pass
+  was only 1.5 ms, and the following window immediately recovered.
+- After closing the Debug window and allowing 30 seconds for composition to
+  settle, a second exact 22:48 seek produced 24 consecutive settled windows
+  at 24.9-25.2 scheduled and rendered fps. Coalescing, `Present()` busy,
+  terminal results, decoder copies, and greater-than-80-ms video/render gaps
+  were all zero; maximum render gap was 63.5 ms, maximum draw 47.3 ms, and
+  maximum libplacebo GPU work 3.0 ms. HWiNFO recorded no CPU/package thermal
+  throttling, critical temperature, CPU/package power-limit, GPU performance-
+  degradation, GPU thermal, or GPU power flags in that second 128-second
+  interval. Core/package/GPU ranges were 44-55/50-84/43-47 degrees Celsius,
+  with average D3D/video-decode/copy-engine utilization of
+  6.39/13.18/0.09 percent. Close while playing exited in 272 ms and produced
+  no `QtAVWinUI3.exe` Application Error or WER event.
+- The corresponding sensor log is
+  `C:\\QtAVTraces\\qtav-irisxe-direct-cold-20260807-194207.csv`. The persistent
+  post-seek defect is therefore also repaired in explicit direct sampling.
+  The first run's single unrelated late transient means the broader
+  zero-transient Iris acceptance item remains open rather than being weakened
+  to a one-pass criterion.
+
 The next Dolby Vision slice is partly complete: FFmpeg-parsed RPU metadata is
 now correlated to exact OHCodec outputs by normalized PTS, and Profile 5 plus
 Profile 8.4 pass through the raw OpenGL ES/libplacebo path. Its strict Vulkan
 half remains gated by the same missing explicit multi-plane device format as
 item 10.
 
-The immediate next local OHOS step is the item-10 confirmation gate, before
-further strict Vulkan or Dolby Vision implementation advances: obtain Huawei's
+The next OHOS step remains the item-10 confirmation gate: obtain Huawei's
 written position on the mapping, its supported device/system and buffer-
 configuration scope, the meaning of returned format features after a guessed
 conversion, and the P010 raw-plane/10-bit guarantee. Where access permits,
 cross-check the stated scope on additional relevant configurations. Record the
 evidence in a follow-up architecture decision, then either promote a narrowly
 supported mapping, retain it as an explicitly opted-in workaround, or reject
-it and use the opaque/fallback paths.
+it and use the opaque/fallback paths. Huawei's response is still pending.
+
+Inserted Windows Vulkan checkpoint (complete before further OHOS item-10
+development):
+
+1. [ ] Define the Windows responsibility split and public targets without
+   combining hardware decode, cross-API interop, rendering, or presentation.
+   Reuse `QtAV::HWD3D11VA`, `D3D11DeviceAccess`, the portable
+   `QtAV::RenderVulkan` engine, the shared FFmpeg/libplacebo bridge, detailed
+   render-result semantics, and the existing Windows output scheduling and
+   diagnostics policies. Add narrowly scoped Windows Vulkan surface/output and
+   D3D11VA-to-Vulkan interop targets and record their names and ownership in an
+   architecture decision before stabilizing public headers.
+2. [ ] Add the Windows Vulkan capability and adapter-identity gate. Match the
+   Vulkan physical device to the D3D11VA DXGI adapter by LUID, require the
+   necessary Win32 surface, external-memory, external-synchronization,
+   multi-plane format, swapchain, and color-space capabilities, and reject
+   cross-adapter or unproven handle combinations explicitly. Do not infer
+   native-device support from WARP or software Vulkan.
+3. [ ] Implement the strict D3D11VA-to-Vulkan zero-copy route. Export retained
+   NV12/P010 decoder resources through supported Win32 handles, import the exact
+   texture-array slice and visible crop into Vulkan, preserve native Y/UV plane
+   layout and bit depth, and keep the source alive through GPU completion.
+   Strict zero copy permits no `Map()`, CPU transfer, staging/upload,
+   `CopySubresourceRegion*`, Vulkan transfer copy, or RGBA representation-
+   normalization intermediate. Probe the actual D3D11/Vulkan external-image
+   contract rather than assuming decoder surfaces are shareable or importable.
+4. [ ] Establish explicit cross-API synchronization and bounded lifetime.
+   Select a capability-proven shared-fence/semaphore or keyed-mutex contract,
+   transfer ownership without polling frame pixels on the CPU, and release the
+   decoder slice/handle only after Vulkan/libplacebo completion. Cover seek,
+   flush, media replacement, device/surface recreation, stale generations,
+   stop, and close-while-playing without leaking handles or recycling an
+   in-flight decoder surface.
+5. [ ] Make libplacebo the Windows Vulkan image and color-pipeline authority.
+   Reuse the portable Vulkan/libplacebo path for native multi-plane sampling,
+   crop, rotation, scaling, chroma reconstruction, transfer/gamut conversion,
+   HDR tone mapping, output encoding, and FFmpeg-parsed Dolby Vision RPU
+   reshaping. Do not add a parallel handwritten Dolby Vision, YUV conversion,
+   tone-mapping, or output shader. Any unavoidable representation conversion
+   must be isolated, justified, counted, and treated as a non-strict fallback.
+6. [ ] Add Windows Vulkan presentation and Player integration, starting with a
+   native `HWND` surface and a Vulkan swapchain on the matched adapter. Reuse
+   the existing Vulkan SDR/HDR10/extended-linear selection where Windows WSI
+   supports it, submit HDR metadata when supported, and preserve the Windows
+   display/HDR-generation, render retry, resize, suspend/recreate, and
+   application-owned render-thread contracts. Wire an explicit backend choice
+   into the Windows player/example without replacing the completed D3D11 path.
+7. [ ] Define fallback truthfully. If direct decoder-resource import is not
+   supported, prefer an explicit one-way fallback to the existing D3D11 output
+   or software decode. A separately measured GPU-only copy into an exportable
+   texture may be offered as a compatibility path, but it must not be reported
+   as strict zero copy; no fallback may silently map or upload the retired
+   hardware frame.
+8. [ ] Add deterministic and native validation for H.264/NV12 and HEVC
+   Main10/P010, exact texture slice/crop, adapter matching, handle and
+   synchronization lifetime, bounded retained frames, retries, resize/surface
+   recreation, seek/flush/replacement/stop/shutdown, SDR and HDR10 output, and
+   fallback selection. Validate Dolby Vision Profile 5 and supported Profile
+   8.x metadata through libplacebo. The strict route must report zero CPU map,
+   transfer, staging, upload, D3D11 copy, Vulkan transfer copy, and
+   representation-normalization operations.
+9. [ ] Build and test Windows static/shared Release configurations, the WinUI
+   or dedicated Windows Vulkan example, install/export packages, and external
+   CMake consumers using the repository Windows FFmpeg/Vulkan/libplacebo
+   dependency prefix. Run native hardware playback on the available Windows
+   adapters and record adapter/driver/extension evidence; do not reuse D3D11
+   renderer results as Vulkan acceptance evidence. Update README, MIGRATION,
+   architecture decisions, testing instructions, and this PLAN when each
+   meaningful subtask completes.
 
 Active local OHOS execution order:
 
@@ -2248,11 +2697,12 @@ Following platform slice:
 1. [~] External Windows machine: complete the Intel administrator trace,
    evidence-backed correction, and same-commit matrix described in `Next task`;
    AMD repair and NVIDIA verification are complete.
-2. [~] This machine: the portable render-result contract, target/toolchain
-   gate, HAP/XComponent Vulkan and OpenGL ES adapters, shared-selector fallback,
-   OHAudio output, and OHCodec direct-surface lifecycle matrix are complete;
-   continue with OHOS `OH_NativeImage`/OpenGL ES native hardware-frame interop
-   without waiting for the external Intel trace.
+2. [~] This machine: the portable render-result contract and the completed OHOS
+   target/toolchain, HAP/XComponent, Vulkan/OpenGL ES, selector, OHAudio,
+   OHCodec lifecycle, raw OpenGL ES, and diagnostic Vulkan import work are
+   retained. Huawei's production-contract reply for OHOS item 10 remains
+   pending. Complete the inserted Windows D3D11VA-to-Vulkan checkpoint before
+   resuming further OHOS item-10 or strict Dolby Vision Vulkan development.
 
 Platform implementation order after the contracts are stable:
 
@@ -2260,6 +2710,10 @@ Platform implementation order after the contracts are stable:
 2. Android production path with connected-device validation.
 3. Android playback performance/regression work.
 4. OHOS production path with connected-device validation (active local slice).
+
+The inserted Windows Vulkan checkpoint is an explicit temporary return to the
+Windows reference path while the external OHOS item-10 contract is blocked. It
+does not reopen the completed AD-010 D3D11 policy matrix.
 
 ## Milestone 3 — Portable reference backends
 
@@ -2334,9 +2788,10 @@ Acceptance:
 
 Status: complete; Milestone 6 is also complete. AD-007 is accepted across
 NVIDIA, Intel, and AMD; the AMD integrated-GPU cadence correction and NVIDIA
-same-commit matrix are fully validated. The Intel post-seek performance matrix
-remains incomplete on the external Windows track, while Milestone 7 is active
-locally.
+same-commit matrix are fully validated. The Intel post-seek decoder-teardown
+root cause is repaired, while its strict transient acceptance and the Radeon
+880M matrix remain incomplete on the external Windows track. Milestone 7 is
+active locally.
 
 ## Milestone 6 — Android production path
 

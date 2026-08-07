@@ -26,6 +26,13 @@ struct QTAV_HW_D3D11VA_EXPORT D3D11VAHardwareDecodeOptions {
     // Extra fixed-pool surfaces reserved for QtAVCore's current render frame
     // and a bounded number of application-retained frames.
     int extraHardwareFrames = 4;
+    // Opt in to shader-resource binding on FFmpeg's decoder texture array.
+    // The default renderer copies the visible NV12/P010 region into an
+    // ordinary shader resource. Enable this only together with
+    // D3D11VideoRenderer's direct decoder-texture sampling option; Direct3D
+    // 11 does not guarantee that decoder surfaces can be sampled, and some
+    // drivers exhibit padding, performance, seek, or lifetime failures.
+    bool directDecoderTextureSampling = false;
 };
 
 // Creates an FFmpeg D3D11VA device on the application-selected device and

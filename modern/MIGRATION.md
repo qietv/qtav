@@ -86,7 +86,8 @@ already own a graphics context or require multiple/custom render targets:
   per-frame display tracking, resize, presentation, and teardown;
 - optional D3D11VA hardware decode through `QtAV::HWD3D11VA`, using the
   application-selected `D3D11DeviceAccess` and retained decoder texture-array
-  slices;
+  slices, with visible-region GPU copy by default and direct decoder-texture
+  sampling as an explicit opt-in;
 - optional Android H.264/HEVC MediaCodec hardware decode through
   `QtAV::HWMediaCodec`, using an application-supplied versioned
   `ANativeWindow` and move-only direct-surface present/drop tokens;
@@ -332,7 +333,20 @@ failures, keeps only the latest pending frame, and retries on its private
 thread. For immediate-context contention it reserves priority over new
 FFmpeg-side acquisitions, performs an immediate bounded handoff wait, and only
 then applies bounded backoff; recovered retries are not counted as terminal
-drops.
+drops. The public D3D11 statistics retain stable cadence, retry, lifecycle,
+Present, gap, decoder-copy, and coarse color/interop/buffer/draw measurements.
+Investigation-only completion-query, clear, `pl_render_image()`, retention,
+and asynchronous libplacebo pass/GPU/callback fields have been removed; code
+that consumed those temporary fields must rebuild and stop depending on them.
+Collection is now tiered through `D3D11StatisticsMode`: `Counters` is the
+low-cost default, `Timing` enables the per-frame clock measurements, and `Off`
+removes continuous statistics work. `D3D11VideoOutput::setStatisticsMode()` may
+change the mode at runtime. Output retry no longer consumes and resets renderer
+statistics on every frame; `VideoRenderRetryReason` carries the exact transient
+busy cause through `VideoRenderAttemptResult` and `VideoRenderResult`, so
+disabling statistics does not change recovery or context-reservation policy.
+The added result/options fields change public C++ structure layouts; consumers
+must rebuild against the matching QtAVCore binaries.
 
 Opaque video players may additionally select
 `D3D11HdrPresentationMode::HDR10` and `DXGI_ALPHA_MODE_IGNORE` in
@@ -342,7 +356,15 @@ composition and alpha blending.
 
 `d3d11vaHardwareDecodeConfig()` creates FFmpeg's D3D11VA device on the same
 retained device access, installs callbacks for the shared recursive lock, and
-requests a bounded number of extra decoder surfaces. `D3D11VAFrame` retains a
+requests a bounded number of extra decoder surfaces. It also enables the
+repository Windows FFmpeg extension that retains a compatible
+`ID3D11VideoDecoder` and its output views with a reused initialized hardware-
+frames context. This removes redundant decoder teardown during repeated HEVC
+format selection; stock FFmpeg binaries do not provide the required opt-in
+field. Decoder arrays do not
+request `D3D11_BIND_SHADER_RESOURCE` unless
+`D3D11VAHardwareDecodeOptions::directDecoderTextureSampling` is enabled.
+`D3D11VAFrame` retains a
 decoded NV12/P010 texture-array slice and validates its native resource before
 returning borrowed D3D11 pointers. The core `NativeHandle` now carries an
 optional subresource index, while Windows SDK and FFmpeg declarations remain
@@ -353,13 +375,16 @@ implemented. `QtAV::RenderD3D11` now exposes decoder-independent
 the adapter layer; imported raw texture pointers and array-slice identity
 remain valid while the texture-frame object lives. `QtAV::InteropD3D11`
 implements same-device validation and retains the decoder NV12/P010 slice
-without a Video Processor RGB pass. The renderer wraps plane-specific D3D11
-views with libplacebo, attaches the exact FFmpeg Dolby Vision RPU before color
-conversion, and renders directly to the selected SDR, FP16 scRGB, or RGB10/PQ
-target. PQ/BT.2020 and Profile 5 hardware frames therefore preserve their raw
-semantic input through the zero-CPU-map path. Direct plane wrapping uses no
-normalization draw or intermediate source texture and therefore satisfies the
-strict no-intermediate source zero-copy definition. The renderer reports D3D11
+without a Video Processor RGB pass. The renderer defaults to copying the even-
+aligned visible rectangle into a bounded same-format NV12/P010 texture ring,
+using `CopySubresourceRegion1()` plus `D3D11_COPY_DISCARD` when D3D11.1 is
+available. It then wraps plane-specific D3D11 views with libplacebo, attaches
+the exact FFmpeg Dolby Vision RPU before color conversion, and renders to the
+selected SDR, FP16 scRGB, or RGB10/PQ target. PQ/BT.2020 and Profile 5 hardware
+frames therefore preserve their raw semantic input through the zero-CPU-map
+path. Explicit direct plane wrapping uses no intermediate source texture and
+therefore satisfies the strict no-intermediate source zero-copy definition.
+The renderer reports D3D11
 hardware-frame capability and
 offers an explicit, disabled-by-default software mapping fallback through
 `setAllowSoftwareMappingFallback()`. The interop and renderer use the same
@@ -373,24 +398,31 @@ console test passes with an active WASAPI render endpoint and audible output,
 while sessions without an endpoint report a CTest skip. The retained-resource
 contract remains documented in [D3D11VA.md](D3D11VA.md).
 
-Hardware imports, their copied core frames, and borrowed targets are retained
-until a D3D11 completion event reports that the libplacebo draw has finished.
-The renderer bounds this queue at three submissions, and
+Default copied textures, their persistent plane wrappers, borrowed targets,
+and original decoder frames are retained until a D3D11 completion event reports
+that the libplacebo draw has finished. Direct mode additionally retains its
+transient decoder-plane wrappers through completion. Both modes then hand the
+source frame and interop wrapper to a fixed-capacity recycler so FFmpeg/D3D11VA
+final release and vendor allocation teardown do not execute on the real-time
+render thread. The renderer bounds both its completion queue and copy ring at
+three submissions, and
 `D3D11VideoRenderer::flush()` explicitly drains it before target resize or
-replacement. Decoder, interop, and renderer submissions share a natively
-multithread-protected immediate context plus QtAVCore's recursive guard.
+replacement, including the recycler. Decoder, interop, and renderer submissions
+share a natively multithread-protected immediate context plus QtAVCore's
+recursive guard.
 Every successfully imported D3D11VA frame uses libplacebo's fast sampling
 policy without the optional GPU histogram peak-detection pass. Successful
 per-frame submission remains asynchronous, without `pl_gpu_finish()`, and
-Dolby Vision raw NV12/P010 input samples the retained decoder array slice
-directly without a GPU copy. Software frames keep the default render
-parameters. Normal flush, resize, media replacement, failure cleanup, and
-teardown still perform the explicit drains required by their lifecycles.
-This vendor-neutral policy is accepted on NVIDIA, Intel, and AMD. A separately
-reported visual 4K cadence issue on an AMD integrated GPU remains a performance
-investigation rather than an imported-frame correctness regression. Closure
-requires a same-build Intel performance regression and exact hardware, driver,
-and objective cadence/stage data from both final test devices.
+Dolby Vision raw NV12/P010 input remains raw in both modes. Software frames
+keep the default render parameters. Normal flush, resize, media replacement,
+failure cleanup, and teardown still perform the explicit drains required by
+their lifecycles. Changes to this policy require fresh NVIDIA, Intel, and AMD
+seek, shutdown, cadence, and stage-timing regression. A separately reported
+visual 4K cadence issue on an AMD integrated GPU remains a performance
+investigation rather than an imported-frame correctness regression. The Intel
+Iris Xe same-build investigation localized and removed redundant decoder
+teardown; the remaining final-device work is the Radeon regression recorded in
+`PLAN.md`.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -621,7 +653,8 @@ implementation.
   presented, deferred until a backend redraw, timer-backoff retry, terminally
   discarded, surface-lost, or fatal. `VideoRenderResult` maps those outcomes
   to Player-facing statuses and includes frame sequence, presentation
-  generation, optional retry delay, and detail. A generation change during the
+  generation, optional retry delay, structured retry reason, and detail. A
+  generation change during the
   backend call returns a terminal `FrameDiscarded` completion;
 - compatibility `renderVideo()` returns a negative value for every non-rendered
   result and therefore cannot distinguish a missing frame from retryable

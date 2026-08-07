@@ -106,7 +106,8 @@ a graphics API. `Player::setRenderCallback()` requests a redraw, and the
 application calls `renderVideoDetailed()` on the thread that owns the native
 graphics context. Immutable current-frame and renderer-binding snapshots keep
 that hot path independent of the Player control mutex. The detailed result
-carries reason, frame sequence, and presentation generation; generation is
+carries status, structured retry reason, frame sequence, and presentation
+generation; generation is
 checked again after the backend call so an invalidated frame is not presented.
 The older `renderVideo()` timestamp/negative-value contract remains as a
 compatibility wrapper. Multiple renderer instances may be keyed by application
@@ -117,7 +118,23 @@ each output pass makes its first non-blocking acquisition. An uncontended pass
 continues immediately; contention uses a private-thread, at-most-8-ms handoff
 before the one-frame latest retry mailbox and bounded timer backoff. The
 reservation is honored by FFmpeg/internal D3D11 users, owns no context itself,
-and is released with the render result before statistics or `Present()`.
+and is released with the render result before retry classification,
+application-requested statistics reads, or `Present()`. D3D11 statistics are
+tiered as off, counters, or coarse timing; the output never consumes them as a
+retry-control channel.
+
+Windows decoder lifetime remains split across responsibilities. Core retains a
+compatible initialized D3D11 hardware-frames context across repeated FFmpeg
+format selection; `QtAV::HWD3D11VA` opts the paired repository FFmpeg package
+into retaining the matching decoder and output views with that context. Device,
+format, dimensions, pool capacity, texture, profile, and complete decoder
+configuration are compatibility gates, so a real change still creates a new
+pool and decoder. The renderer separately retains each imported source through
+GPU completion, destroys renderer-owned wrappers, and hands the source frame
+plus interop reference to a fixed-capacity release worker. This worker keeps
+final FFmpeg/driver destruction off the graphics-owner thread but does not
+replace compatible decoder reuse: a driver may serialize the shared device no
+matter which CPU thread performs an incompatible decoder teardown.
 
 The renderer owns resources derived from its API device/context. Native window
 and presentation ownership stays in a platform adapter or high-level output:
@@ -184,12 +201,20 @@ satisfy strict no-intermediate source zero-copy. A Vulkan native image qualifies
 for the strict claim only when an explicit `VkFormat` and plane mapping let the
 renderer wrap the retained decoded allocation directly for libplacebo.
 
-Windows needs no normalization shader. D3D11VA textures are created with
-`D3D11_BIND_SHADER_RESOURCE`; the interop retains the exact NV12/P010 array
-slice, and libplacebo wraps its luma and chroma plane views directly. A D3D11
-Video Processor RGB conversion is deliberately absent because it would erase
-the raw Profile 5 representation before Dolby Vision reshaping. This direct
-plane wrapping meets the strict no-intermediate source zero-copy definition.
+Windows needs no normalization shader. By default the decoder array is not
+shader-readable: the renderer copies only the even-aligned visible rectangle
+into a same-format NV12/P010 shader-readable texture, then libplacebo wraps its
+luma and chroma plane views. The bounded copy remains GPU-local and zero-CPU-
+copy, but it is not strict no-intermediate source zero-copy. An explicit option
+`D3D11VideoOutputOptions::directDecoderTextureSampling = true` instead creates
+`D3D11_BIND_SHADER_RESOURCE` decoder textures and wraps the retained array
+slice directly; only that mode satisfies the strict claim. The switch defaults
+to `false`, selecting the GPU-copy path. Both modes retain the source/import
+through GPU completion and defer final release to the bounded recycler. A
+D3D11 Video Processor RGB conversion is deliberately absent in both modes
+because it would erase the raw Profile 5 representation before Dolby Vision
+reshaping. These contracts are governed by [AD-010](DECISIONS.md#ad-010-windows-copies-the-visible-decoder-region-by-default)
+and [AD-011](DECISIONS.md#ad-011-windows-reuses-compatible-d3d11va-frames-contexts-and-decoders).
 
 ## Dolby Vision and HDR behavior
 
@@ -232,7 +257,9 @@ The Windows path applies the same ordering through D3D11 only:
 
 ```text
 FFmpeg HEVC/D3D11VA + parsed RPU
-       -> retained shader-readable P010 texture-array slice
+       -> retained P010 texture-array slice
+       -> visible-region same-format GPU copy (default)
+          or direct decoder slice (explicit option)
        -> libplacebo D3D11 luma/chroma plane views
        -> Dolby Vision reshape
        -> libplacebo color/tone/gamut pipeline
@@ -357,7 +384,12 @@ Supported-target FFmpeg and transitive dependencies come only from the
 repository `../ffmpeg/` vcpkg subproject. D3D11, Vulkan, and OpenGL ES
 rendering require the packaged libplacebo build. Windows additionally requires
 `pl_has_d3d11=1` and SPIRV-Cross for libplacebo's SPIR-V-to-HLSL compilation;
-Android requires `pl_has_opengl=1` for `QtAV::RenderOpenGL`.
+Android requires `pl_has_opengl=1` for `QtAV::RenderOpenGL`. The current Windows
+package also exposes the opt-in compatible D3D11VA decoder-reuse ABI required
+by `QtAV::HWD3D11VA`; `cmake/verify-install.cmake` checks that field. A stock or
+independently downloaded Windows FFmpeg is not an ABI-compatible fallback for
+that backend. The extension and retirement condition are governed by
+[FFmpeg FD-005](../ffmpeg/DECISIONS.md#fd-005-reuse-a-compatible-d3d11va-decoder-with-its-frames-context).
 
 Public targets expose only their required installed dependencies. Build-tree,
 NDK, SDK, and producer-machine paths must not leak into exported CMake targets.
@@ -380,9 +412,11 @@ package consumption, exact consumer-buffer acquisition, and opaque-format
 rejection are also validated. The current device cannot exercise the final
 direct-plane import/sampling/GPU-release gate, so no OHOS Vulkan texture PASS
 is claimed yet. [`PLAN.md`](PLAN.md) remains the source of truth for task
-ordering. The transferred Intel Windows cadence investigation remains open on
-its separate administrator-capable machine and is not described as closed by
-local OHOS progress.
+ordering. The transferred Intel Windows investigation traced the persistent
+post-seek stall to redundant D3D11VA decoder teardown and repaired it with the
+compatible frames-context/decoder policy above. The remaining Windows gate is
+the same final Release revision on NVIDIA and AMD, `legend.mkv` only, with
+`directDecoderTextureSampling` both off and on.
 
 ## Architectural invariants for changes
 
@@ -401,4 +435,7 @@ Before accepting a backend change, verify that:
    Vulkan, and OpenGL ES;
 8. direct-Surface and application-rendered modes are reported distinctly;
 9. unsupported capabilities fail or fall back explicitly rather than silently
-   changing color interpretation or copying decoded pixels.
+   changing color interpretation or copying decoded pixels;
+10. Windows repeated format selection reuses a decoder only after every Core
+    frames-context and FFmpeg decoder/configuration compatibility gate passes,
+    and the paired overlay ABI remains install-verified.

@@ -10,6 +10,7 @@
 #include <qtav/frame.h>
 #include <qtav/hardware_decoder.h>
 #include <qtav/media.h>
+#include <qtav/video_render_api.h>
 
 namespace qtav {
 
@@ -61,6 +62,8 @@ struct QTAV_CORE_EXPORT VideoRenderResult {
     std::uint64_t presentationGeneration = 0;
     std::uint32_t retryAfterMilliseconds = 0;
     std::string detail;
+    VideoRenderRetryReason retryReason =
+        VideoRenderRetryReason::Unspecified;
 };
 
 class QTAV_CORE_EXPORT Player {

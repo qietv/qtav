@@ -18,15 +18,33 @@ The example demonstrates:
 - an optional Debug window with playback, decode, render, device, and cadence
   diagnostics.
 
-The D3D11 renderer keeps submitted decoder slices and swap-chain back buffers
-alive until their GPU completion event. Every successfully imported D3D11VA
+The D3D11 renderer defaults to a bounded same-device NV12/P010 texture ring. It
+copies only the even-aligned visible decoder region, uses
+`D3D11_COPY_DISCARD` on D3D11.1, and keeps the decoder slice, copied texture,
+and swap-chain back buffer alive until GPU completion. Completed source frames
+are handed to a bounded recycler so FFmpeg/driver resource destruction cannot
+stall the output render thread. The paired repository FFmpeg package also
+retains a compatible D3D11VA decoder/output-view set across repeated HEVC
+format selection instead of reconstructing it through the shared Intel device.
+Every successfully imported D3D11VA
 frame uses libplacebo's fast sampling policy without an additional GPU
 histogram peak-detection pass. Submission stays asynchronous without a
-per-frame `pl_gpu_finish()`, and Dolby Vision raw NV12/P010 frames sample the
-retained decoder slice directly instead of creating a GPU copy. Native D3D11
-multithread protection, the shared recursive guard, the bounded completion
-queue, and lifecycle drains remain active. Software frames keep the default
-render parameters.
+per-frame `pl_gpu_finish()`. Native D3D11 multithread protection, the shared
+recursive guard, the bounded completion queue, and lifecycle drains remain
+active. Direct decoder-texture sampling is available through the library's
+explicit output option but is not enabled by this example. Software frames
+keep the default render parameters.
+
+The Debug window's `decoder-copies` value is a diagnostic counter, not a UI
+toggle. With the example's default
+`D3D11VideoOutputOptions::directDecoderTextureSampling = false`, it increases
+as D3D11VA frames are copied within the GPU into the bounded texture ring. A
+custom build can set that option to `true` before `open()` to exercise direct
+decoder-texture sampling; then the value must remain zero. The test plan names
+these configurations default GPU-copy mode and direct-sampling mode. A zero
+value is meaningful only when Debug also shows active D3D11VA input,
+progressing rendered frames, and no software mapping fallback. The counter does
+not measure CPU copies or overall GPU Copy-engine activity.
 
 The example's video surface is opaque, so it explicitly selects RGB10/PQ
 presentation with `DXGI_ALPHA_MODE_IGNORE`. This bypasses the extra scRGB/DWM
@@ -151,7 +169,8 @@ built yet.
   Dragging previews the position locally and submits one seek on release;
   keyboard or other value changes are debounced for 180 ms.
 - **Debug** opens or closes the separate diagnostics window. Closing that
-  window also clears the toggle.
+  window also clears the toggle and disables continuous D3D11 statistics and
+  cadence clocks. Opening it enables timing diagnostics for the new interval.
 
 URL playback depends on the protocols and TLS support enabled in the linked
 FFmpeg build. HTTP(S) inputs receive bounded I/O timeout and reconnect
@@ -174,6 +193,11 @@ The Debug window keeps the most recent 1,000 lines and reports:
   and terminal frames, D3D11 context-owner and handoff counts, gaps over 80 ms,
   and maximum render-stage times. `render-skipped` is the compatibility mirror
   of terminal drops; a recovered retry is not counted as skipped.
+
+The player opens its D3D11 output with `D3D11StatisticsMode::Off`. Debug
+temporarily selects `Timing`; closing the window returns to `Off`. Retry and
+resource-lifetime behavior use structured render results and remain identical
+in both modes.
 
 The cadence line helps distinguish decode or network starvation from a slow
 render/driver stage. It is diagnostic evidence, not a stable machine-readable
@@ -209,7 +233,12 @@ log format.
   D3D11 device line, then reproduce after resize and monitor movement.
 - **Playback stutters or audio is noisy:** capture at least two cadence lines
   and note media URL/type, seek history, output color mode, CPU/GPU load, and
-  whether the audio endpoint changed. Follow the evidence guide in
+  whether the audio endpoint changed. Record temperature plus thermal/power-
+  limit flags from the same interval; a hot WPR/xperf session can materially
+  change the cadence it is meant to measure. Open or move the separate Debug
+  window only after the measured interval because WinUI/DirectComposition
+  allocation can create its own transient on integrated GPUs. Follow the
+  evidence guide in
   [Testing](TESTING.md#diagnosing-cadence-and-stalls).
 - **Exit is slow:** reproduce while the Debug window is closed and record
   whether the delay occurs for local media, HTTP media, or both. Do not work
