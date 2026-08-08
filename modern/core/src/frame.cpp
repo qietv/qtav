@@ -503,9 +503,13 @@ struct AudioFrame::Storage {
 
 struct SubtitleFrame::Storage {
     std::string text;
+    std::vector<std::string> assEvents;
+    std::string assHeader;
     std::int64_t timestampMs = 0;
     std::int64_t durationMs = 0;
     bool forced = false;
+    int track = -1;
+    std::uint64_t presentationGeneration = 0;
 };
 
 VideoFrame::VideoFrame(std::shared_ptr<const Storage> storage)
@@ -850,6 +854,26 @@ bool SubtitleFrame::forced() const noexcept
     return storage_ && storage_->forced;
 }
 
+std::vector<std::string> SubtitleFrame::assEvents() const
+{
+    return storage_ ? storage_->assEvents : std::vector<std::string> {};
+}
+
+std::string SubtitleFrame::assHeader() const
+{
+    return storage_ ? storage_->assHeader : std::string {};
+}
+
+int SubtitleFrame::track() const noexcept
+{
+    return storage_ ? storage_->track : -1;
+}
+
+std::uint64_t SubtitleFrame::presentationGeneration() const noexcept
+{
+    return storage_ ? storage_->presentationGeneration : 0;
+}
+
 VideoFrame detail::FrameFactory::video(
     const AVFrame* frame,
     std::int64_t timestampMs,
@@ -889,18 +913,26 @@ AudioFrame detail::FrameFactory::audio(
 
 SubtitleFrame detail::FrameFactory::subtitle(
     std::string text,
+    std::vector<std::string> assEvents,
+    std::string assHeader,
     std::int64_t timestampMs,
     std::int64_t durationMs,
-    bool forced)
+    bool forced,
+    int track,
+    std::uint64_t presentationGeneration)
 {
-    if (text.empty()) {
+    if (text.empty() && assEvents.empty()) {
         return {};
     }
     auto storage = std::make_shared<SubtitleFrame::Storage>();
     storage->text = std::move(text);
+    storage->assEvents = std::move(assEvents);
+    storage->assHeader = std::move(assHeader);
     storage->timestampMs = timestampMs;
     storage->durationMs = durationMs;
     storage->forced = forced;
+    storage->track = track;
+    storage->presentationGeneration = presentationGeneration;
     return SubtitleFrame(std::move(storage));
 }
 

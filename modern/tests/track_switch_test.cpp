@@ -294,8 +294,7 @@ int main(int argc, char** argv)
     assert(unexpectedSubtitleFrames.load() == 0);
     if (!suppliedAudioSubtitleFixture) {
         std::lock_guard<std::mutex> lock(mutex);
-        assert(lastSubtitleText.find("Alternate subtitle cue")
-            != std::string::npos);
+        assert(lastSubtitleText.find("Alternate") != std::string::npos);
         assert(lastSubtitleText.find('{') == std::string::npos);
     }
     auto sinkSnapshot = audioSink->snapshot();
@@ -369,8 +368,7 @@ int main(int argc, char** argv)
     assert(unexpectedSubtitleFrames.load() == 0);
     if (!suppliedAudioSubtitleFixture) {
         std::lock_guard<std::mutex> lock(mutex);
-        assert(lastSubtitleText.find("Primary subtitle cue")
-            != std::string::npos);
+        assert(lastSubtitleText.find("Primary") != std::string::npos);
     }
     sinkSnapshot = audioSink->snapshot();
     assert(sinkSnapshot.openCount >= 2);

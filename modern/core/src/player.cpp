@@ -2196,6 +2196,7 @@ private:
 
             if (produced) {
                 std::string text;
+                std::vector<std::string> assEvents;
                 bool forced = false;
                 for (unsigned index = 0; index < subtitle.num_rects; ++index) {
                     const auto* rectangle = subtitle.rects[index];
@@ -2209,6 +2210,7 @@ private:
                         rectangleText = rectangle->text;
                     } else if (rectangle->type == SUBTITLE_ASS
                                && rectangle->ass) {
+                        assEvents.emplace_back(rectangle->ass);
                         rectangleText = plainTextFromAss(rectangle->ass);
                     } else if (rectangle->text) {
                         rectangleText = rectangle->text;
@@ -2221,7 +2223,7 @@ private:
                     }
                 }
 
-                if (!text.empty()) {
+                if (!text.empty() || !assEvents.empty()) {
                     std::int64_t packetPtsUs = subtitle.pts;
                     if (packetPtsUs == AV_NOPTS_VALUE && packet
                         && packet->pts != AV_NOPTS_VALUE) {
@@ -2259,11 +2261,26 @@ private:
                     if (timestampMs >= rangeStart
                         && (rangeEnd == MediaEnd
                             || timestampMs < rangeEnd)) {
+                        std::string assHeader;
+                        if (media_.subtitle.context->subtitle_header
+                            && media_.subtitle.context->subtitle_header_size
+                                > 0) {
+                            assHeader.assign(
+                                reinterpret_cast<const char*>(
+                                    media_.subtitle.context->subtitle_header),
+                                static_cast<std::size_t>(
+                                    media_.subtitle.context
+                                        ->subtitle_header_size));
+                        }
                         auto frame = detail::FrameFactory::subtitle(
                             std::move(text),
+                            std::move(assEvents),
+                            std::move(assHeader),
                             timestampMs,
                             durationMs,
-                            forced);
+                            forced,
+                            media_.subtitle.streamIndex,
+                            generation);
                         if (frame) {
                             PresentationItem item;
                             item.type = PresentationItem::Type::Subtitle;

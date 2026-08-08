@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <qtav/color.h>
 #include <qtav/export.h>
@@ -76,9 +77,10 @@ private:
     friend struct detail::FrameFactory;
 };
 
-// A decoded, presentation-timed plain-text subtitle cue. Formatted ASS/SSA
-// input is normalized to UTF-8 text before this object is published; bitmap
-// subtitle rectangles are not represented by this plain-text API.
+// A decoded, presentation-timed subtitle cue. text() always provides the
+// normalized UTF-8 plain-text representation. When FFmpeg also supplies ASS/
+// SSA packet data, assEvents() and assHeader() preserve it for an optional
+// styled renderer without exposing FFmpeg or libass types.
 class QTAV_CORE_EXPORT SubtitleFrame {
 public:
     SubtitleFrame() = default;
@@ -90,6 +92,10 @@ public:
     std::int64_t timestamp() const noexcept;
     std::int64_t duration() const noexcept;
     bool forced() const noexcept;
+    std::vector<std::string> assEvents() const;
+    std::string assHeader() const;
+    int track() const noexcept;
+    std::uint64_t presentationGeneration() const noexcept;
 
 private:
     struct Storage;

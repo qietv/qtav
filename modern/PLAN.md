@@ -900,9 +900,10 @@ through `OMX.hisi.video.decoder.vvc` before passing its lifecycle and forced-
 software-fallback matrix. Remaining strict OHOS Vulkan raw-plane/Dolby Vision
 precision work is device-gated on a non-opaque multi-plane format. Milestone
 9 active audio/video/subtitle track switching, FFmpeg subtitle packet decode,
-and the presentation-timed plain-text callback are complete. The next local
-implementation task is the optional libass renderer; do not claim the device-
-gated strict Vulkan item complete without suitable hardware.
+the presentation-timed plain-text callback, and the optional libass renderer
+are complete. The next local implementation task is external audio and
+subtitle sources; do not claim the device-gated strict Vulkan item complete
+without suitable hardware.
 
 AD-010 Windows visible-copy checkpoint:
 
@@ -3148,7 +3149,29 @@ Completed track/subtitle checkpoint on 2026-08-09:
   both install trees export the updated public API, and the OHOS arm64/API 23
   static core cross-build passes against the repository FFmpeg package.
 
-- [ ] libass renderer as an optional module.
+- [x] libass renderer as an optional module.
+
+Completed libass checkpoint on 2026-08-09:
+
+- `SubtitleFrame` retains ASS/SSA packet events, codec-private header, stream
+  index, and presentation generation while preserving normalized UTF-8
+  `text()` and keeping FFmpeg/libass types private;
+- `QtAV::SubtitleLibass` is optional under
+  `QTAV_SUBTITLE_LIBASS=AUTO/ON/OFF`, accepts caller-selected frame/storage
+  sizes and font defaults, resets on track/generation changes, and copies the
+  ordered libass image list into application-owned coverage bitmaps;
+- deterministic SRT-to-ASS playing-switch coverage validates text
+  normalization, raw ASS escape preservation, bounded bitmap geometry,
+  nonzero coverage, generation invalidation, and explicit flush. The supplied
+  one-video/five-audio/five-`mov_text` MP4 also passes real decode, switching,
+  and libass bitmap production;
+- Windows Visual Studio 2026 Release static and shared matrices pass 40/40.
+  Static/shared install trees export `QtAV::SubtitleLibass`, and matching
+  ClangCL external consumers configure, link, and run. Android arm64/API 28
+  and OHOS arm64/API 23 static Core plus SubtitleLibass cross-builds pass
+  against repository dependency packages; the OHOS install exports the new
+  target.
+
 - [ ] External audio and subtitle sources.
 - [ ] Packet buffering policy and buffering status.
 - [ ] Low-latency/live-stream drop policy.

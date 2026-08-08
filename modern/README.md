@@ -32,8 +32,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - local files and FFmpeg-supported network protocols, with bounded HTTP(S)
   read timeouts and reconnect defaults that applications can override through
   `avformat.*` properties;
-- audio, video, and presentation-timed plain-text subtitle callbacks with
-  reference-counted frame lifetime;
+- audio, video, and presentation-timed subtitle callbacks with reference-
+  counted frame lifetime, normalized UTF-8 text, and preserved ASS/SSA packet
+  data when supplied by FFmpeg;
 - structured video range, primaries, transfer, matrix, chroma-location, HDR10
   mastering-display, and content-light metadata;
 - libplacebo as the sole semantic color/shader authority for the Windows
@@ -47,6 +48,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - compile-time `VideoRenderAPI`, `AudioSink`, and hardware-frame interop
   contracts;
 - optional libswscale CPU renderer for application-owned image buffers;
+- optional libass text/ASS subtitle rasterizer that returns ordered, owning
+  coverage bitmaps for application composition without entering the core ABI;
 - optional Windows D3D11 renderer for a retained application-selected device
   and immediate context plus borrowed current render-target/swap-chain views,
   using libplacebo for FFmpeg color metadata, Dolby Vision RPU reshaping, HDR
@@ -150,6 +153,10 @@ Current backend integration boundary:
   `QtAV::AudioResample` supplies the portable libswresample implementation;
 - `QtAV::AudioFile` writes negotiated interleaved PCM to a standard RIFF/WAVE
   file for diagnostics without becoming a playback clock;
+- `QtAV::SubtitleLibass` consumes the ASS header/events retained by
+  `SubtitleFrame`, resets its track on presentation-generation or track
+  changes, and returns ordered owning coverage bitmaps at a caller-selected
+  media position;
 - `QtAV::AudioWASAPI` negotiates shared-mode Float32 mono/stereo PCM against a
   Windows render endpoint, owns an event-driven queue on a dedicated COM
   thread, and supplies an `IAudioClock`-backed playback clock and latency;
@@ -380,6 +387,7 @@ clear error. Current switches are:
   `QTAV_RENDER_VULKAN`, and `QTAV_RENDER_D3D11`;
 - audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_AAUDIO`,
   `QTAV_AUDIO_OHAUDIO`, `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
+- subtitle: `QTAV_SUBTITLE_LIBASS`;
 - hardware decode: `QTAV_HW_D3D11VA`, `QTAV_HW_MEDIACODEC`, and
   `QTAV_HW_OHCODEC`;
 - interop: `QTAV_INTEROP_D3D11`,
@@ -400,6 +408,8 @@ backend explicitly,
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
+`QTAV_SUBTITLE_LIBASS=AUTO` builds `QtAV::SubtitleLibass` when libass 0.17.0
+or newer is available,
 `QTAV_AUDIO_WASAPI=AUTO` builds the shared-mode device sink on Windows,
 `QTAV_HW_D3D11VA=AUTO` builds the Windows hardware-decode
 selection and native-frame access target. `QTAV_INTEROP_D3D11=AUTO` builds the
@@ -636,13 +646,55 @@ intent, and reopens the audio sink so a new native audio format is negotiated.
 Seekable inputs return to the request position; non-seekable inputs continue
 from the next packet of the selected stream.
 
-`onSubtitleFrame()` currently publishes decoded UTF-8 plain text for FFmpeg
-text and ASS/SSA subtitle decoders. ASS event fields and override blocks are
-removed, and `\\N`/`\\n` line breaks plus `\\h` spaces are normalized before
-the callback. `SubtitleFrame` also carries the cue timestamp, duration, and
-forced flag. Bitmap subtitle rectangles are decoded by FFmpeg but are not
-exposed by this plain-text callback; graphical subtitle frames and optional
-libass rendering remain separate work.
+`onSubtitleFrame()` publishes decoded UTF-8 plain text for FFmpeg text and
+ASS/SSA subtitle decoders. ASS event fields and override blocks are removed
+from `text()`, and `\\N`/`\\n` line breaks plus `\\h` spaces are normalized.
+The same reference-counted `SubtitleFrame` preserves FFmpeg's ASS packet
+events and codec-private header through `assEvents()` and `assHeader()` and
+also carries the cue timestamp, duration, forced flag, stream index, and
+presentation generation. Public core headers still expose no FFmpeg or
+libass types.
+
+For styled text subtitles, link `QtAV::SubtitleLibass`, configure its output
+and source-video sizes, add every callback frame once, then render at the
+current media position from the application's composition path:
+
+```cpp
+#include <qtav/libass_subtitle_renderer.h>
+
+qtav::LibassSubtitleRenderer subtitles;
+qtav::LibassSubtitleRendererConfig subtitleConfig;
+subtitleConfig.frameWidth = surfaceWidth;
+subtitleConfig.frameHeight = surfaceHeight;
+subtitleConfig.storageWidth = videoWidth;
+subtitleConfig.storageHeight = videoHeight;
+subtitles.configure(subtitleConfig);
+
+player.onSubtitleFrame(
+    [&](const qtav::SubtitleFrame& frame, int) {
+        if (subtitles.add(frame)) {
+            schedule_video_redraw();
+            schedule_redraw_at(frame.timestamp() + frame.duration());
+        }
+    });
+
+const auto overlay = subtitles.render(player.position());
+for (const auto& image : overlay.images) {
+    // Composite in vector order. Per-pixel source alpha is
+    // image.bitmap[y * image.stride + x] * image.opacity / 255.
+    composite_subtitle_coverage(image);
+}
+```
+
+The rasterizer is thread-safe, copies libass's transient image list into
+owning bitmaps, and automatically starts a new internal track when the next
+frame has a different stream index or presentation generation. Call `flush()`
+immediately when the application initiates a seek or media replacement so no
+old cue is drawn while waiting for the first new-generation frame. Render on
+video redraws (and timer ticks for animated ASS content), preserve image order,
+and schedule a redraw at cue end so static/paused composition clears on time.
+Bitmap subtitle rectangles remain decoded but are not exposed or rendered by
+this text/ASS module; graphical subtitle delivery is separate work.
 
 To capture decoded audio as inspectable PCM, link `QtAV::AudioFile` and
 `QtAV::AudioResample`:
@@ -2222,7 +2274,7 @@ Player facade
   ├─ bounded timestamp-ordered presentation queue
   │    └─ video/frame notification worker with late-frame dropping
   ├─ audio-device master clock with monotonic fallback
-  ├─ reference-counted AudioFrame/VideoFrame
+  ├─ reference-counted AudioFrame/VideoFrame/SubtitleFrame
   ├─ application render scheduling
   │    └─ keyed VideoRenderAPI instances on native render threads
   └─ optional backend contracts
@@ -2230,6 +2282,7 @@ Player facade
        ├─ D3D11 software-frame renderer with borrowed Windows resources
        ├─ mobile Vulkan/OpenGL ES selection and bounded recovery policy
        ├─ libswresample interleaved PCM converter
+       ├─ libass text/ASS owning coverage-bitmap rasterizer
        ├─ RIFF/WAVE diagnostic PCM file sink
        ├─ WASAPI shared-mode device sink with IAudioClock clocking
        ├─ AAudio device sink with callback-safe SPSC buffering

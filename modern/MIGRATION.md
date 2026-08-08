@@ -39,7 +39,7 @@ those identifiers from the active headers.
 | renderer paint method | normally owned by a high-level output; reason-aware `renderVideoDetailed()` or compatibility `renderVideo()` plus `VideoRenderAPI` for external-context integration |
 | `AudioOutput` | `onAudioFrame()` and optional `setAudioSink()` |
 | `setAudioStream()`, `setVideoStream()`, `setSubtitleStream()` | `setActiveTrack(MediaType, TrackInfo::index)` after load; `-1` disables a type |
-| `internalSubtitlePacketRead()` / `PlayerSubtitle` plain text | `onSubtitleFrame()` with a presentation-timed `SubtitleFrame` |
+| `internalSubtitlePacketRead()` / `PlayerSubtitle` plain text | `onSubtitleFrame()` with a presentation-timed `SubtitleFrame`; optional styled text rasterization through `QtAV::SubtitleLibass` |
 | `QThread` playback workers | standard C++ demux, independent audio/video decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
 
@@ -69,7 +69,10 @@ already own a graphics context or require multiple/custom render targets:
 - best-stream audio/video/subtitle selection and asynchronous post-load track
   switching that preserves position and play/pause intent;
 - FFmpeg send/receive software decoding;
-- decoded video, audio, and plain-text subtitle frame callbacks;
+- decoded video, audio, and plain-text subtitle frame callbacks with retained
+  ASS/SSA event/header data for optional styled rendering;
+- optional caller-driven libass rasterization through `QtAV::SubtitleLibass`,
+  returning ordered owning coverage bitmaps without libass types in core;
 - structured video color-space and HDR10 static metadata on `VideoFrame`;
 - compile-time video-render, audio-sink, and hardware-frame interop contracts;
 - optional audio-sink playback output with device-master clock fallback;
@@ -450,7 +453,7 @@ or pace playback. Decoded planar audio therefore normally uses
 - OHOS explicit-multi-plane Vulkan device validation for strict no-intermediate
   wrapping, plus broader raw `GL_EXT_YUV_target`
   OpenGL ES device coverage;
-- bitmap subtitle delivery and libass rendering;
+- bitmap subtitle delivery;
 - buffering policy for live/network streams;
 - audio time-stretch without pitch change;
 - compressed Dolby passthrough, Atmos object rendering, Dolby Vision
@@ -754,8 +757,8 @@ implementation.
 6. Continue the OHOS native-buffer milestone on hardware that exposes an
    explicit sampled multi-plane Vulkan format, then broaden OpenGL ES/HDR
    coverage using the same shared mobile contracts.
-7. Keep the completed audio/video/subtitle switching and plain-text subtitle
-   callback as the base for optional libass rendering and external tracks.
+7. Keep the completed audio/video/subtitle switching, plain-text callback, and
+   optional libass rasterizer as the base for external tracks.
 8. Add live-stream buffering and recovery policies.
 
 Each backend should remain optional so the core library never acquires a GUI

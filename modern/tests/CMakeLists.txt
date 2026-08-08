@@ -149,6 +149,21 @@ target_link_libraries(
 )
 target_compile_features(qtav_core_track_switch_test PRIVATE cxx_std_17)
 
+if(TARGET qtav_subtitle_libass)
+    add_executable(
+        qtav_subtitle_libass_test
+        libass_subtitle_renderer_test.cpp
+    )
+    target_link_libraries(
+        qtav_subtitle_libass_test
+        PRIVATE QtAV::SubtitleLibass
+    )
+    target_compile_features(
+        qtav_subtitle_libass_test
+        PRIVATE cxx_std_17
+    )
+endif()
+
 add_executable(qtav_core_audio_sink_player_test audio_sink_player_test.cpp)
 target_link_libraries(qtav_core_audio_sink_player_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_audio_sink_player_test PRIVATE cxx_std_17)
@@ -514,6 +529,20 @@ if(FFMPEG_EXECUTABLE)
             qtav_core_track_switch_test
             "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
     )
+    if(TARGET qtav_subtitle_libass_test)
+        add_test(
+            NAME qtav_subtitle_libass_render
+            COMMAND
+                qtav_subtitle_libass_test
+                "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_subtitle_libass_render
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_core_multitrack_media
+                TIMEOUT 30
+        )
+    endif()
     set_tests_properties(
         qtav_core_track_switch
         PROPERTIES

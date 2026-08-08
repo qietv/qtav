@@ -67,6 +67,7 @@ if(QTAV_CORE_INSTALL)
     set(QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS avformat avcodec avutil)
     set(QTAV_CORE_PACKAGE_NEEDS_VULKAN FALSE)
     set(QTAV_CORE_PACKAGE_NEEDS_LIBPLACEBO FALSE)
+    set(QTAV_CORE_PACKAGE_NEEDS_LIBASS FALSE)
     if(TARGET qtav_render_cpu)
         list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS swscale)
     endif()
@@ -80,6 +81,9 @@ if(QTAV_CORE_INSTALL)
        OR TARGET qtav_render_opengl
        OR TARGET qtav_render_d3d11)
         set(QTAV_CORE_PACKAGE_NEEDS_LIBPLACEBO TRUE)
+    endif()
+    if(TARGET qtav_subtitle_libass)
+        set(QTAV_CORE_PACKAGE_NEEDS_LIBASS TRUE)
     endif()
 
     install(
