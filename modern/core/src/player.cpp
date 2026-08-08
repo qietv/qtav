@@ -58,6 +58,7 @@ constexpr std::int64_t kMaximumVideoPrerollWaitMilliseconds = 500;
 constexpr std::size_t kMinimumVideoPrerollFrames = 6;
 constexpr std::size_t kMaximumQueuedSoftwareVideoFrames = 8;
 constexpr std::size_t kMaximumQueuedHardwareVideoFrames = 24;
+constexpr std::size_t kMaximumQueuedSubtitleFrames = 64;
 constexpr std::size_t kMaximumQueuedAudioPackets = 128;
 constexpr std::size_t kMaximumQueuedVideoPackets = 128;
 constexpr std::int64_t kLateVideoFrameThresholdMilliseconds = 250;
@@ -162,6 +163,64 @@ bool isHttpUrl(const std::string& url)
 {
     return url.compare(0, 7, "http://") == 0
         || url.compare(0, 8, "https://") == 0;
+}
+
+std::string plainTextFromAss(const char* ass)
+{
+    if (!ass || !*ass) {
+        return {};
+    }
+
+    std::string source(ass);
+    std::size_t textOffset = 0;
+    const bool dialogueLine = source.compare(0, 9, "Dialogue:") == 0;
+    const int metadataFields = dialogueLine ? 9 : 8;
+    for (int field = 0; field < metadataFields; ++field) {
+        const auto comma = source.find(',', textOffset);
+        if (comma == std::string::npos) {
+            textOffset = 0;
+            break;
+        }
+        textOffset = comma + 1;
+    }
+
+    std::string result;
+    result.reserve(source.size() - textOffset);
+    bool overrideBlock = false;
+    for (std::size_t index = textOffset; index < source.size(); ++index) {
+        const char value = source[index];
+        if (value == '{') {
+            overrideBlock = true;
+            continue;
+        }
+        if (overrideBlock) {
+            if (value == '}') {
+                overrideBlock = false;
+            }
+            continue;
+        }
+        if (value == '\\' && index + 1 < source.size()) {
+            const char escaped = source[index + 1];
+            if (escaped == 'N' || escaped == 'n') {
+                result.push_back('\n');
+                ++index;
+                continue;
+            }
+            if (escaped == 'h') {
+                result.push_back(' ');
+                ++index;
+                continue;
+            }
+        }
+        result.push_back(value);
+    }
+
+    const auto first = result.find_first_not_of("\r\n\t ");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = result.find_last_not_of("\r\n\t ");
+    return result.substr(first, last - first + 1);
 }
 
 void applyHttpRecoveryDefaults(
@@ -292,6 +351,18 @@ public:
         Decoder() = default;
         Decoder(const Decoder&) = delete;
         Decoder& operator=(const Decoder&) = delete;
+        Decoder(Decoder&& other) noexcept
+        {
+            swap(other);
+        }
+        Decoder& operator=(Decoder&& other) noexcept
+        {
+            if (this != &other) {
+                Decoder replacement(std::move(other));
+                swap(replacement);
+            }
+            return *this;
+        }
 
         ~Decoder()
         {
@@ -319,6 +390,35 @@ public:
         {
             return context && stream && streamIndex >= 0;
         }
+
+        void swap(Decoder& other) noexcept
+        {
+            using std::swap;
+            swap(context, other.context);
+            swap(contextLifetime, other.contextLifetime);
+            swap(stream, other.stream);
+            swap(streamIndex, other.streamIndex);
+            swap(type, other.type);
+            swap(hardwareDeviceType, other.hardwareDeviceType);
+            swap(hardwarePixelFormat, other.hardwarePixelFormat);
+            swap(reusableHardwareFramesContext,
+                 other.reusableHardwareFramesContext);
+            swap(hardwareNativeIdentity, other.hardwareNativeIdentity);
+            swap(hardwareSurfaceGeneration, other.hardwareSurfaceGeneration);
+            swap(allowSoftwareFallback, other.allowSoftwareFallback);
+            swap(hardwareFallbackUsed, other.hardwareFallbackUsed);
+            swap(hardwareFallbackReported, other.hardwareFallbackReported);
+
+            // Hardware pixel-format negotiation keeps a pointer to the
+            // owning Decoder in AVCodecContext::opaque. Preserve that
+            // relationship when a prepared replacement is installed.
+            if (context && context->opaque == &other) {
+                context->opaque = this;
+            }
+            if (other.context && other.context->opaque == this) {
+                other.context->opaque = &other;
+            }
+        }
     };
 
     struct InterruptContext {
@@ -330,12 +430,14 @@ public:
         AVFormatContext* format = nullptr;
         Decoder video;
         Decoder audio;
+        Decoder subtitle;
         std::int64_t startTimeUs = 0;
 
         void reset()
         {
             video.reset();
             audio.reset();
+            subtitle.reset();
             avformat_close_input(&format);
             startTimeUs = 0;
         }
@@ -353,6 +455,13 @@ public:
         std::int64_t position = 0;
         SeekFlag flags = SeekFlag::FromStart;
         SeekCallback callback;
+    };
+
+    struct TrackSwitchRequest {
+        std::uint64_t mediaSerial = 0;
+        MediaType type = MediaType::Unknown;
+        int track = -1;
+        std::int64_t position = 0;
     };
 
     struct AudioSinkCallbackBridge {
@@ -379,17 +488,27 @@ public:
         enum class Type {
             Audio,
             Video,
+            Subtitle,
         };
 
         Type type = Type::Video;
         AudioFrame audio;
         VideoFrame video;
+        SubtitleFrame subtitle;
         int track = -1;
         std::uint64_t generation = 0;
 
         std::int64_t timestamp() const noexcept
         {
-            return type == Type::Audio ? audio.timestamp() : video.timestamp();
+            switch (type) {
+            case Type::Audio:
+                return audio.timestamp();
+            case Type::Video:
+                return video.timestamp();
+            case Type::Subtitle:
+                return subtitle.timestamp();
+            }
+            return 0;
         }
     };
 
@@ -410,6 +529,7 @@ public:
             loadedSerial_ = 0;
             prepareRequest_.reset();
             seekRequest_.reset();
+            trackSwitchRequests_.clear();
             if (url_.empty()) {
                 requestedState_ = State::Stopped;
             }
@@ -487,6 +607,7 @@ public:
             if (value == State::Stopped) {
                 prepareRequest_.reset();
                 seekRequest_.reset();
+                trackSwitchRequests_.clear();
             }
         }
         if (value == State::Stopped) {
@@ -537,6 +658,71 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return mediaInfo_;
+    }
+
+    bool setActiveTrack(MediaType type, int track)
+    {
+        if (type != MediaType::Audio && type != MediaType::Video
+            && type != MediaType::Subtitle) {
+            return false;
+        }
+        if (track < -1) {
+            return false;
+        }
+
+        const auto requestedPosition = position();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!hasOpenMedia_ || loadedSerial_ != mediaSerial_
+                || currentState_ == State::Stopped) {
+                return false;
+            }
+
+            if (track >= 0) {
+                const auto found = std::find_if(
+                    mediaInfo_.tracks.begin(),
+                    mediaInfo_.tracks.end(),
+                    [type, track](const TrackInfo& candidate) {
+                        return candidate.index == track
+                            && candidate.type == type;
+                    });
+                if (found == mediaInfo_.tracks.end()) {
+                    return false;
+                }
+            }
+
+            int selected = mediaInfo_.activeSubtitleTrack;
+            if (type == MediaType::Audio) {
+                selected = mediaInfo_.activeAudioTrack;
+            } else if (type == MediaType::Video) {
+                selected = mediaInfo_.activeVideoTrack;
+            }
+            for (auto request = trackSwitchRequests_.rbegin();
+                 request != trackSwitchRequests_.rend();
+                 ++request) {
+                if (request->type == type) {
+                    selected = request->track;
+                    break;
+                }
+            }
+            if (selected == track) {
+                return true;
+            }
+
+            trackSwitchRequests_.push_back({
+                mediaSerial_,
+                type,
+                track,
+                requestedPosition,
+            });
+        }
+
+        // Match seek(): public control calls invalidate without waiting. The
+        // playback worker drains in-flight decoder work before replacement.
+        invalidatePlaybackQueues();
+        interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        controlChanged_.notify_all();
+        return true;
     }
 
     std::int64_t position() const
@@ -591,6 +777,12 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         audioFrameCallback_ = std::move(callback);
+    }
+
+    void onSubtitleFrame(SubtitleFrameCallback callback)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        subtitleFrameCallback_ = std::move(callback);
     }
 
     void setVideoFrameScheduler(VideoFrameScheduler scheduler)
@@ -1054,6 +1246,14 @@ private:
                 continue;
             }
 
+            if (!trackSwitchRequests_.empty()) {
+                const auto request = trackSwitchRequests_.front();
+                trackSwitchRequests_.pop_front();
+                lock.unlock();
+                handleTrackSwitch(request);
+                continue;
+            }
+
             if (seekRequest_) {
                 const auto request = std::move(*seekRequest_);
                 seekRequest_.reset();
@@ -1142,7 +1342,9 @@ private:
                 {
                     std::lock_guard<std::mutex> stateLock(mutex_);
                     controlPending = requestedState_ != State::Playing
-                        || loadedSerial_ != mediaSerial_ || seekRequest_.has_value();
+                        || loadedSerial_ != mediaSerial_
+                        || !trackSwitchRequests_.empty()
+                        || seekRequest_.has_value();
                 }
                 if (!controlPending) {
                     stopPlayback(false, true);
@@ -1168,7 +1370,7 @@ private:
         if (!hasOpenMedia_ || loadedSerial_ != mediaSerial_) {
             return true;
         }
-        if (seekRequest_ || prepareRequest_
+        if (!trackSwitchRequests_.empty() || seekRequest_ || prepareRequest_
             || currentState_ != requestedState_) {
             return true;
         }
@@ -1254,6 +1456,7 @@ private:
             media_.video,
             hardwareDecodeConfig);
         openBestDecoder(AVMEDIA_TYPE_AUDIO, media_.audio);
+        openBestDecoder(AVMEDIA_TYPE_SUBTITLE, media_.subtitle);
         if (!media_.video.valid() && !media_.audio.valid()) {
             failOpen(
                 AVERROR_DECODER_NOT_FOUND,
@@ -1327,18 +1530,33 @@ private:
     bool openBestDecoder(
         AVMediaType type,
         Decoder& result,
-        HardwareDecodeConfig hardwareDecodeConfig = {})
+        HardwareDecodeConfig hardwareDecodeConfig = {},
+        int requestedStreamIndex = -1)
     {
         result.reset();
         const AVCodec* softwareDecoder = nullptr;
-        const int streamIndex =
-            av_find_best_stream(
+        int streamIndex = requestedStreamIndex;
+        if (requestedStreamIndex >= 0) {
+            if (!media_.format
+                || static_cast<unsigned>(requestedStreamIndex)
+                    >= media_.format->nb_streams
+                || media_.format->streams[requestedStreamIndex]
+                        ->codecpar->codec_type
+                    != type) {
+                return false;
+            }
+            softwareDecoder = avcodec_find_decoder(
+                media_.format->streams[requestedStreamIndex]
+                    ->codecpar->codec_id);
+        } else {
+            streamIndex = av_find_best_stream(
                 media_.format,
                 type,
                 -1,
                 -1,
                 &softwareDecoder,
                 0);
+        }
         if (streamIndex < 0 || !softwareDecoder) {
             return false;
         }
@@ -1532,6 +1750,7 @@ private:
             || (media_.format->pb->seekable & AVIO_SEEKABLE_NORMAL) != 0;
         result.activeVideoTrack = media_.video.streamIndex;
         result.activeAudioTrack = media_.audio.streamIndex;
+        result.activeSubtitleTrack = media_.subtitle.streamIndex;
 
         result.tracks.reserve(media_.format->nb_streams);
         for (unsigned index = 0; index < media_.format->nb_streams; ++index) {
@@ -1556,6 +1775,164 @@ private:
             result.tracks.push_back(std::move(track));
         }
         return result;
+    }
+
+    void handleTrackSwitch(const TrackSwitchRequest& request)
+    {
+        const auto typeName = [](MediaType type) {
+            switch (type) {
+            case MediaType::Audio:
+                return "audio";
+            case MediaType::Video:
+                return "video";
+            case MediaType::Subtitle:
+                return "subtitle";
+            case MediaType::Unknown:
+                break;
+            }
+            return "unknown";
+        };
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!hasOpenMedia_ || request.mediaSerial != mediaSerial_
+                || loadedSerial_ != mediaSerial_
+                || requestedState_ == State::Stopped) {
+                return;
+            }
+            int active = mediaInfo_.activeSubtitleTrack;
+            if (request.type == MediaType::Audio) {
+                active = mediaInfo_.activeAudioTrack;
+            } else if (request.type == MediaType::Video) {
+                active = mediaInfo_.activeVideoTrack;
+            }
+            if (active == request.track) {
+                return;
+            }
+        }
+
+        Decoder replacement;
+        if (request.track >= 0) {
+            HardwareDecodeConfig hardwareDecodeConfig;
+            if (request.type == MediaType::Video) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                hardwareDecodeConfig = hardwareDecodeConfig_;
+            }
+            AVMediaType ffmpegType = AVMEDIA_TYPE_SUBTITLE;
+            if (request.type == MediaType::Audio) {
+                ffmpegType = AVMEDIA_TYPE_AUDIO;
+            } else if (request.type == MediaType::Video) {
+                ffmpegType = AVMEDIA_TYPE_VIDEO;
+            }
+            if (!openBestDecoder(
+                    ffmpegType,
+                    replacement,
+                    hardwareDecodeConfig,
+                    request.track)) {
+                publishEvent({
+                    "track.error",
+                    "Could not open " + std::string(typeName(request.type))
+                        + " track " + std::to_string(request.track),
+                    AVERROR_DECODER_NOT_FOUND,
+                });
+                // The public call already invalidated queued output. Re-seek
+                // the unchanged decoders so playback resumes coherently.
+                if (mediaInfo().seekable) {
+                    seekMedia(request.position, SeekFlag::KeyFrame);
+                }
+                return;
+            }
+        }
+
+        if (wasCanceled(request.mediaSerial)) {
+            return;
+        }
+
+        resetPlaybackQueues();
+        // A replacement audio track can have a different native format. Close
+        // rather than merely flush so the next frame renegotiates both the
+        // sink and optional converter. This is also safe for video switches
+        // and keeps a single A/V generation boundary.
+        closeAudioSink(true);
+
+        if (request.type == MediaType::Audio) {
+            media_.audio = std::move(replacement);
+        } else if (request.type == MediaType::Video) {
+            media_.video = std::move(replacement);
+        } else {
+            media_.subtitle = std::move(replacement);
+        }
+
+        bool seekable = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!hasOpenMedia_ || request.mediaSerial != mediaSerial_
+                || loadedSerial_ != mediaSerial_) {
+                return;
+            }
+            if (request.type == MediaType::Audio) {
+                mediaInfo_.activeAudioTrack = request.track;
+            } else if (request.type == MediaType::Video) {
+                mediaInfo_.activeVideoTrack = request.track;
+            } else {
+                mediaInfo_.activeSubtitleTrack = request.track;
+            }
+            seekable = mediaInfo_.seekable;
+        }
+
+        int seekError = 0;
+        if (seekable) {
+            seekError = seekMedia(request.position, SeekFlag::KeyFrame);
+        } else {
+            if (media_.video.valid()) {
+                avcodec_flush_buffers(media_.video.context);
+            }
+            if (media_.audio.valid()) {
+                avcodec_flush_buffers(media_.audio.context);
+            }
+            if (media_.subtitle.valid()) {
+                avcodec_flush_buffers(media_.subtitle.context);
+            }
+
+            bool publishBuffering = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                currentPosition_ = request.position;
+                resetClockLocked(request.position);
+                if (currentState_ == State::Playing
+                    && requestedState_ == State::Playing
+                    && (media_.video.valid() || media_.audio.valid())) {
+                    primeOutputWaitLocked(
+                        request.position,
+                        presentationGeneration_.load(
+                            std::memory_order_acquire),
+                        media_.video.valid() && media_.audio.valid(),
+                        false);
+                    publishBuffering = status_ == MediaStatus::Loaded;
+                }
+            }
+            if (publishBuffering) {
+                publishStatus(MediaStatus::Buffering);
+            }
+        }
+
+        if (seekError < 0) {
+            publishEvent({
+                "track.seek",
+                "The track changed, but the playback position could not be "
+                "restored: "
+                    + ffmpegError(seekError),
+                seekError,
+            });
+        }
+        publishEvent({
+            "track.changed",
+            std::string(typeName(request.type))
+                + (request.track >= 0
+                        ? " track changed to "
+                            + std::to_string(request.track)
+                        : " tracks disabled"),
+            0,
+        });
     }
 
     void handleSeek(SeekRequest request)
@@ -1610,7 +1987,8 @@ private:
             currentPosition_ = targetMs;
             resetClockLocked(targetMs);
             waitForData = currentState_ == State::Playing
-                && requestedState_ == State::Playing;
+                && requestedState_ == State::Playing
+                && (media_.video.valid() || media_.audio.valid());
             if (waitForData) {
                 primeOutputWaitLocked(
                     targetMs,
@@ -1667,6 +2045,9 @@ private:
         }
         if (media_.audio.valid()) {
             avcodec_flush_buffers(media_.audio.context);
+        }
+        if (media_.subtitle.valid()) {
+            avcodec_flush_buffers(media_.subtitle.context);
         }
         return 0;
     }
@@ -1744,6 +2125,11 @@ private:
                         std::memory_order_acquire),
                     false);
             }
+        } else if (packet->stream_index == media_.subtitle.streamIndex) {
+            ok = decodeSubtitlePacket(
+                packet,
+                presentationGeneration_.load(
+                    std::memory_order_acquire));
         }
         av_packet_free(&packet);
         {
@@ -1765,6 +2151,152 @@ private:
             }
         }
         return ok ? DecodeResult::Continue : DecodeResult::Error;
+    }
+
+    bool decodeSubtitlePacket(
+        const AVPacket* packet,
+        std::uint64_t generation)
+    {
+        if (!media_.subtitle.valid()) {
+            return true;
+        }
+
+        AVPacket remaining {};
+        if (packet) {
+            remaining = *packet;
+        } else {
+            remaining.pts = AV_NOPTS_VALUE;
+            remaining.dts = AV_NOPTS_VALUE;
+        }
+        const int maximumIterations = packet ? 64 : 32;
+        for (int iteration = 0; iteration < maximumIterations; ++iteration) {
+            if (generation
+                != presentationGeneration_.load(
+                    std::memory_order_acquire)) {
+                return false;
+            }
+
+            AVSubtitle subtitle {};
+            int produced = 0;
+            const int error = avcodec_decode_subtitle2(
+                media_.subtitle.context,
+                &subtitle,
+                &produced,
+                &remaining);
+            if (error < 0) {
+                avsubtitle_free(&subtitle);
+                publishEvent({
+                    "subtitle.decode",
+                    "Could not decode a subtitle packet: "
+                        + ffmpegError(error),
+                    error,
+                });
+                return false;
+            }
+
+            if (produced) {
+                std::string text;
+                bool forced = false;
+                for (unsigned index = 0; index < subtitle.num_rects; ++index) {
+                    const auto* rectangle = subtitle.rects[index];
+                    if (!rectangle) {
+                        continue;
+                    }
+                    forced = forced
+                        || (rectangle->flags & AV_SUBTITLE_FLAG_FORCED) != 0;
+                    std::string rectangleText;
+                    if (rectangle->type == SUBTITLE_TEXT && rectangle->text) {
+                        rectangleText = rectangle->text;
+                    } else if (rectangle->type == SUBTITLE_ASS
+                               && rectangle->ass) {
+                        rectangleText = plainTextFromAss(rectangle->ass);
+                    } else if (rectangle->text) {
+                        rectangleText = rectangle->text;
+                    }
+                    if (!rectangleText.empty()) {
+                        if (!text.empty()) {
+                            text.push_back('\n');
+                        }
+                        text += rectangleText;
+                    }
+                }
+
+                if (!text.empty()) {
+                    std::int64_t packetPtsUs = subtitle.pts;
+                    if (packetPtsUs == AV_NOPTS_VALUE && packet
+                        && packet->pts != AV_NOPTS_VALUE) {
+                        packetPtsUs = av_rescale_q(
+                            packet->pts,
+                            media_.subtitle.stream->time_base,
+                            AV_TIME_BASE_Q);
+                    }
+                    if (packetPtsUs == AV_NOPTS_VALUE) {
+                        packetPtsUs = media_.startTimeUs;
+                    }
+                    const auto timestampMs = std::max<std::int64_t>(
+                        0,
+                        (packetPtsUs - media_.startTimeUs) / 1000
+                            + subtitle.start_display_time);
+                    std::int64_t durationMs =
+                        subtitle.end_display_time
+                            > subtitle.start_display_time
+                        ? subtitle.end_display_time
+                            - subtitle.start_display_time
+                        : 0;
+                    if (durationMs <= 0 && packet && packet->duration > 0) {
+                        durationMs = toMilliseconds(
+                            packet->duration,
+                            media_.subtitle.stream->time_base);
+                    }
+
+                    std::int64_t rangeStart;
+                    std::int64_t rangeEnd;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        rangeStart = rangeStart_;
+                        rangeEnd = rangeEnd_;
+                    }
+                    if (timestampMs >= rangeStart
+                        && (rangeEnd == MediaEnd
+                            || timestampMs < rangeEnd)) {
+                        auto frame = detail::FrameFactory::subtitle(
+                            std::move(text),
+                            timestampMs,
+                            durationMs,
+                            forced);
+                        if (frame) {
+                            PresentationItem item;
+                            item.type = PresentationItem::Type::Subtitle;
+                            item.subtitle = std::move(frame);
+                            item.track = media_.subtitle.streamIndex;
+                            item.generation = generation;
+                            enqueuePresentation(std::move(item));
+                        }
+                    }
+                }
+            }
+            avsubtitle_free(&subtitle);
+
+            if (!packet) {
+                if (!produced) {
+                    return true;
+                }
+                continue;
+            }
+            if (error <= 0 || error >= remaining.size) {
+                return true;
+            }
+            remaining.data += error;
+            remaining.size -= error;
+        }
+
+        publishEvent({
+            "subtitle.decode",
+            "The subtitle decoder did not consume the packet within the "
+            "bounded iteration limit",
+            AVERROR_INVALIDDATA,
+        });
+        return false;
     }
 
     bool decodeRequestValid(std::uint64_t generation) const
@@ -1876,11 +2408,15 @@ private:
             || enqueueVideoPacket({}, generation, true);
         const bool audioEndQueued = !media_.audio.valid()
             || enqueueAudioPacket({}, generation, true);
-        return videoEndQueued && audioEndQueued
+        const bool primaryDecodersFinished =
+            videoEndQueued && audioEndQueued
             && (!media_.video.valid()
                 || waitForVideoPacketsDrained(generation))
             && (!media_.audio.valid()
                 || waitForAudioPacketsDrained(generation));
+        return primaryDecodersFinished
+            && (!media_.subtitle.valid()
+                || decodeSubtitlePacket(nullptr, generation));
     }
 
     void resetVideoPacketQueue()
@@ -2295,6 +2831,7 @@ private:
                 PresentationItem::Type::Video,
                 {},
                 std::move(video),
+                {},
                 decoder.streamIndex,
                 generation,
             });
@@ -2571,6 +3108,10 @@ private:
                 std::memory_order_relaxed);
             return;
         }
+        if (item.type == PresentationItem::Type::Subtitle
+            && queuedSubtitleFrames_ >= kMaximumQueuedSubtitleFrames) {
+            return;
+        }
         const auto insertion = std::upper_bound(
             presentationQueue_.begin(),
             presentationQueue_.end(),
@@ -2588,6 +3129,8 @@ private:
                        queuedVideoFrames_,
                        std::memory_order_relaxed)) {
             }
+        } else if (item.type == PresentationItem::Type::Subtitle) {
+            ++queuedSubtitleFrames_;
         }
         presentationQueue_.insert(insertion, std::move(item));
         presentationChanged_.notify_one();
@@ -2684,6 +3227,7 @@ private:
                     PresentationItem::Type::Audio,
                     std::move(queued.frame),
                     {},
+                    {},
                     queued.track,
                     queued.generation,
                 });
@@ -2750,6 +3294,23 @@ private:
                 resumeClockAfterOutput(
                     item.generation,
                     item.audio.timestamp());
+            }
+            return;
+        }
+
+        if (item.type == PresentationItem::Type::Subtitle) {
+            SubtitleFrameCallback callback;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (item.generation
+                    != presentationGeneration_.load(
+                        std::memory_order_acquire)) {
+                    return;
+                }
+                callback = subtitleFrameCallback_;
+            }
+            if (callback) {
+                callback(item.subtitle, item.track);
             }
             return;
         }
@@ -2874,6 +3435,8 @@ private:
                 presentationQueue_.pop_front();
                 if (item.type == PresentationItem::Type::Video) {
                     --queuedVideoFrames_;
+                } else if (item.type == PresentationItem::Type::Subtitle) {
+                    --queuedSubtitleFrames_;
                 }
                 presentationInFlight_ = true;
             }
@@ -2966,6 +3529,7 @@ private:
             std::lock_guard<std::mutex> lock(presentationMutex_);
             presentationQueue_.clear();
             queuedVideoFrames_ = 0;
+            queuedSubtitleFrames_ = 0;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -4096,6 +4660,7 @@ private:
     std::uint64_t audioDecodeFailureGeneration_ = 0;
     std::deque<PresentationItem> presentationQueue_;
     std::size_t queuedVideoFrames_ = 0;
+    std::size_t queuedSubtitleFrames_ = 0;
     bool presentationInFlight_ = false;
     std::deque<QueuedVideoPacket> videoPackets_;
     bool videoPacketInFlight_ = false;
@@ -4111,6 +4676,7 @@ private:
     std::uint64_t requestSerial_ = 0;
     std::optional<PrepareRequest> prepareRequest_;
     std::optional<SeekRequest> seekRequest_;
+    std::deque<TrackSwitchRequest> trackSwitchRequests_;
 
     State requestedState_ = State::Stopped;
     State currentState_ = State::Stopped;
@@ -4140,6 +4706,7 @@ private:
     EventCallback eventCallback_;
     VideoFrameCallback videoFrameCallback_;
     AudioFrameCallback audioFrameCallback_;
+    SubtitleFrameCallback subtitleFrameCallback_;
     VideoFrameScheduler videoFrameScheduler_;
     std::shared_ptr<AudioSink> audioSink_;
     std::shared_ptr<AudioSink> activeAudioSink_;
@@ -4217,6 +4784,11 @@ MediaInfo Player::mediaInfo() const
     return impl_->mediaInfo();
 }
 
+bool Player::setActiveTrack(MediaType type, int track)
+{
+    return impl_->setActiveTrack(type, track);
+}
+
 std::int64_t Player::position() const
 {
     return impl_->position();
@@ -4254,6 +4826,12 @@ Player& Player::onVideoFrame(VideoFrameCallback callback)
 Player& Player::onAudioFrame(AudioFrameCallback callback)
 {
     impl_->onAudioFrame(std::move(callback));
+    return *this;
+}
+
+Player& Player::onSubtitleFrame(SubtitleFrameCallback callback)
+{
+    impl_->onSubtitleFrame(std::move(callback));
     return *this;
 }
 

@@ -38,6 +38,8 @@ those identifiers from the active headers.
 | Qt paint/update events | normally owned by a high-level output such as `D3D11VideoOutput`; `setRenderCallback()` for external-context integration |
 | renderer paint method | normally owned by a high-level output; reason-aware `renderVideoDetailed()` or compatibility `renderVideo()` plus `VideoRenderAPI` for external-context integration |
 | `AudioOutput` | `onAudioFrame()` and optional `setAudioSink()` |
+| `setAudioStream()`, `setVideoStream()`, `setSubtitleStream()` | `setActiveTrack(MediaType, TrackInfo::index)` after load; `-1` disables a type |
+| `internalSubtitlePacketRead()` / `PlayerSubtitle` plain text | `onSubtitleFrame()` with a presentation-timed `SubtitleFrame` |
 | `QThread` playback workers | standard C++ demux, independent audio/video decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
 
@@ -64,9 +66,10 @@ already own a graphics context or require multiple/custom render targets:
 - prepare, pause/resume, seek, stop, playback rate;
 - A-B range and finite/infinite looping;
 - FFmpeg protocol and demux support;
-- best-stream audio/video selection;
+- best-stream audio/video/subtitle selection and asynchronous post-load track
+  switching that preserves position and play/pause intent;
 - FFmpeg send/receive software decoding;
-- decoded video and audio frame callbacks;
+- decoded video, audio, and plain-text subtitle frame callbacks;
 - structured video color-space and HDR10 static metadata on `VideoFrame`;
 - compile-time video-render, audio-sink, and hardware-frame interop contracts;
 - optional audio-sink playback output with device-master clock fallback;
@@ -447,8 +450,7 @@ or pace playback. Decoded planar audio therefore normally uses
 - OHOS explicit-multi-plane Vulkan device validation for strict no-intermediate
   wrapping, plus broader raw `GL_EXT_YUV_target`
   OpenGL ES device coverage;
-- subtitle decoding and libass rendering;
-- active track switching after load;
+- bitmap subtitle delivery and libass rendering;
 - buffering policy for live/network streams;
 - audio time-stretch without pitch change;
 - compressed Dolby passthrough, Atmos object rendering, Dolby Vision
@@ -645,14 +647,14 @@ implementation.
 ## Threading rules
 
 - control methods are thread-safe;
-- demux, asynchronous control, and state/status callbacks normally run on the
-  playback worker; selected audio/video packets cross bounded queues to
-  independent decode workers so one codec or output path cannot starve the
-  other stream;
+- demux, lightweight subtitle decoding, asynchronous control, and state/status
+  callbacks normally run on the playback worker; selected audio/video packets
+  cross bounded queues to independent decode workers so one codec or output
+  path cannot starve the other stream;
 - `setVideoFrameScheduler()` runs on the video-decode worker before ordinary video
   delivery; an accepted frame is not sent to `onVideoFrame()` or renderers;
-- decoded audio/video frame callbacks and `setRenderCallback()` run on the
-  presentation worker; the bounded video queue drops obsolete late frames
+- decoded audio/video/subtitle frame callbacks and `setRenderCallback()` run
+  on the presentation worker; the bounded video queue drops obsolete late frames
   when application presentation falls behind;
 - media events normally run on the playback, decode, or audio-output worker;
   forwarded audio-sink events run on the backend's event thread;
@@ -752,7 +754,8 @@ implementation.
 6. Continue the OHOS native-buffer milestone on hardware that exposes an
    explicit sampled multi-plane Vulkan format, then broaden OpenGL ES/HDR
    coverage using the same shared mobile contracts.
-7. Add subtitle and multi-track switching.
+7. Keep the completed audio/video/subtitle switching and plain-text subtitle
+   callback as the base for optional libass rendering and external tracks.
 8. Add live-stream buffering and recovery policies.
 
 Each backend should remain optional so the core library never acquires a GUI

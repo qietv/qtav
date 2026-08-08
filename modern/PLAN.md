@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-08
+Last updated: 2026-08-09
 
 Status legend:
 
@@ -898,10 +898,11 @@ fallback. The Windows-hosted OHOS dependency rebuild and verifier passed, and
 the signed Pura X Max HAP presented the complete supplied 600-frame sample
 through `OMX.hisi.video.decoder.vvc` before passing its lifecycle and forced-
 software-fallback matrix. Remaining strict OHOS Vulkan raw-plane/Dolby Vision
-precision work is device-gated on a non-opaque multi-plane format. The next
-local implementation task is Milestone 9 active audio/video track switching;
-do not claim the device-gated strict Vulkan item complete without suitable
-hardware.
+precision work is device-gated on a non-opaque multi-plane format. Milestone
+9 active audio/video/subtitle track switching, FFmpeg subtitle packet decode,
+and the presentation-timed plain-text callback are complete. The next local
+implementation task is the optional libass renderer; do not claim the device-
+gated strict Vulkan item complete without suitable hardware.
 
 AD-010 Windows visible-copy checkpoint:
 
@@ -3130,9 +3131,23 @@ Acceptance:
 
 ## Milestone 9 — Playback feature parity
 
-- [ ] Active audio/video track switching after load.
-- [ ] Subtitle packet decode.
-- [ ] Plain-text subtitle callback.
+- [x] Active audio/video track switching after load, extended to subtitle
+  tracks through the same `TrackInfo::index` and generation contract.
+- [x] Subtitle packet decode through the selected FFmpeg 8 subtitle decoder.
+- [x] Presentation-timed plain-text subtitle callback with UTF-8 text,
+  timestamp, duration, forced flag, and ASS/SSA event/override normalization.
+
+Completed track/subtitle checkpoint on 2026-08-09:
+
+- a deterministic two-video/two-audio/SRT/ASS fixture verifies paused and
+  playing switches, generation invalidation, position preservation, audio-sink
+  format renegotiation, subtitle normalization, and per-type disable;
+- the supplied MP4 fixture verifies one video, five audio, and five subtitle
+  tracks plus real FFmpeg decode and post-load audio/subtitle switching;
+- Windows Visual Studio 2026 Release static and shared matrices pass 39/39,
+  both install trees export the updated public API, and the OHOS arm64/API 23
+  static core cross-build passes against the repository FFmpeg package.
+
 - [ ] libass renderer as an optional module.
 - [ ] External audio and subtitle sources.
 - [ ] Packet buffering policy and buffering status.

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include <qtav/frame.h>
 
@@ -24,6 +25,11 @@ struct QTAV_CORE_EXPORT FrameFactory {
         const AVFrame* frame,
         std::int64_t timestampMs,
         std::int64_t durationMs);
+    static SubtitleFrame subtitle(
+        std::string text,
+        std::int64_t timestampMs,
+        std::int64_t durationMs,
+        bool forced);
     static VideoFrame hardware(
         HardwareFrame frame,
         std::int64_t timestampMs = 0,

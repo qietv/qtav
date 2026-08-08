@@ -75,6 +75,8 @@ public:
     using SeekCallback = std::function<void(std::int64_t)>;
     using VideoFrameCallback = std::function<void(const VideoFrame&, int)>;
     using AudioFrameCallback = std::function<void(const AudioFrame&, int)>;
+    using SubtitleFrameCallback =
+        std::function<void(const SubtitleFrame&, int)>;
     // Runs on the video-decode worker as soon as a decoded video frame is within
     // the bounded decode window. Returning true transfers presentation
     // scheduling to the callback and suppresses the later
@@ -113,6 +115,11 @@ public:
 
     MediaStatus mediaStatus() const;
     MediaInfo mediaInfo() const;
+    // Asynchronously selects one loaded audio, video, or subtitle track by
+    // TrackInfo::index. Pass -1 to disable that media type. The request is
+    // rejected when media is not loaded, the type is unsupported, or the
+    // index does not identify a track of the requested type.
+    bool setActiveTrack(MediaType type, int track);
     std::int64_t position() const;
     PlaybackStatistics playbackStatistics() const noexcept;
 
@@ -121,6 +128,7 @@ public:
     Player& onEvent(EventCallback callback);
     Player& onVideoFrame(VideoFrameCallback callback);
     Player& onAudioFrame(AudioFrameCallback callback);
+    Player& onSubtitleFrame(SubtitleFrameCallback callback);
 
     Player& setAudioSink(std::shared_ptr<AudioSink> sink);
     Player& setAudioFrameConverter(

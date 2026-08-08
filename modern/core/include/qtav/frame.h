@@ -76,4 +76,27 @@ private:
     friend struct detail::FrameFactory;
 };
 
+// A decoded, presentation-timed plain-text subtitle cue. Formatted ASS/SSA
+// input is normalized to UTF-8 text before this object is published; bitmap
+// subtitle rectangles are not represented by this plain-text API.
+class QTAV_CORE_EXPORT SubtitleFrame {
+public:
+    SubtitleFrame() = default;
+
+    explicit operator bool() const noexcept;
+    bool isValid() const noexcept;
+
+    std::string text() const;
+    std::int64_t timestamp() const noexcept;
+    std::int64_t duration() const noexcept;
+    bool forced() const noexcept;
+
+private:
+    struct Storage;
+    explicit SubtitleFrame(std::shared_ptr<const Storage> storage);
+
+    std::shared_ptr<const Storage> storage_;
+    friend struct detail::FrameFactory;
+};
+
 } // namespace qtav

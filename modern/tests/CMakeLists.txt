@@ -140,6 +140,15 @@ add_executable(qtav_core_control_test control_test.cpp)
 target_link_libraries(qtav_core_control_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_control_test PRIVATE cxx_std_17)
 
+add_executable(qtav_core_track_switch_test track_switch_test.cpp)
+target_link_libraries(
+    qtav_core_track_switch_test
+    PRIVATE
+        QtAV::Core
+        qtav_test_simulated_audio_sink
+)
+target_compile_features(qtav_core_track_switch_test PRIVATE cxx_std_17)
+
 add_executable(qtav_core_audio_sink_player_test audio_sink_player_test.cpp)
 target_link_libraries(qtav_core_audio_sink_player_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_audio_sink_player_test PRIVATE cxx_std_17)
@@ -445,6 +454,71 @@ if(FFMPEG_EXECUTABLE)
         PROPERTIES
             FIXTURES_REQUIRED qtav_core_media
             TIMEOUT 15
+    )
+    set(
+        QTAV_CORE_MULTITRACK_TEST_MEDIA
+        "${CMAKE_CURRENT_BINARY_DIR}/qtav-core-multitrack-test.mkv"
+    )
+    add_test(
+        NAME qtav_core_generate_multitrack_media
+        COMMAND
+            "${FFMPEG_EXECUTABLE}"
+            -hide_banner
+            -loglevel error
+            -y
+            -f lavfi
+            -i testsrc2=size=160x90:rate=12
+            -f lavfi
+            -i color=c=blue:size=96x64:rate=12
+            -f lavfi
+            -i sine=frequency=440:sample_rate=48000
+            -f lavfi
+            -i sine=frequency=880:sample_rate=44100
+            -f srt
+            -i "${CMAKE_CURRENT_SOURCE_DIR}/track-switch-primary.srt"
+            -f ass
+            -i "${CMAKE_CURRENT_SOURCE_DIR}/track-switch-alternate.ass"
+            -map 0:v:0
+            -map 1:v:0
+            -map 2:a:0
+            -map 3:a:0
+            -map 4:s:0
+            -map 5:s:0
+            -t 6
+            -c:v mpeg4
+            -g 12
+            -c:a aac
+            -c:s:0 srt
+            -c:s:1 ass
+            -metadata:s:v:0 language=eng
+            -metadata:s:v:1 language=jpn
+            -metadata:s:a:0 language=eng
+            -metadata:s:a:1 language=jpn
+            -metadata:s:s:0 language=eng
+            -metadata:s:s:1 language=jpn
+            -disposition:v:0 default
+            -disposition:v:1 0
+            -disposition:a:0 default
+            -disposition:a:1 0
+            -disposition:s:0 default
+            -disposition:s:1 0
+            "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_generate_multitrack_media
+        PROPERTIES FIXTURES_SETUP qtav_core_multitrack_media
+    )
+    add_test(
+        NAME qtav_core_track_switch
+        COMMAND
+            qtav_core_track_switch_test
+            "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_track_switch
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_multitrack_media
+            TIMEOUT 30
     )
     add_test(
         NAME qtav_core_audio_sink_player

@@ -32,14 +32,16 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - local files and FFmpeg-supported network protocols, with bounded HTTP(S)
   read timeouts and reconnect defaults that applications can override through
   `avformat.*` properties;
-- audio and video frame callbacks with reference-counted frame lifetime;
+- audio, video, and presentation-timed plain-text subtitle callbacks with
+  reference-counted frame lifetime;
 - structured video range, primaries, transfer, matrix, chroma-location, HDR10
   mastering-display, and content-light metadata;
 - libplacebo as the sole semantic color/shader authority for the Windows
   D3D11, Vulkan, and OpenGL ES GPU renderers, including color conversion,
   Dolby Vision reshaping, tone/gamut mapping, scaling, and output encoding;
 - `prepare`, `seek`, pause/resume/stop, playback rate, A-B range, and loop;
-- media/track information and `avformat.*` property forwarding;
+- media/track information, asynchronous post-load audio/video/subtitle track
+  switching, and `avformat.*` property forwarding;
 - decoder-driven `setRenderCallback()` plus reason-aware render-thread
   `renderVideoDetailed()` and the compatibility `renderVideo()` wrapper;
 - compile-time `VideoRenderAPI`, `AudioSink`, and hardware-frame interop
@@ -609,6 +611,9 @@ player
     .onVideoFrame([](const qtav::VideoFrame& frame, int track) {
         // Inspect, filter, or forward the decoded frame.
     })
+    .onSubtitleFrame([](const qtav::SubtitleFrame& frame, int track) {
+        show_subtitle(frame.text(), frame.timestamp(), frame.duration());
+    })
     .setVideoRenderer([](const qtav::VideoFrame& frame, void* surface) {
         // Upload/draw on the application's render thread.
     })
@@ -619,6 +624,25 @@ player
 player.setMedia("movie.mkv");
 player.setState(qtav::State::Playing);
 ```
+
+After `MediaStatus::Loaded`, `MediaInfo::tracks` contains FFmpeg container
+stream indices and the three `active*Track` fields. Pass a matching
+`TrackInfo::index` to `setActiveTrack(MediaType, index)`, or `-1` to disable
+that media type. The method validates and queues the request synchronously;
+decoder replacement, queue invalidation, and position restoration are
+asynchronous. A playing switch reports `Buffering` until output from the new
+generation arrives, emits `track.changed` on success, preserves play/pause
+intent, and reopens the audio sink so a new native audio format is negotiated.
+Seekable inputs return to the request position; non-seekable inputs continue
+from the next packet of the selected stream.
+
+`onSubtitleFrame()` currently publishes decoded UTF-8 plain text for FFmpeg
+text and ASS/SSA subtitle decoders. ASS event fields and override blocks are
+removed, and `\\N`/`\\n` line breaks plus `\\h` spaces are normalized before
+the callback. `SubtitleFrame` also carries the cue timestamp, duration, and
+forced flag. Bitmap subtitle rectangles are decoded by FFmpeg but are not
+exposed by this plain-text callback; graphical subtitle frames and optional
+libass rendering remain separate work.
 
 To capture decoded audio as inspectable PCM, link `QtAV::AudioFile` and
 `QtAV::AudioResample`:
@@ -1223,12 +1247,12 @@ existing `setVideoRenderer()` callback remains available and is used when no
 `VideoRenderAPI` is registered for the requested key.
 
 State/status callbacks are normally invoked from the playback worker. The
-playback worker only demuxes selected packets; independent audio- and
-video-decode workers prevent codec work or output backpressure on one stream
-from starving packet delivery to the other. Decoded audio/video frame
-notifications and `setRenderCallback()` run on a separate presentation
-worker, so a slow application redraw path cannot stall demux, decode, or
-device audio submission. The video presentation queue is bounded;
+playback worker demuxes selected packets and decodes the comparatively light
+subtitle packets; independent audio- and video-decode workers prevent codec
+work or output backpressure on one A/V stream from starving the other. Decoded
+audio/video/subtitle frame notifications and `setRenderCallback()` run on a
+separate presentation worker, so a slow application redraw path cannot stall
+demux, decode, or device audio submission. The video presentation queue is bounded;
 when the application falls behind, it preserves the imminent queued frame and
 discards an incoming farther-future frame instead of accumulating unbounded
 latency or repeatedly replacing the next presentable frame.

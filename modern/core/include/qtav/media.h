@@ -80,6 +80,7 @@ struct QTAV_CORE_EXPORT MediaInfo {
     std::vector<TrackInfo> tracks;
     int activeVideoTrack = -1;
     int activeAudioTrack = -1;
+    int activeSubtitleTrack = -1;
 };
 
 struct QTAV_CORE_EXPORT MediaEvent {

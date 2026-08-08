@@ -501,6 +501,13 @@ struct AudioFrame::Storage {
     std::int64_t durationMs = 0;
 };
 
+struct SubtitleFrame::Storage {
+    std::string text;
+    std::int64_t timestampMs = 0;
+    std::int64_t durationMs = 0;
+    bool forced = false;
+};
+
 VideoFrame::VideoFrame(std::shared_ptr<const Storage> storage)
     : storage_(std::move(storage))
 {
@@ -808,6 +815,41 @@ std::int64_t AudioFrame::duration() const noexcept
     return storage_ ? storage_->durationMs : 0;
 }
 
+SubtitleFrame::SubtitleFrame(std::shared_ptr<const Storage> storage)
+    : storage_(std::move(storage))
+{
+}
+
+SubtitleFrame::operator bool() const noexcept
+{
+    return isValid();
+}
+
+bool SubtitleFrame::isValid() const noexcept
+{
+    return storage_ && !storage_->text.empty();
+}
+
+std::string SubtitleFrame::text() const
+{
+    return storage_ ? storage_->text : std::string {};
+}
+
+std::int64_t SubtitleFrame::timestamp() const noexcept
+{
+    return storage_ ? storage_->timestampMs : 0;
+}
+
+std::int64_t SubtitleFrame::duration() const noexcept
+{
+    return storage_ ? storage_->durationMs : 0;
+}
+
+bool SubtitleFrame::forced() const noexcept
+{
+    return storage_ && storage_->forced;
+}
+
 VideoFrame detail::FrameFactory::video(
     const AVFrame* frame,
     std::int64_t timestampMs,
@@ -843,6 +885,23 @@ AudioFrame detail::FrameFactory::audio(
     auto storage =
         std::make_shared<AudioFrame::Storage>(frame, timestampMs, durationMs);
     return storage->frame ? AudioFrame(std::move(storage)) : AudioFrame {};
+}
+
+SubtitleFrame detail::FrameFactory::subtitle(
+    std::string text,
+    std::int64_t timestampMs,
+    std::int64_t durationMs,
+    bool forced)
+{
+    if (text.empty()) {
+        return {};
+    }
+    auto storage = std::make_shared<SubtitleFrame::Storage>();
+    storage->text = std::move(text);
+    storage->timestampMs = timestampMs;
+    storage->durationMs = durationMs;
+    storage->forced = forced;
+    return SubtitleFrame(std::move(storage));
 }
 
 VideoFrame detail::FrameFactory::hardware(
