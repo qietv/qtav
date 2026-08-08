@@ -120,12 +120,12 @@ already own a graphics context or require multiple/custom render targets:
   `QtAV::RenderOpenGLAndroid` EGL/window adaptation for native RGB10_A2 HDR or
   explicit RGBA8/sRGB fallback and OHOS `QtAV::RenderOpenGLOHOS` adaptation
   for a capability-verified RGBA8/sRGB baseline;
-- one GPU semantic pipeline: libplacebo is the sole Windows D3D11, Vulkan, and
-  OpenGL ES authority for color conversion, Dolby Vision, tone/gamut mapping,
-  scaling, and output encoding. Platform interop only imports native buffers,
-  preserves synchronization and lifetime, and exposes raw representation;
-  backend-local shaders may normalize that representation but may not perform
-  semantic color work;
+- one GPU semantic pipeline: libplacebo is the sole authority across Windows
+  D3D11 and the Android/OHOS Vulkan and OpenGL ES paths for color conversion,
+  Dolby Vision, tone/gamut mapping, scaling, and output encoding. Platform
+  interop only imports native buffers, preserves synchronization and lifetime,
+  and exposes raw representation; backend-local shaders may normalize that
+  representation but may not perform semantic color work;
 - optional platform-neutral `QtAV::RenderMobile` policy that keeps one
   `VideoRenderAPI` attached across Vulkan-preferred startup, bounded same-API
   recovery, one-way OpenGL ES fallback, and the no-renderer state, with an

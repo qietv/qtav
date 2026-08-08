@@ -1154,3 +1154,95 @@ compatible decoder retention or no longer uninitializes unchanged D3D11VA
 state. Remove Core's opt-in, rebuild and verify the Windows dependency package,
 run static/shared tests, and repeat the cold Intel seek/ETW regression before
 adopting the upstream replacement.
+
+## AD-012: Reject a production Windows Vulkan backend
+
+- Date: 2026-08-08
+- Status: Rejected
+- Scope: Windows video rendering, presentation, hardware-frame interop, HDR,
+  packaging, and support policy
+
+### Context
+
+QtAVCore investigated whether its portable libplacebo/Vulkan renderer should
+also become an optional Windows output beside the completed D3D11 path. The
+prototype separated Win32 surface/presentation ownership, Vulkan rendering,
+and D3D11VA-to-Vulkan capability checks; it was never committed or published
+as an API. Testing used an Intel Iris Xe with Windows driver 32.0.101.7088 and
+an HDR-capable PHL 27B1U7903 selected as the primary display.
+
+The investigation produced these results:
+
+1. Windows Advanced Color was active on the display. The production D3D11
+   path passed native HDR validation with 10-bit output, 240-nit system SDR
+   white and a reported 417.712-nit peak. D3D11VA also passed native H.264/NV12
+   and HEVC Main10/P010 decode and direct D3D11 sampling. Hardware decode was
+   therefore available; it was not the limiting capability.
+2. Both `vkGetPhysicalDeviceSurfaceFormatsKHR` and the Win32-monitor/full-
+   screen-aware `vkGetPhysicalDeviceSurfaceFormats2KHR` query advertised only
+   `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR` with RGBA8/BGRA8 UNORM or sRGB formats.
+   No HDR10/PQ, HLG, or extended-linear/scRGB surface format was available.
+3. `C:\\test\\legend.mkv` passed the PQ-source gate, and
+   `C:\\test\\wednesday.mp4` passed the Dolby Vision Profile 5 RPU gate. Both
+   correctly failed a required-HDR Vulkan presentation because the selected
+   surface exposed no HDR color space. The prototype could present those
+   software-decoded sources only through an SDR swapchain.
+4. External-image capability probes rejected exact sampled-image import of
+   the retained D3D11VA NV12 and P010 decoder textures. A strict Windows
+   D3D11VA-to-Vulkan route therefore had neither a proven native-resource
+   import contract nor the required HDR presentation contract on this common
+   adapter class.
+5. `VK_EXT_hdr_metadata` availability did not change the result. Khronos
+   defines that extension as metadata submission; it neither selects nor
+   overrides the swapchain color space. Intel support also states that
+   `VK_EXT_swapchain_colorspace` is not supported on Iris Xe, consistent with
+   the native surface-format evidence.
+
+Vulkan defines HDR color spaces and other Windows GPU vendors or future Intel
+adapters may expose them. The finding is not that Vulkan is intrinsically
+unable to output HDR. It is that Windows Vulkan does not provide the broad,
+capability-complete target matrix QtAVCore requires, while the existing D3D11
+path already provides hardware decode, zero-CPU-map rendering, SDR/HDR output,
+Dolby Vision processing, display switching, and Windows-native validation.
+
+### Decision
+
+1. D3D11 is QtAVCore's only formal, default, and complete Windows graphics
+   backend. Windows packages build and export the D3D11 renderer, D3D11VA
+   decoder/interop, and D3D11 composition output; they do not build or export a
+   Windows Vulkan surface renderer or high-level output.
+2. QtAVCore will not implement D3D11VA-to-Vulkan texture import, cross-API
+   synchronization, or a Vulkan-render-to-DXGI presentation bridge on Windows.
+   A bridge would retain the D3D11 dependency while adding another resource,
+   synchronization, device-loss, HDR, and driver test matrix.
+3. The portable Vulkan/libplacebo engine remains supported for Android and
+   OHOS. Sharing that engine across mobile targets is not a reason to create a
+   Windows Vulkan product backend.
+4. The uncommitted investigation implementation is discarded. Its negative
+   capability results remain recorded here and in `PLAN.md`; no public target,
+   API, example, package export, or compatibility promise survives it.
+5. Reconsideration requires a concrete Windows product requirement plus a new
+   architecture decision backed by native multi-vendor hardware-decode,
+   external-memory/synchronization, SDR/HDR, lifecycle, and packaging evidence.
+   General API symmetry or speculative future driver support is insufficient.
+
+### Consequences
+
+- Windows development and regression coverage remain concentrated on the
+  production D3D11/DXGI path used by Intel generations that remain in the
+  supported installed base.
+- QtAVCore avoids a second Windows presentation stack whose useful capability
+  was below the existing backend on the tested adapter.
+- Applications requiring a Vulkan-owned Windows compositor are outside the
+  supported QtAVCore Windows output contract. They may still consume core
+  decoded software frames through application-owned integration, without a
+  QtAVCore Windows Vulkan backend claim.
+
+### Primary references
+
+- [Khronos `VkColorSpaceKHR`](https://registry.khronos.org/VulkanSC/specs/1.0-extensions/man/html/VkColorSpaceKHR.html)
+- [Khronos `VK_EXT_hdr_metadata`](https://registry.khronos.org/VulkanSC/specs/1.0-extensions/man/html/VK_EXT_hdr_metadata.html)
+- [Khronos full-screen-exclusive presentation query](https://registry.khronos.org/vulkan/specs/latest/man/html/VkFullScreenExclusiveEXT.html)
+- [Intel Iris Xe Vulkan extension support response](https://community.intel.com/t5/Graphics/Vulkan-extensions-support-request/m-p/1688246)
+- [Intel 11th-14th generation Windows graphics driver](https://www.intel.com/content/www/us/en/download/864990/intel-11th-14th-gen-processor-graphics-windows.html)
+- [Microsoft DirectX Advanced Color](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range)

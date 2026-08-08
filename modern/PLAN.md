@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-07
+Last updated: 2026-08-08
 
 Status legend:
 
@@ -20,14 +20,14 @@ OHOS cross-compilation host through the DevEco native SDK.
 
 OHOS remains the strategic active platform-development target, but its item-10
 production decision is waiting for Huawei's written external-format contract.
-While that reply is pending, a Windows D3D11VA-to-Vulkan zero-copy backend is
-inserted as the immediate implementation checkpoint and must complete before
-further OHOS item-10 development resumes. The earlier Windows D3D11VA
-seek/shutdown hotfix recorded in AD-010 is complete. It replaces direct
-decoder-slice sampling as the default D3D11-renderer policy with an mpv-style
-visible-region GPU copy and keeps direct sampling as an explicit option.
-AD-007's native context protection and bounded asynchronous submission remain
-binding.
+The intervening Windows Vulkan investigation is closed and rejected by AD-012:
+Windows retains D3D11 as its only formal, default, and complete graphics
+backend. No Windows Vulkan renderer, output, or D3D11VA-to-Vulkan interop is on
+the implementation roadmap. The earlier Windows D3D11VA seek/shutdown hotfix
+recorded in AD-010 is complete. It replaces direct decoder-slice sampling as
+the default D3D11-renderer policy with an mpv-style visible-region GPU copy and
+keeps direct sampling as an explicit option. AD-007's native context protection
+and bounded asynchronous submission remain binding.
 
 The user's separate AMD integrated-GPU 4K frame-loss report is objectively
 located, corrected, and fully verified by reason-aware render retry plus
@@ -179,10 +179,9 @@ Continuation checkpoint:
   D3D11 backend. FFmpeg-parsed Dolby Vision metadata, Dolby Vision reshaping,
   transfer handling, gamut conversion, HDR tone mapping, and target encoding
   are owned by libplacebo; QtAVCore has no alternate native Windows shader for
-  those operations. The current implementation exposes only the QtAVCore D3D11
-  renderer on Windows. The inserted checkpoint in `Next task` adds a Vulkan
-  renderer/output and D3D11VA-to-Vulkan interop without changing this completed
-  baseline until that work is implemented and validated;
+  those operations. The QtAVCore D3D11 renderer/output is the only formal
+  Windows graphics path. AD-012 rejects a Windows Vulkan renderer/output and
+  D3D11VA-to-Vulkan interop after native capability investigation;
 - QtAVCore now requires FFmpeg 8.0 or newer (libavcodec major 62+); compatibility
   branches for FFmpeg 5–7 are intentionally out of scope;
 - `../ffmpeg/` now provides a pinned vcpkg dependency-build subproject for
@@ -861,10 +860,10 @@ explicitly waived repeating the four hardware cells because the cleanup only
 deleted diagnostic measurements and text, without changing decode, copy,
 render, presentation, resource-lifetime, or shutdown behavior. AD-010 is
 closed. The active platform track remains OHOS strategically, but Huawei's
-written response now gates further item-10 production work. While that response
-is pending, the immediate implementation track is the inserted Windows
-D3D11VA-to-Vulkan checkpoint defined below. Its completion is required before
-resuming OHOS item 10. The completed OHOS work includes its Milestone 7
+written response now gates further item-10 production work. The Windows Vulkan
+capability investigation performed while waiting for that response is closed
+and rejected by AD-012; it is not a replacement implementation track. The
+completed OHOS work includes its Milestone 7
 target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
@@ -1260,74 +1259,31 @@ evidence in a follow-up architecture decision, then either promote a narrowly
 supported mapping, retain it as an explicitly opted-in workaround, or reject
 it and use the opaque/fallback paths. Huawei's response is still pending.
 
-Inserted Windows Vulkan checkpoint (complete before further OHOS item-10
-development):
+Closed Windows Vulkan research checkpoint (not an implementation task):
 
-1. [ ] Define the Windows responsibility split and public targets without
-   combining hardware decode, cross-API interop, rendering, or presentation.
-   Reuse `QtAV::HWD3D11VA`, `D3D11DeviceAccess`, the portable
-   `QtAV::RenderVulkan` engine, the shared FFmpeg/libplacebo bridge, detailed
-   render-result semantics, and the existing Windows output scheduling and
-   diagnostics policies. Add narrowly scoped Windows Vulkan surface/output and
-   D3D11VA-to-Vulkan interop targets and record their names and ownership in an
-   architecture decision before stabilizing public headers.
-2. [ ] Add the Windows Vulkan capability and adapter-identity gate. Match the
-   Vulkan physical device to the D3D11VA DXGI adapter by LUID, require the
-   necessary Win32 surface, external-memory, external-synchronization,
-   multi-plane format, swapchain, and color-space capabilities, and reject
-   cross-adapter or unproven handle combinations explicitly. Do not infer
-   native-device support from WARP or software Vulkan.
-3. [ ] Implement the strict D3D11VA-to-Vulkan zero-copy route. Export retained
-   NV12/P010 decoder resources through supported Win32 handles, import the exact
-   texture-array slice and visible crop into Vulkan, preserve native Y/UV plane
-   layout and bit depth, and keep the source alive through GPU completion.
-   Strict zero copy permits no `Map()`, CPU transfer, staging/upload,
-   `CopySubresourceRegion*`, Vulkan transfer copy, or RGBA representation-
-   normalization intermediate. Probe the actual D3D11/Vulkan external-image
-   contract rather than assuming decoder surfaces are shareable or importable.
-4. [ ] Establish explicit cross-API synchronization and bounded lifetime.
-   Select a capability-proven shared-fence/semaphore or keyed-mutex contract,
-   transfer ownership without polling frame pixels on the CPU, and release the
-   decoder slice/handle only after Vulkan/libplacebo completion. Cover seek,
-   flush, media replacement, device/surface recreation, stale generations,
-   stop, and close-while-playing without leaking handles or recycling an
-   in-flight decoder surface.
-5. [ ] Make libplacebo the Windows Vulkan image and color-pipeline authority.
-   Reuse the portable Vulkan/libplacebo path for native multi-plane sampling,
-   crop, rotation, scaling, chroma reconstruction, transfer/gamut conversion,
-   HDR tone mapping, output encoding, and FFmpeg-parsed Dolby Vision RPU
-   reshaping. Do not add a parallel handwritten Dolby Vision, YUV conversion,
-   tone-mapping, or output shader. Any unavoidable representation conversion
-   must be isolated, justified, counted, and treated as a non-strict fallback.
-6. [ ] Add Windows Vulkan presentation and Player integration, starting with a
-   native `HWND` surface and a Vulkan swapchain on the matched adapter. Reuse
-   the existing Vulkan SDR/HDR10/extended-linear selection where Windows WSI
-   supports it, submit HDR metadata when supported, and preserve the Windows
-   display/HDR-generation, render retry, resize, suspend/recreate, and
-   application-owned render-thread contracts. Wire an explicit backend choice
-   into the Windows player/example without replacing the completed D3D11 path.
-7. [ ] Define fallback truthfully. If direct decoder-resource import is not
-   supported, prefer an explicit one-way fallback to the existing D3D11 output
-   or software decode. A separately measured GPU-only copy into an exportable
-   texture may be offered as a compatibility path, but it must not be reported
-   as strict zero copy; no fallback may silently map or upload the retired
-   hardware frame.
-8. [ ] Add deterministic and native validation for H.264/NV12 and HEVC
-   Main10/P010, exact texture slice/crop, adapter matching, handle and
-   synchronization lifetime, bounded retained frames, retries, resize/surface
-   recreation, seek/flush/replacement/stop/shutdown, SDR and HDR10 output, and
-   fallback selection. Validate Dolby Vision Profile 5 and supported Profile
-   8.x metadata through libplacebo. The strict route must report zero CPU map,
-   transfer, staging, upload, D3D11 copy, Vulkan transfer copy, and
-   representation-normalization operations.
-9. [ ] Build and test Windows static/shared Release configurations, the WinUI
-   or dedicated Windows Vulkan example, install/export packages, and external
-   CMake consumers using the repository Windows FFmpeg/Vulkan/libplacebo
-   dependency prefix. Run native hardware playback on the available Windows
-   adapters and record adapter/driver/extension evidence; do not reuse D3D11
-   renderer results as Vulkan acceptance evidence. Update README, MIGRATION,
-   architecture decisions, testing instructions, and this PLAN when each
-   meaningful subtask completes.
+1. [x] Confirm that Vulkan itself defines HDR10/PQ, HLG, and extended-linear
+   presentation color spaces and that HDR metadata submission does not replace
+   surface color-space support.
+2. [x] On Intel Iris Xe driver 32.0.101.7088 with the HDR PHL 27B1U7903 as the
+   primary display, query both ordinary and Win32-monitor/full-screen-aware
+   surface formats. Both exposed only RGBA8/BGRA8 with
+   `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`; no PQ, HLG, or extended-linear format
+   was available.
+3. [x] Verify the source gates independently: `C:\\test\\legend.mkv` carried
+   PQ and `C:\\test\\wednesday.mp4` carried a Dolby Vision Profile 5 RPU. Both
+   required-HDR Vulkan attempts rejected the SDR-only surface instead of
+   misreporting it as HDR.
+4. [x] Verify that Intel hardware decode was not the failure: native
+   D3D11VA H.264/NV12 and HEVC Main10/P010 decode and D3D11 sampling passed,
+   while the Vulkan external-image probes rejected exact sampled import of the
+   retained D3D11 decoder textures.
+5. [x] Verify the production alternative on the same display: Windows Advanced
+   Color and D3D11 HDR passed with active 10-bit output, 240-nit system SDR
+   white, and a reported 417.712-nit peak.
+6. [x] Reject productization in AD-012 and discard the uncommitted prototype.
+   Windows keeps D3D11 as its only formal/default/complete graphics backend;
+   no Windows Vulkan surface/output, D3D11VA-to-Vulkan interop, public target,
+   package export, example, or validation matrix remains planned.
 
 Active local OHOS execution order:
 
@@ -2701,8 +2657,9 @@ Following platform slice:
    target/toolchain, HAP/XComponent, Vulkan/OpenGL ES, selector, OHAudio,
    OHCodec lifecycle, raw OpenGL ES, and diagnostic Vulkan import work are
    retained. Huawei's production-contract reply for OHOS item 10 remains
-   pending. Complete the inserted Windows D3D11VA-to-Vulkan checkpoint before
-   resuming further OHOS item-10 or strict Dolby Vision Vulkan development.
+   pending. Resume further OHOS item-10 or strict Dolby Vision Vulkan work only
+   when that contract gate can progress; do not substitute a Windows Vulkan
+   implementation task.
 
 Platform implementation order after the contracts are stable:
 
@@ -2711,9 +2668,9 @@ Platform implementation order after the contracts are stable:
 3. Android playback performance/regression work.
 4. OHOS production path with connected-device validation (active local slice).
 
-The inserted Windows Vulkan checkpoint is an explicit temporary return to the
-Windows reference path while the external OHOS item-10 contract is blocked. It
-does not reopen the completed AD-010 D3D11 policy matrix.
+AD-012 closes the temporary Windows Vulkan investigation without changing the
+platform order. The Windows reference path remains D3D11-only, and the
+completed AD-010 D3D11 policy matrix remains binding.
 
 ## Milestone 3 — Portable reference backends
 

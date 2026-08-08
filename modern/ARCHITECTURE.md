@@ -31,6 +31,14 @@ The active implementation has these non-negotiable boundaries:
   is wrapped directly as libplacebo's source, with no normalization draw or
   intermediate source texture.
 
+Windows has one production graphics path: D3D11VA decode, D3D11 interop and
+D3D11 rendering/presentation. D3D11 is the default and complete Windows
+backend. QtAVCore does not build, export, or plan a Windows Vulkan renderer,
+swapchain output, or D3D11VA-to-Vulkan interop target. The portable Vulkan
+renderer remains part of the Android/OHOS architecture; that does not imply a
+Windows Vulkan support commitment. The evidence and rejection decision are
+recorded in [AD-012](DECISIONS.md#ad-012-reject-a-production-windows-vulkan-backend).
+
 ## Repository layers
 
 ```text
@@ -181,9 +189,10 @@ Vision reshape, tone mapping, or output encoding.
 Platform interop is limited to native-buffer import, format/plane exposure,
 producer/consumer synchronization, timestamp and generation correlation, and
 reference-counted lifetime through GPU completion. It must not become a second
-color pipeline. This division applies equally to Windows D3D11, Vulkan, and
-OpenGL ES: libplacebo is their sole semantic color, Dolby Vision, tone-map,
-gamut-map, scaling, and output-encoding authority.
+color pipeline. This division applies equally to Windows D3D11 and the
+Android/OHOS Vulkan and OpenGL ES paths: libplacebo is their sole semantic
+color, Dolby Vision, tone-map, gamut-map, scaling, and output-encoding
+authority.
 
 This boundary currently allows two mobile normalization passes:
 
