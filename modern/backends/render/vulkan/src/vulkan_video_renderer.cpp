@@ -109,6 +109,35 @@ bool supportedTargetFormat(
     }
 }
 
+pl_bit_encoding ycbcrBitEncoding(VkFormat format) noexcept
+{
+    switch (format) {
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+        return { 16, 10, 6 };
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+        return { 16, 12, 4 };
+    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
+        return { 16, 16, 0 };
+    default:
+        return { 8, 8, 0 };
+    }
+}
+
 pl_rotation rotation(VideoRotation value) noexcept
 {
     switch (value) {
@@ -1681,10 +1710,6 @@ public:
                 "The imported Vulkan hardware format has no libplacebo YUV plane mapping";
             return false;
         }
-        const bool tenBit = sourceFormat
-                == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
-            || sourceFormat
-                == VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16;
         setSourceColor(source, frame);
         if (hasDovi
             && !qtav_pl_map_dovi(&frame, &dovi, native)) {
@@ -1699,9 +1724,7 @@ public:
             }
             : externalNormalized
             ? pl_bit_encoding { 16, 16, 0 }
-            : tenBit
-            ? pl_bit_encoding { 16, 10, 6 }
-            : pl_bit_encoding { 8, 8, 0 };
+            : ycbcrBitEncoding(sourceFormat);
         if (!hasDovi
             && (externalNormalized
                 || texture->params.format->num_planes == 0)) {

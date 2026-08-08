@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include "ohos_vulkan_context.h"
+#include "vvc_validation_session.h"
 
 #include <ace/xcomponent/native_interface_xcomponent.h>
 #include <hilog/log.h>
@@ -476,8 +477,32 @@ public:
         const std::uint8_t* h264Data,
         std::size_t h264Size,
         const std::uint8_t* hevcData,
-        std::size_t hevcSize)
+        std::size_t hevcSize,
+        const std::uint8_t* vvcData,
+        std::size_t vvcSize)
     {
+        if (vvcData && vvcSize > 1) {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            player_.setState(State::Stopped);
+            player_
+                .setRenderCallback({})
+                .setVideoRenderAPI({})
+                .setVideoFrameScheduler({})
+                .setHardwareDecodeConfig({});
+            if (selector_) {
+                selector_->close();
+                selector_.reset();
+            }
+            vulkanContext_.reset();
+            vvcValidation_ =
+                std::make_unique<VVCValidationSession>();
+            mediaReady_ = true;
+            mediaStarted_ = true;
+            return vvcValidation_->start(
+                vvcData,
+                vvcSize,
+                window_);
+        }
         if (!h264Data || h264Size == 0 || !hevcData || hevcSize == 0) {
             fail("The packaged H.264 or HEVC test media is empty");
             return false;
@@ -507,6 +532,16 @@ public:
 
     void stop()
     {
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            if (vvcValidation_) {
+                vvcValidation_->stop();
+                vvcValidation_.reset();
+                mediaStarted_ = false;
+                mediaReady_ = false;
+                return;
+            }
+        }
         player_.setState(State::Stopped);
         releaseRetainedOHCodecOutput(false);
         player_
@@ -523,6 +558,13 @@ public:
 
     void setForeground(bool foreground)
     {
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            if (vvcValidation_) {
+                vvcValidation_->setForeground(foreground);
+                return;
+            }
+        }
         const auto lifecycle = ohCodecLifecycle_.load(
             std::memory_order_acquire);
         if (lifecycle != OHCodecLifecyclePhase::H264BackgroundPending
@@ -567,6 +609,20 @@ public:
         if (sizeResult != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
             fail("Could not query the XComponent surface size");
             return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            if (vvcValidation_) {
+                window_ = window;
+                renderConfig_.surfaceSize = {
+                    static_cast<int>(width),
+                    static_cast<int>(height),
+                };
+                surfaceReady_ = true;
+                vvcValidation_->setSurface(window);
+                return;
+            }
         }
 
         std::lock_guard<std::mutex> lock(pipelineMutex_);
@@ -666,6 +722,10 @@ public:
         OHNativeWindow* window)
     {
         std::lock_guard<std::mutex> lock(pipelineMutex_);
+        if (vvcValidation_) {
+            window_ = window;
+            return;
+        }
         if (!window || window != window_) {
             return;
         }
@@ -742,11 +802,23 @@ public:
     void releaseSurface()
     {
         std::lock_guard<std::mutex> lock(pipelineMutex_);
+        if (vvcValidation_) {
+            vvcValidation_->clearSurface();
+            surfaceReady_ = false;
+            window_ = nullptr;
+            return;
+        }
         releaseSurfaceLocked();
     }
 
     std::string status() const
     {
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex_);
+            if (vvcValidation_) {
+                return vvcValidation_->status();
+            }
+        }
         std::string detail;
         MediaStatus mediaStatus = MediaStatus::NoMedia;
         {
@@ -3229,7 +3301,17 @@ private:
                 >= ohCodecVulkanH264Rendered_.load(
                     std::memory_order_relaxed)
             && statistics.opaqueFormatsRejected == 0;
-        if ((!opaqueUnsupported && !directH264 && !opaqueSampledH264)
+        const bool workaroundSampledH264 =
+            statistics.externalFormatWorkaroundImports
+                >= ohCodecVulkanH264Rendered_.load(
+                    std::memory_order_relaxed)
+            && statistics.normalizationPasses
+                >= ohCodecVulkanH264Rendered_.load(
+                    std::memory_order_relaxed)
+            && statistics.lastForcedVulkanFormat != VK_FORMAT_UNDEFINED
+            && statistics.opaqueFormatsRejected == 0;
+        if ((!opaqueUnsupported && !directH264 && !opaqueSampledH264
+             && !workaroundSampledH264)
             || statistics.unsupportedFormatsRejected != 0) {
             failOHCodecVulkan(
                 "OHCodec/Vulkan H.264 did not satisfy strict direct-plane import before replacement");
@@ -3248,6 +3330,9 @@ private:
                 + std::to_string(statistics.directPlaneImports)
                 + " opaqueImports="
                 + std::to_string(statistics.opaqueExternalImports)
+                + " workaroundImports="
+                + std::to_string(
+                    statistics.externalFormatWorkaroundImports)
                 + " opaqueRejected="
                 + std::to_string(statistics.opaqueFormatsRejected));
     }
@@ -3363,6 +3448,31 @@ private:
             && statistics.opaqueFormatsRejected == 0
             && statistics.lastVulkanFormat == VK_FORMAT_UNDEFINED
             && statistics.lastExternalFormat != 0;
+        const bool workaroundSampledPassed =
+            ohCodecVulkanH264Rendered_.load(std::memory_order_relaxed)
+                >= RequiredOHCodecVulkanH264Frames
+            && ohCodecVulkanHEVCRendered_.load(
+                   std::memory_order_relaxed)
+                >= RequiredOHCodecVulkanHEVCFrames
+            && statistics.nativeBuffersAcquired >= totalRendered
+            && statistics.nativeBuffersImported >= totalRendered
+            && statistics.codecOutputsQueued
+                >= statistics.nativeBuffersImported
+            && statistics.frameAvailableCallbacks
+                >= statistics.nativeBuffersImported
+            && statistics.externalFormatWorkaroundImports
+                == statistics.nativeBuffersImported
+            && statistics.outputsReleasedAfterGpu
+                <= statistics.nativeBuffersImported
+            && statistics.nativeBuffersImported
+                    - statistics.outputsReleasedAfterGpu
+                <= VulkanVideoRenderer::FramesInFlight
+            && statistics.normalizationPasses
+                == statistics.nativeBuffersImported
+            && statistics.opaqueFormatsRejected == 0
+            && statistics.lastVulkanFormat == VK_FORMAT_UNDEFINED
+            && statistics.lastForcedVulkanFormat != VK_FORMAT_UNDEFINED
+            && statistics.lastExternalFormat != 0;
         const bool opaqueUnsupportedPassed =
             totalRendered == 0
             && statistics.codecOutputsQueued >= 2
@@ -3379,7 +3489,8 @@ private:
                     == NATIVEBUFFER_PIXEL_FMT_YCBCR_P010)
             && statistics.lastVulkanFormat == VK_FORMAT_UNDEFINED
             && statistics.lastExternalFormat != 0;
-        const bool vulkanSampled = directPassed || opaqueSampledPassed;
+        const bool vulkanSampled = directPassed || opaqueSampledPassed
+            || workaroundSampledPassed;
         const bool passed = commonPassed
             && (vulkanSampled || opaqueUnsupportedPassed);
         if (!passed) {
@@ -3430,6 +3541,8 @@ private:
                     ? "forced-vkformat-libplacebo"
                 : statistics.forcedVkFormatNativeSamples != 0
                     ? "forced-vkformat-native"
+                : statistics.externalFormatWorkaroundImports != 0
+                    ? "external-format-workaround"
                 : directPassed ? "explicit-plane"
                 : opaqueSampledPassed ? "opaque-ycbcr-normalized"
                                       : "unsupported")
@@ -3449,6 +3562,9 @@ private:
             + std::to_string(statistics.directPlaneImports)
             + " opaqueImports="
             + std::to_string(statistics.opaqueExternalImports)
+            + " workaroundImports="
+            + std::to_string(
+                statistics.externalFormatWorkaroundImports)
             + " forcedVkFormatImports="
             + std::to_string(statistics.forcedVkFormatImports)
             + " forcedNativeSamples="
@@ -4135,10 +4251,12 @@ private:
             vulkanStatistics.nativeBuffersAcquired > 0 &&
             (vulkanStatistics.directPlaneImports > 0 ||
              vulkanStatistics.opaqueExternalImports > 0 ||
+             vulkanStatistics.externalFormatWorkaroundImports > 0 ||
              vulkanStatistics.opaqueFormatsRejected > 0) &&
             vulkanStatistics.unsupportedFormatsRejected == 0 &&
             vulkanStatistics.normalizationPasses <=
-                vulkanStatistics.opaqueExternalImports &&
+                vulkanStatistics.opaqueExternalImports +
+                    vulkanStatistics.externalFormatWorkaroundImports &&
             vulkanStatistics.cpuMapCalls == 0 &&
             vulkanStatistics.softwareTransferCalls == 0 &&
             vulkanStatistics.stagingCopies == 0 &&
@@ -4184,8 +4302,18 @@ private:
             openGLStatistics.rendererUploads == 0 && vulkanSourcePassed &&
             player_.state() == State::Stopped;
         if (!passed) {
-            failOHCodecFallback("OHCodec native Vulkan-to-OpenGL ES fallback "
-                                "counters did not satisfy the required route");
+            failOHCodecFallback(
+                "OHCodec native Vulkan-to-OpenGL ES fallback counters did "
+                "not satisfy the required route: direct=" +
+                std::to_string(vulkanStatistics.directPlaneImports) +
+                " opaque=" +
+                std::to_string(vulkanStatistics.opaqueExternalImports) +
+                " workaround=" +
+                std::to_string(
+                    vulkanStatistics.externalFormatWorkaroundImports) +
+                " normalized=" +
+                std::to_string(vulkanStatistics.normalizationPasses) +
+                " glesRendered=" + std::to_string(rendered));
             return;
         }
 
@@ -4290,10 +4418,12 @@ private:
             vulkanStatistics.nativeBuffersAcquired > 0 &&
             (vulkanStatistics.directPlaneImports > 0 ||
              vulkanStatistics.opaqueExternalImports > 0 ||
+             vulkanStatistics.externalFormatWorkaroundImports > 0 ||
              vulkanStatistics.opaqueFormatsRejected > 0) &&
             vulkanStatistics.unsupportedFormatsRejected == 0 &&
             vulkanStatistics.normalizationPasses <=
-                vulkanStatistics.opaqueExternalImports &&
+                vulkanStatistics.opaqueExternalImports +
+                    vulkanStatistics.externalFormatWorkaroundImports &&
             vulkanStatistics.cpuMapCalls == 0 &&
             vulkanStatistics.softwareTransferCalls == 0 &&
             vulkanStatistics.stagingCopies == 0 &&
@@ -4762,6 +4892,7 @@ private:
         ohCodecFallbackOpenGLFinalStatistics_;
     OHCodecVulkanInteropStatistics ohCodecVulkanFinalStatistics_;
     std::unique_ptr<OHOSVulkanContext> vulkanContext_;
+    std::unique_ptr<VVCValidationSession> vvcValidation_;
     std::shared_ptr<MobileVideoRendererSelector> selector_;
     std::shared_ptr<OHCodecOpenGLInterop> ohCodecOpenGLInterop_;
     std::shared_ptr<OHOSOpenGLVideoRenderer> ohCodecOpenGLRenderer_;
@@ -5000,8 +5131,8 @@ bool byteArrayView(
 
 napi_value start(napi_env env, napi_callback_info info)
 {
-    std::size_t argumentCount = 2;
-    napi_value arguments[2] { nullptr, nullptr };
+    std::size_t argumentCount = 3;
+    napi_value arguments[3] { nullptr, nullptr, nullptr };
     if (napi_get_cb_info(
             env,
             info,
@@ -5010,14 +5141,16 @@ napi_value start(napi_env env, napi_callback_info info)
             nullptr,
             nullptr)
             != napi_ok
-        || argumentCount != 2) {
+        || argumentCount != 3) {
         return booleanValue(env, false);
     }
 
     const std::uint8_t* h264Data = nullptr;
     const std::uint8_t* hevcData = nullptr;
+    const std::uint8_t* vvcData = nullptr;
     std::size_t h264Size = 0;
     std::size_t hevcSize = 0;
+    std::size_t vvcSize = 0;
     if (!byteArrayView(
             env,
             arguments[0],
@@ -5027,7 +5160,12 @@ napi_value start(napi_env env, napi_callback_info info)
             env,
             arguments[1],
             hevcData,
-            hevcSize)) {
+            hevcSize)
+        || !byteArrayView(
+            env,
+            arguments[2],
+            vvcData,
+            vvcSize)) {
         return booleanValue(env, false);
     }
     return booleanValue(
@@ -5036,7 +5174,9 @@ napi_value start(napi_env env, napi_callback_info info)
             h264Data,
             h264Size,
             hevcData,
-            hevcSize));
+            hevcSize,
+            vvcData,
+            vvcSize));
 }
 
 napi_value stop(napi_env env, napi_callback_info)

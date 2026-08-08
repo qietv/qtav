@@ -40,8 +40,17 @@ OHCodecVulkanInteropConfig {
     // Required when vkGetNativeBufferPropertiesOHOS exposes an opaque
     // externalFormat and Vulkan must create a sampler YCbCr conversion.
     bool samplerYcbcrConversionEnabled = false;
+    // Diagnostic override. Disabled means use the production policy below.
     OHCodecVulkanExternalFormatProbeMode externalFormatProbeMode =
         OHCodecVulkanExternalFormatProbeMode::Disabled;
+    // HarmonyOS drivers may return VK_FORMAT_UNDEFINED while externalFormat
+    // is numerically identical to a standard Vulkan YCbCr format. The
+    // production workaround is enabled by default and reinterprets only a
+    // closed allow-list of standard packed/multiplane YCbCr formats. Object
+    // creation and sampling support remain runtime gates. Applications should
+    // expose this setting so users can disable the workaround while vendor
+    // drivers are still evolving.
+    bool externalFormatWorkaroundEnabled = true;
 };
 
 struct QTAV_INTEROP_OHCODEC_VULKAN_EXPORT
@@ -70,6 +79,7 @@ OHCodecVulkanInteropStatistics {
     VkFormat lastVulkanFormat = VK_FORMAT_UNDEFINED;
     VkFormat lastForcedVulkanFormat = VK_FORMAT_UNDEFINED;
     std::uint64_t lastExternalFormat = 0;
+    std::uint64_t externalFormatWorkaroundImports = 0;
 };
 
 // Presents one OHCodec output into a private OH_ConsumerSurface, acquires the

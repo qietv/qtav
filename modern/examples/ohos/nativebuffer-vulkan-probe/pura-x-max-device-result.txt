@@ -1,0 +1,75 @@
+QtAVCore OHCodec / OH_NativeBuffer Vulkan follow-up
+Date: 2026-08-08
+Device: HUAWEI Pura X Max (HOP-AL00)
+System: HOP-AL00 6.1.0.135(SP17C00E135R4P5)
+API: 24
+
+Inputs:
+  H.264 -> NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP / NV12
+  HEVC Main 10, yuv420p10le, BT.2020/PQ ->
+    NATIVEBUFFER_PIXEL_FMT_YCBCR_P010
+
+vkGetNativeBufferPropertiesOHOS observations:
+  NV12:
+    nativeFormat=24
+    vkFormat=0 (VK_FORMAT_UNDEFINED)
+    externalFormat=1000156003
+
+  P010:
+    nativeFormat=35
+    vkFormat=0 (VK_FORMAT_UNDEFINED)
+    externalFormat=1000156013
+
+Default opaque external-format validation:
+  QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS
+  mode=opaque-ycbcr-normalized
+  h264Rendered=30 hevcRendered=30 acquired=60 imported=60
+  directPlanes=0 opaqueImports=60 releasedAfterGpu=59
+  opaqueRejected=0 objectProbes=1 objectProbeSuccesses=1
+  normalization=60 cpuMap=0 transfer=0 staging=0 upload=0
+
+The P010 result marker ended with:
+  nativeFormat=35 vkFormat=0 externalFormat=1000156013
+
+A separate NV12-only repack ended with:
+  nativeFormat=24 vkFormat=0 externalFormat=1000156003
+
+Diagnostic forced-explicit/libplacebo validation:
+  QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS
+  mode=forced-vkformat-libplacebo
+  h264Rendered=30 hevcRendered=30 acquired=60 imported=60
+  directPlanes=60 forcedVkFormatImports=60 forcedLibplacebo=60
+  releasedAfterGpu=59 normalization=0
+  cpuMap=0 transfer=0 staging=0 upload=0
+
+Conclusion:
+  This newer device still exposes both decoder formats as
+  VK_FORMAT_UNDEFINED plus an implementation-defined externalFormat.
+  Standards-based opaque import remains usable. The two historical numerical
+  mappings also remain consumable in the explicitly enabled diagnostic path,
+  but this run does not establish a portable or supported production mapping.
+
+Production-policy connected validation:
+  Signed HAP: entry-default-signed.hap
+  QTAV_OHOS_OHCODEC_VULKAN_RESULT PASS
+  mode=external-format-workaround
+  h264Rendered=30 hevcRendered=30 acquired=60 imported=60
+  directPlanes=0 opaqueImports=0 workaroundImports=60 normalization=60
+  nativeFormat=24 vkFormat=0 forcedVkFormat=1000156003
+  externalFormat=1000156003
+  cpuMap=0 transfer=0 staging=0 upload=0
+
+  QTAV_OHOS_OHCODEC_FALLBACK_RESULT PASS
+  route=opengl-interop vulkanRendered=8 glesRendered=30
+  oldGeneration=5 newGeneration=6 vulkanImported=8 rawYcbcr=30 released=30
+  cpuMap=0 transfer=0 staging=0 upload=0
+
+  QTAV_OHOS_OHCODEC_SOFTWARE_FALLBACK_RESULT PASS
+  hardwareInputs=17 softwareInputs=39 softwareRendered=30
+  selectorDiscards=1 cpuMap=0 transfer=0 staging=0 upload=0
+
+  QTAV_OHOS_RESULT PASS
+
+The production-default workaround therefore remains runtime-gated but is
+usable on this device, and both required automatic fallback stages are proven
+on the connected application path.

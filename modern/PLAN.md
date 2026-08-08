@@ -18,8 +18,11 @@ matrix or roadmap. A macOS development machine may still act only as a
 cross-compilation host for Android/OHOS; 64-bit Windows is also a supported
 OHOS cross-compilation host through the DevEco native SDK.
 
-OHOS remains the strategic active platform-development target, but its item-10
-production decision is waiting for Huawei's written external-format contract.
+OHOS remains the strategic active platform-development target. Huawei's
+item-10 reply is incorporated into AD-009, and the resulting production-default
+external-format workaround plus Vulkan-to-OpenGL/software fallback policy has
+passed the connected Pura X Max regression. Strict raw-component Vulkan Dolby
+Vision validation remains open.
 The intervening Windows Vulkan investigation is closed and rejected by AD-012:
 Windows retains D3D11 as its only formal, default, and complete graphics
 backend. No Windows Vulkan renderer, output, or D3D11VA-to-Vulkan interop is on
@@ -859,11 +862,14 @@ cleanup, and local final-binary validation are complete. On 2026-08-08 the user
 explicitly waived repeating the four hardware cells because the cleanup only
 deleted diagnostic measurements and text, without changing decode, copy,
 render, presentation, resource-lifetime, or shutdown behavior. AD-010 is
-closed. The active platform track remains OHOS strategically, but Huawei's
-written response now gates further item-10 production work. The Windows Vulkan
-capability investigation performed while waiting for that response is closed
-and rejected by AD-012; it is not a replacement implementation track. The
-completed OHOS work includes its Milestone 7
+closed. The active platform track remains OHOS strategically. Huawei's written
+response has been incorporated into AD-009: the broader production-default
+external-format workaround, its application kill switch and OpenGL ES startup
+preference, plus Vulkan-to-OpenGL/software fallback are implemented and pass
+the signed Pura X Max connected regression. The Windows Vulkan capability
+investigation performed while waiting for that response is closed and rejected
+by AD-012; it is not a replacement implementation track. The completed OHOS
+work includes its Milestone 7
 target/toolchain gate, portable Android/OHOS
 render-result contract, HAP shell, Vulkan/OpenGL ES software-rendering fallback,
 native OHAudio output, OHCodec decoder selection, direct `OHNativeWindow`
@@ -879,11 +885,23 @@ Maleoon device's opaque external format and shader-samples it through
 `VkSamplerYcbcrConversion`; H.264 and HEVC pass 60/60 frames without decoded-
 source CPU copies. A diagnostic reinterpretation of the returned external IDs
 as explicit NV12/P010 `VkFormat` values also passes both application-owned
-Vulkan sampling and libplacebo direct-plane wrapping for 60/60 frames. Item 10
-remains partial. AD-009 records this allowlisted external-ID guess as a
-workaround, not a final format-negotiation solution: device and libplacebo
-capability are proven, but Huawei has not confirmed the mapping as a stable
-production interface contract.
+Vulkan sampling and libplacebo direct-plane wrapping for 60/60 frames. Item 10's
+production policy is complete; its strict raw-component/non-opaque format and
+Dolby Vision precision gates remain partial. AD-009 records the allowlisted
+external-ID mapping as a runtime-gated Huawei workaround, not a portable Vulkan
+format contract.
+
+The capability-gated OHOS VVC/H.266 item is complete. The repository FFmpeg
+overlay registers `vvc_ohcodec`, maps the OHOS VVC MIME, selects
+`vvc_mp4toannexb`, and keeps FFmpeg's native software decoder as QtAVCore's
+fallback. The Windows-hosted OHOS dependency rebuild and verifier passed, and
+the signed Pura X Max HAP presented the complete supplied 600-frame sample
+through `OMX.hisi.video.decoder.vvc` before passing its lifecycle and forced-
+software-fallback matrix. Remaining strict OHOS Vulkan raw-plane/Dolby Vision
+precision work is device-gated on a non-opaque multi-plane format. The next
+local implementation task is Milestone 9 active audio/video track switching;
+do not claim the device-gated strict Vulkan item complete without suitable
+hardware.
 
 AD-010 Windows visible-copy checkpoint:
 
@@ -1339,14 +1357,19 @@ Active local OHOS execution order:
     through both the native Vulkan sampler and libplacebo with 60/60 rendered
     frames and no normalization intermediate. Before this item or downstream
     strict Vulkan work advances:
-    - [ ] Obtain Huawei's written confirmation or rejection of the
-      external-ID-to-`VkFormat` mapping as a supported application contract.
-    - [ ] Confirm the applicable device, system/driver, native format, usage,
-      modifier/compression, dataspace/HDR, and `formatFeatures` constraints.
+    - [x] Obtain Huawei's written production guidance. Huawei permits the
+      bounded workaround as a production default, notes that affected formats
+      are not limited to NV12/P010, and requires automatic OpenGL ES/software
+      fallback plus application/user controls.
+    - [ ] Confirm the complete applicable device, system/driver, native format,
+      usage, modifier/compression, dataspace/HDR, and `formatFeatures`
+      constraints.
     - [ ] Confirm that the P010 mapping preserves standard raw Y/UV layout and
       full 10-bit precision before Dolby Vision reshape.
-    - [ ] Record the result in a follow-up decision and choose the final policy:
-      supported narrow mapping, opt-in workaround with fallback, or rejection.
+    - [x] Amend AD-009 and implement the selected production policy: a
+      default-on standard-YCbCr allow-list with runtime Vulkan gates, an
+      application kill switch, an OpenGL ES startup preference, and the
+      Vulkan -> OpenGL ES interop -> software-decode failure chain.
 11. [~] Correlate FFmpeg-parsed Dolby Vision RPU side data with the exact
     retained OHCodec output after timestamp-unit normalization. Validate Dolby
     Vision Profile 5 and supported Profile 8.x media through the raw OpenGL ES
@@ -1553,6 +1576,63 @@ the decoder reconfiguration. The exact markers were
 tests continue to cover the explicit direct-surface and no-video alternatives.
 This completes the two OHOS fallback checklist items; explicit-plane strict
 wrapping and raw-component Vulkan Dolby Vision validation remain gated.
+
+The OHOS NativeBuffer query was repeated on 2026-08-08 with a newer HUAWEI
+Pura X Max (`HOP-AL00`), HarmonyOS 6.1.0.135 SP17 / API 24. The exact retained
+OHCodec/ConsumerSurface buffers still queried as opaque external formats:
+H.264/NV12 returned `nativeFormat=24`, `VkFormat=0`, and
+`externalFormat=1000156003`; HEVC Main10/P010 returned `nativeFormat=35`,
+`VkFormat=0`, and `externalFormat=1000156013`. Default
+`VkExternalFormatOHOS` import and sampling passed 60/60 frames with one GPU
+normalization pass per frame and zero decoded-source CPU map, transfer,
+staging, or upload. The diagnostic forced-explicit/libplacebo build also
+passed 60/60 frames with `directPlanes=60` and `normalization=0`, after which
+the local build configuration was restored to its default `DISABLED` probe
+mode. This broadens the device evidence but does not resolve item 10's formal
+constraint or P010 raw-precision confirmation gates.
+
+Huawei's follow-up reply on 2026-08-08 permits the compatibility workaround to
+be enabled by default in production, warns that common formats beyond
+NV12/P010 may also report `VK_FORMAT_UNDEFINED` while remaining usable, and
+requires user controls plus fallback while the Vulkan driver matures. The
+interop now recognizes a closed set of standard Vulkan packed/multi-planar
+YCbCr external IDs across 8/10/12/16-bit and 4:2:0/4:2:2/4:4:4 families,
+defaults `externalFormatWorkaroundEnabled` to true, and preserves an opaque-
+external path when the application disables it. Unsupported IDs and all
+sampled-format/object/import/sampling failures are fatal to the Vulkan
+candidate. The selector now exposes `preferredAPI=OpenGLES` and invokes the
+hardware fallback policy again if replacement OpenGL ES interop fails, letting
+the application clear hardware decode and continue with software frames. The
+OHOS API-23 shared build compiled and linked all 88 test/example targets; the
+cross-built selector test includes the two-stage fallback and startup-
+preference cases. Strict raw P010 precision for Vulkan Dolby Vision remains
+open.
+
+The signed production-policy HAP then passed the full Pura X Max regression.
+The default workaround imported and GPU-normalized 60/60 H.264/HEVC frames
+reported as `VK_FORMAT_UNDEFINED`, with `workaroundImports=60` and all decoded-
+source CPU-copy counters at zero. An injected Vulkan hardware-frame failure
+switched to OpenGL ES interop (`vulkanRendered=8`, `glesRendered=30`), and an
+independent session disabled OHCodec and rendered 30 software frames after the
+same Vulkan failure. Both fallback routes and the final connected-device result
+reported `PASS`.
+
+The same Pura X Max was also probed for VVC/H.266 decode capability on
+2026-08-08 using a supplied 1280x720, 60 fps, 8-bit 4:2:0 `vvc1` sample. The
+API-24 hardware-category query returned `OMX.hisi.video.decoder.vvc` with
+`hardware=1`, four maximum instances, VVC Main 10 and Main 10 Still Picture
+profiles, and a reported 1-240 fps range at 1280x720. The device accepted
+1280x720 at 60 fps, created the decoder by its hardware name, and configured
+NV12 output with `AV_ERR_OK`. This proves an advertised and constructible
+hardware VVC path whose reported envelope includes the supplied sample. That
+probe preceded the completed 600-frame validation recorded below. At the time,
+QtAVCore's FFmpeg package retained the native software VVC decoder while
+`QtAV::HWOHCodec` selected only the H.264/HEVC OHCodec wrappers. An audit of official
+FFmpeg `n9.0` and current master found no `ff_vvc_oh_decoder`,
+`CONFIG_VVC_OH_DECODER`, or `vvc_oh_decoder_deps`; the repository therefore
+needed an OHCodec overlay rather than a version-only dependency upgrade. That
+overlay and its connected acceptance are now complete through FD-006 and the
+Milestone 7 VVC item.
 
 The portable render-attempt slice completed on 2026-08-05. The public
 `VideoRenderAttemptResult` now carries `Presented`, `DeferredUntilRedraw`,
@@ -2655,11 +2735,11 @@ Following platform slice:
    AMD repair and NVIDIA verification are complete.
 2. [~] This machine: the portable render-result contract and the completed OHOS
    target/toolchain, HAP/XComponent, Vulkan/OpenGL ES, selector, OHAudio,
-   OHCodec lifecycle, raw OpenGL ES, and diagnostic Vulkan import work are
-   retained. Huawei's production-contract reply for OHOS item 10 remains
-   pending. Resume further OHOS item-10 or strict Dolby Vision Vulkan work only
-   when that contract gate can progress; do not substitute a Windows Vulkan
-   implementation task.
+   OHCodec lifecycle, raw OpenGL ES, diagnostic Vulkan import, and Huawei-
+   constrained production workaround/fallback work are retained and connected-
+   device verified. Further OHOS work is the remaining strict Dolby Vision
+   Vulkan/raw-precision gate; do not substitute a Windows Vulkan implementation
+   task.
 
 Platform implementation order after the contracts are stable:
 
@@ -2814,6 +2894,9 @@ active locally.
 - [x] On Vulkan-to-OpenGL ES renderer fallback, attempt compatible GLES native
   interop for subsequent frames; otherwise follow an explicit direct-surface,
   software-decode, or no-video policy without implicit hardware-frame mapping.
+  The production-policy Pura X Max HAP passed the native interop route with 8
+  Vulkan plus 30 OpenGL ES frames, then passed an independent software route
+  with 30 software-rendered frames; all source CPU-copy counters stayed zero.
 - [x] Software fallback independent of renderer mapping/interop fallback.
 
 Acceptance:
@@ -2852,7 +2935,8 @@ Windows performance issue remains open in parallel and must not be described as
 fixed or closed. Target clarification, the OHOS arm64/API 23 dependency and
 toolchain validation, portable render-result contract, Vulkan/OpenGL ES
 selector path, OHAudio sink, OHCodec H.264/HEVC direct-surface lifecycle matrix,
-and raw-YCbCr OHCodec/OpenGL ES/libplacebo path are complete and connected-
+capability-gated VVC/H.266 hardware decode, and raw-YCbCr
+OHCodec/OpenGL ES/libplacebo path are complete and connected-
 device validated. Exact-PTS OHCodec Dolby Vision attachment and Profile 5/8.4
 raw-OpenGL validation are also complete. Retained `OH_NativeBuffer` opaque
 Vulkan import and shader sampling now pass 60/60 H.264/HEVC frames. Direct
@@ -2866,7 +2950,7 @@ Target clarification gate:
   arm64-v8a. The build baseline uses DevEco Studio 6.1, OpenHarmony SDK
   6.1.1.125/API 24, and an arm64/API 23 minimum target. DevEco debug signing is
   configured; HDC 3.2 installs and launches a signed HAP. The device exposes
-  H.264/HEVC OHCodec decoders, OHAudio construction, `OH_NativeBuffer`, and
+  H.264/HEVC/VVC OHCodec decoders, OHAudio construction, `OH_NativeBuffer`, and
   `VK_OHOS_external_memory`. A generic OpenHarmony distribution remains a
   secondary compatibility target without a recorded device validation.
 
@@ -2875,8 +2959,9 @@ Target clarification gate:
 - [x] The reproducible OHOS arm64/API 23 FFmpeg 8.1.2 dependency cross-build
   under `../ffmpeg/` supports both macOS and 64-bit Windows hosts. The Windows
   entry handles the DevEco `Program Files` path through a stable junction,
-  enables `--enable-ohcodec`, and verifies the installed H.264/HEVC OHCodec
-  decoder symbols plus the explicit surface-output header and release symbols.
+  enables `--enable-ohcodec`, and verifies the installed H.264/HEVC/VVC
+  OHCodec decoder symbols, VVC MP4-to-Annex-B bitstream filter, explicit
+  surface-output header, and release symbols.
 - [x] The Windows-hosted QtAVCore OHOS script configures the repository vcpkg
   and OHOS chainload toolchains, then builds and installs Release static and
   shared SDKs. The shared build applies `-Wl,-Bsymbolic`; FFmpeg pkg-config
@@ -2886,8 +2971,9 @@ Target clarification gate:
   validation. The existing dependency CI remains on its macOS self-hosted
   runner. Local signed-HAP XComponent Vulkan/OpenGL ES presentation and
   one-way selector fallback, OHAudio output, the complete H.264/HEVC OHCodec
-  direct-output lifecycle matrix, and raw-YCbCr OpenGL ES/libplacebo interop
-  plus Profile 5/8.4 exact-PTS Dolby Vision attachment are now validated; CI
+  direct-output lifecycle matrix, capability-gated VVC full-stream/lifecycle/
+  software-fallback validation, and raw-YCbCr OpenGL ES/libplacebo interop plus
+  Profile 5/8.4 exact-PTS Dolby Vision attachment are now validated; CI
   execution remains pending.
 
 Windows toolchain validation on 2026-08-05 rebuilt the complete target
@@ -2940,6 +3026,39 @@ change.
   disconnect behavior.
 - [x] Add an OHOS OHCodec hardware-decode target using FFmpeg 8
   `AV_HWDEVICE_TYPE_OHCODEC` and explicit H.264/HEVC wrapper-decoder selection.
+- [x] Add capability-gated VVC/H.266 hardware decode for newer OHOS devices.
+  Extend the repository FFmpeg overlay with a registered `vvc_ohcodec` decoder,
+  VVC MIME mapping, and `vvc_mp4toannexb` input conversion because official
+  FFmpeg `n9.0` and current master do not provide that wrapper. Select the
+  decoder only when `OH_AVCodec_GetCapabilityByCategory(..., false, HARDWARE)`
+  returns a hardware capability; keep the existing FFmpeg software VVC decoder
+  as the automatic fallback on unsupported devices or failed create/configure/
+  start. Rebuild the directly affected OHOS FFmpeg package and pass
+  `cmake/verify-install.cmake` before rebuilding QtAVCore.
+
+  Connected acceptance uses
+  `C:\Users\zzzhr\Downloads\vvc.mp4` on the recorded Pura X Max. It must feed
+  the complete 600-frame 1280x720/60 `vvc1` stream through
+  `OMX.hisi.video.decoder.vvc`, prove that software VVC was not selected, cover
+  EOS/flush/seek/stop and surface recreation, present through the compatible
+  native output path, and retain bounded frame lifetime with zero decoded-
+  source CPU map, transfer, staging, or upload where native-buffer interop is
+  used. A forced unavailable/create/configure failure must reopen the same media
+  through software decode without a crash or stale hardware frame.
+
+  Completed on 2026-08-08. Patch `0058-ohcodec-vvc-decoder.patch` registered
+  the wrapper/MIME/BSF contract; `scripts/build-ohos.ps1` rebuilt FFmpeg 8.1.2
+  on Windows and `verify-install.cmake` passed. The signed Pura X Max HAP used
+  `OMX.hisi.video.decoder.vvc`, presented all 600 source frames, and accumulated
+  694 hardware frames across EOS, pause/resume, 4000 ms seek/flush, stop, and
+  surface recreation. It reported `maxPending=1`, `maxQueued=0`, one stale-
+  generation rejection, and no decoded-source map/transfer/staging/upload. A
+  forced missing supplied device emitted exactly one hardware-fallback event
+  and decoded 30 software frames from the same media with no stale hardware
+  frame. Rebuilding the HAP without the optional VVC fixture and rerunning the
+  complete existing connected-device matrix also passed, including H.264/HEVC
+  direct output, OpenGL ES/Vulkan interop, both renderer-fallback routes, and
+  OHAudio.
 - [x] Reuse the shared surface-backed presentation contract for playback-clock
   scheduling, present/drop, outstanding-buffer bounds, flush, stop, and surface
   recreation. Packet-feed/output-retention bounds and the complete H.264/HEVC
@@ -2986,6 +3105,10 @@ Acceptance:
   without media reopen, and the both-renderers-unavailable error path;
 - OHCodec H.264 and HEVC paths cover pause/resume, seek, media replacement,
   stop, background/foreground transition, surface recreation, and shutdown;
+- on a device advertising hardware VVC, the complete supplied VVC sample uses
+  the named hardware decoder and passes lifecycle/presentation checks; devices
+  without that capability or with a failed hardware open continue by software
+  decode;
 - the OHOS OpenGL ES result proves raw-YCbCr sampling, zero implicit-RGB images,
   exact timestamp correlation, zero decoded-source CPU map, transfer, staging,
   or upload calls, and separately reports its single RGBA16F GPU normalization

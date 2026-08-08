@@ -1,5 +1,6 @@
 interface QtAVNativeContext {
-  start(h264Media: Uint8Array, hevcMedia: Uint8Array): boolean;
+  start(h264Media: Uint8Array, hevcMedia: Uint8Array,
+    vvcMedia: Uint8Array): boolean;
   setForeground(foreground: boolean): void;
   stop(): void;
   status(): string;
@@ -39,25 +40,30 @@ struct Index {
       this.statusText = 'Could not obtain the ArkUI host context';
       return;
     }
+    const optionalVvc = hostContext.resourceManager.getRawFileContent(
+      'qtav-ohos-test-vvc.mp4')
+      .catch(() => new Uint8Array([0]));
     Promise.all([
       hostContext.resourceManager.getRawFileContent(
         'qtav-ohos-test-h264.mp4'),
       hostContext.resourceManager.getRawFileContent(
-        'qtav-ohos-test-hevc.mp4')
+        'qtav-ohos-test-hevc.mp4'),
+      optionalVvc
     ])
       .then((media: Uint8Array[]) => {
         if (this.disposed) {
           return;
         }
         const nativeContext = this.nativeContext;
-        if (!nativeContext || !nativeContext.start(media[0], media[1])) {
-          this.statusText = 'Native start rejected the packaged H.264/HEVC media';
+        if (!nativeContext ||
+          !nativeContext.start(media[0], media[1], media[2])) {
+          this.statusText = 'Native start rejected the packaged test media';
           return;
         }
       })
       .catch((error: Error) => {
         if (!this.disposed) {
-          this.statusText = `Could not load packaged H.264/HEVC media: ${error.message}`;
+          this.statusText = `Could not load packaged media: ${error.message}`;
         }
       });
   }

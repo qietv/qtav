@@ -10,6 +10,7 @@ endif()
 add_library(qtav_ohos_xcomponent_example SHARED
     native/ohos_vulkan_context.cpp
     native/qtav_ohos_napi.cpp
+    native/vvc_validation_session.cpp
 )
 target_compile_features(
     qtav_ohos_xcomponent_example PRIVATE cxx_std_17)
@@ -19,7 +20,7 @@ set(
     QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE
     "DISABLED"
     CACHE STRING
-    "OHCodec opaque external-format diagnostic: DISABLED, NATIVE, or LIBPLACEBO")
+    "OHCodec external-format diagnostic override: DISABLED uses the production policy; NATIVE or LIBPLACEBO force a probe path")
 set_property(
     CACHE QTAV_OHOS_EXTERNAL_FORMAT_PROBE_MODE
     PROPERTY STRINGS DISABLED NATIVE LIBPLACEBO)
@@ -42,6 +43,7 @@ target_link_libraries(qtav_ohos_xcomponent_example
         "${QTAV_OHOS_ACE_NAPI_LIBRARY}"
         "${QTAV_OHOS_HILOG_LIBRARY}"
         ace_ndk.z
+        native_media_codecbase
         native_window
         QtAV::Core
         QtAV::AudioOHAudio

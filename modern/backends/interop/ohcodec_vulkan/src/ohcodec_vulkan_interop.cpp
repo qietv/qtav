@@ -55,10 +55,30 @@ std::uint32_t firstMemoryType(std::uint32_t bits) noexcept
 bool directPlaneFormat(VkFormat format) noexcept
 {
     switch (format) {
-    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
     case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
-    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
         return true;
     default:
         return false;
@@ -67,22 +87,100 @@ bool directPlaneFormat(VkFormat format) noexcept
 
 bool compatibleNativeFormat(std::int32_t format) noexcept
 {
-    return format == NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP
+    return format == NATIVEBUFFER_PIXEL_FMT_YUV_422_I
+        || format == NATIVEBUFFER_PIXEL_FMT_YCBCR_422_SP
+        || format == NATIVEBUFFER_PIXEL_FMT_YCRCB_422_SP
+        || format == NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP
+        || format == NATIVEBUFFER_PIXEL_FMT_YCRCB_420_SP
+        || format == NATIVEBUFFER_PIXEL_FMT_YCBCR_422_P
+        || format == NATIVEBUFFER_PIXEL_FMT_YCRCB_422_P
         || format == NATIVEBUFFER_PIXEL_FMT_YCBCR_420_P
-        || format == NATIVEBUFFER_PIXEL_FMT_YCBCR_P010;
+        || format == NATIVEBUFFER_PIXEL_FMT_YCRCB_420_P
+        || format == NATIVEBUFFER_PIXEL_FMT_YUYV_422_PKG
+        || format == NATIVEBUFFER_PIXEL_FMT_UYVY_422_PKG
+        || format == NATIVEBUFFER_PIXEL_FMT_YVYU_422_PKG
+        || format == NATIVEBUFFER_PIXEL_FMT_VYUY_422_PKG
+        || format == NATIVEBUFFER_PIXEL_FMT_YCBCR_P010
+        || format == NATIVEBUFFER_PIXEL_FMT_YCRCB_P010;
 }
 
 VkFormat explicitFormatFromOpaqueId(std::uint64_t externalFormat) noexcept
 {
-    switch (externalFormat) {
-    case static_cast<std::uint64_t>(
-        VK_FORMAT_G8_B8R8_2PLANE_420_UNORM):
-        return VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
-    case static_cast<std::uint64_t>(
-        VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16):
-        return VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+    if (externalFormat
+        > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int32_t>::max())) {
+        return VK_FORMAT_UNDEFINED;
+    }
+    const VkFormat candidate = static_cast<VkFormat>(externalFormat);
+    switch (candidate) {
+    case VK_FORMAT_G8B8G8R8_422_UNORM:
+    case VK_FORMAT_B8G8R8G8_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+    case VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16:
+    case VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16:
+    case VK_FORMAT_B12X4G12X4R12X4G12X4_422_UNORM_4PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16B16G16R16_422_UNORM:
+    case VK_FORMAT_B16G16R16G16_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
+        return candidate;
     default:
         return VK_FORMAT_UNDEFINED;
+    }
+}
+
+bool nativeFormatMatchesExplicitFormat(
+    std::int32_t nativeFormat,
+    VkFormat vulkanFormat) noexcept
+{
+    switch (nativeFormat) {
+    case NATIVEBUFFER_PIXEL_FMT_YUV_422_I:
+    case NATIVEBUFFER_PIXEL_FMT_YUYV_422_PKG:
+    case NATIVEBUFFER_PIXEL_FMT_UYVY_422_PKG:
+    case NATIVEBUFFER_PIXEL_FMT_YVYU_422_PKG:
+    case NATIVEBUFFER_PIXEL_FMT_VYUY_422_PKG:
+        return vulkanFormat == VK_FORMAT_G8B8G8R8_422_UNORM
+            || vulkanFormat == VK_FORMAT_B8G8R8G8_422_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_422_SP:
+    case NATIVEBUFFER_PIXEL_FMT_YCRCB_422_SP:
+        return vulkanFormat == VK_FORMAT_G8_B8R8_2PLANE_422_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP:
+    case NATIVEBUFFER_PIXEL_FMT_YCRCB_420_SP:
+        return vulkanFormat == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_422_P:
+    case NATIVEBUFFER_PIXEL_FMT_YCRCB_422_P:
+        return vulkanFormat == VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_420_P:
+    case NATIVEBUFFER_PIXEL_FMT_YCRCB_420_P:
+        return vulkanFormat == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_P010:
+    case NATIVEBUFFER_PIXEL_FMT_YCRCB_P010:
+        return vulkanFormat
+            == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+    default:
+        return false;
     }
 }
 
@@ -343,6 +441,7 @@ struct AtomicStatistics {
     std::atomic<std::uint64_t> nativeBuffersImported { 0 };
     std::atomic<std::uint64_t> directPlaneImports { 0 };
     std::atomic<std::uint64_t> opaqueExternalImports { 0 };
+    std::atomic<std::uint64_t> externalFormatWorkaroundImports { 0 };
     std::atomic<std::uint64_t> forcedVkFormatImports { 0 };
     std::atomic<std::uint64_t> forcedVkFormatNativeSamples { 0 };
     std::atomic<std::uint64_t> forcedVkFormatLibplaceboImports { 0 };
@@ -417,6 +516,7 @@ struct SharedState {
     PFN_vkGetNativeBufferPropertiesOHOS getNativeBufferProperties = nullptr;
     PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
     bool samplerYcbcrConversionEnabled = false;
+    bool externalFormatWorkaroundEnabled = true;
     OHCodecVulkanExternalFormatProbeMode externalFormatProbeMode =
         OHCodecVulkanExternalFormatProbeMode::Disabled;
     std::mutex mutex;
@@ -776,17 +876,23 @@ private:
             std::memory_order_relaxed);
         const bool queriedOpaqueExternal =
             formatProperties.format == VK_FORMAT_UNDEFINED;
-        const bool forceVkFormat = queriedOpaqueExternal
+        const bool diagnosticForceVkFormat = queriedOpaqueExternal
             && state_->externalFormatProbeMode
                 != OHCodecVulkanExternalFormatProbeMode::Disabled;
-        const bool forcedNativeSampling = forceVkFormat
-            && state_->externalFormatProbeMode
-                == OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatNativeSampling;
-        const bool forcedLibplacebo = forceVkFormat
+        const bool useExternalFormatWorkaround = queriedOpaqueExternal
+            && !diagnosticForceVkFormat
+            && state_->externalFormatWorkaroundEnabled;
+        const bool reinterpretExternalFormat =
+            diagnosticForceVkFormat || useExternalFormatWorkaround;
+        const bool forcedNativeSampling = reinterpretExternalFormat
+            && (useExternalFormatWorkaround
+                || state_->externalFormatProbeMode
+                    == OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatNativeSampling);
+        const bool forcedLibplacebo = diagnosticForceVkFormat
             && state_->externalFormatProbeMode
                 == OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatLibplacebo;
         VkFormat importFormat = formatProperties.format;
-        if (forceVkFormat) {
+        if (reinterpretExternalFormat) {
             importFormat = explicitFormatFromOpaqueId(
                 formatProperties.externalFormat);
             state_->statistics.lastForcedVulkanFormat.store(
@@ -794,8 +900,39 @@ private:
                 std::memory_order_relaxed);
             if (importFormat == VK_FORMAT_UNDEFINED) {
                 status = VulkanHardwareImportStatus::Unsupported;
-                error = "forced VkFormat probe has no recognized NV12/P010 mapping for externalFormat="
+                error = "The opaque externalFormat is not in the supported standard Vulkan YCbCr allow-list: externalFormat="
                     + std::to_string(formatProperties.externalFormat);
+                state_->statistics.unsupportedFormatsRejected.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                return false;
+            }
+            if (!nativeFormatMatchesExplicitFormat(
+                    nativeConfig.format,
+                    importFormat)) {
+                status = VulkanHardwareImportStatus::Unsupported;
+                error = "The externalFormat workaround candidate conflicts with the OH_NativeBuffer format: nativeFormat="
+                    + std::to_string(nativeConfig.format)
+                    + " VkFormat="
+                    + std::to_string(
+                        static_cast<std::int32_t>(importFormat));
+                state_->statistics.unsupportedFormatsRejected.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                return false;
+            }
+            VkFormatProperties explicitProperties {};
+            vkGetPhysicalDeviceFormatProperties(
+                state_->device.physicalDevice,
+                importFormat,
+                &explicitProperties);
+            if ((explicitProperties.optimalTilingFeatures
+                    & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+                == 0U) {
+                status = VulkanHardwareImportStatus::Unsupported;
+                error = "The externalFormat workaround candidate is not sampled-image capable: VkFormat="
+                    + std::to_string(
+                        static_cast<std::int32_t>(importFormat));
                 state_->statistics.unsupportedFormatsRejected.fetch_add(
                     1,
                     std::memory_order_relaxed);
@@ -803,7 +940,7 @@ private:
             }
         }
         const bool useOpaqueExternalFormat =
-            queriedOpaqueExternal && !forceVkFormat;
+            queriedOpaqueExternal && !reinterpretExternalFormat;
         const bool createYcbcrSampler =
             useOpaqueExternalFormat || forcedNativeSampling;
         if (createYcbcrSampler) {
@@ -1084,7 +1221,11 @@ private:
         state_->statistics.nativeBuffersImported.fetch_add(
             1,
             std::memory_order_relaxed);
-        if (forceVkFormat) {
+        if (useExternalFormatWorkaround) {
+            state_->statistics.externalFormatWorkaroundImports.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        } else if (diagnosticForceVkFormat) {
             state_->statistics.forcedVkFormatImports.fetch_add(
                 1,
                 std::memory_order_relaxed);
@@ -1178,6 +1319,8 @@ public:
         state_->importSemaphoreFd = importSemaphoreFd;
         state_->samplerYcbcrConversionEnabled =
             config.samplerYcbcrConversionEnabled;
+        state_->externalFormatWorkaroundEnabled =
+            config.externalFormatWorkaroundEnabled;
         state_->externalFormatProbeMode =
             config.externalFormatProbeMode;
         state_->consumerSurface = OH_ConsumerSurface_Create();
@@ -1526,6 +1669,9 @@ OHCodecVulkanInterop::statistics() const noexcept
         std::memory_order_relaxed);
     result.opaqueExternalImports = source.opaqueExternalImports.load(
         std::memory_order_relaxed);
+    result.externalFormatWorkaroundImports =
+        source.externalFormatWorkaroundImports.load(
+            std::memory_order_relaxed);
     result.forcedVkFormatImports = source.forcedVkFormatImports.load(
         std::memory_order_relaxed);
     result.forcedVkFormatNativeSamples =

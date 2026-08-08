@@ -98,6 +98,20 @@ Mate 60 Pro / Maleoon 910 / HarmonyOS 6.1.0.135：
 因此已确认当前设备具有消费能力，libplacebo 也接受两个显式多平面格式。
 剩余问题只有数值映射的正式性、适用范围、稳定性和 P010 raw 10-bit 保证。
 
+2026-08-08 在更新的 HUAWEI Pura X Max（`HOP-AL00`，HarmonyOS
+6.1.0.135 SP17，API 24）上复查，接口表现没有改变：
+
+| 输入 | `OH_NativeBuffer` 格式 | 查询 `VkFormat` | `externalFormat` |
+|---|---:|---:|---:|
+| H.264/NV12 | 24 | `VK_FORMAT_UNDEFINED` (0) | 1000156003 |
+| HEVC Main10/P010 | 35 | `VK_FORMAT_UNDEFINED` (0) | 1000156013 |
+
+默认 opaque 路径导入并采样 60/60 帧；forced-explicit/libplacebo 诊断路径也
+直接建立并渲染 60/60 个多平面输入，`directPlanes=60`、`normalization=0`。
+两条路径的 `cpuMap/transfer/staging/upload` 均为 0。完整设备标记见
+[`pura-x-max-device-result.txt`](pura-x-max-device-result.txt)。这增加了第二台
+设备证据，但仍不构成 `externalFormat` 数值映射的正式量产承诺。
+
 ## 编译检查
 
 使用应用现有的 OHOS toolchain 和 libplacebo pkg-config 环境配置本目录：

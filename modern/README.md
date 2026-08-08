@@ -62,9 +62,10 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - optional OHOS OHAudio device sink with negotiated Float32 PCM,
   callback-safe bounded buffering, hardware presentation timing, lifecycle
   control, and non-callback route/error recovery;
-- optional OHOS OHCodec H.264/HEVC direct-surface hardware decoding through a
-  retained, versioned application-supplied `OHNativeWindow`, with move-only
-  present/drop/timed-presentation tokens;
+- optional OHOS OHCodec H.264/HEVC plus capability-gated VVC/H.266 direct-
+  surface hardware decoding through a retained, versioned application-
+  supplied `OHNativeWindow`, with move-only present/drop/timed-presentation
+  tokens and native FFmpeg software fallback;
 - optional D3D11VA hardware decoding on an application-selected retained
   D3D11 device, with reference-counted NV12/P010 decoder texture-array slices,
   a default visible-region GPU-copy render policy, optional direct decoder-
@@ -97,16 +98,18 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   when available and preserves an explicit RGBA8/sRGB SDR fallback; the first
   OHOS adapter slice capability-gates an exact RGBA8/sRGB surface and reports
   required HDR as unavailable until native HDR validation is complete;
-- optional platform-neutral mobile renderer selector that performs
-  Vulkan-preferred startup, bounded same-API recovery, fatal one-way fallback
-  to OpenGL ES, and an explicit no-renderer state;
+- optional platform-neutral mobile renderer selector that defaults to
+  Vulkan-preferred startup, exposes an OpenGL ES preference, performs bounded
+  same-API recovery and fatal one-way fallback, and has an explicit
+  no-renderer state;
 - explicit cross-API hardware-frame fallback decisions that rebind subsequent
   decoder output to compatible OpenGL ES native interop or select direct
   surface, software decode, or no video without retrying or mapping a frame
   produced for the retired Vulkan surface;
-- an accepted Android/OHOS mobile rendering policy that prefers Vulkan and
-  uses a separate OpenGL ES/EGL backend after Vulkan is unavailable or fails
-  fatally, while keeping recoverable surface recreation within the active API;
+- an accepted Android/OHOS mobile rendering policy that prefers Vulkan by
+  default, permits a user-selected OpenGL ES preference, and uses the separate
+  backend after Vulkan is unavailable or fails fatally, while keeping
+  recoverable surface recreation within the active API;
 - a reproducible Android arm64 cross-build and connected-device
   NativeActivity harness for QtAVCore plus pinned FFmpeg 8.1.2 software
   decoding, Vulkan presentation, OpenGL ES/EGL native-HDR plus SDR fallback,
@@ -166,8 +169,9 @@ Current backend integration boundary:
   output into a single-decision direct-surface present/drop token;
 - `QtAV::HWOHCodec` retains and versions an application-supplied
   `OHNativeWindow`, creates FFmpeg's `AV_HWDEVICE_TYPE_OHCODEC` device, and
-  explicitly selects the H.264/HEVC `*_ohcodec` wrapper decoder. Each surface
-  output becomes a single-decision present/drop/timed-presentation token;
+  explicitly selects the H.264/HEVC or capability-gated VVC `*_ohcodec`
+  wrapper decoder. Each surface output becomes a single-decision
+  present/drop/timed-presentation token;
 - `QtAV::InteropMediaCodecVulkan` owns a private GPU-sampled `AImageReader`,
   supplies its surface to `QtAV::HWMediaCodec`, correlates codec and image
   timestamps, imports retained `AHardwareBuffer` images and fences into the
@@ -250,17 +254,19 @@ Current backend integration boundary:
   output; cross-API fallback never retries or maps the retired native frame;
 - OHOS OHCodec decoder selection, explicit direct-surface presentation tokens,
   and the H.264/HEVC lifecycle matrix are implemented and device-validated.
-  Native hardware-frame texture interop remains pending. The preferred target
-  is retained `OH_NativeBuffer` import through Vulkan; the OpenGL ES fallback
+  Native hardware-frame texture interop is implemented with retained
+  `OH_NativeBuffer` import through Vulkan and raw-component OpenGL ES. The
+  OpenGL ES fallback
   requires raw `GL_EXT_YUV_target` sampling rather than implicit external-OES
   YUV-to-RGB conversion.
 
 Mobile renderer creation remains in the application or thin platform layer
 that owns the native window and graphics devices, while
 `MobileVideoRendererSelector` implements the accepted shared selection policy.
-A new session probes Vulkan first and selects OpenGL ES when Vulkan is
-unavailable or cannot open its initial surface. `SurfaceLost` causes bounded
-same-API recreation; a fatal error or exhausted Vulkan recovery retires Vulkan
+A new session probes `MobileRendererSelectorConfig::preferredAPI` first
+(Vulkan by default) and selects the other configured API when the preferred
+backend is unavailable or cannot open its initial surface. `SurfaceLost`
+causes bounded same-API recreation; a fatal error or exhausted Vulkan recovery retires Vulkan
 for that session and retries the retained frame through OpenGL ES without
 reopening media. `suspendSurface()` and `recreateSurface()` preserve the
 selected API across an application-led native-window replacement. If both
@@ -270,8 +276,10 @@ renderer fallback policies remain independent. When the current frame is
 hardware-backed, `setHardwareFrameFallbackCallback()` runs synchronously
 after the OpenGL ES candidate is prepared and before any cross-API retry. The
 application reconfigures subsequent decoder output and returns the chosen
-route. Late frames from the retired native surface are discarded without
-mapping; no callback or a `None` decision reports presentation unavailable.
+route. If OpenGL ES hardware interop later fails, the callback runs again so
+the application can disable hardware decode and continue with software frames.
+Late frames from a retired native surface are discarded without mapping; no
+callback or a `None` decision reports presentation unavailable.
 The accepted design is
 specified in [`MOBILE.md`](MOBILE.md).
 
@@ -744,7 +752,7 @@ hardware timing; subjective audibility still requires a human listening check.
 
 Link `QtAV::HWOHCodec` in an OHOS application. Create a new
 `OHCodecSurface` for every ArkUI-published `OHNativeWindow` generation, set
-the returned configuration before opening H.264 or HEVC media, and consume
+the returned configuration before opening H.264, HEVC, or VVC media, and consume
 each surface output from the decode-worker scheduler:
 
 ```cpp
@@ -781,6 +789,13 @@ retained frame release without an explicit token decision, the FFmpeg overlay
 also unconditionally drops/frees it; abandonment never implies presentation.
 `ohCodecFrame()` rejects stale or foreign window generations.
 
+For VVC, the repository FFmpeg overlay registers `vvc_ohcodec`, maps the OHOS
+VVC MIME, and applies `vvc_mp4toannexb` to MP4 `vvc1` input. The wrapper first
+queries the hardware capability category and never silently selects an
+OHCodec software implementation. Leave `allowSoftwareFallback` enabled when
+the application should reopen unsupported or failed hardware sessions with
+FFmpeg's native software VVC decoder.
+
 The repository FFmpeg overlay supplies the narrow opaque release API required
 to make that decision without copying FFmpeg's private decoder state. It is a
 surface-output API only: it does not expose an `OH_AVBuffer` or establish
@@ -802,6 +817,15 @@ separate `QtAV::InteropOHCodecVulkan` target now implements strict retained
 `OH_NativeBuffer` import, while `QtAV::InteropOHCodecOpenGL` provides the
 raw-component OpenGL ES route. The latter exposes raw components through
 `GL_EXT_YUV_target` and does not rely on implicit external-OES conversion.
+
+On 2026-08-08 the signed Pura X Max VVC mode selected
+`OMX.hisi.video.decoder.vvc` and presented the complete 600-frame
+1280x720/60 `vvc1` sample. The lifecycle accumulated 694 VVC hardware frames
+across EOS, pause/resume, a 4000 ms seek/flush, explicit stop, XComponent
+surface recreation, and stale-generation rejection, with `maxPending=1` and
+`maxQueued=0`. A forced missing supplied device then reopened the same media
+through FFmpeg software VVC, delivered 30 frames, emitted exactly one hardware-
+fallback event, and accepted no stale hardware frame.
 
 ### OHCodec OpenGL ES raw-component interop
 
@@ -852,6 +876,10 @@ interopConfig.ohosExternalMemoryEnabled = true;
 interopConfig.foreignQueueFamilyEnabled = true;
 interopConfig.syncFdSemaphoreEnabled = true;
 interopConfig.samplerYcbcrConversionEnabled = true;
+// Production default. Bind this to an application/user setting while Huawei's
+// Vulkan driver behavior continues to evolve.
+interopConfig.externalFormatWorkaroundEnabled =
+    !settings.disableOhosExternalFormatWorkaround;
 
 auto interop = std::make_shared<qtav::OHCodecVulkanInterop>(
     borrowedVulkanDevice,
@@ -871,14 +899,24 @@ converts it to `OH_NativeBuffer`. An acquire sync fd is imported into a Vulkan
 semaphore. The consumer buffer remains retained until the renderer's GPU
 completion timeline retires the texture.
 
-Explicit sampled NV12/P010-compatible two- or three-plane `VkFormat` values
-are passed directly to `pl_vulkan_wrap`. For `VK_FORMAT_UNDEFINED` plus an
-opaque external-format ID, the interop creates `VkExternalFormatOHOS`, imports
-the same native buffer, and exposes a `VkSamplerYcbcrConversion` image view.
-The renderer samples it once into an RGBA16F GPU image before libplacebo. This
-opaque route never maps the decoded source, performs a software transfer,
-stages, or uploads its pixels; it is zero-CPU-copy but, because of the GPU
-normalization image, is not strict no-intermediate source zero-copy.
+Explicit sampled multi-planar `VkFormat` values are passed directly to
+`pl_vulkan_wrap`. For `VK_FORMAT_UNDEFINED` plus an external-format ID, the
+default production workaround accepts only a closed standard Vulkan YCbCr
+allow-list covering common 8/10/12/16-bit packed and two-/three-plane
+4:2:0/4:2:2/4:4:4 formats. It reinterprets the recognized ID as an explicit
+format, verifies sampled-image support, creates the explicit YCbCr conversion,
+requires a matching OH native YUV layout, imports/binds the same NativeBuffer,
+and samples once into an RGBA16F GPU image before libplacebo. Unknown IDs,
+layout conflicts, and any feature/object/import/sampling failure are rejected
+and trigger renderer fallback; arbitrary IDs are never cast.
+
+Setting `externalFormatWorkaroundEnabled=false` is the application/user kill
+switch. It restores the standards-based opaque path using
+`VkExternalFormatOHOS` and `VK_FORMAT_UNDEFINED`. Both paths avoid decoded-
+source mapping, software transfer, staging, and upload. Because both use the
+GPU normalization image, neither claims strict no-intermediate source zero
+copy. The separate forced-libplacebo probe remains available for strict-plane
+diagnostics.
 
 The connected Mate 60 Pro probe on 2026-08-06 exercised real H.264/NV12,
 HEVC/NV12, and HEVC Main10/P010 outputs. The queried Vulkan format remained
@@ -900,10 +938,12 @@ Application-owned Vulkan YCbCr sampling passed 30 H.264/NV12 plus 30 HEVC
 Main10/P010 frames. Direct `pl_vulkan_wrap` with libplacebo 7.351.0 also passed
 all 60 frames with `directPlanes=60`, `normalization=0`, and zero CPU map,
 transfer, staging, or upload. This proves the device and libplacebo paths can
-consume the forced explicit formats. Production direct-plane use remains
-disabled until Huawei confirms that the implementation-defined
-external-format IDs may formally and stably be used as those `VkFormat`
-values across supported devices and system/driver versions.
+consume the forced explicit formats. Huawei subsequently approved a bounded
+production workaround, warned that formats beyond NV12/P010 may behave the
+same way, and required automatic OpenGL ES/software fallback plus user
+controls. The default production path is therefore broader but deliberately
+uses explicit YCbCr sampling and GPU normalization; strict direct-plane use
+remains a separate diagnostic/precision claim.
 
 The same connected harness now exercises the shared selector with real
 OHCodec frames. After eight successful opaque Vulkan imports it injects a
@@ -1454,6 +1494,9 @@ Vulkan device:
 #include <qtav/mobile_video_renderer.h>
 
 qtav::MobileRendererSelectorConfig selectorConfig;
+selectorConfig.preferredAPI = settings.preferOpenGLES
+    ? qtav::MobileRenderAPI::OpenGLES
+    : qtav::MobileRenderAPI::Vulkan;
 selectorConfig.vulkan = [&] {
     return createPreparedAndroidVulkanRenderer(currentWindow);
 };
@@ -1471,7 +1514,8 @@ selector->setSelectionCallback([](const auto& event) {
 });
 selector->setHardwareFrameFallbackCallback(
     [&](const qtav::MobileHardwareFrameFallbackEvent& event) {
-        if (event.sourceDevice
+        if (event.previousAPI == qtav::MobileRenderAPI::Vulkan
+            && event.sourceDevice
                 == qtav::HardwareDeviceType::MediaCodec
             && preparedOpenGLInterop) {
             player.setHardwareDecodeConfig(
@@ -1483,9 +1527,10 @@ selector->setHardwareFrameFallbackCallback(
                 "MediaCodec rebound to the OpenGL AImageReader producer",
             };
         }
+        player.setHardwareDecodeConfig({});
         return qtav::MobileHardwareFrameFallbackDecision {
-            qtav::MobileHardwareFrameFallbackRoute::NoVideo,
-            "No compatible native interop was available",
+            qtav::MobileHardwareFrameFallbackRoute::SoftwareDecode,
+            "Hardware interop failed; continuing with software decode",
         };
     });
 
@@ -1495,10 +1540,12 @@ player.setVideoRenderAPI(selector);
 
 Each successful factory result contains an already window-bound
 `VideoRenderAPI`; an unavailable result carries its diagnostic reason. The
-selector prefers Vulkan on every new `open()` session. A candidate
+selector tries `preferredAPI` on every new `open()` session. A candidate
 `SurfaceLost` event triggers at most `maximumRecoveryAttempts` complete
 same-API recreations. A candidate `Error` is fatal: Vulkan switches one-way to
-OpenGL ES, while fatal OpenGL ES failure reports video unavailable. The
+OpenGL ES. When the failing OpenGL ES input is a hardware frame, the hardware
+fallback callback runs again and may select `SoftwareDecode`; non-hardware
+fatal OpenGL ES failures report video unavailable. The
 current frame is retained and retried after successful recovery or fallback,
 and the selector object remains attached to `Player`, so media is not reopened.
 The exception is a cross-API hardware frame: it belongs to the retired native

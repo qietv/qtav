@@ -80,6 +80,20 @@ public:
             : selectorConfig_.openGLES;
     }
 
+    MobileRenderAPI preferredAPI() const noexcept
+    {
+        return selectorConfig_.preferredAPI == MobileRenderAPI::OpenGLES
+            ? MobileRenderAPI::OpenGLES
+            : MobileRenderAPI::Vulkan;
+    }
+
+    static MobileRenderAPI alternateAPI(MobileRenderAPI api) noexcept
+    {
+        return api == MobileRenderAPI::OpenGLES
+            ? MobileRenderAPI::Vulkan
+            : MobileRenderAPI::OpenGLES;
+    }
+
     void notifyRender(const VideoRenderEvent& event)
     {
         EventCallback callback = eventCallback_;
@@ -316,7 +330,6 @@ public:
 
         closeRenderer();
         selectedAPI_ = MobileRenderAPI::None;
-        vulkanRetired_ = true;
 
         std::string openGLError;
         if (!activate(MobileRenderAPI::OpenGLES, openGLError)) {
@@ -633,6 +646,19 @@ public:
                 std::move(failure.detail),
                 retryFrame);
         }
+        if (api == MobileRenderAPI::OpenGLES && retryFrame
+            && retryFrame->hasHardwareFrame()) {
+            const HardwareFrame hardware = retryFrame->hardwareFrame();
+            return applyHardwareFrameFallback(
+                MobileRenderAPI::OpenGLES,
+                joinDetail(
+                    "OpenGL ES hardware interop failed; software decode "
+                    "is the remaining renderer-backed route",
+                    std::move(failure.detail)),
+                hardware.deviceType(),
+                hardwareSurface(*retryFrame),
+                {});
+        }
         return becomeUnavailable(api, std::move(failure.detail));
     }
 
@@ -644,7 +670,6 @@ public:
         renderConfig_ = config;
         sessionConfigured_ = true;
         suspended_ = false;
-        vulkanRetired_ = false;
         hardwareFallbackRoute_ =
             MobileHardwareFrameFallbackRoute::None;
         retiredHardwareDevice_ = HardwareDeviceType::Unknown;
@@ -652,38 +677,42 @@ public:
         lastError_.clear();
         ++sessionGeneration_;
 
-        std::string vulkanError;
-        if (activate(MobileRenderAPI::Vulkan, vulkanError)) {
+        const MobileRenderAPI preferred = preferredAPI();
+        const MobileRenderAPI alternate = alternateAPI(preferred);
+        std::string preferredError;
+        if (activate(preferred, preferredError)) {
             notifySelection(
                 MobileRendererSelectionEventType::Selected,
                 MobileRenderAPI::None,
-                MobileRenderAPI::Vulkan,
-                "Selected Vulkan for the new mobile renderer session");
+                preferred,
+                "Selected " + apiLabel(preferred)
+                    + " as the preferred backend for the new mobile "
+                      "renderer session");
             return true;
         }
 
-        vulkanRetired_ = true;
-        std::string openGLError;
-        if (activate(MobileRenderAPI::OpenGLES, openGLError)) {
+        std::string alternateError;
+        if (activate(alternate, alternateError)) {
             notifySelection(
                 MobileRendererSelectionEventType::FellBack,
-                MobileRenderAPI::Vulkan,
-                MobileRenderAPI::OpenGLES,
+                preferred,
+                alternate,
                 joinDetail(
-                    "Selected OpenGL ES during startup",
-                    vulkanError));
+                    "Selected " + apiLabel(alternate)
+                        + " after the preferred startup backend failed",
+                    preferredError));
             return true;
         }
 
         return becomeUnavailable(
-            MobileRenderAPI::Vulkan,
+            preferred,
             joinDetail(
                 joinDetail(
-                    "Vulkan startup failed",
-                    vulkanError),
+                    apiLabel(preferred) + " startup failed",
+                    preferredError),
                 joinDetail(
-                    "OpenGL ES startup failed",
-                    openGLError)));
+                    apiLabel(alternate) + " startup failed",
+                    alternateError)));
     }
 
     bool configure(const VideoRenderConfig& config)
@@ -757,7 +786,6 @@ public:
         renderConfig_ = {};
         sessionConfigured_ = false;
         suspended_ = false;
-        vulkanRetired_ = false;
         hardwareFallbackRoute_ =
             MobileHardwareFrameFallbackRoute::None;
         retiredHardwareDevice_ = HardwareDeviceType::Unknown;
@@ -811,7 +839,6 @@ public:
     std::uint64_t candidateGeneration_ = 0;
     bool sessionConfigured_ = false;
     bool suspended_ = false;
-    bool vulkanRetired_ = false;
     bool hasPendingEvent_ = false;
     MobileHardwareFrameFallbackRoute hardwareFallbackRoute_ =
         MobileHardwareFrameFallbackRoute::None;
@@ -953,8 +980,8 @@ bool MobileVideoRendererSelector::usingFallback() const noexcept
         return false;
     }
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
-    return impl_->selectedAPI_ == MobileRenderAPI::OpenGLES
-        && impl_->vulkanRetired_;
+    return impl_->selectedAPI_ != MobileRenderAPI::None
+        && impl_->selectedAPI_ != impl_->preferredAPI();
 }
 
 MobileHardwareFrameFallbackRoute

@@ -96,6 +96,15 @@ software transfer, staging, and upload calls.
 The generated 440 Hz and 660 Hz tones allow a manual audibility check, while
 automation validates delivery and hardware timing.
 
+An optional VVC-only mode is selected by packaging `-VVCMediaSource`. It
+preflights the exact 600-frame 1280x720/60 `vvc1` fixture, queries the OHOS
+hardware capability, presents the complete stream through `vvc_ohcodec`, then
+covers pause/resume, seek/flush, explicit stop, a real XComponent surface
+recreation, stale-generation rejection, and bounded direct-surface lifetime.
+It finally forces a missing supplied OHCodec device and requires the same
+media to reopen through FFmpeg's native software VVC decoder without a stale
+hardware frame.
+
 Build the QtAVCore shared libraries, native N-API module, and unsigned template
 HAP with:
 
@@ -128,6 +137,19 @@ result marker with:
   -ProjectRoot C:/path/to/signed-project `
   -BundleName com.example.bundle
 ```
+
+Run the capability-gated VVC matrix with the supplied fixture using:
+
+```powershell
+./modern/examples/ohos/run-connected-device.ps1 `
+  -VVCMediaSource C:/Users/zzzhr/Downloads/vvc.mp4 `
+  -TimeoutSeconds 120
+```
+
+The runner requires `OMX.hisi.video.decoder.vvc` on the recorded Pura X Max,
+600 hardware presentations, all lifecycle counters, exactly one deliberate
+software-fallback event, `maxPending=1`, `maxQueued=0`, and no decoded-source
+map, transfer, staging, or upload operation.
 
 For a residual-disabled base-layer Dolby Vision fixture, request a strict
 profile assertion. The runner uses `ffprobe` before building, then requires

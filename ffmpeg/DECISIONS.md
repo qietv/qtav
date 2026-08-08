@@ -339,3 +339,64 @@ uninitializes unchanged hardware acceleration in that path. Rebuild and verify
 the Windows dependency package, remove the QtAVCore opt-in, pass static/shared
 tests, and repeat the cold Intel seek/ETW matrix before adopting the upstream
 replacement.
+
+## FD-006: Add a capability-gated OHCodec VVC decoder wrapper
+
+- Date: 2026-08-08
+- Status: Accepted
+- Scope: OHOS arm64 FFmpeg VVC/H.266 hardware decode
+
+### Context
+
+FFmpeg 8.1.2, official `n9.0`, and current upstream master provide the native
+software VVC decoder and `vvc_mp4toannexb` bitstream filter but do not register
+an OHCodec VVC wrapper. The recorded Pura X Max advertises and constructs
+`OMX.hisi.video.decoder.vvc` for the supplied 1280x720/60 `vvc1` stream, so a
+version-only FFmpeg upgrade cannot expose that hardware path to QtAVCore.
+
+### Decision
+
+Patch the OHCodec decoder family with `vvc_ohcodec`. Map `AV_CODEC_ID_VVC` to
+`OH_AVCODEC_MIMETYPE_VIDEO_VVC`, select `vvc_mp4toannexb`, and reuse the same
+surface-output lifetime contract as H.264/HEVC. Decoder selection must first
+query `OH_AVCodec_GetCapabilityByCategory(mime, false, HARDWARE)`; the wrapper
+does not fall through to an OHCodec software component. QtAVCore's existing
+hardware-open policy reopens the same stream with FFmpeg's native software VVC
+decoder when the wrapper is missing, the hardware capability is unavailable,
+or hardware open fails.
+
+The policy is implemented by
+[`0058-ohcodec-vvc-decoder.patch`](ports/ffmpeg/0058-ohcodec-vvc-decoder.patch).
+The installed-package verifier requires `ff_vvc_oh_decoder` and
+`ff_vvc_mp4toannexb_bsf` in the OHOS `libavcodec.a` archive.
+
+### Rejected alternatives
+
+- Upgrading FFmpeg alone does not add the missing wrapper.
+- Selecting an OHCodec software component would obscure which implementation
+  ran and duplicate FFmpeg's already retained native software fallback.
+- Feeding MP4 length-prefixed VVC packets directly is incompatible with the
+  Annex-B input expected by the exercised hardware decoder.
+- Adding an external VVC decoder or encoder would violate the native-decoder
+  dependency policy and expand the distribution/licensing surface.
+
+### Consequences and validation
+
+The wrapper is registered only in OHOS builds with OHCodec available; other
+targets and FFmpeg's native VVC decoder remain unchanged. On 2026-08-08 the
+Windows-hosted OHOS dependency build completed and `verify-install.cmake`
+passed. A signed Pura X Max HAP then presented all 600 frames of the supplied
+1280x720/60 sample through `OMX.hisi.video.decoder.vvc`, with 694 hardware
+frames across EOS, pause/resume, seek/flush, explicit stop, and surface
+recreation. Maximum pending output was one and the core video queue remained
+zero. A forced missing-device run emitted the hardware-fallback event and
+decoded 30 frames from the same media in software without a stale hardware
+frame.
+
+### Retirement condition
+
+Remove the patch when a pinned upstream FFmpeg release provides an equivalent
+hardware-capability-gated OHCodec VVC wrapper with MP4-to-Annex-B conversion
+and the same surface-output contract. Rebuild and verify the dependency
+package, rebuild QtAVCore, and repeat the complete connected 600-frame plus
+forced-software-fallback lifecycle before adopting it.

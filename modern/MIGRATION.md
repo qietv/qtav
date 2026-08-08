@@ -91,7 +91,8 @@ already own a graphics context or require multiple/custom render targets:
 - optional Android H.264/HEVC MediaCodec hardware decode through
   `QtAV::HWMediaCodec`, using an application-supplied versioned
   `ANativeWindow` and move-only direct-surface present/drop tokens;
-- optional OHOS H.264/HEVC OHCodec decoder selection through
+- optional OHOS H.264/HEVC and capability-gated VVC/H.266 OHCodec decoder
+  selection through
   `QtAV::HWOHCodec`, using a retained, versioned application-supplied
   `OHNativeWindow` and move-only direct-surface present/drop/timed tokens;
 - optional OHOS OHCodec/Vulkan texture interop through
@@ -256,7 +257,7 @@ clock/latency, pause/resume, seek/flush, and loop-boundary drain; subjective
 audibility remains a manual listening check.
 
 OHOS applications can now create a backend-specific `OHCodecSurface` and pass
-`ohCodecHardwareDecodeConfig()` before opening H.264 or HEVC media. The
+`ohCodecHardwareDecodeConfig()` before opening H.264, HEVC, or VVC media. The
 backend retains the exact `OHNativeWindow` generation, creates FFmpeg's
 `AV_HWDEVICE_TYPE_OHCODEC` device, and requests the explicit `*_ohcodec`
 wrapper with an independent software-fallback policy. Generic hardware frames
@@ -288,6 +289,17 @@ sync fd, and keeps the buffer alive until the GPU completion timeline retires
   contract that exposes an explicit multi-plane Vulkan format. The OpenGL ES fallback requires raw
 `GL_EXT_YUV_target` sampling and RGBA16F GPU normalization, not implicit
 external-OES YUV-to-RGB conversion.
+
+The repository FFmpeg overlay now registers `vvc_ohcodec`, maps the OHOS VVC
+MIME, and selects `vvc_mp4toannexb` for MP4 `vvc1` packets. Its decoder lookup
+uses only the OHOS hardware capability category; if that capability or the
+hardware open is unavailable, QtAVCore's existing
+`allowSoftwareFallback=true` policy reopens the same stream with FFmpeg's
+native software VVC decoder. The 2026-08-08 Pura X Max run selected
+`OMX.hisi.video.decoder.vvc`, presented all 600 frames of the supplied
+1280x720/60 sample, covered EOS, pause/resume, seek/flush, stop, surface
+recreation, and stale-generation rejection, then passed a forced unavailable
+device run with 30 software frames and no stale hardware output.
 
 On Windows, `D3D11DeviceAccess` verifies and retains an application-selected
 `ID3D11Device` and its immediate context. `D3D11VideoRenderer` accepts that
@@ -525,6 +537,24 @@ released. The consumer-surface bridge avoids the software-copying FFmpeg
 OHCodec buffer-output branch and leaves the generic core API free of OHOS
 types.
 
+Huawei now permits the bounded `VK_FORMAT_UNDEFINED` compatibility workaround
+as a production default and notes that it is not limited to NV12/P010.
+`OHCodecVulkanInteropConfig::externalFormatWorkaroundEnabled` therefore
+defaults to `true`; set it to `false` from an application/user setting to use
+only the opaque `VkExternalFormatOHOS` route. The workaround recognizes a
+closed set of standard packed and multi-planar Vulkan YCbCr IDs and still
+requires every sampled-format, object-creation, NativeBuffer import, and
+sampling operation to succeed. It is not an arbitrary external-ID cast.
+
+`MobileRendererSelectorConfig::preferredAPI` is a new public field. It
+defaults to `MobileRenderAPI::Vulkan`; use `OpenGLES` for a user-selected
+OpenGL ES startup preference. A fatal Vulkan hardware import prepares OpenGL
+ES and invokes the existing reconfiguration callback. If replacement OpenGL
+ES hardware interop later fails, the callback now runs a second time so the
+application can clear `HardwareDecodeConfig` and return `SoftwareDecode`.
+Consumers must rebuild because both configuration structures have changed
+layout.
+
 The Mate 60 Pro additionally passed two diagnostic-only explicit-format
 experiments for H.264/NV12 and HEVC Main10/P010. Reinterpreting external IDs
 `1000156003` and `1000156013` as their numerically equal Vulkan multi-planar
@@ -532,8 +562,9 @@ formats allowed both an application-owned Vulkan YCbCr shader and direct
 libplacebo 7.351.0 plane wrapping to render 30 frames per codec. The direct
 libplacebo run reported 60 direct-plane imports, no RGBA16F normalization, and
 no decoded-source CPU map, transfer, staging, or upload. This demonstrates
-working device and renderer capability, but the mapping stays behind a probe
-mode until Huawei documents it as a stable production contract.
+working device and renderer capability. Huawei's later guidance promotes the
+bounded, fallback-protected workaround to the default production policy,
+while strict direct-plane/P010 precision claims remain separately gated.
 
 The OHOS HAP also connects `MobileVideoRendererSelector` to native OHCodec
 fallback. A Vulkan hardware-frame failure now prepares the OpenGL ES candidate

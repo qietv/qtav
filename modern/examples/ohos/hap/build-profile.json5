@@ -3,6 +3,7 @@
     "products": [
       {
         "name": "default",
+        "signingConfig": "default",
         "compatibleSdkVersion": "6.1.0(23)",
         "runtimeOS": "HarmonyOS",
         "targetSdkVersion": "6.1.1(24)"
@@ -14,6 +15,21 @@
       },
       {
         "name": "release"
+      }
+    ],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\zzzhr\\.ohos\\config\\default_hap_VSmzWIqDAPE8nM0LBV14q7-9cCFz6gKSjMXV1dzapyk=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BA4D45CE23D1CCBFE89377F8DE784584EBA52F33644B3FD215DD7E61099D90ECB092A1153175C7D",
+          "profile": "C:\\Users\\zzzhr\\.ohos\\config\\default_hap_VSmzWIqDAPE8nM0LBV14q7-9cCFz6gKSjMXV1dzapyk=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\zzzhr\\.ohos\\config\\default_hap_VSmzWIqDAPE8nM0LBV14q7-9cCFz6gKSjMXV1dzapyk=.p12",
+          "storePassword": "0000001B37F54A5C2B0AA1CA6AB6884835A638EE185016637D68A93616EC34B28B9DD46F444BD4F371C1DD"
+        }
       }
     ]
   },

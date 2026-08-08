@@ -69,6 +69,8 @@ if(TRIPLET MATCHES "ohos")
         av_ohcodec_render_buffer_at_time
         ff_h264_oh_decoder
         ff_hevc_oh_decoder
+        ff_vvc_oh_decoder
+        ff_vvc_mp4toannexb_bsf
     )
         if(NOT QTAV_OHOS_AVCODEC_SYMBOLS MATCHES
            "(^|[\r\n])[^\r\n]*${QTAV_OHOS_CODEC_SYMBOL}([\r\n]|$)")

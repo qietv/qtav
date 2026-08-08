@@ -1,0 +1,60 @@
+diff --git a/configure b/configure
+index e4d8223..59502a2 100644
+--- a/configure
++++ b/configure
+@@ -3677,5 +3677,7 @@ vp9_qsv_encoder_select="qsvenc"
+ vp9_v4l2m2m_decoder_deps="v4l2_m2m vp9_v4l2_m2m"
+ amf_capture_filter_deps="amf"
++vvc_oh_decoder_deps="ohcodec"
++vvc_oh_decoder_select="vvc_mp4toannexb_bsf"
+ vvc_qsv_decoder_select="vvc_mp4toannexb_bsf qsvdec"
+ 
+ # parsers
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 54e4e12..3185f57 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -837,6 +837,7 @@ OBJS-$(CONFIG_VP9_V4L2M2M_DECODER)     += v4l2_m2m_dec.o
+ OBJS-$(CONFIG_VQA_DECODER)             += vqavideo.o
+ OBJS-$(CONFIG_VQC_DECODER)             += vqcdec.o
+ OBJS-$(CONFIG_VVC_DECODER)             += executor.o h2645data.o
++OBJS-$(CONFIG_VVC_OH_DECODER)          += ohcodec.o ohdec.o
+ OBJS-$(CONFIG_VVC_SEI)                 += h2645_sei.o aom_film_grain.o h274.o
+ OBJS-$(CONFIG_WADY_DPCM_DECODER)       += dpcm.o
+ OBJS-$(CONFIG_WAVARC_DECODER)          += wavarc.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index 107c078..5e738bc 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -935,5 +935,6 @@ extern const FFCodec ff_vp9_qsv_decoder;
+ extern const FFCodec ff_vp9_vaapi_encoder;
+ extern const FFCodec ff_vp9_qsv_encoder;
++extern const FFCodec ff_vvc_oh_decoder;
+ extern const FFCodec ff_vvc_qsv_decoder;
+ 
+ // null codecs
+diff --git a/libavcodec/ohcodec.h b/libavcodec/ohcodec.h
+index fd4a72b..18fdb3c 100644
+--- a/libavcodec/ohcodec.h
++++ b/libavcodec/ohcodec.h
+@@ -44,6 +44,8 @@ static inline const char *ff_oh_mime(enum AVCodecID codec_id, void *log)
+         return OH_AVCODEC_MIMETYPE_VIDEO_AVC;
+     case AV_CODEC_ID_HEVC:
+         return OH_AVCODEC_MIMETYPE_VIDEO_HEVC;
++    case AV_CODEC_ID_VVC:
++        return OH_AVCODEC_MIMETYPE_VIDEO_VVC;
+     default:
+         av_log(log, AV_LOG_ERROR, "Unsupported codec %s\n",
+                avcodec_get_name(codec_id));
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index 39c21d4..785bdeb 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -1010,3 +1010,7 @@ DECLARE_OHCODEC_VDEC(h264, "H.264", AV_CODEC_ID_H264, "h264_mp4toannexb")
+ #if CONFIG_HEVC_OH_DECODER
+ DECLARE_OHCODEC_VDEC(hevc, "H.265", AV_CODEC_ID_HEVC, "hevc_mp4toannexb")
+ #endif
++
++#if CONFIG_VVC_OH_DECODER
++DECLARE_OHCODEC_VDEC(vvc, "H.266", AV_CODEC_ID_VVC, "vvc_mp4toannexb")
++#endif

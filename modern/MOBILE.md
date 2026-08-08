@@ -440,11 +440,16 @@ retained codec output into the private surface, acquires the corresponding
 consumer buffer stays retained until the renderer GPU timeline destroys the
 imported image and memory, then it is returned to the consumer surface.
 
-The target accepts only explicit sampled two- or three-plane 4:2:0 8/10-bit
-`VkFormat` values that libplacebo wraps directly. It therefore claims strict
-source zero-copy only after that route succeeds. `VK_FORMAT_UNDEFINED` with an
-opaque external-format ID is rejected; this target deliberately does not add a
-raw GPU normalization texture that would weaken the claim to zero-CPU-copy.
+The target accepts driver-reported explicit multi-planar `VkFormat` values
+that libplacebo wraps directly. It claims strict source zero-copy only after
+that route succeeds. When the driver instead reports `VK_FORMAT_UNDEFINED`,
+the production-default Huawei workaround recognizes only a closed set of
+standard Vulkan packed/multi-planar YCbCr IDs across common 8/10/12/16-bit and
+4:2:0/4:2:2/4:4:4 families. It uses the explicit format with Vulkan YCbCr
+sampling and a raw GPU normalization texture, so it remains zero-CPU-copy but
+does not claim strict source zero-copy. Disabling
+`externalFormatWorkaroundEnabled` selects the standards-based opaque
+`VkExternalFormatOHOS` path instead.
 
 The OHOS OpenGL ES fallback is a separate, lower-priority target. It must prove
 raw `GL_EXT_YUV_target` sampling and normalize crop-aware Y/Cb/Cr into RGBA16F
@@ -461,13 +466,14 @@ output. The private consumer-surface bridge avoids FFmpeg's software-copying
 OHCodec buffer-output branch and keeps the SDK types in the optional backend.
 Exact format,
 protected-content, lifetime, and fence support remain target-SDK/device gates.
-On 2026-08-06 the connected Mate 60 Pro acquired one real H.264 and one real
-HEVC buffer, both reported `NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP`, but Vulkan
-returned only `VK_FORMAT_UNDEFINED` with external format `1000156003`. The HAP
-therefore reported the expected strict `UNSUPPORTED` result with two opaque
-rejections and zero map/transfer/staging/upload/normalization counters. No OHOS
-texture-interop PASS is claimed until explicit-plane import, sampling, and
-post-GPU release execute on suitable hardware.
+The Mate 60 Pro and Pura X Max both returned `VK_FORMAT_UNDEFINED` with
+external format `1000156003` for H.264/NV12 and `1000156013` for HEVC
+Main10/P010. Opaque sampling and the forced explicit-format probes each passed
+60/60 frames with zero decoded-source map/transfer/staging/upload calls.
+Huawei subsequently permitted the bounded workaround as a production default,
+while requiring broader-format handling, automatic OpenGL ES then software-
+decode fallback, a user kill switch, and a user OpenGL ES preference. Strict
+direct-plane/P010 precision remains a separate claim.
 
 On the same device, residual-disabled Profile 5 and Profile 8.4 each rendered
 45 HEVC frames through the raw OpenGL ES path with 45 RPU frames queued,
@@ -479,13 +485,14 @@ OpenGL result, not a strict source-zero-copy Vulkan result.
 
 When the active renderer changes from Vulkan to OpenGL ES, the implemented
 selector callback first permits the platform layer to reconfigure newly
-decoded native buffers for the prepared OpenGL ES interop path. If that path
-is unavailable, the callback selects direct-surface presentation, software
-decode, or no video. Direct-surface and no-video routes retire the renderer;
-software decode keeps OpenGL ES active for the later software frames. The
-current Vulkan hardware frame is dropped, not retried, and none of these
+decoded native buffers for the prepared OpenGL ES interop path. If that
+hardware interop later fails, the callback runs again and may select software
+decode while keeping OpenGL ES active for later software frames. Direct-
+surface and no-video remain terminal alternatives. The current frame from
+each retired hardware surface is dropped, not retried, and none of these
 routes maps or uploads it. The reverse transition is not attempted during the
-same renderer session.
+same renderer session. `preferredAPI=OpenGLES` provides the independent user
+startup preference.
 
 Seek, loop, stop, media replacement, decoder flush, surface replacement, and
 renderer fallback advance a generation and reject late native buffers. Device

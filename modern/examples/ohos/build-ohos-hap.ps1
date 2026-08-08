@@ -5,6 +5,7 @@ param(
     [string]$MediaSource,
     [string]$H264MediaSource,
     [string]$HEVCMediaSource,
+    [string]$VVCMediaSource,
     [int]$HEVCMediaDurationSeconds = 0,
     [int]$Parallel = [Environment]::ProcessorCount,
     [switch]$SkipQtAVBuild,
@@ -147,6 +148,8 @@ $PackagedH264Media = Join-Path `
     $RawFileDirectory 'qtav-ohos-test-h264.mp4'
 $PackagedHEVCMedia = Join-Path `
     $RawFileDirectory 'qtav-ohos-test-hevc.mp4'
+$PackagedVVCMedia = Join-Path `
+    $RawFileDirectory 'qtav-ohos-test-vvc.mp4'
 
 $Ffmpeg = $null
 if (-not $H264MediaSource -or -not $HEVCMediaSource -or
@@ -251,6 +254,17 @@ Stage-QtAVOhosMedia `
     -Destination $PackagedHEVCMedia `
     -Codec HEVC `
     -DurationSeconds $HEVCMediaDurationSeconds
+
+if ($VVCMediaSource) {
+    $VVCMediaSource = [IO.Path]::GetFullPath($VVCMediaSource)
+    if (-not (Test-Path -LiteralPath $VVCMediaSource -PathType Leaf)) {
+        throw "The requested VVC test media does not exist: $VVCMediaSource"
+    }
+    Copy-Item -Force -LiteralPath $VVCMediaSource `
+        -Destination $PackagedVVCMedia
+} elseif (Test-Path -LiteralPath $PackagedVVCMedia) {
+    Remove-Item -Force -LiteralPath $PackagedVVCMedia
+}
 
 if ($NoPackage) {
     return

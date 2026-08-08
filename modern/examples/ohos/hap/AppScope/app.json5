@@ -1,6 +1,6 @@
 {
   "app": {
-    "bundleName": "com.qtav.core.ohos",
+    "bundleName": "com.qtffmpeg.core",
     "vendor": "QtAVCore",
     "versionCode": 1000000,
     "versionName": "1.0.0",

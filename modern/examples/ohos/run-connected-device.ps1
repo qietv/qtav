@@ -4,8 +4,9 @@ param(
     [string]$BuildDirectory,
     [string]$H264MediaSource,
     [string]$HEVCMediaSource,
+    [string]$VVCMediaSource,
     [int]$HEVCMediaDurationSeconds = 0,
-    [string]$BundleName = 'com.qtav.core.ohos',
+    [string]$BundleName,
     [ValidateSet(0, 5, 84)]
     [int]$RequireDolbyVisionProfile = 0,
     [int]$TimeoutSeconds = 90,
@@ -20,6 +21,54 @@ if (-not $ProjectRoot) {
     $ProjectRoot = Join-Path $ExampleRoot 'hap'
 }
 $ProjectRoot = [IO.Path]::GetFullPath($ProjectRoot)
+
+if ($VVCMediaSource) {
+    $VVCMediaSource = [IO.Path]::GetFullPath($VVCMediaSource)
+    if (-not (Test-Path -LiteralPath $VVCMediaSource -PathType Leaf)) {
+        throw "The requested VVC test media does not exist: $VVCMediaSource"
+    }
+    $VVCProbe = Get-Command ffprobe -ErrorAction SilentlyContinue
+    if (-not $VVCProbe) {
+        throw 'ffprobe is required to validate VVC test media'
+    }
+    $VVCProbeOutput = @(
+        & $VVCProbe.Source `
+            -v error `
+            -select_streams 'v:0' `
+            -show_entries `
+                'stream=codec_name,codec_tag_string,width,height,r_frame_rate,nb_frames' `
+            -of json `
+            $VVCMediaSource
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "ffprobe could not inspect VVC media: $VVCMediaSource"
+    }
+    $VVCProbeData = ($VVCProbeOutput -join "`n") | ConvertFrom-Json
+    $VVCStream = @($VVCProbeData.streams) | Select-Object -First 1
+    if (-not $VVCStream -or
+        $VVCStream.codec_name -ne 'vvc' -or
+        $VVCStream.codec_tag_string -ne 'vvc1' -or
+        [int]$VVCStream.width -ne 1280 -or
+        [int]$VVCStream.height -ne 720 -or
+        $VVCStream.r_frame_rate -ne '60/1' -or
+        [int]$VVCStream.nb_frames -ne 600) {
+        throw ('VVC validation requires the complete 600-frame ' +
+            '1280x720/60 vvc1 sample')
+    }
+    Write-Host 'VVC 600-frame media preflight: PASS'
+}
+
+if (-not $BundleName) {
+    $AppConfigPath = Join-Path $ProjectRoot 'AppScope/app.json5'
+    $AppConfig = Get-Content -LiteralPath $AppConfigPath -Raw
+    $BundleNameMatch = [regex]::Match(
+        $AppConfig,
+        '"bundleName"\s*:\s*"([^"\r\n]+)"')
+    if (-not $BundleNameMatch.Success) {
+        throw "Could not read bundleName from $AppConfigPath"
+    }
+    $BundleName = $BundleNameMatch.Groups[1].Value
+}
 
 if ($RequireDolbyVisionProfile -ne 0) {
     if (-not $HEVCMediaSource) {
@@ -79,6 +128,9 @@ if (-not $SkipBuild) {
     }
     if ($HEVCMediaSource) {
         $BuildArguments.HEVCMediaSource = $HEVCMediaSource
+    }
+    if ($VVCMediaSource) {
+        $BuildArguments.VVCMediaSource = $VVCMediaSource
     }
     if ($HEVCMediaDurationSeconds -gt 0) {
         $BuildArguments.HEVCMediaDurationSeconds =
@@ -218,5 +270,19 @@ if ($RequireDolbyVisionProfile -ne 0) {
     Write-Host ("QtAVCore OHOS Dolby Vision Profile " +
         "$RequireDolbyVisionProfile validation: PASS " +
         "(rendered=$HevcRendered, RPU released=$DoviReleased)")
+}
+if ($VVCMediaSource) {
+    $VVCMatch = [regex]::Match(
+        $RelevantLog,
+        'QTAV_OHOS_VVC_RESULT PASS frames=600 decoder=([^\s]+) wrapper=vvc_ohcodec[^\r\n]*eos=1[^\r\n]*pauseResume=1[^\r\n]*seek=1[^\r\n]*flush=1[^\r\n]*stop=1[^\r\n]*surfaceRecreation=1[^\r\n]*staleRejected=1[^\r\n]*maxPending=1[^\r\n]*fallbackEvents=1[^\r\n]*hardwareFallback=0[^\r\n]*cpuMap=0 transfer=0 staging=0 upload=0')
+    if (-not $VVCMatch.Success) {
+        throw 'OHOS VVC validation did not emit the required acceptance counters'
+    }
+    if ($VVCMatch.Groups[1].Value -ne 'OMX.hisi.video.decoder.vvc') {
+        throw ('The recorded Pura X Max did not select its named hardware ' +
+            "VVC decoder: $($VVCMatch.Groups[1].Value)")
+    }
+    Write-Host ('QtAVCore OHOS VVC validation: PASS ' +
+        "(decoder=$($VVCMatch.Groups[1].Value), frames=600)")
 }
 Write-Host 'QtAVCore OHOS connected-device validation: PASS'

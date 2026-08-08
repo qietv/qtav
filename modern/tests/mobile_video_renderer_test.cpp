@@ -280,6 +280,47 @@ void testPreferredVulkan()
     expect(openGLES->calls == 0, "OpenGL ES was probed unnecessarily");
 }
 
+void testPreferredOpenGLES()
+{
+    {
+        auto vulkan = std::make_shared<FactoryScript>();
+        auto openGLES = std::make_shared<FactoryScript>();
+        openGLES->behaviors.push_back(behavior());
+        auto config = selectorConfig(vulkan, openGLES);
+        config.preferredAPI = qtav::MobileRenderAPI::OpenGLES;
+
+        qtav::MobileVideoRendererSelector selector(std::move(config));
+        expect(selector.open(renderConfig()), "OpenGL ES startup failed");
+        expect(
+            selector.selectedAPI() == qtav::MobileRenderAPI::OpenGLES,
+            "The configured OpenGL ES preference was ignored");
+        expect(
+            !selector.usingFallback(),
+            "The preferred OpenGL ES backend was marked as fallback");
+        expect(vulkan->calls == 0, "Vulkan was probed unnecessarily");
+    }
+
+    {
+        auto vulkan = std::make_shared<FactoryScript>();
+        auto openGLES = std::make_shared<FactoryScript>();
+        openGLES->unavailableDetail = "No compatible EGLConfig";
+        vulkan->behaviors.push_back(behavior());
+        auto config = selectorConfig(vulkan, openGLES);
+        config.preferredAPI = qtav::MobileRenderAPI::OpenGLES;
+
+        qtav::MobileVideoRendererSelector selector(std::move(config));
+        expect(
+            selector.open(renderConfig()),
+            "Vulkan did not handle unavailable preferred OpenGL ES");
+        expect(
+            selector.selectedAPI() == qtav::MobileRenderAPI::Vulkan,
+            "The alternate Vulkan backend was not selected");
+        expect(
+            selector.usingFallback(),
+            "The alternate Vulkan backend was not marked as fallback");
+    }
+}
+
 void testVulkanUnavailableAndInitialFailure()
 {
     {
@@ -645,6 +686,68 @@ void testHardwareFrameFallbackRoutes()
     }
 }
 
+void testHardwareFrameFallbackCascadesToSoftwareDecode()
+{
+    auto vulkan = std::make_shared<FactoryScript>();
+    auto openGLES = std::make_shared<FactoryScript>();
+    vulkan->behaviors.push_back(
+        behavior({
+            {
+                false,
+                qtav::VideoRenderEventType::Error,
+                "VK_ERROR_FORMAT_NOT_SUPPORTED",
+            },
+        }));
+    auto openGLBehavior = behavior({
+        {
+            false,
+            qtav::VideoRenderEventType::Error,
+            "OpenGL ES native-image import failed",
+        },
+    });
+    openGLBehavior->hardwareDevices = {
+        qtav::HardwareDeviceType::MediaCodec,
+    };
+    openGLES->behaviors.push_back(openGLBehavior);
+
+    int callbackCalls = 0;
+    int mapCalls = 0;
+    qtav::MobileVideoRendererSelector selector(
+        selectorConfig(vulkan, openGLES));
+    selector.setHardwareFrameFallbackCallback(
+        [&callbackCalls](
+            const qtav::MobileHardwareFrameFallbackEvent& event) {
+            ++callbackCalls;
+            if (event.previousAPI == qtav::MobileRenderAPI::Vulkan) {
+                return qtav::MobileHardwareFrameFallbackDecision {
+                    qtav::MobileHardwareFrameFallbackRoute::
+                        OpenGLESInterop,
+                    "rebound decoder output to OpenGL ES",
+                };
+            }
+            return qtav::MobileHardwareFrameFallbackDecision {
+                qtav::MobileHardwareFrameFallbackRoute::SoftwareDecode,
+                "disabled hardware decode after OpenGL ES interop failed",
+            };
+        });
+    expect(selector.open(renderConfig()), "Vulkan startup failed");
+    expect(
+        selector.render(hardwareFrame(0x6000U, 12, mapCalls)),
+        "Vulkan-to-OpenGL ES hardware fallback failed");
+    expect(
+        selector.render(hardwareFrame(0x7000U, 13, mapCalls)),
+        "OpenGL ES hardware failure did not fall back to software decode");
+    expect(
+        selector.hardwareFrameFallbackRoute()
+            == qtav::MobileHardwareFrameFallbackRoute::SoftwareDecode,
+        "The final software-decode route was not recorded");
+    expect(callbackCalls == 2, "The two-stage fallback callback was not run");
+    expect(
+        selector.render(qtav::VideoFrame {}),
+        "A software frame was not rendered after the fallback chain");
+    expect(mapCalls == 0, "The fallback chain mapped a hardware frame");
+}
+
 void testHardwareFrameFallbackRequiresExplicitPolicy()
 {
     auto vulkan = std::make_shared<FactoryScript>();
@@ -802,12 +905,14 @@ void testBothBackendsUnavailable()
 int main()
 {
     testPreferredVulkan();
+    testPreferredOpenGLES();
     testVulkanUnavailableAndInitialFailure();
     testRecoverableVulkanRecreation();
     testFatalOneWayFallback();
     testRetryableRenderDoesNotChangeAPI();
     testDetailedRenderAttemptContract();
     testHardwareFrameFallbackRoutes();
+    testHardwareFrameFallbackCascadesToSoftwareDecode();
     testHardwareFrameFallbackRequiresExplicitPolicy();
     testRepeatedRecoveryFailureFallsBack();
     testSurfaceSuspendAndSameAPIResume();

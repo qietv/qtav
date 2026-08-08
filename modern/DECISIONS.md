@@ -835,6 +835,7 @@ environmental caution and keeps only the Intel performance comparison open.
 ## AD-009: OHOS external-format guessing is a bounded workaround
 
 - Date: 2026-08-06
+- Amended: 2026-08-08 after Huawei's production-policy reply
 - Status: Accepted
 - Scope: OHCodec `OH_NativeBuffer` import, Vulkan multi-planar formats, and
   libplacebo source wrapping on OHOS
@@ -901,33 +902,39 @@ modifiers, compression modes, usages, dataspaces, or HDR configurations.
    `VkSamplerYcbcrConversion`. When needed, a GPU-only representation-
    normalization pass feeds libplacebo. This is zero-CPU-copy, but it is not
    strict raw-plane/no-intermediate zero-copy.
-3. When the query succeeds but reports `VK_FORMAT_UNDEFINED`, OHOS code may
-   consider an allowlisted guess from `externalFormat` to an explicit
-   `VkFormat`, then attempt direct Vulkan/libplacebo consumption. This is a
-   workaround, not the final OHOS format-negotiation solution and not a
-   general cast of arbitrary external IDs.
-4. The only currently evidenced guesses are:
-
-   ```text
-   1000156003 -> VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
-   1000156013 -> VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
-   ```
-
-   Any workaround implementation must also validate the expected OH native
-   format, dimensions, texture usage, sampled-image features, image creation,
-   NativeBuffer memory import/bind, and libplacebo plane mapping. Any mismatch
-   or Vulkan/libplacebo failure must select the established opaque,
-   OpenGL ES, direct-surface, software-decode, or no-video fallback instead of
-   retrying an unsafe cast.
-5. The guessed mapping remains disabled by default while its production
-   contract is unconfirmed. It must be separately diagnosable and must not be
-   described as portable, standard, certified, or guaranteed to preserve raw
-   P010 precision for Dolby Vision.
-6. Before further OHOS strict Vulkan direct-plane or Dolby Vision work is
-   accepted, obtain additional confirmation of the mapping's formal status,
-   supported device/system scope, feature semantics, modifier/compression
-   constraints, and P010 raw 10-bit plane guarantee. Record that evidence as a
-   follow-up decision before promoting, narrowing, or rejecting the workaround.
+3. Huawei confirmed that the workaround may be enabled by default in
+   production, warned that formats beyond NV12/P010 may exhibit the same
+   `VK_FORMAT_UNDEFINED` report, and required application-visible controls and
+   fallback while its Vulkan driver continues to evolve.
+4. The production path therefore recognizes a closed allow-list of standard
+   Vulkan packed and multi-planar YCbCr external IDs across 8/10/12/16-bit,
+   4:2:0/4:2:2/4:4:4, and two-/three-plane families. It never casts an
+   arbitrary external ID. The OH native format must still be an accepted video
+   YUV family, and dimensions, texture usage, explicit-format sampled-image
+   support, sampler conversion, image creation, NativeBuffer memory
+   import/bind, image view, queue synchronization, and actual sampling remain
+   runtime gates.
+5. `OHCodecVulkanInteropConfig::externalFormatWorkaroundEnabled` defaults to
+   `true`. Setting it to `false` uses the standards-based opaque
+   `VkExternalFormatOHOS` path and gives applications the required user-facing
+   kill switch. The production workaround uses explicit-format Vulkan YCbCr
+   sampling followed by the existing GPU normalization pass; the direct
+   libplacebo plane mode remains separately diagnosable.
+6. A workaround mapping or Vulkan import/sampling failure is fatal to the
+   current Vulkan candidate. `MobileVideoRendererSelector` then prepares
+   OpenGL ES. Its synchronous application callback first rebinds future
+   OHCodec output to OpenGL ES interop; if that hardware interop subsequently
+   fails, the callback is invoked again so the application can disable
+   hardware decode and continue with software frames. No frame from a retired
+   native surface is retried or CPU-mapped.
+7. `MobileRendererSelectorConfig::preferredAPI` defaults to Vulkan and may be
+   set to `OpenGLES`, providing the required user-facing preference. This is a
+   startup preference, not a permanent ban: failure to open the preferred API
+   tries the other configured candidate.
+8. This workaround remains an OHOS/Huawei compatibility policy, not a portable
+   Vulkan guarantee. Strict raw-plane/no-intermediate use, especially the P010
+   raw 10-bit guarantee required before Dolby Vision reshaping, remains a
+   separate validation gate.
 
 ### Consequences
 
@@ -935,25 +942,42 @@ modifiers, compression modes, usages, dataspaces, or HDR configurations.
 - The opaque external-format path remains the correctness fallback and keeps
   decoded pixels off the CPU, while its GPU intermediate and converted sample
   semantics remain explicit.
-- The guessed direct-plane path can be used for investigation and, if the
-  application explicitly opts into the risk, as a bounded workaround. Its
-  allowlist and fallback behavior prevent unknown external IDs from silently
-  being reinterpreted.
-- libplacebo support is no longer the open question: it accepts the two
-  explicit NV12/P010 formats. The open question is whether OHOS/Huawei formally
-  permits deriving those formats from the returned external IDs.
-- Milestone completion and production claims remain gated on the additional
-  vendor/interface confirmation rather than on the successful single-device
-  probe alone.
+- The bounded compatibility path is production-default, but its allow-list,
+  object-creation gates, fallback chain, and application kill switch prevent
+  unknown or newly broken external IDs from silently being reinterpreted.
+- libplacebo support is no longer the open question: it accepts the evidenced
+  explicit NV12/P010 formats. Broader allow-listed formats remain individually
+  gated by the actual Vulkan driver operations on each device.
+- Production use of the workaround is no longer vendor-confirmation-gated;
+  strict Vulkan raw-plane/Dolby Vision claims remain separately gated.
 
 ### Current validation evidence
 
 On the Mate 60 Pro, both the application-owned forced-format sampler and the
 direct libplacebo path rendered 30 H.264/NV12 plus 30 HEVC Main10/P010 frames.
 The libplacebo run reported `directPlanes=60`, `normalization=0`, and zero
-decoded-source CPU map, transfer, staging, or upload. Restoring the default
-disabled-workaround build then passed the complete connected OHOS regression,
+decoded-source CPU map, transfer, staging, or upload. The then-default
+disabled-workaround build also passed the complete connected OHOS regression,
 including opaque Vulkan sampling and Vulkan-to-OpenGL/software fallbacks.
+
+The result was independently reproduced on 2026-08-08 with a HUAWEI Pura X
+Max (`HOP-AL00`) running HarmonyOS 6.1.0.135 SP17 / API 24. The standard query
+still returned `VK_FORMAT_UNDEFINED` plus external format `1000156003` for
+`NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP` and `1000156013` for
+`NATIVEBUFFER_PIXEL_FMT_YCBCR_P010`. Opaque import and sampling passed 60/60
+frames. The separately enabled forced-format/libplacebo diagnostic also
+passed 60/60 frames with `directPlanes=60`, `normalization=0`, and no decoded-
+source CPU map, transfer, staging, or upload. Huawei's later reply permits the
+bounded workaround as a production default while explicitly requiring
+broader-format handling, Vulkan-to-OpenGL/software fallback, a workaround kill
+switch, and an OpenGL ES startup preference. The amended decision implements
+those constraints without describing the mapping as a portable Vulkan
+contract. The resulting signed production-policy HAP subsequently passed the
+same Pura X Max: 60/60 frames used the default workaround and GPU normalization,
+an injected Vulkan failure switched from 8 Vulkan frames to 30 OpenGL ES native-
+interop frames, and an independent session continued with 30 software-rendered
+frames after disabling OHCodec. Every route reported zero decoded-source CPU
+map, transfer, staging, or upload.
 
 ## AD-010: Windows copies the visible decoder region by default
 

@@ -172,17 +172,19 @@ project-specific behavior:
 - the Android FFmpeg overlay enables FFmpeg's built-in RPU decoder for the
   HEVC MediaCodec wrapper and PTS-correlates parsed Dolby Vision metadata with
   hardware output frames before QtAVCore receives them.
-- the OHOS FFmpeg overlay requires the native H.264 and HEVC OHCodec wrappers;
-  configure failure is fatal. Its HEVC wrapper enables FFmpeg's built-in RPU
+- the OHOS FFmpeg overlay requires the native H.264, HEVC, and VVC OHCodec
+  wrappers; configure failure is fatal. The VVC wrapper capability-gates
+  hardware selection, maps the platform VVC MIME, and converts MP4 `vvc1`
+  packets through `vvc_mp4toannexb`. Its HEVC wrapper enables FFmpeg's built-in RPU
   parser, keeps a bounded metadata queue keyed by the exact microsecond packet
   PTS submitted to OHCodec, and attaches the result to the returned output with
   the same PTS. Flush and close clear the queue and parser state. The overlay
   also exposes a narrow opaque OHCodec surface output token with explicit
   render, timed-render, and drop decisions. An undecided final frame release is
   always a drop, never an implicit present. The verifier checks both decoder
-  symbols, the public header, and both release symbols in the installed
+  symbols, the VVC bitstream-filter symbol, the public header, and both release symbols in the installed
   `libavcodec.a` archive. The compatibility boundary is governed by
-  [FD-004](DECISIONS.md).
+  [FD-004 and FD-006](DECISIONS.md).
 - libsmb2 supplies the missing private Winsock link metadata required by a
   static Windows consumer.
 
@@ -217,8 +219,9 @@ Every entry script runs `cmake/verify-install.cmake` after vcpkg installation.
 The verifier checks:
 
 - required FFmpeg 8/libavcodec 62 headers and metadata;
-- H.264/HEVC OHCodec decoder symbols plus the explicit surface-output header
-  and release symbols in the OHOS archive;
+- H.264/HEVC/VVC OHCodec decoder symbols, the VVC MP4-to-Annex-B bitstream
+  filter, plus the explicit surface-output header and release symbols in the
+  OHOS archive;
 - the opt-in D3D11VA decoder-reuse field in the installed Windows FFmpeg
   header;
 - OpenSSL, libsmb2, libass, libplacebo/glslang/OpenGL/OpenGL ES/Dolby Vision

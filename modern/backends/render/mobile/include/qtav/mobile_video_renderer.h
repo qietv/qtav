@@ -42,6 +42,11 @@ struct QTAV_RENDER_MOBILE_EXPORT MobileRendererSelectorConfig {
     // recoverable surface failure before Vulkan is retired or OpenGL ES is
     // reported unavailable. A fatal renderer error bypasses these attempts.
     std::size_t maximumRecoveryAttempts = 2;
+
+    // Applications may expose this as a user preference. Vulkan remains the
+    // default; OpenGLES tries OpenGL ES first and uses Vulkan only when the
+    // preferred backend cannot be opened for the new session.
+    MobileRenderAPI preferredAPI = MobileRenderAPI::Vulkan;
 };
 
 enum class MobileRendererSelectionEventType {
@@ -94,7 +99,7 @@ struct QTAV_RENDER_MOBILE_EXPORT MobileHardwareFrameFallbackDecision {
 
 // Platform-neutral mobile renderer policy. Platform factories create fully
 // prepared Vulkan or OpenGL ES VideoRenderAPI adapters for the current native
-// window generation. The selector prefers Vulkan for each new open session,
+// window generation. The selector starts with the configured preferred API,
 // performs bounded same-API recreation for SurfaceLost, retires Vulkan after
 // a fatal or repeatedly unrecoverable failure, and never probes it again until
 // close() followed by a new open().
@@ -131,14 +136,17 @@ public:
 
     void setSelectionCallback(SelectionCallback callback);
     // Invoked synchronously after Vulkan is retired for a current hardware
-    // frame. OpenGLESInterop requires the prepared OpenGL ES candidate to
+    // frame, and again if the replacement OpenGL ES hardware interop later
+    // fails. OpenGLESInterop requires the prepared OpenGL ES candidate to
     // advertise the source device and asks the callback to reconfigure future
     // decoder output for that interop surface. SoftwareDecode keeps OpenGL ES
-    // active for future software frames. DirectSurface hands presentation back
-    // to the application, while NoVideo deliberately discards future video.
-    // Returning None, or omitting this callback, reports presentation
-    // unavailable. The callback may request thread-safe Player control changes
-    // but must not destroy this selector.
+    // active for future software frames. This permits the application to apply
+    // an automatic Vulkan -> OpenGL ES interop -> software-decode chain without
+    // coupling renderer policy to decoder control. DirectSurface hands
+    // presentation back to the application, while NoVideo deliberately
+    // discards future video. Returning None, or omitting this callback, reports
+    // presentation unavailable. The callback may request thread-safe Player
+    // control changes but must not destroy this selector.
     void setHardwareFrameFallbackCallback(
         HardwareFrameFallbackCallback callback);
 

@@ -36,9 +36,9 @@ The FFmpeg overlay applies this policy:
 - `--enable-libsmb2`, using the FFmpeg integration patch and protocol sources
   imported from the reference `avbuild2` tree;
 - `--enable-vulkan --enable-libplacebo --enable-libass --enable-libdav1d`;
-- `--enable-ohcodec` for the OHOS triplet, with H.264 and HEVC wrapper
-  decoders plus the opaque explicit surface-output decision API required by
-  installed-package verification;
+- `--enable-ohcodec` for the OHOS triplet, with H.264, HEVC, and capability-
+  gated VVC wrapper decoders plus the opaque explicit surface-output decision
+  API required by installed-package verification;
 - FFmpeg's native VVC/H.266 decoder remains enabled because the build never
   disables the native decoder set; no external VVC encoder is included;
 - `--enable-lto --enable-small --disable-avdevice --disable-iamf`;
@@ -75,6 +75,15 @@ Releasing the last frame reference without an explicit decision unconditionally
 drops the output; it never implicitly renders an abandoned output.
 It does not expose `OH_AVBuffer`/`OH_NativeBuffer` texture interop. The API and
 retirement criteria are recorded in [FD-004](DECISIONS.md).
+
+The OHOS overlay also registers `vvc_ohcodec`, maps `AV_CODEC_ID_VVC` to the
+platform VVC MIME, and selects `vvc_mp4toannexb` for MP4 `vvc1` input. The
+wrapper asks `OH_AVCodec_GetCapabilityByCategory(..., false, HARDWARE)` before
+creating a decoder and does not silently choose an OHCodec software component.
+QtAVCore can therefore reopen the same stream with FFmpeg's existing native
+software VVC decoder when hardware selection or open fails. The package
+verifier requires both the wrapper and bitstream-filter symbols; rationale and
+retirement criteria are recorded in [FD-006](DECISIONS.md).
 
 The resulting FFmpeg binaries are GPLv3. Review the complete notices under
 each installed triplet's `share/` directory before distribution.
