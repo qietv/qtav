@@ -900,10 +900,12 @@ through `OMX.hisi.video.decoder.vvc` before passing its lifecycle and forced-
 software-fallback matrix. Remaining strict OHOS Vulkan raw-plane/Dolby Vision
 precision work is device-gated on a non-opaque multi-plane format. Milestone
 9 active audio/video/subtitle track switching, FFmpeg subtitle packet decode,
-the presentation-timed plain-text callback, the optional libass renderer, and
-external audio/subtitle sidecars are complete. The next local implementation
-task is packet buffering policy and buffering status; do not claim the device-
-gated strict Vulkan item complete without suitable hardware.
+the presentation-timed plain-text callback, the optional libass renderer,
+external audio/subtitle sidecars, and bounded packet buffering/status are
+complete, including the optional bounded system-temporary-file spill tier and
+explicit cache clearing. The next local implementation task is the low-
+latency/live-stream drop policy; do not claim the device-gated strict Vulkan
+item complete without suitable hardware.
 
 AD-010 Windows visible-copy checkpoint:
 
@@ -3206,7 +3208,38 @@ Completed external-source checkpoint on 2026-08-09:
   static matrix links the same dependency package successfully, so this is
   not counted as an external-source implementation failure.
 
-- [ ] Packet buffering policy and buffering status.
+- [x] Packet buffering policy and buffering status.
+
+Completed packet-buffer checkpoint on 2026-08-09:
+
+- `PacketBufferPolicy` supplies independent initial/rebuffer time targets,
+  public memory duration/byte limits with unchanged five-second/32 MiB
+  defaults, underflow detection, and an explicit disable path; invalid values
+  are normalized at the public API boundary;
+- the existing per-stream compressed-packet queues now retain normalized packet
+  timestamps, durations, and byte sizes. Audio/video decode consumers wait at
+  one shared generation gate during initial play, seek, track switch, or a
+  confirmed underflow while the playback worker continues demuxing;
+- the opt-in `PacketDiskCachePolicy` spills compressed payloads beyond the
+  memory limits into one compacting, bounded file below a player-specific
+  system temporary directory. It has independent time/byte configuration,
+  removes empty/reset/destructed caches automatically, and exposes a synchronous
+  clear operation that safely re-seeks active seekable playback;
+- `PacketBufferStatus` reports the minimum usable duration across active A/V
+  streams, total plus memory/disk bytes, the volatile file path, progress,
+  reason, presentation generation, and capacity-limited completion. Independent
+  input EOF prevents a short external sidecar from holding a longer primary
+  stream in buffering;
+- deterministic Windows Release coverage validates policy normalization,
+  initial fill start/completion, nonzero byte progress, playing-seek generation
+  refill, actual disk spill/path reporting, in-playback file removal, and final
+  status convergence. Visual Studio 2026 static/shared matrices pass 43/43
+  with the default 500 ms initial and 750 ms rebuffer policy, and both
+  workspace-local installs export byte-identical updated public headers and
+  CMake packages. Android arm64/API 28 and OHOS arm64/API 23 static cores also
+  cross-build against their repository dependency packages; the OHOS entry
+  re-verifies its installed FFmpeg package before compiling.
+
 - [ ] Low-latency/live-stream drop policy.
 - [ ] Reconnect and recoverable network errors.
 - [ ] Frame stepping and accurate seek.

@@ -457,7 +457,8 @@ or pace playback. Decoded planar audio therefore normally uses
   wrapping, plus broader raw `GL_EXT_YUV_target`
   OpenGL ES device coverage;
 - bitmap subtitle delivery;
-- buffering policy for live/network streams;
+- low-latency live-stream packet/frame dropping and recoverable network-error
+  policy beyond the completed bounded packet reservoir;
 - audio time-stretch without pitch change;
 - compressed Dolby passthrough, Atmos object rendering, Dolby Vision
   enhancement-layer residual reconstruction, display tunnelling, licensing,
@@ -657,6 +658,20 @@ implementation.
   callbacks normally run on the playback worker; selected audio/video packets
   cross bounded queues to independent decode workers so one codec or output
   path cannot starve the other stream;
+- compressed-packet buffering is now explicit through `PacketBufferPolicy`,
+  `packetBufferStatus()`, and `onPacketBufferStatus()`. Initial playback, seek,
+  track switching, and confirmed queue underflow fill both selected A/V queues
+  to a time target before decoder release. The status exposes the minimum
+  usable A/V duration, combined bytes, memory/disk byte split, temporary-cache
+  path, progress, reason, capacity-limited completion, and presentation
+  generation; an underflow transition may run on the starving decode worker;
+- the default packet reservoir remains memory-only at five seconds and 32 MiB.
+  `PacketDiskCachePolicy` optionally spills later compressed packets into a
+  bounded, automatically removed file under the system temporary directory.
+  Writes run on the playback worker and materialization reads run on the
+  relevant decode worker behind an internal file lock. Calling
+  `clearPacketDiskCache()` can synchronously drain packet workers and schedule
+  a position-preserving seek, so do not invoke it from a Player callback;
 - `setVideoFrameScheduler()` runs on the video-decode worker before ordinary video
   delivery; an accepted frame is not sent to `onVideoFrame()` or renderers;
 - decoded audio/video/subtitle frame callbacks and `setRenderCallback()` run
@@ -762,7 +777,8 @@ implementation.
    coverage using the same shared mobile contracts.
 7. Keep the completed audio/video/subtitle switching, plain-text callback, and
    optional libass rasterizer as the base for external tracks.
-8. Add live-stream buffering and recovery policies.
+8. Add the low-latency/live-stream drop policy on top of the completed packet
+   buffering/status contract, then add recoverable network-error handling.
 
 Each backend should remain optional so the core library never acquires a GUI
 toolkit dependency.

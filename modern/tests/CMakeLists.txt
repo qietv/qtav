@@ -136,6 +136,10 @@ add_executable(qtav_core_playback_test playback_test.cpp)
 target_link_libraries(qtav_core_playback_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_playback_test PRIVATE cxx_std_17)
 
+add_executable(qtav_core_packet_buffer_test packet_buffer_test.cpp)
+target_link_libraries(qtav_core_packet_buffer_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_packet_buffer_test PRIVATE cxx_std_17)
+
 add_executable(qtav_core_control_test control_test.cpp)
 target_link_libraries(qtav_core_control_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_control_test PRIVATE cxx_std_17)
@@ -458,8 +462,13 @@ if(FFMPEG_EXECUTABLE)
         NAME qtav_core_playback
         COMMAND qtav_core_playback_test "${QTAV_CORE_TEST_MEDIA}"
     )
+    add_test(
+        NAME qtav_core_packet_buffer
+        COMMAND qtav_core_packet_buffer_test "${QTAV_CORE_TEST_MEDIA}"
+    )
     set_tests_properties(
         qtav_core_playback
+        qtav_core_packet_buffer
         PROPERTIES
             FIXTURES_REQUIRED qtav_core_media
             TIMEOUT 15

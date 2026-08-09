@@ -1270,3 +1270,101 @@ Dolby Vision processing, display switching, and Windows-native validation.
 - [Intel Iris Xe Vulkan extension support response](https://community.intel.com/t5/Graphics/Vulkan-extensions-support-request/m-p/1688246)
 - [Intel 11th-14th generation Windows graphics driver](https://www.intel.com/content/www/us/en/download/864990/intel-11th-14th-gen-processor-graphics-windows.html)
 - [Microsoft DirectX Advanced Color](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range)
+
+## AD-013: Packet buffering gates both decoders by usable media time
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core demux/decode backpressure, playback time, buffering status, and
+  external-input EOF
+
+### Context
+
+Core already demuxed on its control worker and sent selected compressed audio
+and video packets through independent fixed-capacity queues to decoder workers.
+Those queues isolated codec backpressure, but consumers started immediately.
+A blocked network read could therefore empty one decoder without an explicit
+packet-fill target or packet-specific progress, while the generic
+`MediaStatus::Buffering` also represented seek output and audio-device clock
+re-anchoring.
+
+### Decision
+
+1. Keep FFmpeg input ownership on the playback worker. Do not add a second
+   demux thread or duplicate format-context synchronization.
+2. Measure each existing compressed queue by normalized media time and bytes.
+   During initial play, seek, track switch, or confirmed underflow, hold both
+   A/V consumers behind one presentation-generation gate while demux continues.
+3. Release only when every selected A/V stream reaches its target or its own
+   input reaches EOF. Report the minimum usable stream duration, combined
+   bytes, progress, reason, and generation through `PacketBufferStatus`.
+4. Bound memory and head-of-line blocking by per-stream time, combined bytes,
+   and the existing packet-count limits. If a bound prevents the target from
+   being reached, release with `capacityLimited` rather than deadlocking an
+   interleaved source behind one full stream.
+5. Freeze playback time through the existing output-wait contract until the
+   released generation actually produces output. Packet buffering does not
+   implement low-latency drops, adaptive bitrate selection, or network-error
+   retry policy.
+
+### Consequences
+
+- Local and remote playback share deterministic buffering semantics; callers
+  can disable buffering or set either fill target to zero.
+- A short external audio sidecar can reach EOF independently without blocking a
+  longer primary video stream.
+- Underflow detection and packet progress may be published from a decode
+  worker. Callbacks retain the existing rule that they may request control
+  changes but must not destroy `Player` inline.
+- The next live-stream milestone can choose an explicit late/drop strategy on
+  top of this reservoir without changing its accounting or conflating packet
+  loss with buffering progress.
+
+## AD-014: Optional packet disk cache is a bounded temporary spill tier
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core compressed-packet storage, temporary-file lifecycle, public
+  buffering policy/status, and explicit cache clearing
+
+### Context
+
+The packet reservoir originally retained FFmpeg packet references only in RAM.
+Its public five-second and 32 MiB limits are appropriate defaults, but a caller
+may need a longer prefetch window without retaining every compressed payload in
+memory. Dropping a queued payload is not safe once demux has advanced, and a
+persistent media cache has materially different identity, validation, privacy,
+and eviction requirements.
+
+### Decision
+
+1. Preserve `maximumBufferMilliseconds` and `maximumBufferBytes` as independent
+   public memory limits with their existing five-second/32 MiB defaults.
+2. Add an opt-in `PacketDiskCachePolicy` spill tier, disabled by default, with
+   separately configurable per-stream time and combined-byte limits. Its
+   disabled defaults are 60 seconds and 256 MiB.
+3. Store only compressed packet payloads in one player-specific file below the
+   system temporary directory. Keep FFmpeg packet properties in the bounded
+   in-process queue, materialize the payload on the owning decode worker, and
+   serialize file reads, writes, compaction, and removal internally.
+4. Compact still-live records before the configured byte boundary so physical
+   growth does not accumulate across long playback. Remove the file and its
+   dedicated directory as soon as no disk entries remain and at every normal
+   generation reset or player destruction.
+5. Report total, memory, and disk compressed bytes plus the volatile path. A
+   synchronous clear drains current packet work and re-seeks seekable playback
+   from its current position; it refuses an active non-seekable source rather
+   than silently skipping removed packets.
+
+### Consequences
+
+- Applications can choose a larger network reservoir while keeping the default
+  memory footprint unchanged, and can explicitly remove temporary media data.
+- The spill file is transient and not encrypted by QtAVCore. It is not a
+  persistent download, content-addressed cache, or offline-playback contract.
+- Disk I/O can add decode latency and is intentionally opt-in. File failures
+  emit `packet.disk_cache.error` once per generation and playback continues on
+  the memory tier; corrupt or externally removed live entries are fatal to the
+  affected decode generation.
+- Clearing an active cache is a control operation and must not run inline from
+  a Player callback because it may wait for decoder workers to drain.

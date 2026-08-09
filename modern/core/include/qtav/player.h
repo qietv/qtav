@@ -31,6 +31,59 @@ struct QTAV_CORE_EXPORT PlaybackStatistics {
     std::uint64_t maximumVideoPresentationStarvationMilliseconds = 0;
 };
 
+// Optional spill storage for compressed packets that no longer fit in the
+// in-memory reservoir. Files are created below the system temporary directory
+// and are removed as soon as the disk-backed queue becomes empty. The disk
+// cache is disabled by default, so these limits allocate no storage unless the
+// application opts in.
+struct QTAV_CORE_EXPORT PacketDiskCachePolicy {
+    bool enabled = false;
+    std::int64_t maximumCacheMilliseconds = 60'000;
+    std::uint64_t maximumCacheBytes = 256U * 1024U * 1024U;
+};
+
+// Time-based packet buffering remains separate from decoder/output queues and
+// from the later low-latency frame-drop policy. maximumBufferMilliseconds and
+// maximumBufferBytes are the public in-memory limits. Values are normalized by
+// Player: negative durations become zero, a zero byte limit uses the default,
+// and the enabled memory-plus-disk duration is raised to the larger fill target.
+struct QTAV_CORE_EXPORT PacketBufferPolicy {
+    bool enabled = true;
+    std::int64_t initialBufferMilliseconds = 500;
+    std::int64_t rebufferMilliseconds = 750;
+    std::int64_t maximumBufferMilliseconds = 5'000;
+    std::uint64_t maximumBufferBytes = 32U * 1024U * 1024U;
+    std::int64_t underflowDetectionMilliseconds = 120;
+    PacketDiskCachePolicy diskCache;
+};
+
+enum class PacketBufferingReason {
+    None,
+    InitialPlayback,
+    Seek,
+    TrackSwitch,
+    Underflow,
+};
+
+// Snapshot reported while compressed audio/video packets are filling. The
+// buffered duration is the minimum usable duration across active audio/video
+// streams; bytes is their combined compressed size. A completed snapshot has
+// buffering=false and progress=1.0. capacityLimited means playback resumed at
+// a hard packet/time/byte bound before the requested duration was available.
+struct QTAV_CORE_EXPORT PacketBufferStatus {
+    bool buffering = false;
+    PacketBufferingReason reason = PacketBufferingReason::None;
+    std::int64_t bufferedMilliseconds = 0;
+    std::int64_t targetMilliseconds = 0;
+    std::uint64_t bufferedBytes = 0;
+    std::uint64_t memoryBufferedBytes = 0;
+    std::uint64_t diskBufferedBytes = 0;
+    std::string diskCachePath;
+    double progress = 1.0;
+    std::uint64_t presentationGeneration = 0;
+    bool capacityLimited = false;
+};
+
 enum class VideoRenderStatus {
     Rendered,
     // No current frame exists, or its presentation generation was invalidated
@@ -70,6 +123,8 @@ class QTAV_CORE_EXPORT Player {
 public:
     using StateCallback = std::function<void(State)>;
     using StatusCallback = std::function<bool(MediaStatus, MediaStatus)>;
+    using PacketBufferStatusCallback =
+        std::function<void(const PacketBufferStatus&)>;
     using EventCallback = std::function<bool(const MediaEvent&)>;
     using PrepareCallback = std::function<void(std::int64_t, bool*)>;
     using SeekCallback = std::function<void(std::int64_t)>;
@@ -130,9 +185,20 @@ public:
     bool setActiveTrack(MediaType type, int track);
     std::int64_t position() const;
     PlaybackStatistics playbackStatistics() const noexcept;
+    Player& setPacketBufferPolicy(PacketBufferPolicy policy);
+    PacketBufferPolicy packetBufferPolicy() const;
+    PacketBufferStatus packetBufferStatus() const;
+    std::string packetDiskCachePath() const;
+    // Synchronously removes the temporary cache. If disk-backed packets are
+    // active, all compressed prefetch is discarded and seekable playback is
+    // restarted from the current position so cleared packets are not skipped.
+    // Returns false without clearing active cache for a non-seekable input.
+    // Do not call this blocking operation from a Player callback.
+    bool clearPacketDiskCache();
 
     Player& onStateChanged(StateCallback callback);
     Player& onMediaStatus(StatusCallback callback);
+    Player& onPacketBufferStatus(PacketBufferStatusCallback callback);
     Player& onEvent(EventCallback callback);
     Player& onVideoFrame(VideoFrameCallback callback);
     Player& onAudioFrame(AudioFrameCallback callback);

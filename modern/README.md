@@ -32,6 +32,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - local files and FFmpeg-supported network protocols, with bounded HTTP(S)
   read timeouts and reconnect defaults that applications can override through
   `avformat.*` properties;
+- bounded time/byte compressed-packet buffering with initial, seek/track, and
+  underflow fill gates plus reason-aware progress/status callbacks;
 - one optional external audio input and one optional external subtitle input,
   merged with the main input on normalized media time and exposed through the
   same asynchronous track-selection contract;
@@ -668,6 +670,83 @@ own start time before demux ordering and frame presentation. If the main input
 does not contain audio or subtitles, the best matching external track becomes
 active automatically. Otherwise the main input keeps best-stream priority and
 the application can select a sidecar with `setActiveTrack()`.
+
+### Packet buffering
+
+`PacketBufferPolicy` controls a bounded compressed-packet reservoir in front
+of the independent audio/video decoders. The default waits for 500 ms from
+each active A/V stream before initial playback, refills to 750 ms after a
+confirmed 120 ms underflow, and caps the in-memory portion of each stream at
+five seconds, the combined in-memory compressed payload at 32 MiB, and each
+in-memory decoder queue at 128 packets. Both memory limits are public through
+`maximumBufferMilliseconds` and `maximumBufferBytes`. The setter normalizes
+negative durations to zero and restores the default byte limit when it is
+zero. Set `enabled = false`, or set the applicable fill target to zero, to
+bypass the corresponding fill gate.
+
+```cpp
+qtav::PacketBufferPolicy buffering;
+buffering.initialBufferMilliseconds = 1'000;
+buffering.rebufferMilliseconds = 1'500;
+buffering.maximumBufferMilliseconds = 8'000;
+buffering.maximumBufferBytes = 48U * 1024U * 1024U;
+buffering.diskCache.enabled = true;
+buffering.diskCache.maximumCacheMilliseconds = 60'000;
+buffering.diskCache.maximumCacheBytes = 256U * 1024U * 1024U;
+
+player
+    .setPacketBufferPolicy(buffering)
+    .onPacketBufferStatus([](const qtav::PacketBufferStatus& status) {
+        update_buffer_ui(
+            status.buffering,
+            status.progress,
+            status.bufferedMilliseconds,
+            status.bufferedBytes);
+    });
+```
+
+The optional `PacketDiskCachePolicy` is disabled by default. When enabled,
+packets that no longer fit in the memory duration, byte, or 128-packet limits
+spill into one bounded file under a player-specific directory in the system
+temporary folder. Its defaults are 60 seconds per stream and 256 MiB combined.
+The on-disk log compacts live entries before its configured byte boundary, and
+the file plus its directory are removed automatically when the disk-backed
+queue becomes empty, on seek, stop, media replacement, or player destruction.
+This is volatile prefetch, not a persistent download or offline-media cache;
+the temporary payload is not encrypted by QtAVCore.
+
+If a fill target is larger than the configured memory duration, enabling the
+disk cache raises its normalized duration enough for the combined reservoir to
+reach that target. With disk caching disabled, the memory duration retains the
+previous behavior and is raised instead. A zero disk byte limit restores the
+256 MiB default.
+
+`PacketBufferStatus::bufferedMilliseconds` is the minimum usable duration
+across selected audio/video streams, not their sum; `bufferedBytes` is the
+combined compressed size across both storage tiers. `memoryBufferedBytes` and
+`diskBufferedBytes` split that total, while `diskCachePath` and
+`packetDiskCachePath()` expose the current volatile file path. `reason`
+distinguishes initial playback, seek, track switch, and runtime underflow, and
+`presentationGeneration` rejects stale UI updates. Playback is released when
+every active stream reaches its target or EOF. If the fixed packet, duration,
+or byte capacity is reached first, the completed snapshot sets
+`capacityLimited` instead of deadlocking the interleaved demuxer behind one
+full stream. Progress callbacks are coalesced at approximately one-percentage-
+point changes and always report start, completion, and cancellation.
+
+`clearPacketDiskCache()` removes the cache synchronously. During seekable
+playback it also discards the in-memory compressed prefetch and requests a
+keyframe seek from the current position, because the demuxer may already be
+ahead of packets just removed from disk. It returns false without changing an
+active non-seekable input; stop that input first if its cache must be cleared.
+
+Packet buffering changes `MediaStatus` to `Buffering` and freezes playback
+time until output from the released generation really resumes. The same media
+status is also used for audio-device clock re-anchoring, so use the packet
+status callback when a UI needs packet-specific progress. This policy does not
+drop compressed packets or decoded frames, choose an adaptive bitrate, or
+retry failed network I/O; low-latency dropping and recoverable network errors
+remain separate policies.
 
 `onSubtitleFrame()` publishes decoded UTF-8 plain text for FFmpeg text and
 ASS/SSA subtitle decoders. ASS event fields and override blocks are removed
@@ -1321,9 +1400,11 @@ Passing an empty `std::shared_ptr` removes the renderer for that key. The
 existing `setVideoRenderer()` callback remains available and is used when no
 `VideoRenderAPI` is registered for the requested key.
 
-State/status callbacks are normally invoked from the playback worker. The
-playback worker demuxes selected packets and decodes the comparatively light
-subtitle packets; independent audio- and video-decode workers prevent codec
+State/status callbacks are normally invoked from the playback worker; a
+confirmed packet underflow can also publish buffering status from the starving
+audio/video decode worker. The packet-buffer callback follows the same rule.
+The playback worker demuxes selected packets and decodes the comparatively
+light subtitle packets; independent audio- and video-decode workers prevent codec
 work or output backpressure on one A/V stream from starving the other. Decoded
 audio/video/subtitle frame notifications and `setRenderCallback()` run on a
 separate presentation worker, so a slow application redraw path cannot stall
@@ -1384,7 +1465,8 @@ freeze the fallback clock until the device clock re-anchors. Queue invalidation
 in the public `seek()` call does not wait for the presentation or audio workers
 to release their queue locks. HTTP(S) inputs additionally use a 15-second read
 timeout and bounded FFmpeg reconnect defaults, all overridable through
-`avformat.*`; this is not yet a general adaptive/live packet-buffer policy.
+`avformat.*`. Those FFmpeg protocol options remain distinct from the packet
+reservoir and are not yet a general recoverable-error policy.
 
 ### CPU image-buffer renderer
 
