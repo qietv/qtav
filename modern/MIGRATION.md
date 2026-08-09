@@ -39,6 +39,7 @@ those identifiers from the active headers.
 | renderer paint method | normally owned by a high-level output; reason-aware `renderVideoDetailed()` or compatibility `renderVideo()` plus `VideoRenderAPI` for external-context integration |
 | `AudioOutput` | `onAudioFrame()` and optional `setAudioSink()` |
 | `setAudioStream()`, `setVideoStream()`, `setSubtitleStream()` | `setActiveTrack(MediaType, TrackInfo::index)` after load; `-1` disables a type |
+| `setExternalAudio()` and application-managed external subtitles | `setExternalMedia(MediaType::Audio/Subtitle, url)` before or during playback; select discovered sidecar tracks through `setActiveTrack()` |
 | `internalSubtitlePacketRead()` / `PlayerSubtitle` plain text | `onSubtitleFrame()` with a presentation-timed `SubtitleFrame`; optional styled text rasterization through `QtAV::SubtitleLibass` |
 | `QThread` playback workers | standard C++ demux, independent audio/video decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
@@ -68,6 +69,8 @@ already own a graphics context or require multiple/custom render targets:
 - FFmpeg protocol and demux support;
 - best-stream audio/video/subtitle selection and asynchronous post-load track
   switching that preserves position and play/pause intent;
+- external audio/subtitle inputs merged into `MediaInfo::tracks`; external
+  selector IDs are distinct from their per-source `TrackInfo::streamIndex`;
 - FFmpeg send/receive software decoding;
 - decoded video, audio, and plain-text subtitle frame callbacks with retained
   ASS/SSA event/header data for optional styled rendering;

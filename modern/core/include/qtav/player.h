@@ -100,6 +100,14 @@ public:
     void setMedia(std::string url);
     std::string url() const;
 
+    // Configures one external audio or subtitle input. An empty URL removes
+    // that input. The configuration persists across setMedia() calls. If
+    // media is loaded, changing it asynchronously reopens the current main
+    // input at the current position while preserving play/pause intent.
+    // Returns false for media types other than Audio and Subtitle.
+    bool setExternalMedia(MediaType type, std::string url);
+    std::string externalMedia(MediaType type) const;
+
     void prepare(
         std::int64_t startPosition = 0,
         PrepareCallback callback = {},

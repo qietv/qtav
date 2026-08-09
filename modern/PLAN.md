@@ -900,10 +900,10 @@ through `OMX.hisi.video.decoder.vvc` before passing its lifecycle and forced-
 software-fallback matrix. Remaining strict OHOS Vulkan raw-plane/Dolby Vision
 precision work is device-gated on a non-opaque multi-plane format. Milestone
 9 active audio/video/subtitle track switching, FFmpeg subtitle packet decode,
-the presentation-timed plain-text callback, and the optional libass renderer
-are complete. The next local implementation task is external audio and
-subtitle sources; do not claim the device-gated strict Vulkan item complete
-without suitable hardware.
+the presentation-timed plain-text callback, the optional libass renderer, and
+external audio/subtitle sidecars are complete. The next local implementation
+task is packet buffering policy and buffering status; do not claim the device-
+gated strict Vulkan item complete without suitable hardware.
 
 AD-010 Windows visible-copy checkpoint:
 
@@ -3172,7 +3172,40 @@ Completed libass checkpoint on 2026-08-09:
   against repository dependency packages; the OHOS install exports the new
   target.
 
-- [ ] External audio and subtitle sources.
+- [x] External audio and subtitle sources.
+
+Completed external-source checkpoint on 2026-08-09:
+
+- `Player::setExternalMedia()` configures one persistent audio and one
+  persistent subtitle sidecar, accepts runtime removal/replacement through an
+  asynchronous position-preserving reopen, and keeps the main input as the
+  duration/range/end-of-media authority;
+- `MediaInfo::tracks` combines main and external tracks in one stable selector
+  namespace. Main `TrackInfo::index` values retain their container stream
+  indices, while sidecars expose distinct selector IDs plus their actual
+  `streamIndex`, `sourceUrl`, and `external` identity;
+- the control worker timestamp-orders selected packets from the main, external
+  audio, and external subtitle demuxers after normalizing each input's own
+  start time. Seek, loop, track switching, media replacement, automatic best-
+  sidecar selection, generation invalidation, and audio-format renegotiation
+  share the existing lifecycle boundary;
+- deterministic coverage verifies internal-to-external audio/subtitle
+  switching, seek, runtime sidecar removal with internal fallback, and the
+  no-primary-decoder case. The latter also fixed a presentation startup edge:
+  subtitles no longer claim the first audio/video output clock slot or cause
+  the priming audio frame to be discarded;
+- all five supplied Opus sidecars and all five UTF-8 SRT sidecars under
+  `build/test-media/external-tracks/` pass with `video_only.mp4`, including
+  automatic external-track activation and callback identity checks;
+- Windows Visual Studio 2026 Release static/shared matrices pass 42/42.
+  Android arm64/API 28 and OHOS arm64/API 23 static Core cross-builds pass;
+  Windows static/shared installs export the API and their matching ClangCL
+  external consumers link and run. A stale MSVC static all-backends consumer
+  configuration still reproduces its FFmpeg archive/link-order failure
+  (`avutil.lib` LNK1136 plus unresolved FFmpeg symbols); the in-tree MSVC
+  static matrix links the same dependency package successfully, so this is
+  not counted as an external-source implementation failure.
+
 - [ ] Packet buffering policy and buffering status.
 - [ ] Low-latency/live-stream drop policy.
 - [ ] Reconnect and recoverable network errors.

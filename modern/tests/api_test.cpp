@@ -11,6 +11,11 @@ int main()
     assert(player.state() == qtav::State::Stopped);
     assert(player.mediaStatus() == qtav::MediaStatus::NoMedia);
     assert(player.position() == 0);
+    assert(!player.setExternalMedia(qtav::MediaType::Video, "video.mp4"));
+    assert(player.setExternalMedia(qtav::MediaType::Audio, "audio.opus"));
+    assert(player.setExternalMedia(qtav::MediaType::Subtitle, "subtitle.srt"));
+    assert(player.externalMedia(qtav::MediaType::Audio) == "audio.opus");
+    assert(player.externalMedia(qtav::MediaType::Subtitle) == "subtitle.srt");
 
     qtav::VideoColorSpace color;
     assert(!color.isSpecified());

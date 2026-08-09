@@ -333,11 +333,20 @@ public:
         avformat_network_deinit();
     }
 
+    enum class InputSource {
+        Primary,
+        ExternalAudio,
+        ExternalSubtitle,
+    };
+
     struct Decoder {
         AVCodecContext* context = nullptr;
         std::shared_ptr<AVCodecContext> contextLifetime;
         AVStream* stream = nullptr;
         int streamIndex = -1;
+        int trackIndex = -1;
+        std::int64_t startTimeUs = 0;
+        InputSource source = InputSource::Primary;
         MediaType type = MediaType::Unknown;
         HardwareDeviceType hardwareDeviceType = HardwareDeviceType::Unknown;
         AVPixelFormat hardwarePixelFormat = AV_PIX_FMT_NONE;
@@ -376,6 +385,9 @@ public:
             contextLifetime.reset();
             stream = nullptr;
             streamIndex = -1;
+            trackIndex = -1;
+            startTimeUs = 0;
+            source = InputSource::Primary;
             type = MediaType::Unknown;
             hardwareDeviceType = HardwareDeviceType::Unknown;
             hardwarePixelFormat = AV_PIX_FMT_NONE;
@@ -398,6 +410,9 @@ public:
             swap(contextLifetime, other.contextLifetime);
             swap(stream, other.stream);
             swap(streamIndex, other.streamIndex);
+            swap(trackIndex, other.trackIndex);
+            swap(startTimeUs, other.startTimeUs);
+            swap(source, other.source);
             swap(type, other.type);
             swap(hardwareDeviceType, other.hardwareDeviceType);
             swap(hardwarePixelFormat, other.hardwarePixelFormat);
@@ -426,8 +441,52 @@ public:
         std::uint64_t epoch = 0;
     };
 
+    struct DemuxState {
+        std::shared_ptr<AVPacket> pendingPacket;
+        std::int64_t pendingTimestamp = 0;
+        bool end = false;
+
+        void reset()
+        {
+            pendingPacket.reset();
+            pendingTimestamp = 0;
+            end = false;
+        }
+    };
+
+    struct ExternalInput {
+        AVFormatContext* format = nullptr;
+        std::string url;
+        std::int64_t startTimeUs = 0;
+        DemuxState demux;
+
+        void resetDemux()
+        {
+            demux.reset();
+        }
+
+        void reset()
+        {
+            resetDemux();
+            avformat_close_input(&format);
+            url.clear();
+            startTimeUs = 0;
+        }
+    };
+
+    struct TrackSource {
+        int index = -1;
+        MediaType type = MediaType::Unknown;
+        InputSource source = InputSource::Primary;
+        int streamIndex = -1;
+    };
+
     struct MediaContext {
         AVFormatContext* format = nullptr;
+        DemuxState demux;
+        ExternalInput externalAudio;
+        ExternalInput externalSubtitle;
+        std::vector<TrackSource> tracks;
         Decoder video;
         Decoder audio;
         Decoder subtitle;
@@ -438,6 +497,10 @@ public:
             video.reset();
             audio.reset();
             subtitle.reset();
+            tracks.clear();
+            demux.reset();
+            externalAudio.reset();
+            externalSubtitle.reset();
             avformat_close_input(&format);
             startTimeUs = 0;
         }
@@ -544,6 +607,57 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return url_;
+    }
+
+    bool setExternalMedia(MediaType type, std::string value)
+    {
+        if (type != MediaType::Audio && type != MediaType::Subtitle) {
+            return false;
+        }
+
+        const auto reopenPosition = position();
+        bool reopen = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto& configured = type == MediaType::Audio
+                ? externalAudioUrl_
+                : externalSubtitleUrl_;
+            if (configured == value) {
+                return true;
+            }
+            configured = std::move(value);
+            if (!url_.empty() && requestedState_ != State::Stopped) {
+                ++mediaSerial_;
+                loadedSerial_ = 0;
+                seekRequest_.reset();
+                trackSwitchRequests_.clear();
+                prepareRequest_ = PrepareRequest {
+                    ++requestSerial_,
+                    reopenPosition,
+                    SeekFlag::KeyFrame,
+                    {},
+                };
+                reopen = true;
+            }
+        }
+        if (reopen) {
+            invalidatePlaybackQueues();
+            interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+            controlChanged_.notify_all();
+        }
+        return true;
+    }
+
+    std::string externalMedia(MediaType type) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (type == MediaType::Audio) {
+            return externalAudioUrl_;
+        }
+        if (type == MediaType::Subtitle) {
+            return externalSubtitleUrl_;
+        }
+        return {};
     }
 
     void prepare(
@@ -1377,6 +1491,101 @@ private:
         return currentState_ == State::Playing;
     }
 
+    int openInput(const std::string& inputUrl, AVFormatContext** output)
+    {
+        if (!output) {
+            return AVERROR(EINVAL);
+        }
+        *output = nullptr;
+        auto* format = avformat_alloc_context();
+        if (!format) {
+            return AVERROR(ENOMEM);
+        }
+        format->interrupt_callback = { &Impl::interruptCallback, &interrupt_ };
+
+        AVDictionary* options = nullptr;
+        applyHttpRecoveryDefaults(inputUrl, &options);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& [key, value] : properties_) {
+                constexpr const char prefix[] = "avformat.";
+                if (key.compare(0, sizeof(prefix) - 1, prefix) == 0) {
+                    av_dict_set(
+                        &options,
+                        key.c_str() + sizeof(prefix) - 1,
+                        value.c_str(),
+                        0);
+                }
+            }
+        }
+
+        int error = avformat_open_input(
+            &format,
+            inputUrl.c_str(),
+            nullptr,
+            &options);
+        av_dict_free(&options);
+        if (error >= 0) {
+            error = avformat_find_stream_info(format, nullptr);
+        }
+        if (error < 0) {
+            avformat_close_input(&format);
+            return error;
+        }
+        *output = format;
+        return 0;
+    }
+
+    AVFormatContext* formatForSource(InputSource source) const noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return media_.format;
+        case InputSource::ExternalAudio:
+            return media_.externalAudio.format;
+        case InputSource::ExternalSubtitle:
+            return media_.externalSubtitle.format;
+        }
+        return nullptr;
+    }
+
+    std::int64_t startTimeForSource(InputSource source) const noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return media_.startTimeUs;
+        case InputSource::ExternalAudio:
+            return media_.externalAudio.startTimeUs;
+        case InputSource::ExternalSubtitle:
+            return media_.externalSubtitle.startTimeUs;
+        }
+        return 0;
+    }
+
+    DemuxState& demuxForSource(InputSource source) noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return media_.demux;
+        case InputSource::ExternalAudio:
+            return media_.externalAudio.demux;
+        case InputSource::ExternalSubtitle:
+            return media_.externalSubtitle.demux;
+        }
+        return media_.demux;
+    }
+
+    const TrackSource* trackSource(int index, MediaType type) const noexcept
+    {
+        const auto found = std::find_if(
+            media_.tracks.begin(),
+            media_.tracks.end(),
+            [index, type](const TrackSource& candidate) {
+                return candidate.index == index && candidate.type == type;
+            });
+        return found == media_.tracks.end() ? nullptr : &*found;
+    }
+
     void openForPlayback(
         std::uint64_t serial,
         const std::string& mediaUrl,
@@ -1397,54 +1606,90 @@ private:
         interrupt_.owner = this;
         interrupt_.epoch = interruptEpoch_.load(std::memory_order_acquire);
 
-        auto* format = avformat_alloc_context();
-        if (!format) {
-            failOpen(AVERROR(ENOMEM), "Could not allocate the FFmpeg format context");
-            return;
-        }
-        format->interrupt_callback = { &Impl::interruptCallback, &interrupt_ };
-
-        AVDictionary* options = nullptr;
-        applyHttpRecoveryDefaults(mediaUrl, &options);
+        std::string externalAudioUrl;
+        std::string externalSubtitleUrl;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [key, value] : properties_) {
-                constexpr const char prefix[] = "avformat.";
-                if (key.compare(0, sizeof(prefix) - 1, prefix) == 0) {
-                    av_dict_set(
-                        &options,
-                        key.c_str() + sizeof(prefix) - 1,
-                        value.c_str(),
-                        0);
-                }
-            }
+            externalAudioUrl = externalAudioUrl_;
+            externalSubtitleUrl = externalSubtitleUrl_;
         }
 
-        int error =
-            avformat_open_input(&format, mediaUrl.c_str(), nullptr, &options);
-        av_dict_free(&options);
+        int error = openInput(mediaUrl, &media_.format);
         if (error < 0) {
-            if (format) {
-                avformat_close_input(&format);
-            }
             if (wasCanceled(serial)) {
                 return;
             }
             failOpen(error, "Could not open media '" + mediaUrl + "'");
             return;
         }
+        media_.startTimeUs =
+            media_.format->start_time == AV_NOPTS_VALUE
+            ? 0
+            : media_.format->start_time;
 
-        media_.format = format;
-        error = avformat_find_stream_info(media_.format, nullptr);
+        const auto openExternal = [&](ExternalInput& input,
+                                      const std::string& inputUrl,
+                                      AVMediaType expectedType,
+                                      const char* description) {
+            if (inputUrl.empty()) {
+                return 0;
+            }
+            const int openError = openInput(inputUrl, &input.format);
+            if (openError < 0) {
+                return openError;
+            }
+            input.url = inputUrl;
+            input.startTimeUs =
+                input.format->start_time == AV_NOPTS_VALUE
+                ? 0
+                : input.format->start_time;
+            const AVCodec* decoder = nullptr;
+            const int stream = av_find_best_stream(
+                input.format,
+                expectedType,
+                -1,
+                -1,
+                &decoder,
+                0);
+            if (stream < 0 || !decoder) {
+                publishEvent({
+                    "external.error",
+                    std::string(description) + " '" + inputUrl
+                        + "' contains no supported "
+                        + (expectedType == AVMEDIA_TYPE_AUDIO
+                                ? "audio"
+                                : "subtitle")
+                        + " track",
+                    stream,
+                });
+                return stream;
+            }
+            return 0;
+        };
+
+        error = openExternal(
+            media_.externalAudio,
+            externalAudioUrl,
+            AVMEDIA_TYPE_AUDIO,
+            "External audio input");
+        if (error >= 0) {
+            error = openExternal(
+                media_.externalSubtitle,
+                externalSubtitleUrl,
+                AVMEDIA_TYPE_SUBTITLE,
+                "External subtitle input");
+        }
         if (error < 0) {
             if (wasCanceled(serial)) {
                 media_.reset();
                 return;
             }
-            failOpen(error, "Could not read media stream information");
+            failOpen(error, "Could not open the configured external media");
             media_.reset();
             return;
         }
+
+        auto info = buildMediaInfo(mediaUrl);
 
         HardwareDecodeConfig hardwareDecodeConfig;
         {
@@ -1452,11 +1697,28 @@ private:
             hardwareDecodeConfig = hardwareDecodeConfig_;
         }
         openBestDecoder(
+            InputSource::Primary,
             AVMEDIA_TYPE_VIDEO,
             media_.video,
             hardwareDecodeConfig);
-        openBestDecoder(AVMEDIA_TYPE_AUDIO, media_.audio);
-        openBestDecoder(AVMEDIA_TYPE_SUBTITLE, media_.subtitle);
+        if (!openBestDecoder(
+                InputSource::Primary,
+                AVMEDIA_TYPE_AUDIO,
+                media_.audio)) {
+            openBestDecoder(
+                InputSource::ExternalAudio,
+                AVMEDIA_TYPE_AUDIO,
+                media_.audio);
+        }
+        if (!openBestDecoder(
+                InputSource::Primary,
+                AVMEDIA_TYPE_SUBTITLE,
+                media_.subtitle)) {
+            openBestDecoder(
+                InputSource::ExternalSubtitle,
+                AVMEDIA_TYPE_SUBTITLE,
+                media_.subtitle);
+        }
         if (!media_.video.valid() && !media_.audio.valid()) {
             failOpen(
                 AVERROR_DECODER_NOT_FOUND,
@@ -1465,11 +1727,9 @@ private:
             return;
         }
 
-        const auto info = buildMediaInfo(mediaUrl);
-        media_.startTimeUs =
-            media_.format->start_time == AV_NOPTS_VALUE
-            ? 0
-            : media_.format->start_time;
+        info.activeVideoTrack = media_.video.trackIndex;
+        info.activeAudioTrack = media_.audio.trackIndex;
+        info.activeSubtitleTrack = media_.subtitle.trackIndex;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1528,29 +1788,34 @@ private:
     }
 
     bool openBestDecoder(
+        InputSource source,
         AVMediaType type,
         Decoder& result,
         HardwareDecodeConfig hardwareDecodeConfig = {},
-        int requestedStreamIndex = -1)
+        int requestedStreamIndex = -1,
+        int requestedTrackIndex = -1)
     {
         result.reset();
+        auto* format = formatForSource(source);
+        if (!format) {
+            return false;
+        }
         const AVCodec* softwareDecoder = nullptr;
         int streamIndex = requestedStreamIndex;
         if (requestedStreamIndex >= 0) {
-            if (!media_.format
-                || static_cast<unsigned>(requestedStreamIndex)
-                    >= media_.format->nb_streams
-                || media_.format->streams[requestedStreamIndex]
+            if (static_cast<unsigned>(requestedStreamIndex)
+                    >= format->nb_streams
+                || format->streams[requestedStreamIndex]
                         ->codecpar->codec_type
                     != type) {
                 return false;
             }
             softwareDecoder = avcodec_find_decoder(
-                media_.format->streams[requestedStreamIndex]
+                format->streams[requestedStreamIndex]
                     ->codecpar->codec_id);
         } else {
             streamIndex = av_find_best_stream(
-                media_.format,
+                format,
                 type,
                 -1,
                 -1,
@@ -1561,7 +1826,7 @@ private:
             return false;
         }
 
-        auto* stream = media_.format->streams[streamIndex];
+        auto* stream = format->streams[streamIndex];
         const auto requestedDevice =
             type == AVMEDIA_TYPE_VIDEO
             ? hardwareDecodeConfig.deviceType
@@ -1729,11 +1994,30 @@ private:
         result.context = result.contextLifetime.get();
         result.stream = stream;
         result.streamIndex = streamIndex;
+        result.source = source;
+        result.startTimeUs = startTimeForSource(source);
+        if (requestedTrackIndex >= 0) {
+            result.trackIndex = requestedTrackIndex;
+        } else {
+            const auto found = std::find_if(
+                media_.tracks.begin(),
+                media_.tracks.end(),
+                [source, streamIndex, type](const TrackSource& candidate) {
+                    return candidate.source == source
+                        && candidate.streamIndex == streamIndex
+                        && candidate.type == mediaTypeFromFFmpeg(type);
+                });
+            if (found == media_.tracks.end()) {
+                result.reset();
+                return false;
+            }
+            result.trackIndex = found->index;
+        }
         result.type = mediaTypeFromFFmpeg(type);
         return true;
     }
 
-    MediaInfo buildMediaInfo(const std::string& mediaUrl) const
+    MediaInfo buildMediaInfo(const std::string& mediaUrl)
     {
         MediaInfo result;
         result.url = mediaUrl;
@@ -1748,17 +2032,31 @@ private:
         result.seekable =
             !media_.format->pb
             || (media_.format->pb->seekable & AVIO_SEEKABLE_NORMAL) != 0;
-        result.activeVideoTrack = media_.video.streamIndex;
-        result.activeAudioTrack = media_.audio.streamIndex;
-        result.activeSubtitleTrack = media_.subtitle.streamIndex;
+        const auto externalAudioStreams = media_.externalAudio.format
+            ? media_.externalAudio.format->nb_streams
+            : 0;
+        const auto externalSubtitleStreams = media_.externalSubtitle.format
+            ? media_.externalSubtitle.format->nb_streams
+            : 0;
+        result.tracks.reserve(
+            media_.format->nb_streams + externalAudioStreams
+            + externalSubtitleStreams);
+        media_.tracks.clear();
+        media_.tracks.reserve(result.tracks.capacity());
 
-        result.tracks.reserve(media_.format->nb_streams);
-        for (unsigned index = 0; index < media_.format->nb_streams; ++index) {
-            const auto* stream = media_.format->streams[index];
+        const auto appendTrack = [&](AVStream* stream,
+                                     int index,
+                                     int streamIndex,
+                                     InputSource source,
+                                     const std::string& sourceUrl,
+                                     bool external) {
             const auto* parameters = stream->codecpar;
             TrackInfo track;
-            track.index = static_cast<int>(index);
+            track.index = index;
+            track.streamIndex = streamIndex;
             track.type = mediaTypeFromFFmpeg(parameters->codec_type);
+            track.sourceUrl = sourceUrl;
+            track.external = external;
             track.codec = avcodec_get_name(parameters->codec_id);
             if (const auto* descriptor =
                     avcodec_descriptor_get(parameters->codec_id)) {
@@ -1772,8 +2070,57 @@ private:
             track.height = parameters->height;
             track.sampleRate = parameters->sample_rate;
             track.channels = parameters->ch_layout.nb_channels;
+            media_.tracks.push_back({
+                track.index,
+                track.type,
+                source,
+                track.streamIndex,
+            });
             result.tracks.push_back(std::move(track));
+        };
+
+        for (unsigned index = 0; index < media_.format->nb_streams; ++index) {
+            appendTrack(
+                media_.format->streams[index],
+                static_cast<int>(index),
+                static_cast<int>(index),
+                InputSource::Primary,
+                mediaUrl,
+                false);
         }
+
+        int nextIndex = static_cast<int>(media_.format->nb_streams);
+        const auto appendExternal = [&](const ExternalInput& input,
+                                        InputSource source,
+                                        MediaType expectedType) {
+            if (!input.format) {
+                return;
+            }
+            for (unsigned streamIndex = 0;
+                 streamIndex < input.format->nb_streams;
+                 ++streamIndex) {
+                auto* stream = input.format->streams[streamIndex];
+                if (mediaTypeFromFFmpeg(stream->codecpar->codec_type)
+                    != expectedType) {
+                    continue;
+                }
+                appendTrack(
+                    stream,
+                    nextIndex++,
+                    static_cast<int>(streamIndex),
+                    source,
+                    input.url,
+                    true);
+            }
+        };
+        appendExternal(
+            media_.externalAudio,
+            InputSource::ExternalAudio,
+            MediaType::Audio);
+        appendExternal(
+            media_.externalSubtitle,
+            InputSource::ExternalSubtitle,
+            MediaType::Subtitle);
         return result;
     }
 
@@ -1812,6 +2159,17 @@ private:
 
         Decoder replacement;
         if (request.track >= 0) {
+            const auto* selected = trackSource(request.track, request.type);
+            if (!selected) {
+                publishEvent({
+                    "track.error",
+                    "Could not resolve "
+                        + std::string(typeName(request.type)) + " track "
+                        + std::to_string(request.track),
+                    AVERROR_STREAM_NOT_FOUND,
+                });
+                return;
+            }
             HardwareDecodeConfig hardwareDecodeConfig;
             if (request.type == MediaType::Video) {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1824,10 +2182,12 @@ private:
                 ffmpegType = AVMEDIA_TYPE_VIDEO;
             }
             if (!openBestDecoder(
+                    selected->source,
                     ffmpegType,
                     replacement,
                     hardwareDecodeConfig,
-                    request.track)) {
+                    selected->streamIndex,
+                    selected->index)) {
                 publishEvent({
                     "track.error",
                     "Could not open " + std::string(typeName(request.type))
@@ -1883,6 +2243,9 @@ private:
         if (seekable) {
             seekError = seekMedia(request.position, SeekFlag::KeyFrame);
         } else {
+            media_.demux.reset();
+            media_.externalAudio.resetDemux();
+            media_.externalSubtitle.resetDemux();
             if (media_.video.valid()) {
                 avcodec_flush_buffers(media_.video.context);
             }
@@ -2003,8 +2366,6 @@ private:
         }
 
         interrupt_.epoch = interruptEpoch_.load(std::memory_order_acquire);
-        const auto timestamp =
-            media_.startTimeUs + targetMs * static_cast<std::int64_t>(1000);
         int ffmpegFlags = AVSEEK_FLAG_BACKWARD;
         if (hasFlag(flags, SeekFlag::AnyFrame)) {
             ffmpegFlags |= AVSEEK_FLAG_ANY;
@@ -2013,13 +2374,39 @@ private:
             ffmpegFlags &= ~AVSEEK_FLAG_BACKWARD;
         }
 
-        const int error = avformat_seek_file(
-            media_.format,
-            -1,
-            std::numeric_limits<std::int64_t>::min(),
-            timestamp,
-            std::numeric_limits<std::int64_t>::max(),
-            ffmpegFlags);
+        media_.demux.reset();
+        media_.externalAudio.resetDemux();
+        media_.externalSubtitle.resetDemux();
+
+        const auto sourceIsActive = [&](InputSource source) {
+            return (media_.video.valid() && media_.video.source == source)
+                || (media_.audio.valid() && media_.audio.source == source)
+                || (media_.subtitle.valid()
+                    && media_.subtitle.source == source);
+        };
+        const auto seekSource = [&](InputSource source) {
+            auto* format = formatForSource(source);
+            if (!format) {
+                return AVERROR(EINVAL);
+            }
+            const auto timestamp = startTimeForSource(source)
+                + targetMs * static_cast<std::int64_t>(1000);
+            return avformat_seek_file(
+                format,
+                -1,
+                std::numeric_limits<std::int64_t>::min(),
+                timestamp,
+                std::numeric_limits<std::int64_t>::max(),
+                ffmpegFlags);
+        };
+
+        int error = seekSource(InputSource::Primary);
+        if (error >= 0 && sourceIsActive(InputSource::ExternalAudio)) {
+            error = seekSource(InputSource::ExternalAudio);
+        }
+        if (error >= 0 && sourceIsActive(InputSource::ExternalSubtitle)) {
+            error = seekSource(InputSource::ExternalSubtitle);
+        }
         if (error < 0) {
             bool publishLoaded = false;
             {
@@ -2058,8 +2445,67 @@ private:
         Error,
     };
 
-    DecodeResult readAndDecodeOnePacket()
+    enum class InputReadResult {
+        Ready,
+        End,
+        Error,
+    };
+
+    bool sourceIsActive(InputSource source) const noexcept
     {
+        if (source == InputSource::Primary && media_.format) {
+            // The main input remains the duration/end-of-media authority even
+            // when every selected decoder reads from a sidecar (for example,
+            // an audio-only main input with external audio selected).
+            return true;
+        }
+        return (media_.video.valid() && media_.video.source == source)
+            || (media_.audio.valid() && media_.audio.source == source)
+            || (media_.subtitle.valid()
+                && media_.subtitle.source == source);
+    }
+
+    bool selectedStream(InputSource source, int streamIndex) const noexcept
+    {
+        const bool selected =
+            (media_.video.valid() && media_.video.source == source
+                && media_.video.streamIndex == streamIndex)
+            || (media_.audio.valid() && media_.audio.source == source
+                && media_.audio.streamIndex == streamIndex)
+            || (media_.subtitle.valid()
+                && media_.subtitle.source == source
+                && media_.subtitle.streamIndex == streamIndex);
+        if (selected || source != InputSource::Primary) {
+            return selected;
+        }
+        const bool hasPrimaryDecoder =
+            (media_.video.valid()
+             && media_.video.source == InputSource::Primary)
+            || (media_.audio.valid()
+                && media_.audio.source == InputSource::Primary)
+            || (media_.subtitle.valid()
+                && media_.subtitle.source == InputSource::Primary);
+        return !hasPrimaryDecoder;
+    }
+
+    InputReadResult ensureDemuxPacket(InputSource source)
+    {
+        auto& demux = demuxForSource(source);
+        if (!sourceIsActive(source)) {
+            demux.reset();
+            return InputReadResult::End;
+        }
+        if (demux.pendingPacket) {
+            return InputReadResult::Ready;
+        }
+        if (demux.end) {
+            return InputReadResult::End;
+        }
+
+        auto* format = formatForSource(source);
+        if (!format) {
+            return InputReadResult::End;
+        }
         AVPacket* packet = av_packet_alloc();
         if (!packet) {
             publishEvent({
@@ -2067,12 +2513,121 @@ private:
                 "Could not allocate an FFmpeg packet",
                 AVERROR(ENOMEM),
             });
-            return DecodeResult::Error;
+            return InputReadResult::Error;
         }
 
-        const int error = av_read_frame(media_.format, packet);
-        if (error == AVERROR_EOF) {
-            av_packet_free(&packet);
+        while (true) {
+            const int error = av_read_frame(format, packet);
+            if (error == AVERROR_EOF) {
+                av_packet_free(&packet);
+                demux.end = true;
+                return InputReadResult::End;
+            }
+            if (error < 0) {
+                av_packet_free(&packet);
+                if (error != AVERROR_EXIT) {
+                    const char* input = source == InputSource::Primary
+                        ? "main"
+                        : source == InputSource::ExternalAudio
+                            ? "external audio"
+                            : "external subtitle";
+                    publishEvent({
+                        "reader.error",
+                        "Could not read " + std::string(input)
+                            + " packet: " + ffmpegError(error),
+                        error,
+                    });
+                }
+                return InputReadResult::Error;
+            }
+            if (!selectedStream(source, packet->stream_index)) {
+                av_packet_unref(packet);
+                continue;
+            }
+
+            const auto* stream = format->streams[packet->stream_index];
+            const auto packetTimestamp = packet->dts != AV_NOPTS_VALUE
+                ? packet->dts
+                : packet->pts;
+            demux.pendingTimestamp = packetTimestamp == AV_NOPTS_VALUE
+                ? std::numeric_limits<std::int64_t>::min()
+                : (av_rescale_q(
+                       packetTimestamp,
+                       stream->time_base,
+                       AV_TIME_BASE_Q)
+                    - startTimeForSource(source))
+                    / 1000;
+            demux.pendingPacket = std::shared_ptr<AVPacket>(
+                packet,
+                [](AVPacket* owned) { av_packet_free(&owned); });
+            return InputReadResult::Ready;
+        }
+    }
+
+    DecodeResult readAndDecodeOnePacket()
+    {
+        const InputSource sources[] = {
+            InputSource::Primary,
+            InputSource::ExternalAudio,
+            InputSource::ExternalSubtitle,
+        };
+        InputSource selectedSource = InputSource::Primary;
+        bool hasPacket = false;
+        std::int64_t selectedTimestamp =
+            std::numeric_limits<std::int64_t>::max();
+        for (const auto source : sources) {
+            const auto result = ensureDemuxPacket(source);
+            if (result == InputReadResult::Error) {
+                return DecodeResult::Error;
+            }
+            auto& demux = demuxForSource(source);
+            if (result == InputReadResult::Ready
+                && (!hasPacket
+                    || demux.pendingTimestamp < selectedTimestamp)) {
+                hasPacket = true;
+                selectedSource = source;
+                selectedTimestamp = demux.pendingTimestamp;
+            }
+        }
+
+        if (media_.demux.end) {
+            std::int64_t duration = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                duration = mediaInfo_.duration;
+            }
+            if (duration > 0) {
+                for (const auto source : {
+                         InputSource::ExternalAudio,
+                         InputSource::ExternalSubtitle,
+                     }) {
+                    auto& demux = demuxForSource(source);
+                    if (demux.pendingPacket
+                        && demux.pendingTimestamp > duration) {
+                        demux.pendingPacket.reset();
+                        demux.end = true;
+                        if (selectedSource == source) {
+                            hasPacket = false;
+                        }
+                    }
+                }
+                if (!hasPacket) {
+                    for (const auto source : sources) {
+                        auto& demux = demuxForSource(source);
+                        if (demux.pendingPacket
+                            && (!hasPacket
+                                || demux.pendingTimestamp
+                                    < selectedTimestamp)) {
+                            hasPacket = true;
+                            selectedSource = source;
+                            selectedTimestamp = demux.pendingTimestamp;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!hasPacket) {
             const auto generation =
                 presentationGeneration_.load(std::memory_order_acquire);
             if (!finishQueuedDecoding(generation)) {
@@ -2080,21 +2635,15 @@ private:
             }
             return DecodeResult::End;
         }
-        if (error < 0) {
-            av_packet_free(&packet);
-            if (error != AVERROR_EXIT) {
-                publishEvent({
-                    "reader.error",
-                    "Could not read media packet: " + ffmpegError(error),
-                    error,
-                });
-            }
-            return DecodeResult::Error;
-        }
+
+        auto& selectedDemux = demuxForSource(selectedSource);
+        auto packet = std::move(selectedDemux.pendingPacket);
 
         bool ok = true;
-        if (packet->stream_index == media_.video.streamIndex) {
-            AVPacket* copy = av_packet_clone(packet);
+        if (media_.video.valid()
+            && media_.video.source == selectedSource
+            && packet->stream_index == media_.video.streamIndex) {
+            AVPacket* copy = av_packet_clone(packet.get());
             if (!copy) {
                 ok = false;
             } else {
@@ -2109,8 +2658,10 @@ private:
                         std::memory_order_acquire),
                     false);
             }
-        } else if (packet->stream_index == media_.audio.streamIndex) {
-            AVPacket* copy = av_packet_clone(packet);
+        } else if (media_.audio.valid()
+                   && media_.audio.source == selectedSource
+                   && packet->stream_index == media_.audio.streamIndex) {
+            AVPacket* copy = av_packet_clone(packet.get());
             if (!copy) {
                 ok = false;
             } else {
@@ -2125,13 +2676,14 @@ private:
                         std::memory_order_acquire),
                     false);
             }
-        } else if (packet->stream_index == media_.subtitle.streamIndex) {
+        } else if (media_.subtitle.valid()
+                   && media_.subtitle.source == selectedSource
+                   && packet->stream_index == media_.subtitle.streamIndex) {
             ok = decodeSubtitlePacket(
-                packet,
+                packet.get(),
                 presentationGeneration_.load(
                     std::memory_order_acquire));
         }
-        av_packet_free(&packet);
         {
             std::lock_guard<std::mutex> lock(videoPacketMutex_);
             if (videoDecodeFailed_
@@ -2233,11 +2785,11 @@ private:
                             AV_TIME_BASE_Q);
                     }
                     if (packetPtsUs == AV_NOPTS_VALUE) {
-                        packetPtsUs = media_.startTimeUs;
+                        packetPtsUs = media_.subtitle.startTimeUs;
                     }
                     const auto timestampMs = std::max<std::int64_t>(
                         0,
-                        (packetPtsUs - media_.startTimeUs) / 1000
+                        (packetPtsUs - media_.subtitle.startTimeUs) / 1000
                             + subtitle.start_display_time);
                     std::int64_t durationMs =
                         subtitle.end_display_time
@@ -2279,13 +2831,13 @@ private:
                             timestampMs,
                             durationMs,
                             forced,
-                            media_.subtitle.streamIndex,
+                            media_.subtitle.trackIndex,
                             generation);
                         if (frame) {
                             PresentationItem item;
                             item.type = PresentationItem::Type::Subtitle;
                             item.subtitle = std::move(frame);
-                            item.track = media_.subtitle.streamIndex;
+                            item.track = media_.subtitle.trackIndex;
                             item.generation = generation;
                             enqueuePresentation(std::move(item));
                         }
@@ -2726,7 +3278,9 @@ private:
                 decoder.stream->time_base,
                 AV_TIME_BASE_Q);
             timestampMs =
-                std::max<std::int64_t>(0, (absoluteUs - media_.startTimeUs) / 1000);
+                std::max<std::int64_t>(
+                    0,
+                    (absoluteUs - decoder.startTimeUs) / 1000);
         } else {
             std::lock_guard<std::mutex> lock(mutex_);
             timestampMs = currentPosition_;
@@ -2827,7 +3381,7 @@ private:
                         .count();
                 if (scheduler(
                         video,
-                        decoder.streamIndex,
+                        decoder.trackIndex,
                         deadlineNanoseconds)) {
                     deliveredVideoFrames_.fetch_add(
                         1,
@@ -2849,7 +3403,7 @@ private:
                 {},
                 std::move(video),
                 {},
-                decoder.streamIndex,
+                decoder.trackIndex,
                 generation,
             });
         } else if (decoder.type == MediaType::Audio) {
@@ -2857,7 +3411,7 @@ private:
                 detail::FrameFactory::audio(frame, timestampMs, durationMs);
             return enqueueAudioFrame(
                 std::move(audio),
-                decoder.streamIndex,
+                decoder.trackIndex,
                 generation);
         }
         return true;
@@ -2871,14 +3425,18 @@ private:
 
     bool hasEarlierQueuedPresentation(
         std::int64_t timestamp,
-        std::uint64_t generation) const
+        std::uint64_t generation,
+        bool includeSubtitles) const
     {
         std::lock_guard<std::mutex> lock(presentationMutex_);
         return std::any_of(
             presentationQueue_.begin(),
             presentationQueue_.end(),
-            [timestamp, generation](const PresentationItem& item) {
+            [timestamp, generation, includeSubtitles](
+                const PresentationItem& item) {
                 return item.generation == generation
+                    && (includeSubtitles
+                        || item.type != PresentationItem::Type::Subtitle)
                     && item.timestamp() < timestamp;
             });
     }
@@ -2887,7 +3445,8 @@ private:
         std::int64_t timestampMs,
         std::uint64_t generation,
         bool yieldToEarlierItem = true,
-        bool claimOutputPrime = true)
+        bool claimOutputPrime = true,
+        bool yieldToEarlierSubtitles = true)
     {
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
@@ -2903,7 +3462,8 @@ private:
                 yieldToEarlierItem
                 && hasEarlierQueuedPresentation(
                     timestampMs,
-                    generation);
+                    generation,
+                    yieldToEarlierSubtitles);
             lock.lock();
             if (quitting_.load(std::memory_order_acquire)
                 || generation
@@ -3022,7 +3582,7 @@ private:
             AV_TIME_BASE_Q);
         const auto timestampMs = std::max<std::int64_t>(
             0,
-            (absoluteUs - media_.startTimeUs) / 1000);
+            (absoluteUs - decoder.startTimeUs) / 1000);
 
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
@@ -3231,6 +3791,7 @@ private:
                             queued.frame.timestamp(),
                             queued.generation,
                             true,
+                            false,
                             false)
                         == PresentationWaitResult::Ready;
                 }
@@ -3460,7 +4021,9 @@ private:
 
             const auto waitResult = waitUntilPresentation(
                 item.timestamp(),
-                item.generation);
+                item.generation,
+                true,
+                item.type != PresentationItem::Type::Subtitle);
             if (waitResult
                 == PresentationWaitResult::EarlierItemQueued) {
                 enqueuePresentation(std::move(item));
@@ -4688,6 +5251,8 @@ private:
     bool hasOpenMedia_ = false;
     std::atomic<bool> reachedRangeEnd_ { false };
     std::string url_;
+    std::string externalAudioUrl_;
+    std::string externalSubtitleUrl_;
     std::uint64_t mediaSerial_ = 1;
     std::uint64_t loadedSerial_ = 0;
     std::uint64_t requestSerial_ = 0;
@@ -4758,6 +5323,16 @@ void Player::setMedia(std::string url)
 std::string Player::url() const
 {
     return impl_->url();
+}
+
+bool Player::setExternalMedia(MediaType type, std::string url)
+{
+    return impl_->setExternalMedia(type, std::move(url));
+}
+
+std::string Player::externalMedia(MediaType type) const
+{
+    return impl_->externalMedia(type);
 }
 
 void Player::prepare(

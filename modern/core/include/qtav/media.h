@@ -59,8 +59,16 @@ constexpr bool hasFlag(SeekFlag value, SeekFlag flag) noexcept
 }
 
 struct QTAV_CORE_EXPORT TrackInfo {
+    // Stable selector within the current MediaInfo snapshot. Main-input
+    // tracks retain their FFmpeg stream index; external tracks are assigned
+    // non-overlapping values after the main input's stream range.
     int index = -1;
+    // Stream index within sourceUrl. Use index, not streamIndex, with
+    // Player::setActiveTrack().
+    int streamIndex = -1;
     MediaType type = MediaType::Unknown;
+    std::string sourceUrl;
+    bool external = false;
     std::string codec;
     std::string codecDescription;
     std::string language;

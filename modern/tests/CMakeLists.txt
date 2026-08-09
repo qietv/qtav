@@ -149,6 +149,10 @@ target_link_libraries(
 )
 target_compile_features(qtav_core_track_switch_test PRIVATE cxx_std_17)
 
+add_executable(qtav_core_external_track_test external_track_test.cpp)
+target_link_libraries(qtav_core_external_track_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_external_track_test PRIVATE cxx_std_17)
+
 if(TARGET qtav_subtitle_libass)
     add_executable(
         qtav_subtitle_libass_test
@@ -529,6 +533,23 @@ if(FFMPEG_EXECUTABLE)
             qtav_core_track_switch_test
             "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
     )
+    add_test(
+        NAME qtav_core_external_tracks
+        COMMAND
+            qtav_core_external_track_test
+            "${QTAV_CORE_TEST_MEDIA}"
+            "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
+            "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
+    )
+    add_test(
+        NAME qtav_core_external_tracks_without_primary_decoder
+        COMMAND
+            qtav_core_external_track_test
+            "${QTAV_CORE_TEST_MEDIA}"
+            "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
+            "${QTAV_CORE_MULTITRACK_TEST_MEDIA}"
+            --disable-primary-video
+    )
     if(TARGET qtav_subtitle_libass_test)
         add_test(
             NAME qtav_subtitle_libass_render
@@ -548,6 +569,14 @@ if(FFMPEG_EXECUTABLE)
         PROPERTIES
             FIXTURES_REQUIRED qtav_core_multitrack_media
             TIMEOUT 30
+    )
+    set_tests_properties(
+        qtav_core_external_tracks
+        qtav_core_external_tracks_without_primary_decoder
+        PROPERTIES
+            FIXTURES_REQUIRED
+                "qtav_core_media;qtav_core_multitrack_media"
+            TIMEOUT 45
     )
     add_test(
         NAME qtav_core_audio_sink_player

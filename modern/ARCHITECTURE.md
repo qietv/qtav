@@ -75,6 +75,7 @@ application control
        │
        ▼
 demux/control worker
+       ├── main + external audio/subtitle timestamp merge
        ├── bounded audio packets ──► audio decode worker
        │                                  │
        │                                  ▼
@@ -101,6 +102,14 @@ render callback cannot stop packet delivery to the other stream. Queues are
 bounded. Late video is dropped rather than converted into unbounded latency.
 The audio device clock is the playback master when valid; otherwise a bounded
 monotonic fallback is used.
+
+The main input plus at most one configured external audio and subtitle input
+are opened by the same control worker. Their selected packets are ordered on a
+timeline normalized by each input's start time, while the main input remains
+the duration/end-of-media authority. Seek, loop, track replacement, and media
+replacement reset all active demux states at one presentation-generation
+boundary. Public track selectors are unique across inputs; the actual
+per-input stream index remains diagnostic metadata only.
 
 Decoded `AudioFrame` and `VideoFrame` objects are cheap reference-counted
 views. Copying a frame retains its backing FFmpeg frame or hardware token. A

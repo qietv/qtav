@@ -32,6 +32,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - local files and FFmpeg-supported network protocols, with bounded HTTP(S)
   read timeouts and reconnect defaults that applications can override through
   `avformat.*` properties;
+- one optional external audio input and one optional external subtitle input,
+  merged with the main input on normalized media time and exposed through the
+  same asynchronous track-selection contract;
 - audio, video, and presentation-timed subtitle callbacks with reference-
   counted frame lifetime, normalized UTF-8 text, and preserved ASS/SSA packet
   data when supplied by FFmpeg;
@@ -631,12 +634,26 @@ player
         schedule_on_render_thread([&] { player.renderVideo(); });
     });
 
+player.setExternalMedia(qtav::MediaType::Audio, "commentary.opus");
+player.setExternalMedia(qtav::MediaType::Subtitle, "captions.srt");
 player.setMedia("movie.mkv");
 player.setState(qtav::State::Playing);
 ```
 
-After `MediaStatus::Loaded`, `MediaInfo::tracks` contains FFmpeg container
-stream indices and the three `active*Track` fields. Pass a matching
+`setExternalMedia()` accepts `MediaType::Audio` or `MediaType::Subtitle`; an
+empty URL removes that sidecar. One input of each type may be configured, and
+each input may itself contain multiple tracks. The configuration persists
+across main-media replacement. Changing it while media is loaded
+asynchronously reopens the main input at the current position and preserves
+play/pause intent. The main input remains the authority for the playback
+duration, range, and end of media.
+
+After `MediaStatus::Loaded`, `MediaInfo::tracks` contains tracks from the main
+input and configured sidecars plus the three `active*Track` fields. Main-input
+`TrackInfo::index` values retain their FFmpeg stream indices. External tracks
+receive non-overlapping selector values; `TrackInfo::streamIndex` records the
+actual stream within `sourceUrl`, and `external` identifies a sidecar. Pass a
+matching
 `TrackInfo::index` to `setActiveTrack(MediaType, index)`, or `-1` to disable
 that media type. The method validates and queues the request synchronously;
 decoder replacement, queue invalidation, and position restoration are
@@ -646,12 +663,18 @@ intent, and reopens the audio sink so a new native audio format is negotiated.
 Seekable inputs return to the request position; non-seekable inputs continue
 from the next packet of the selected stream.
 
+Packet timestamps from each active input are normalized against that input's
+own start time before demux ordering and frame presentation. If the main input
+does not contain audio or subtitles, the best matching external track becomes
+active automatically. Otherwise the main input keeps best-stream priority and
+the application can select a sidecar with `setActiveTrack()`.
+
 `onSubtitleFrame()` publishes decoded UTF-8 plain text for FFmpeg text and
 ASS/SSA subtitle decoders. ASS event fields and override blocks are removed
 from `text()`, and `\\N`/`\\n` line breaks plus `\\h` spaces are normalized.
 The same reference-counted `SubtitleFrame` preserves FFmpeg's ASS packet
 events and codec-private header through `assEvents()` and `assHeader()` and
-also carries the cue timestamp, duration, forced flag, stream index, and
+also carries the cue timestamp, duration, forced flag, track identity, and
 presentation generation. Public core headers still expose no FFmpeg or
 libass types.
 
@@ -688,7 +711,7 @@ for (const auto& image : overlay.images) {
 
 The rasterizer is thread-safe, copies libass's transient image list into
 owning bitmaps, and automatically starts a new internal track when the next
-frame has a different stream index or presentation generation. Call `flush()`
+frame has a different track identity or presentation generation. Call `flush()`
 immediately when the application initiates a seek or media replacement so no
 old cue is drawn while waiting for the first new-generation frame. Render on
 video redraws (and timer ticks for animated ASS content), preserve image order,
