@@ -67,6 +67,10 @@ already own a graphics context or require multiple/custom render targets:
 - prepare, pause/resume, seek, stop, playback rate;
 - A-B range and finite/infinite looping;
 - FFmpeg protocol and demux support;
+- two-layer network recovery: bounded FFmpeg HTTP(S) protocol retries followed
+  by a default-enabled, observable, interruptible `NetworkRecoveryPolicy` that
+  reopens compatible failed inputs and resumes seekable media at the current
+  position;
 - best-stream audio/video/subtitle selection and asynchronous post-load track
   switching that preserves position and play/pause intent;
 - external audio/subtitle inputs merged into `MediaInfo::tracks`; external
@@ -457,7 +461,6 @@ or pace playback. Decoded planar audio therefore normally uses
   wrapping, plus broader raw `GL_EXT_YUV_target`
   OpenGL ES device coverage;
 - bitmap subtitle delivery;
-- buffering policy for live/network streams;
 - audio time-stretch without pitch change;
 - compressed Dolby passthrough, Atmos object rendering, Dolby Vision
   enhancement-layer residual reconstruction, display tunnelling, licensing,
@@ -657,8 +660,41 @@ implementation.
   callbacks normally run on the playback worker; selected audio/video packets
   cross bounded queues to independent decode workers so one codec or output
   path cannot starve the other stream;
+- compressed-packet buffering is now explicit through `PacketBufferPolicy`,
+  `packetBufferStatus()`, and `onPacketBufferStatus()`. Initial playback, seek,
+  track switching, and confirmed queue underflow fill both selected A/V queues
+  to a time target before decoder release. The status exposes the minimum
+  usable A/V duration, combined bytes, memory/disk byte split, temporary-cache
+  path, progress, reason, capacity-limited completion, and presentation
+  generation; an underflow transition may run on the starving decode worker;
+- the default packet reservoir remains memory-only at five seconds and 32 MiB.
+  `PacketDiskCachePolicy` optionally spills later compressed packets into a
+  bounded, automatically removed file under the system temporary directory.
+  Writes run on the playback worker and materialization reads run on the
+  relevant decode worker behind an internal file lock. Calling
+  `clearPacketDiskCache()` can synchronously drain packet workers and schedule
+  a position-preserving seek, so do not invoke it from a Player callback;
+- Player-level `NetworkRecoveryPolicy` runs after a recognized network input's
+  FFmpeg protocol has returned a recoverable open/read error. Backoff and fresh
+  opens stay on the playback worker; status callbacks expose each wait, reopen,
+  recovery, or terminal failure. A read replacement remains provisional until
+  its first selected non-corrupt packet or clean EOF, so immediate post-open
+  failures stay inside the same bounded attempt budget. Repeated failures also
+  share that budget until selected demux timestamps advance by at least 500 ms;
+  seek, track change, and media replacement reset the continuity interval.
+  Installing a replacement drains in-flight decoder work, invalidates the old
+  generation, verifies selected stream/codec compatibility, retains its first
+  usable packet, and refills packets with
+  `PacketBufferingReason::NetworkRecovery`. Stop, seek, pause, prepare, track
+  switch, and media replacement cancel a pending read-retry wait;
 - `setVideoFrameScheduler()` runs on the video-decode worker before ordinary video
   delivery; an accepted frame is not sent to `onVideoFrame()` or renderers;
+- `LivePlaybackPolicy` is an opt-in presentation-worker policy. It bounds the
+  queued decoded-video window, retains its newest timestamps under pressure,
+  and uses the configured late threshold to catch video up to the existing
+  audio/monotonic playback clock. It never drops compressed packets, audio, or
+  subtitles, and it does not apply after `setVideoFrameScheduler()` accepts a
+  frame;
 - decoded audio/video/subtitle frame callbacks and `setRenderCallback()` run
   on the presentation worker; the bounded video queue drops obsolete late frames
   when application presentation falls behind;
@@ -683,8 +719,10 @@ implementation.
   from the cached, submitted-audio-bounded device clock while a sink write is
   waiting for backend queue space;
 - HTTP(S) inputs default to a 15-second FFmpeg I/O timeout plus bounded
-  reconnect attempts; `avformat.rw_timeout`, `avformat.reconnect`, and the
-  other FFmpeg protocol properties can override those defaults;
+  protocol reconnect attempts; `avformat.rw_timeout`, `avformat.reconnect`, and
+  the other FFmpeg properties override that first layer. The separate
+  `NetworkRecoveryPolicy` defaults to three fresh opens with 250 ms exponential
+  backoff capped at two seconds after the protocol returns an error;
 - `renderVideoDetailed()` runs synchronously on its caller and should be called
   from the thread that owns the native graphics context. Atomically published
   immutable frame/binding snapshots keep this hot path off the Player control
@@ -762,7 +800,8 @@ implementation.
    coverage using the same shared mobile contracts.
 7. Keep the completed audio/video/subtitle switching, plain-text callback, and
    optional libass rasterizer as the base for external tracks.
-8. Add live-stream buffering and recovery policies.
+8. Add frame stepping and accurate seek on top of the completed asynchronous
+   seek and generation contracts.
 
 Each backend should remain optional so the core library never acquires a GUI
 toolkit dependency.

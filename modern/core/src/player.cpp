@@ -7,10 +7,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cerrno>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -46,6 +52,7 @@ using Milliseconds = std::chrono::milliseconds;
 
 constexpr std::int64_t kMaximumQueuedAudioMilliseconds = 500;
 constexpr std::int64_t kMaximumVideoDecodeLeadMilliseconds = 250;
+constexpr std::int64_t kNetworkRecoveryProgressMilliseconds = 500;
 // Encoded surface-decoder packets need enough lead for deep HEVC reordering,
 // while a decoded Surface frame owns a finite decoder output buffer until the
 // application presents or drops it. Keep those two windows independent: feed
@@ -61,6 +68,11 @@ constexpr std::size_t kMaximumQueuedHardwareVideoFrames = 24;
 constexpr std::size_t kMaximumQueuedSubtitleFrames = 64;
 constexpr std::size_t kMaximumQueuedAudioPackets = 128;
 constexpr std::size_t kMaximumQueuedVideoPackets = 128;
+constexpr std::size_t kMaximumQueuedDiskPacketMetadata = 16'384;
+constexpr std::uint64_t kDefaultMaximumPacketBufferBytes =
+    32U * 1024U * 1024U;
+constexpr std::uint64_t kDefaultMaximumPacketDiskCacheBytes =
+    256U * 1024U * 1024U;
 constexpr std::int64_t kLateVideoFrameThresholdMilliseconds = 250;
 constexpr std::int64_t kHttpReadTimeoutMicroseconds = 15'000'000;
 
@@ -165,6 +177,54 @@ bool isHttpUrl(const std::string& url)
         || url.compare(0, 8, "https://") == 0;
 }
 
+std::string urlScheme(const std::string& url)
+{
+    const auto delimiter = url.find("://");
+    if (delimiter == std::string::npos || delimiter == 0) {
+        return {};
+    }
+    std::string scheme = url.substr(0, delimiter);
+    std::transform(
+        scheme.begin(),
+        scheme.end(),
+        scheme.begin(),
+        [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+    return scheme;
+}
+
+bool isNetworkUrl(const std::string& url)
+{
+    const auto scheme = urlScheme(url);
+    return scheme == "http" || scheme == "https" || scheme == "ftp"
+        || scheme == "ftps" || scheme == "gopher" || scheme == "gophers"
+        || scheme == "tcp" || scheme == "tls" || scheme == "udp"
+        || scheme == "rtp" || scheme == "rtsp" || scheme == "rtmp"
+        || scheme == "rtmps" || scheme == "rist" || scheme == "srt";
+}
+
+bool isRecoverableNetworkError(int error)
+{
+    if (error >= 0 || error == AVERROR_EOF || error == AVERROR_EXIT) {
+        return false;
+    }
+    switch (error) {
+    case AVERROR(ENOMEM):
+    case AVERROR(EINVAL):
+    case AVERROR(ENOSYS):
+    case AVERROR(EACCES):
+    case AVERROR(ENOENT):
+    case AVERROR_HTTP_BAD_REQUEST:
+    case AVERROR_HTTP_UNAUTHORIZED:
+    case AVERROR_HTTP_FORBIDDEN:
+    case AVERROR_HTTP_NOT_FOUND:
+        return false;
+    default:
+        return true;
+    }
+}
+
 std::string plainTextFromAss(const char* ass)
 {
     if (!ass || !*ass) {
@@ -242,6 +302,333 @@ void applyHttpRecoveryDefaults(
     av_dict_set(options, "reconnect_delay_total_max", "10", 0);
 }
 
+class PacketDiskStore final
+    : public std::enable_shared_from_this<PacketDiskStore> {
+public:
+    struct Entry {
+        std::uint64_t id = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t offset = 0;
+        std::uint64_t size = 0;
+    };
+
+    struct StoreResult {
+        std::shared_ptr<Entry> entry;
+        bool capacityLimited = false;
+        std::string error;
+    };
+
+    ~PacketDiskStore()
+    {
+        clear();
+    }
+
+    StoreResult store(
+        const std::uint8_t* data,
+        std::uint64_t size,
+        std::uint64_t maximumBytes)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!data || size == 0) {
+            return { {}, false, "The packet payload is empty" };
+        }
+        if (size > maximumBytes
+            || activeBytes_ > maximumBytes - size) {
+            return { {}, true, {} };
+        }
+
+        std::string error;
+        if (!ensureOpenLocked(error)) {
+            return { {}, false, std::move(error) };
+        }
+        if (appendOffset_ > maximumBytes - size
+            && !compactLocked(error)) {
+            return { {}, false, std::move(error) };
+        }
+        if (appendOffset_ > maximumBytes - size) {
+            return { {}, true, {} };
+        }
+
+        file_.clear();
+        file_.seekp(static_cast<std::streamoff>(appendOffset_));
+        file_.write(
+            reinterpret_cast<const char*>(data),
+            static_cast<std::streamsize>(size));
+        file_.flush();
+        if (!file_) {
+            file_.clear();
+            return {
+                {},
+                false,
+                "Could not write the packet-cache temporary file",
+            };
+        }
+
+        const auto id = nextEntryId_++;
+        const auto generation = generation_;
+        const auto offset = appendOffset_;
+        std::weak_ptr<PacketDiskStore> owner = shared_from_this();
+        auto entry = std::shared_ptr<Entry>(
+            new Entry { id, generation, offset, size },
+            [owner](Entry* released) {
+                if (auto store = owner.lock()) {
+                    store->release(
+                        released->generation,
+                        released->size);
+                }
+                delete released;
+            });
+        entries_.push_back(entry);
+        appendOffset_ += size;
+        activeBytes_ += size;
+        return { std::move(entry), false, {} };
+    }
+
+    bool load(
+        const std::shared_ptr<Entry>& entry,
+        std::vector<std::uint8_t>& payload,
+        std::string& error)
+    {
+        if (!entry) {
+            error = "The packet-cache entry is missing";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (entry->generation != generation_ || !file_.is_open()) {
+            error = "The packet-cache entry was cleared before it was read";
+            return false;
+        }
+        if (entry->size
+            > static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+            error = "The packet-cache entry is too large for this process";
+            return false;
+        }
+
+        payload.resize(static_cast<std::size_t>(entry->size));
+        file_.clear();
+        file_.seekg(static_cast<std::streamoff>(entry->offset));
+        file_.read(
+            reinterpret_cast<char*>(payload.data()),
+            static_cast<std::streamsize>(entry->size));
+        if (!file_) {
+            file_.clear();
+            payload.clear();
+            error = "Could not read the packet-cache temporary file";
+            return false;
+        }
+        return true;
+    }
+
+    std::uint64_t bytes() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return activeBytes_;
+    }
+
+    bool empty() const
+    {
+        return bytes() == 0;
+    }
+
+    std::string path() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return filePath_.u8string();
+    }
+
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        clearFilesLocked();
+    }
+
+private:
+    bool ensureOpenLocked(std::string& error)
+    {
+        if (file_.is_open()) {
+            return true;
+        }
+
+        std::error_code filesystemError;
+        const auto temporaryRoot =
+            std::filesystem::temp_directory_path(filesystemError);
+        if (filesystemError) {
+            error = "Could not locate the system temporary directory: "
+                + filesystemError.message();
+            return false;
+        }
+
+        static std::atomic<std::uint64_t> nextDirectoryId { 1 };
+        const auto timeId = static_cast<std::uint64_t>(
+            Clock::now().time_since_epoch().count());
+        for (int attempt = 0; attempt < 32; ++attempt) {
+            const auto candidate = temporaryRoot
+                / ("qtavcore-packet-cache-"
+                   + std::to_string(timeId) + "-"
+                   + std::to_string(
+                       nextDirectoryId.fetch_add(
+                           1,
+                           std::memory_order_relaxed)));
+            filesystemError.clear();
+            if (std::filesystem::create_directory(
+                    candidate,
+                    filesystemError)) {
+                directoryPath_ = candidate;
+                break;
+            }
+            if (filesystemError) {
+                error = "Could not create the packet-cache temporary "
+                        "directory: "
+                    + filesystemError.message();
+                return false;
+            }
+        }
+        if (directoryPath_.empty()) {
+            error = "Could not reserve a unique packet-cache temporary "
+                    "directory";
+            return false;
+        }
+
+        filePath_ = directoryPath_ / "packets-0.cache";
+        file_.open(
+            filePath_,
+            std::ios::in | std::ios::out | std::ios::binary
+                | std::ios::trunc);
+        if (!file_) {
+            error = "Could not open the packet-cache temporary file";
+            clearFilesLocked();
+            return false;
+        }
+        return true;
+    }
+
+    bool compactLocked(std::string& error)
+    {
+        std::vector<std::shared_ptr<Entry>> activeEntries;
+        activeEntries.reserve(entries_.size());
+        for (const auto& candidate : entries_) {
+            if (auto entry = candidate.lock()) {
+                if (entry->generation == generation_) {
+                    activeEntries.push_back(std::move(entry));
+                }
+            }
+        }
+
+        const auto replacementPath = directoryPath_
+            / ("packets-" + std::to_string(++fileSerial_) + ".cache");
+        std::fstream replacement(
+            replacementPath,
+            std::ios::in | std::ios::out | std::ios::binary
+                | std::ios::trunc);
+        if (!replacement) {
+            error = "Could not create a compacted packet-cache file";
+            return false;
+        }
+
+        std::vector<std::uint8_t> copyBuffer(64U * 1024U);
+        std::vector<std::uint64_t> replacementOffsets;
+        replacementOffsets.reserve(activeEntries.size());
+        std::uint64_t replacementOffset = 0;
+        file_.flush();
+        for (const auto& entry : activeEntries) {
+            replacementOffsets.push_back(replacementOffset);
+            file_.clear();
+            file_.seekg(static_cast<std::streamoff>(entry->offset));
+            replacement.clear();
+            replacement.seekp(
+                static_cast<std::streamoff>(replacementOffset));
+            auto remaining = entry->size;
+            while (remaining > 0) {
+                const auto chunk = static_cast<std::size_t>(std::min<
+                    std::uint64_t>(remaining, copyBuffer.size()));
+                file_.read(
+                    reinterpret_cast<char*>(copyBuffer.data()),
+                    static_cast<std::streamsize>(chunk));
+                if (!file_) {
+                    error = "Could not read the packet cache while compacting";
+                    break;
+                }
+                replacement.write(
+                    reinterpret_cast<const char*>(copyBuffer.data()),
+                    static_cast<std::streamsize>(chunk));
+                if (!replacement) {
+                    error = "Could not write the compacted packet cache";
+                    break;
+                }
+                remaining -= chunk;
+                replacementOffset += chunk;
+            }
+            if (!error.empty()) {
+                break;
+            }
+        }
+        replacement.flush();
+        if (!replacement || !error.empty()) {
+            replacement.close();
+            std::error_code ignored;
+            std::filesystem::remove(replacementPath, ignored);
+            file_.clear();
+            return false;
+        }
+
+        const auto previousPath = filePath_;
+        file_.close();
+        file_ = std::move(replacement);
+        filePath_ = replacementPath;
+        appendOffset_ = replacementOffset;
+        entries_.clear();
+        for (std::size_t index = 0; index < activeEntries.size(); ++index) {
+            activeEntries[index]->offset = replacementOffsets[index];
+            entries_.push_back(activeEntries[index]);
+        }
+        std::error_code ignored;
+        std::filesystem::remove(previousPath, ignored);
+        return true;
+    }
+
+    void release(std::uint64_t generation, std::uint64_t size)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation != generation_) {
+            return;
+        }
+        activeBytes_ = size >= activeBytes_ ? 0 : activeBytes_ - size;
+        if (activeBytes_ == 0) {
+            clearFilesLocked();
+        }
+    }
+
+    void clearFilesLocked()
+    {
+        if (file_.is_open()) {
+            file_.close();
+        }
+        std::error_code ignored;
+        if (!directoryPath_.empty()) {
+            std::filesystem::remove_all(directoryPath_, ignored);
+        }
+        filePath_.clear();
+        directoryPath_.clear();
+        entries_.clear();
+        activeBytes_ = 0;
+        appendOffset_ = 0;
+        fileSerial_ = 0;
+        ++generation_;
+    }
+
+    mutable std::mutex mutex_;
+    std::filesystem::path directoryPath_;
+    std::filesystem::path filePath_;
+    std::fstream file_;
+    std::vector<std::weak_ptr<Entry>> entries_;
+    std::uint64_t generation_ = 1;
+    std::uint64_t nextEntryId_ = 1;
+    std::uint64_t activeBytes_ = 0;
+    std::uint64_t appendOffset_ = 0;
+    std::uint64_t fileSerial_ = 0;
+};
+
 } // namespace
 
 class Player::Impl {
@@ -298,6 +685,7 @@ public:
         audioPacketChanged_.notify_all();
         audioPacketSpace_.notify_all();
         audioPacketDrained_.notify_all();
+        packetBufferChanged_.notify_all();
         {
             std::lock_guard<std::mutex> lock(presentationMutex_);
         }
@@ -329,6 +717,7 @@ public:
             videoDecodeWorker_.join();
         }
         replaceAudioSink(nullptr, nullptr, audioSinkSerial_);
+        packetDiskStore_->clear();
         media_.reset();
         avformat_network_deinit();
     }
@@ -444,14 +833,24 @@ public:
     struct DemuxState {
         std::shared_ptr<AVPacket> pendingPacket;
         std::int64_t pendingTimestamp = 0;
+        std::int64_t pendingDuration = 0;
         bool end = false;
 
         void reset()
         {
             pendingPacket.reset();
             pendingTimestamp = 0;
+            pendingDuration = 0;
             end = false;
         }
+    };
+
+    struct ReadRecoveryBudget {
+        bool active = false;
+        std::uint64_t mediaSerial = 0;
+        std::int64_t progressTimestamp =
+            std::numeric_limits<std::int64_t>::min();
+        std::uint32_t attempts = 0;
     };
 
     struct ExternalInput {
@@ -541,11 +940,47 @@ public:
 
     struct QueuedVideoPacket {
         std::shared_ptr<AVPacket> packet;
+        std::shared_ptr<AVPacket> diskPacketProperties;
+        std::shared_ptr<PacketDiskStore::Entry> diskEntry;
         std::uint64_t generation = 0;
+        std::int64_t timestamp = 0;
+        std::int64_t duration = 0;
+        std::uint64_t bytes = 0;
         bool end = false;
     };
 
     using QueuedAudioPacket = QueuedVideoPacket;
+
+    struct DiskPacketResult {
+        std::shared_ptr<AVPacket> properties;
+        std::shared_ptr<PacketDiskStore::Entry> entry;
+        bool capacityLimited = false;
+        std::string error;
+    };
+
+    struct PacketQueueMetrics {
+        std::int64_t bufferedMilliseconds = 0;
+        std::int64_t memoryBufferedMilliseconds = 0;
+        std::int64_t diskBufferedMilliseconds = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t memoryBytes = 0;
+        std::uint64_t diskBytes = 0;
+        std::size_t packets = 0;
+        std::size_t memoryPackets = 0;
+        std::size_t diskPackets = 0;
+    };
+
+    struct PacketBufferState {
+        bool buffering = false;
+        PacketBufferingReason reason = PacketBufferingReason::None;
+        std::int64_t targetMilliseconds = 0;
+        std::uint64_t generation = 0;
+        bool needsAudio = false;
+        bool needsVideo = false;
+        bool audioEnded = false;
+        bool videoEnded = false;
+        bool capacityLimited = false;
+    };
 
     struct PresentationItem {
         enum class Type {
@@ -593,6 +1028,7 @@ public:
             prepareRequest_.reset();
             seekRequest_.reset();
             trackSwitchRequests_.clear();
+            networkRecoveryStatus_ = {};
             if (url_.empty()) {
                 requestedState_ = State::Stopped;
             }
@@ -860,7 +1296,178 @@ public:
                 std::memory_order_relaxed),
             maximumVideoPresentationStarvationMilliseconds_.load(
                 std::memory_order_relaxed),
+            lowLatencyVideoQueueDrops_.load(std::memory_order_relaxed),
+            networkRecoveryAttempts_.load(std::memory_order_relaxed),
+            successfulNetworkRecoveries_.load(std::memory_order_relaxed),
+            failedNetworkRecoveries_.load(std::memory_order_relaxed),
         };
+    }
+
+    void setLivePlaybackPolicy(LivePlaybackPolicy policy)
+    {
+        policy.maximumQueuedVideoFrames = std::clamp<std::uint32_t>(
+            policy.maximumQueuedVideoFrames,
+            1,
+            static_cast<std::uint32_t>(
+                kMaximumQueuedHardwareVideoFrames));
+        policy.lateVideoFrameThresholdMilliseconds =
+            std::max<std::int64_t>(
+                0,
+                policy.lateVideoFrameThresholdMilliseconds);
+        std::lock_guard<std::mutex> lock(mutex_);
+        livePlaybackPolicy_ = policy;
+    }
+
+    LivePlaybackPolicy livePlaybackPolicy() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return livePlaybackPolicy_;
+    }
+
+    void setNetworkRecoveryPolicy(NetworkRecoveryPolicy policy)
+    {
+        policy.maximumAttempts = std::clamp<std::uint32_t>(
+            policy.maximumAttempts,
+            1,
+            32);
+        policy.initialRetryDelayMilliseconds = std::max<std::int64_t>(
+            0,
+            policy.initialRetryDelayMilliseconds);
+        policy.maximumRetryDelayMilliseconds = std::max(
+            policy.initialRetryDelayMilliseconds,
+            policy.maximumRetryDelayMilliseconds);
+        std::lock_guard<std::mutex> lock(mutex_);
+        networkRecoveryPolicy_ = policy;
+    }
+
+    NetworkRecoveryPolicy networkRecoveryPolicy() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return networkRecoveryPolicy_;
+    }
+
+    NetworkRecoveryStatus networkRecoveryStatus() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return networkRecoveryStatus_;
+    }
+
+    void setPacketBufferPolicy(PacketBufferPolicy policy)
+    {
+        policy.initialBufferMilliseconds =
+            std::max<std::int64_t>(0, policy.initialBufferMilliseconds);
+        policy.rebufferMilliseconds =
+            std::max<std::int64_t>(0, policy.rebufferMilliseconds);
+        policy.maximumBufferMilliseconds = std::max<std::int64_t>(
+            1,
+            policy.maximumBufferMilliseconds);
+        if (policy.maximumBufferBytes == 0) {
+            policy.maximumBufferBytes = kDefaultMaximumPacketBufferBytes;
+        }
+        policy.underflowDetectionMilliseconds = std::max<std::int64_t>(
+            0,
+            policy.underflowDetectionMilliseconds);
+        policy.diskCache.maximumCacheMilliseconds =
+            std::max<std::int64_t>(
+                0,
+                policy.diskCache.maximumCacheMilliseconds);
+        if (policy.diskCache.maximumCacheBytes == 0) {
+            policy.diskCache.maximumCacheBytes =
+                kDefaultMaximumPacketDiskCacheBytes;
+        }
+        const auto largestTarget = std::max(
+            policy.initialBufferMilliseconds,
+            policy.rebufferMilliseconds);
+        if (policy.diskCache.enabled) {
+            const auto requiredDiskDuration = largestTarget
+                    > policy.maximumBufferMilliseconds
+                ? largestTarget - policy.maximumBufferMilliseconds
+                : 0;
+            policy.diskCache.maximumCacheMilliseconds = std::max(
+                policy.diskCache.maximumCacheMilliseconds,
+                requiredDiskDuration);
+        } else {
+            policy.maximumBufferMilliseconds = std::max(
+                policy.maximumBufferMilliseconds,
+                largestTarget);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            packetBufferPolicy_ = policy;
+        }
+        diskCacheUnavailable_.store(false, std::memory_order_release);
+        std::uint64_t activeGeneration = 0;
+        std::int64_t activeTarget = 0;
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            if (packetBufferState_.buffering) {
+                activeGeneration = packetBufferState_.generation;
+                activeTarget = packetBufferState_.reason
+                        == PacketBufferingReason::InitialPlayback
+                    ? policy.initialBufferMilliseconds
+                    : policy.rebufferMilliseconds;
+                packetBufferState_.targetMilliseconds = activeTarget;
+            }
+        }
+        if (activeGeneration != 0
+            && (!policy.enabled || activeTarget <= 0)) {
+            completePacketBuffering(activeGeneration);
+        } else if (activeGeneration != 0) {
+            updatePacketBuffering(activeGeneration);
+        }
+        packetBufferChanged_.notify_all();
+        audioPacketChanged_.notify_all();
+        videoPacketChanged_.notify_all();
+    }
+
+    PacketBufferPolicy packetBufferPolicy() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return packetBufferPolicy_;
+    }
+
+    PacketBufferStatus packetBufferStatus() const
+    {
+        return currentPacketBufferStatus();
+    }
+
+    std::string packetDiskCachePath() const
+    {
+        return packetDiskStore_->path();
+    }
+
+    bool clearPacketDiskCache()
+    {
+        if (packetDiskStore_->empty()) {
+            return true;
+        }
+
+        const auto restartPosition = position();
+        bool restart = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            restart = hasOpenMedia_ && currentState_ != State::Stopped;
+            if (restart && !mediaInfo_.seekable) {
+                return false;
+            }
+            if (restart) {
+                seekRequest_ = SeekRequest {
+                    ++requestSerial_,
+                    restartPosition,
+                    SeekFlag::KeyFrame,
+                    {},
+                };
+            }
+        }
+
+        if (restart) {
+            resetPlaybackQueues();
+            interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+            controlChanged_.notify_all();
+        } else {
+            packetDiskStore_->clear();
+        }
+        return true;
     }
 
     void onStateChanged(StateCallback callback)
@@ -873,6 +1480,18 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         statusCallback_ = std::move(callback);
+    }
+
+    void onPacketBufferStatus(PacketBufferStatusCallback callback)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        packetBufferStatusCallback_ = std::move(callback);
+    }
+
+    void onNetworkRecoveryStatus(NetworkRecoveryStatusCallback callback)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        networkRecoveryStatusCallback_ = std::move(callback);
     }
 
     void onEvent(EventCallback callback)
@@ -1391,12 +2010,17 @@ private:
                 const auto transitionPosition =
                     wasPlaying ? position() : currentPosition();
                 setAudioSinkPaused(requested != State::Playing);
+                std::uint64_t packetBufferGeneration = 0;
+                bool startPacketBuffer = false;
                 {
                     std::lock_guard<std::mutex> stateLock(mutex_);
                     if (wasPlaying) {
                         currentPosition_ = transitionPosition;
                     }
                     if (requested == State::Playing) {
+                        packetBufferGeneration = presentationGeneration_.load(
+                            std::memory_order_acquire);
+                        startPacketBuffer = true;
                         if (audioSinkOpen_ && audioSinkHasClock_) {
                             // A paused device clock cannot be extrapolated
                             // across resume. Allow the first queued output to
@@ -1423,6 +2047,18 @@ private:
                     }
                 }
                 publishState(requested);
+                const auto packetStreams = activePacketStreams();
+                if (startPacketBuffer
+                    && beginPacketBuffering(
+                        PacketBufferingReason::InitialPlayback,
+                        packetBufferGeneration,
+                        packetStreams.first,
+                        packetStreams.second)) {
+                    beginOutputWait(
+                        packetBufferGeneration,
+                        transitionPosition);
+                    updatePacketBuffering(packetBufferGeneration);
+                }
                 audioQueueChanged_.notify_all();
                 audioQueueSpace_.notify_all();
                 presentationChanged_.notify_all();
@@ -1575,6 +2211,268 @@ private:
         return media_.demux;
     }
 
+    ReadRecoveryBudget& readRecoveryBudgetForSource(
+        InputSource source) noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return primaryReadRecoveryBudget_;
+        case InputSource::ExternalAudio:
+            return externalAudioReadRecoveryBudget_;
+        case InputSource::ExternalSubtitle:
+            return externalSubtitleReadRecoveryBudget_;
+        }
+        return primaryReadRecoveryBudget_;
+    }
+
+    std::int64_t& demuxProgressForSource(InputSource source) noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return primaryDemuxProgress_;
+        case InputSource::ExternalAudio:
+            return externalAudioDemuxProgress_;
+        case InputSource::ExternalSubtitle:
+            return externalSubtitleDemuxProgress_;
+        }
+        return primaryDemuxProgress_;
+    }
+
+    void resetReadRecoveryTracking() noexcept
+    {
+        primaryReadRecoveryBudget_ = {};
+        externalAudioReadRecoveryBudget_ = {};
+        externalSubtitleReadRecoveryBudget_ = {};
+        primaryDemuxProgress_ = std::numeric_limits<std::int64_t>::min();
+        externalAudioDemuxProgress_ =
+            std::numeric_limits<std::int64_t>::min();
+        externalSubtitleDemuxProgress_ =
+            std::numeric_limits<std::int64_t>::min();
+    }
+
+    AVFormatContext*& formatSlotForSource(InputSource source) noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return media_.format;
+        case InputSource::ExternalAudio:
+            return media_.externalAudio.format;
+        case InputSource::ExternalSubtitle:
+            return media_.externalSubtitle.format;
+        }
+        return media_.format;
+    }
+
+    std::int64_t& startTimeSlotForSource(InputSource source) noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return media_.startTimeUs;
+        case InputSource::ExternalAudio:
+            return media_.externalAudio.startTimeUs;
+        case InputSource::ExternalSubtitle:
+            return media_.externalSubtitle.startTimeUs;
+        }
+        return media_.startTimeUs;
+    }
+
+    std::string urlForSource(InputSource source) const
+    {
+        if (source == InputSource::ExternalAudio) {
+            return media_.externalAudio.url;
+        }
+        if (source == InputSource::ExternalSubtitle) {
+            return media_.externalSubtitle.url;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return url_;
+    }
+
+    static NetworkRecoveryInput publicRecoveryInput(
+        InputSource source) noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return NetworkRecoveryInput::Primary;
+        case InputSource::ExternalAudio:
+            return NetworkRecoveryInput::ExternalAudio;
+        case InputSource::ExternalSubtitle:
+            return NetworkRecoveryInput::ExternalSubtitle;
+        }
+        return NetworkRecoveryInput::Primary;
+    }
+
+    static const char* inputDescription(InputSource source) noexcept
+    {
+        switch (source) {
+        case InputSource::Primary:
+            return "main";
+        case InputSource::ExternalAudio:
+            return "external audio";
+        case InputSource::ExternalSubtitle:
+            return "external subtitle";
+        }
+        return "unknown";
+    }
+
+    static bool formatIsSeekable(const AVFormatContext* format) noexcept
+    {
+        return format
+            && (!format->pb
+                || (format->pb->seekable & AVIO_SEEKABLE_NORMAL) != 0);
+    }
+
+    bool networkRecoveryControlValid(
+        std::uint64_t serial,
+        NetworkRecoveryOperation operation) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (quitting_.load(std::memory_order_acquire)
+            || serial != mediaSerial_
+            || requestedState_ == State::Stopped) {
+            return false;
+        }
+        if (operation == NetworkRecoveryOperation::Open) {
+            return true;
+        }
+        return loadedSerial_ == mediaSerial_
+            && currentState_ == State::Playing
+            && requestedState_ == State::Playing
+            && !seekRequest_ && !prepareRequest_
+            && trackSwitchRequests_.empty();
+    }
+
+    bool waitForNetworkRetry(
+        std::uint64_t serial,
+        NetworkRecoveryOperation operation,
+        std::int64_t delayMilliseconds)
+    {
+        if (delayMilliseconds <= 0) {
+            return networkRecoveryControlValid(serial, operation);
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto canceled = [this, serial, operation] {
+            if (quitting_.load(std::memory_order_acquire)
+                || serial != mediaSerial_
+                || requestedState_ == State::Stopped) {
+                return true;
+            }
+            return operation == NetworkRecoveryOperation::Read
+                && (loadedSerial_ != mediaSerial_
+                    || currentState_ != State::Playing
+                    || requestedState_ != State::Playing || seekRequest_
+                    || prepareRequest_ || !trackSwitchRequests_.empty());
+        };
+        return !controlChanged_.wait_for(
+            lock,
+            Milliseconds(delayMilliseconds),
+            canceled);
+    }
+
+    static std::int64_t nextNetworkRetryDelay(
+        std::int64_t current,
+        std::int64_t maximum) noexcept
+    {
+        if (current <= 0 || current >= maximum) {
+            return std::max<std::int64_t>(0, std::min(current, maximum));
+        }
+        if (current > maximum / 2) {
+            return maximum;
+        }
+        return std::min(maximum, current * 2);
+    }
+
+    int openInputWithRecovery(
+        const std::string& inputUrl,
+        InputSource source,
+        std::uint64_t serial,
+        AVFormatContext** output)
+    {
+        int error = openInput(inputUrl, output);
+        const auto policy = networkRecoveryPolicy();
+        if (error >= 0 || !policy.enabled || !isNetworkUrl(inputUrl)
+            || !isRecoverableNetworkError(error)) {
+            return error;
+        }
+
+        auto delay = policy.initialRetryDelayMilliseconds;
+        std::uint32_t attemptsConsumed = 0;
+        for (std::uint32_t attempt = 1;
+             attempt <= policy.maximumAttempts;
+             ++attempt) {
+            NetworkRecoveryStatus status;
+            status.state = NetworkRecoveryState::Waiting;
+            status.operation = NetworkRecoveryOperation::Open;
+            status.input = publicRecoveryInput(source);
+            status.url = inputUrl;
+            status.attempt = attempt;
+            status.maximumAttempts = policy.maximumAttempts;
+            status.retryDelayMilliseconds = delay;
+            status.error = error;
+            status.presentationGeneration = presentationGeneration_.load(
+                std::memory_order_acquire);
+            publishNetworkRecoveryStatus(status);
+            if (!waitForNetworkRetry(
+                    serial,
+                    NetworkRecoveryOperation::Open,
+                    delay)) {
+                publishNetworkRecoveryStatus({});
+                return AVERROR_EXIT;
+            }
+
+            status.state = NetworkRecoveryState::Reopening;
+            status.retryDelayMilliseconds = 0;
+            publishNetworkRecoveryStatus(status);
+            attemptsConsumed = attempt;
+            networkRecoveryAttempts_.fetch_add(1, std::memory_order_relaxed);
+            error = openInput(inputUrl, output);
+            if (error >= 0) {
+                status.state = NetworkRecoveryState::Recovered;
+                status.error = 0;
+                publishNetworkRecoveryStatus(status);
+                successfulNetworkRecoveries_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                publishEvent({
+                    "network.recovered",
+                    "Recovered while opening the "
+                        + std::string(inputDescription(source))
+                        + " network input on attempt "
+                        + std::to_string(attempt),
+                    0,
+                });
+                return 0;
+            }
+            if (!isRecoverableNetworkError(error)) {
+                break;
+            }
+            delay = nextNetworkRetryDelay(
+                delay,
+                policy.maximumRetryDelayMilliseconds);
+        }
+
+        NetworkRecoveryStatus failed;
+        failed.state = NetworkRecoveryState::Failed;
+        failed.operation = NetworkRecoveryOperation::Open;
+        failed.input = publicRecoveryInput(source);
+        failed.url = inputUrl;
+        failed.attempt = attemptsConsumed;
+        failed.maximumAttempts = policy.maximumAttempts;
+        failed.error = error;
+        failed.presentationGeneration = presentationGeneration_.load(
+            std::memory_order_acquire);
+        publishNetworkRecoveryStatus(failed);
+        failedNetworkRecoveries_.fetch_add(1, std::memory_order_relaxed);
+        publishEvent({
+            "network.recovery.failed",
+            "Could not recover the "
+                + std::string(inputDescription(source))
+                + " network input while opening: " + ffmpegError(error),
+            error,
+        });
+        return error;
+    }
+
     const TrackSource* trackSource(int index, MediaType type) const noexcept
     {
         const auto found = std::find_if(
@@ -1592,6 +2490,7 @@ private:
         std::optional<PrepareRequest> prepare)
     {
         resetPlaybackQueues();
+        resetReadRecoveryTracking();
         closeAudioSink(true);
         media_.reset();
         {
@@ -1614,7 +2513,11 @@ private:
             externalSubtitleUrl = externalSubtitleUrl_;
         }
 
-        int error = openInput(mediaUrl, &media_.format);
+        int error = openInputWithRecovery(
+            mediaUrl,
+            InputSource::Primary,
+            serial,
+            &media_.format);
         if (error < 0) {
             if (wasCanceled(serial)) {
                 return;
@@ -1634,7 +2537,14 @@ private:
             if (inputUrl.empty()) {
                 return 0;
             }
-            const int openError = openInput(inputUrl, &input.format);
+            const auto source = expectedType == AVMEDIA_TYPE_AUDIO
+                ? InputSource::ExternalAudio
+                : InputSource::ExternalSubtitle;
+            const int openError = openInputWithRecovery(
+                inputUrl,
+                source,
+                serial,
+                &input.format);
             if (openError < 0) {
                 return openError;
             }
@@ -1765,10 +2675,13 @@ private:
 
         publishStatus(MediaStatus::Loaded);
         State requested;
+        std::uint64_t packetBufferGeneration = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             requested = requestedState_;
             if (requested == State::Playing) {
+                packetBufferGeneration = presentationGeneration_.load(
+                    std::memory_order_acquire);
                 const auto position =
                     std::max<std::int64_t>(0, preparedPosition);
                 primeOutputWaitLocked(
@@ -1780,6 +2693,15 @@ private:
             }
         }
         publishState(requested);
+        const auto packetStreams = activePacketStreams();
+        if (requested == State::Playing
+            && beginPacketBuffering(
+                PacketBufferingReason::InitialPlayback,
+                packetBufferGeneration,
+                packetStreams.first,
+                packetStreams.second)) {
+            updatePacketBuffering(packetBufferGeneration);
+        }
 
         if (prepare && prepare->callback) {
             bool boost = true;
@@ -2197,7 +3119,10 @@ private:
                 // The public call already invalidated queued output. Re-seek
                 // the unchanged decoders so playback resumes coherently.
                 if (mediaInfo().seekable) {
-                    seekMedia(request.position, SeekFlag::KeyFrame);
+                    seekMedia(
+                        request.position,
+                        SeekFlag::KeyFrame,
+                        PacketBufferingReason::TrackSwitch);
                 }
                 return;
             }
@@ -2208,6 +3133,7 @@ private:
         }
 
         resetPlaybackQueues();
+        resetReadRecoveryTracking();
         // A replacement audio track can have a different native format. Close
         // rather than merely flush so the next frame renegotiates both the
         // sink and optional converter. This is also safe for video switches
@@ -2241,7 +3167,10 @@ private:
 
         int seekError = 0;
         if (seekable) {
-            seekError = seekMedia(request.position, SeekFlag::KeyFrame);
+            seekError = seekMedia(
+                request.position,
+                SeekFlag::KeyFrame,
+                PacketBufferingReason::TrackSwitch);
         } else {
             media_.demux.reset();
             media_.externalAudio.resetDemux();
@@ -2275,6 +3204,16 @@ private:
             }
             if (publishBuffering) {
                 publishStatus(MediaStatus::Buffering);
+            }
+            const auto generation = presentationGeneration_.load(
+                std::memory_order_acquire);
+            const auto packetStreams = activePacketStreams();
+            if (beginPacketBuffering(
+                    PacketBufferingReason::TrackSwitch,
+                    generation,
+                    packetStreams.first,
+                    packetStreams.second)) {
+                updatePacketBuffering(generation);
             }
         }
 
@@ -2335,7 +3274,11 @@ private:
         }
     }
 
-    int seekMedia(std::int64_t targetMs, SeekFlag flags)
+    int seekMedia(
+        std::int64_t targetMs,
+        SeekFlag flags,
+        PacketBufferingReason bufferingReason =
+            PacketBufferingReason::Seek)
     {
         if (!media_.format) {
             return AVERROR(EINVAL);
@@ -2343,6 +3286,7 @@ private:
 
         const auto previousPosition = position();
         resetPlaybackQueues();
+        resetReadRecoveryTracking();
         flushAudioSink();
         bool waitForData = false;
         {
@@ -2436,6 +3380,18 @@ private:
         if (media_.subtitle.valid()) {
             avcodec_flush_buffers(media_.subtitle.context);
         }
+        if (waitForData) {
+            const auto generation = presentationGeneration_.load(
+                std::memory_order_acquire);
+            const auto packetStreams = activePacketStreams();
+            if (beginPacketBuffering(
+                    bufferingReason,
+                    generation,
+                    packetStreams.first,
+                    packetStreams.second)) {
+                updatePacketBuffering(generation);
+            }
+        }
         return 0;
     }
 
@@ -2448,6 +3404,7 @@ private:
     enum class InputReadResult {
         Ready,
         End,
+        Recovered,
         Error,
     };
 
@@ -2488,6 +3445,438 @@ private:
         return !hasPrimaryDecoder;
     }
 
+    int validateRecoveredInput(
+        InputSource source,
+        const AVFormatContext* replacement) const noexcept
+    {
+        if (!replacement) {
+            return AVERROR(EINVAL);
+        }
+        const auto validate = [source, replacement](const Decoder& decoder) {
+            if (!decoder.valid() || decoder.source != source) {
+                return true;
+            }
+            if (decoder.streamIndex < 0
+                || static_cast<unsigned>(decoder.streamIndex)
+                    >= replacement->nb_streams) {
+                return false;
+            }
+            const auto* parameters =
+                replacement->streams[decoder.streamIndex]->codecpar;
+            return parameters
+                && parameters->codec_type == decoder.context->codec_type
+                && parameters->codec_id == decoder.context->codec_id;
+        };
+        return validate(media_.video) && validate(media_.audio)
+                && validate(media_.subtitle)
+            ? 0
+            : AVERROR_STREAM_NOT_FOUND;
+    }
+
+    static int seekRecoveredFormat(
+        AVFormatContext* format,
+        std::int64_t startTimeUs,
+        std::int64_t positionMilliseconds)
+    {
+        if (!formatIsSeekable(format)) {
+            return 0;
+        }
+        const auto timestamp = startTimeUs
+            + std::max<std::int64_t>(0, positionMilliseconds) * 1000;
+        return avformat_seek_file(
+            format,
+            -1,
+            std::numeric_limits<std::int64_t>::min(),
+            timestamp,
+            std::numeric_limits<std::int64_t>::max(),
+            AVSEEK_FLAG_BACKWARD);
+    }
+
+    int readRecoveredPacket(
+        InputSource source,
+        AVFormatContext* format,
+        AVPacket** output,
+        bool* reachedEnd)
+    {
+        if (!format || !output || !reachedEnd) {
+            return AVERROR(EINVAL);
+        }
+        *output = nullptr;
+        *reachedEnd = false;
+        auto* packet = av_packet_alloc();
+        if (!packet) {
+            return AVERROR(ENOMEM);
+        }
+        while (true) {
+            const int error = av_read_frame(format, packet);
+            if (error == AVERROR_EOF) {
+                av_packet_free(&packet);
+                *reachedEnd = true;
+                return 0;
+            }
+            if (error < 0) {
+                av_packet_free(&packet);
+                return error;
+            }
+            if (selectedStream(source, packet->stream_index)
+                && (packet->flags & AV_PKT_FLAG_CORRUPT) == 0) {
+                *output = packet;
+                return 0;
+            }
+            av_packet_unref(packet);
+        }
+    }
+
+    void storeDemuxPacket(
+        InputSource source,
+        AVFormatContext* format,
+        AVPacket* packet)
+    {
+        auto& demux = demuxForSource(source);
+        const auto* stream = format->streams[packet->stream_index];
+        const auto packetTimestamp = packet->dts != AV_NOPTS_VALUE
+            ? packet->dts
+            : packet->pts;
+        demux.pendingTimestamp = packetTimestamp == AV_NOPTS_VALUE
+            ? std::numeric_limits<std::int64_t>::min()
+            : (av_rescale_q(
+                   packetTimestamp,
+                   stream->time_base,
+                   AV_TIME_BASE_Q)
+                - startTimeForSource(source))
+                / 1000;
+        demux.pendingDuration = packet->duration > 0
+            ? std::max<std::int64_t>(
+                0,
+                av_rescale_q(
+                    packet->duration,
+                    stream->time_base,
+                    AVRational { 1, 1000 }))
+            : 0;
+        if (demux.pendingTimestamp
+            != std::numeric_limits<std::int64_t>::min()) {
+            auto& progress = demuxProgressForSource(source);
+            progress = std::max(progress, demux.pendingTimestamp);
+        }
+        demux.pendingPacket = std::shared_ptr<AVPacket>(
+            packet,
+            [](AVPacket* owned) { av_packet_free(&owned); });
+    }
+
+    int installRecoveredInput(
+        InputSource source,
+        AVFormatContext*& replacement,
+        AVPacket*& firstPacket,
+        bool reachedEnd,
+        std::uint64_t serial,
+        std::int64_t resumePosition)
+    {
+        if (!replacement
+            || !networkRecoveryControlValid(
+                serial,
+                NetworkRecoveryOperation::Read)) {
+            return AVERROR_EXIT;
+        }
+
+        resetPlaybackQueues();
+        flushAudioSink();
+        if (!networkRecoveryControlValid(
+                serial,
+                NetworkRecoveryOperation::Read)) {
+            return AVERROR_EXIT;
+        }
+
+        auto*& slot = formatSlotForSource(source);
+        auto* retired = slot;
+        slot = replacement;
+        replacement = nullptr;
+
+        const auto actualStartTime = slot->start_time == AV_NOPTS_VALUE
+            ? 0
+            : slot->start_time;
+        const auto normalizedStartTime = formatIsSeekable(slot)
+            ? actualStartTime
+            : actualStartTime - resumePosition * 1000;
+        startTimeSlotForSource(source) = normalizedStartTime;
+
+        media_.demux.reset();
+        media_.externalAudio.resetDemux();
+        media_.externalSubtitle.resetDemux();
+
+        const auto updateDecoder = [&](Decoder& decoder) {
+            if (!decoder.valid() || decoder.source != source) {
+                return;
+            }
+            decoder.stream = slot->streams[decoder.streamIndex];
+            decoder.startTimeUs = normalizedStartTime;
+            decoder.context->pkt_timebase = decoder.stream->time_base;
+        };
+        updateDecoder(media_.video);
+        updateDecoder(media_.audio);
+        updateDecoder(media_.subtitle);
+
+        if (firstPacket) {
+            storeDemuxPacket(source, slot, firstPacket);
+            firstPacket = nullptr;
+        } else if (reachedEnd) {
+            demuxForSource(source).end = true;
+        }
+
+        for (const auto other : {
+                 InputSource::Primary,
+                 InputSource::ExternalAudio,
+                 InputSource::ExternalSubtitle,
+             }) {
+            if (other == source || !sourceIsActive(other)) {
+                continue;
+            }
+            auto* format = formatForSource(other);
+            if (!formatIsSeekable(format)) {
+                continue;
+            }
+            const int alignmentError = seekRecoveredFormat(
+                format,
+                startTimeForSource(other),
+                resumePosition);
+            if (alignmentError < 0) {
+                publishEvent({
+                    "network.recovery.alignment",
+                    "Recovered the failed network input, but could not "
+                    "realign the "
+                        + std::string(inputDescription(other))
+                        + " input: " + ffmpegError(alignmentError),
+                    alignmentError,
+                });
+            }
+        }
+
+        if (media_.video.valid()) {
+            avcodec_flush_buffers(media_.video.context);
+        }
+        if (media_.audio.valid()) {
+            avcodec_flush_buffers(media_.audio.context);
+        }
+        if (media_.subtitle.valid()) {
+            avcodec_flush_buffers(media_.subtitle.context);
+        }
+        avformat_close_input(&retired);
+
+        bool waitForData = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (source == InputSource::Primary) {
+                mediaInfo_.startTime = actualStartTime / 1000;
+                if (slot->duration != AV_NOPTS_VALUE) {
+                    mediaInfo_.duration = slot->duration / 1000;
+                }
+                mediaInfo_.seekable = formatIsSeekable(slot);
+            }
+            currentPosition_ = clampPositionLocked(resumePosition);
+            resetClockLocked(currentPosition_);
+            waitForData = currentState_ == State::Playing
+                && requestedState_ == State::Playing
+                && (media_.video.valid() || media_.audio.valid());
+            if (waitForData) {
+                primeOutputWaitLocked(
+                    currentPosition_,
+                    presentationGeneration_.load(std::memory_order_acquire),
+                    media_.video.valid() && media_.audio.valid(),
+                    audioSinkOpen_ && audioSinkHasClock_);
+            }
+        }
+        if (waitForData) {
+            publishStatus(MediaStatus::Buffering);
+            const auto generation = presentationGeneration_.load(
+                std::memory_order_acquire);
+            const auto packetStreams = activePacketStreams();
+            if (beginPacketBuffering(
+                    PacketBufferingReason::NetworkRecovery,
+                    generation,
+                    packetStreams.first,
+                    packetStreams.second)) {
+                updatePacketBuffering(generation);
+            }
+        }
+        return 0;
+    }
+
+    int recoverNetworkRead(InputSource source, int initialError)
+    {
+        const auto inputUrl = urlForSource(source);
+        const auto policy = networkRecoveryPolicy();
+        if (!policy.enabled || !isNetworkUrl(inputUrl)
+            || !isRecoverableNetworkError(initialError)) {
+            return initialError;
+        }
+
+        std::uint64_t serial = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            serial = mediaSerial_;
+        }
+        auto& budget = readRecoveryBudgetForSource(source);
+        const auto progress = demuxProgressForSource(source);
+        const bool newBudget = !budget.active
+            || budget.mediaSerial != serial;
+        const bool madeProgress = !newBudget
+            && budget.progressTimestamp
+                != std::numeric_limits<std::int64_t>::min()
+            && progress >= budget.progressTimestamp
+                    + kNetworkRecoveryProgressMilliseconds;
+        if (newBudget || madeProgress) {
+            budget.active = true;
+            budget.mediaSerial = serial;
+            budget.progressTimestamp = progress;
+            budget.attempts = 0;
+        } else if (budget.progressTimestamp
+                       == std::numeric_limits<std::int64_t>::min()
+                   && progress
+                       != std::numeric_limits<std::int64_t>::min()) {
+            // Establish an anchor without forgiving an attempt that only
+            // produced one early packet before failing again.
+            budget.progressTimestamp = progress;
+        }
+        int error = initialError;
+        auto delay = policy.initialRetryDelayMilliseconds;
+        for (std::uint32_t consumed = 0;
+             consumed < budget.attempts;
+             ++consumed) {
+            delay = nextNetworkRetryDelay(
+                delay,
+                policy.maximumRetryDelayMilliseconds);
+        }
+        std::uint32_t attemptsConsumed = budget.attempts;
+        for (std::uint32_t attempt = budget.attempts + 1;
+             attempt <= policy.maximumAttempts;
+             ++attempt) {
+            const auto resumePosition = position();
+            NetworkRecoveryStatus status;
+            status.state = NetworkRecoveryState::Waiting;
+            status.operation = NetworkRecoveryOperation::Read;
+            status.input = publicRecoveryInput(source);
+            status.url = inputUrl;
+            status.attempt = attempt;
+            status.maximumAttempts = policy.maximumAttempts;
+            status.retryDelayMilliseconds = delay;
+            status.error = error;
+            status.resumePosition = resumePosition;
+            status.presentationGeneration = presentationGeneration_.load(
+                std::memory_order_acquire);
+            publishNetworkRecoveryStatus(status);
+            if (!waitForNetworkRetry(
+                    serial,
+                    NetworkRecoveryOperation::Read,
+                    delay)) {
+                publishNetworkRecoveryStatus({});
+                return AVERROR_EXIT;
+            }
+
+            status.state = NetworkRecoveryState::Reopening;
+            status.retryDelayMilliseconds = 0;
+            publishNetworkRecoveryStatus(status);
+            attemptsConsumed = attempt;
+            budget.attempts = attempt;
+            networkRecoveryAttempts_.fetch_add(1, std::memory_order_relaxed);
+
+            AVFormatContext* replacement = nullptr;
+            AVPacket* firstPacket = nullptr;
+            bool reachedEnd = false;
+            error = openInput(inputUrl, &replacement);
+            if (error >= 0) {
+                error = validateRecoveredInput(source, replacement);
+            }
+            const auto replacementStartTime = replacement
+                    && replacement->start_time != AV_NOPTS_VALUE
+                ? replacement->start_time
+                : 0;
+            if (error >= 0 && formatIsSeekable(replacement)) {
+                error = seekRecoveredFormat(
+                    replacement,
+                    replacementStartTime,
+                    resumePosition);
+            }
+            if (error >= 0) {
+                // A successful open is provisional until the replacement can
+                // return a selected packet (or a clean EOF). Keep immediate
+                // post-open failures inside this bounded recovery cycle.
+                error = readRecoveredPacket(
+                    source,
+                    replacement,
+                    &firstPacket,
+                    &reachedEnd);
+            }
+            if (error >= 0) {
+                error = installRecoveredInput(
+                    source,
+                    replacement,
+                    firstPacket,
+                    reachedEnd,
+                    serial,
+                    resumePosition);
+            }
+            av_packet_free(&firstPacket);
+            avformat_close_input(&replacement);
+
+            if (error >= 0) {
+                status.state = NetworkRecoveryState::Recovered;
+                status.error = 0;
+                status.resumePosition = resumePosition;
+                status.presentationGeneration = presentationGeneration_.load(
+                    std::memory_order_acquire);
+                publishNetworkRecoveryStatus(status);
+                successfulNetworkRecoveries_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                publishEvent({
+                    "network.recovered",
+                    "Recovered the "
+                        + std::string(inputDescription(source))
+                        + " network input at "
+                        + std::to_string(resumePosition)
+                        + " ms on attempt " + std::to_string(attempt),
+                    0,
+                });
+                return 0;
+            }
+            if (error == AVERROR_EXIT
+                || !networkRecoveryControlValid(
+                    serial,
+                    NetworkRecoveryOperation::Read)) {
+                publishNetworkRecoveryStatus({});
+                return AVERROR_EXIT;
+            }
+            if (!isRecoverableNetworkError(error)) {
+                break;
+            }
+            delay = nextNetworkRetryDelay(
+                delay,
+                policy.maximumRetryDelayMilliseconds);
+        }
+
+        NetworkRecoveryStatus failed;
+        failed.state = NetworkRecoveryState::Failed;
+        failed.operation = NetworkRecoveryOperation::Read;
+        failed.input = publicRecoveryInput(source);
+        failed.url = inputUrl;
+        failed.attempt = attemptsConsumed;
+        failed.maximumAttempts = policy.maximumAttempts;
+        failed.error = error;
+        failed.resumePosition = position();
+        failed.presentationGeneration = presentationGeneration_.load(
+            std::memory_order_acquire);
+        publishNetworkRecoveryStatus(failed);
+        failedNetworkRecoveries_.fetch_add(1, std::memory_order_relaxed);
+        publishEvent({
+            "network.recovery.failed",
+            "Could not recover the "
+                + std::string(inputDescription(source))
+                + " network input after a read error: "
+                + ffmpegError(error),
+            error,
+        });
+        return error;
+    }
+
     InputReadResult ensureDemuxPacket(InputSource source)
     {
         auto& demux = demuxForSource(source);
@@ -2525,17 +3914,17 @@ private:
             }
             if (error < 0) {
                 av_packet_free(&packet);
-                if (error != AVERROR_EXIT) {
-                    const char* input = source == InputSource::Primary
-                        ? "main"
-                        : source == InputSource::ExternalAudio
-                            ? "external audio"
-                            : "external subtitle";
+                const int recoveryError = recoverNetworkRead(source, error);
+                if (recoveryError >= 0) {
+                    return InputReadResult::Recovered;
+                }
+                if (recoveryError != AVERROR_EXIT) {
                     publishEvent({
                         "reader.error",
-                        "Could not read " + std::string(input)
-                            + " packet: " + ffmpegError(error),
-                        error,
+                        "Could not read "
+                            + std::string(inputDescription(source))
+                            + " packet: " + ffmpegError(recoveryError),
+                        recoveryError,
                     });
                 }
                 return InputReadResult::Error;
@@ -2545,21 +3934,7 @@ private:
                 continue;
             }
 
-            const auto* stream = format->streams[packet->stream_index];
-            const auto packetTimestamp = packet->dts != AV_NOPTS_VALUE
-                ? packet->dts
-                : packet->pts;
-            demux.pendingTimestamp = packetTimestamp == AV_NOPTS_VALUE
-                ? std::numeric_limits<std::int64_t>::min()
-                : (av_rescale_q(
-                       packetTimestamp,
-                       stream->time_base,
-                       AV_TIME_BASE_Q)
-                    - startTimeForSource(source))
-                    / 1000;
-            demux.pendingPacket = std::shared_ptr<AVPacket>(
-                packet,
-                [](AVPacket* owned) { av_packet_free(&owned); });
+            storeDemuxPacket(source, format, packet);
             return InputReadResult::Ready;
         }
     }
@@ -2577,8 +3952,27 @@ private:
             std::numeric_limits<std::int64_t>::max();
         for (const auto source : sources) {
             const auto result = ensureDemuxPacket(source);
+            if (result == InputReadResult::Recovered) {
+                // Installing an external-input replacement invalidates every
+                // source's pending demux packet. Restart the whole merge scan
+                // so a candidate selected earlier in this loop cannot outlive
+                // that generation reset.
+                return DecodeResult::Continue;
+            }
             if (result == InputReadResult::Error) {
                 return DecodeResult::Error;
+            }
+            if (result == InputReadResult::End) {
+                const auto generation = presentationGeneration_.load(
+                    std::memory_order_acquire);
+                if (media_.audio.valid()
+                    && media_.audio.source == source) {
+                    markPacketStreamEnded(generation, false);
+                }
+                if (media_.video.valid()
+                    && media_.video.source == source) {
+                    markPacketStreamEnded(generation, true);
+                }
             }
             auto& demux = demuxForSource(source);
             if (result == InputReadResult::Ready
@@ -2638,6 +4032,8 @@ private:
 
         auto& selectedDemux = demuxForSource(selectedSource);
         auto packet = std::move(selectedDemux.pendingPacket);
+        const auto packetTimestamp = selectedDemux.pendingTimestamp;
+        const auto packetDuration = selectedDemux.pendingDuration;
 
         bool ok = true;
         if (media_.video.valid()
@@ -2656,6 +4052,8 @@ private:
                     std::move(retained),
                     presentationGeneration_.load(
                         std::memory_order_acquire),
+                    packetTimestamp,
+                    packetDuration,
                     false);
             }
         } else if (media_.audio.valid()
@@ -2674,6 +4072,8 @@ private:
                     std::move(retained),
                     presentationGeneration_.load(
                         std::memory_order_acquire),
+                    packetTimestamp,
+                    packetDuration,
                     false);
             }
         } else if (media_.subtitle.valid()
@@ -2881,22 +4281,587 @@ private:
             && requestedState_ == State::Playing;
     }
 
+    std::pair<bool, bool> activePacketStreams() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {
+            hasOpenMedia_ && mediaInfo_.activeAudioTrack >= 0,
+            hasOpenMedia_ && mediaInfo_.activeVideoTrack >= 0,
+        };
+    }
+
+    template <typename Queue>
+    static PacketQueueMetrics packetQueueMetrics(const Queue& queue)
+    {
+        PacketQueueMetrics metrics;
+        std::int64_t firstTimestamp =
+            std::numeric_limits<std::int64_t>::max();
+        std::int64_t lastEnd =
+            std::numeric_limits<std::int64_t>::min();
+        std::int64_t summedDuration = 0;
+        std::int64_t firstMemoryTimestamp = firstTimestamp;
+        std::int64_t lastMemoryEnd = lastEnd;
+        std::int64_t summedMemoryDuration = 0;
+        std::int64_t firstDiskTimestamp = firstTimestamp;
+        std::int64_t lastDiskEnd = lastEnd;
+        std::int64_t summedDiskDuration = 0;
+        const auto accumulateDuration = [](
+                                            const auto& queued,
+                                            std::int64_t& first,
+                                            std::int64_t& last,
+                                            std::int64_t& summed) {
+            summed += std::max<std::int64_t>(0, queued.duration);
+            if (queued.timestamp
+                == std::numeric_limits<std::int64_t>::min()) {
+                return;
+            }
+            first = std::min(first, queued.timestamp);
+            last = std::max(
+                last,
+                queued.timestamp
+                    + std::max<std::int64_t>(0, queued.duration));
+        };
+        const auto duration = [](std::int64_t first,
+                                 std::int64_t last,
+                                 std::int64_t summed) {
+            const auto span = first
+                    != std::numeric_limits<std::int64_t>::max()
+                    && last >= first
+                ? last - first
+                : 0;
+            return std::max(span, summed);
+        };
+        for (const auto& queued : queue) {
+            if (!queued.packet || queued.end) {
+                if (!queued.diskEntry || queued.end) {
+                    continue;
+                }
+            }
+            ++metrics.packets;
+            metrics.bytes += queued.bytes;
+            accumulateDuration(
+                queued,
+                firstTimestamp,
+                lastEnd,
+                summedDuration);
+            if (queued.diskEntry) {
+                ++metrics.diskPackets;
+                metrics.diskBytes += queued.bytes;
+                accumulateDuration(
+                    queued,
+                    firstDiskTimestamp,
+                    lastDiskEnd,
+                    summedDiskDuration);
+            } else {
+                ++metrics.memoryPackets;
+                metrics.memoryBytes += queued.bytes;
+                accumulateDuration(
+                    queued,
+                    firstMemoryTimestamp,
+                    lastMemoryEnd,
+                    summedMemoryDuration);
+            }
+        }
+        metrics.bufferedMilliseconds = duration(
+            firstTimestamp,
+            lastEnd,
+            summedDuration);
+        metrics.memoryBufferedMilliseconds = duration(
+            firstMemoryTimestamp,
+            lastMemoryEnd,
+            summedMemoryDuration);
+        metrics.diskBufferedMilliseconds = duration(
+            firstDiskTimestamp,
+            lastDiskEnd,
+            summedDiskDuration);
+        return metrics;
+    }
+
+    PacketBufferStatus currentPacketBufferStatus() const
+    {
+        PacketBufferState state;
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            state = packetBufferState_;
+        }
+
+        PacketQueueMetrics audio;
+        PacketQueueMetrics video;
+        {
+            std::lock_guard<std::mutex> lock(audioPacketMutex_);
+            audio = packetQueueMetrics(audioPackets_);
+        }
+        {
+            std::lock_guard<std::mutex> lock(videoPacketMutex_);
+            video = packetQueueMetrics(videoPackets_);
+        }
+
+        std::int64_t buffered = state.targetMilliseconds;
+        bool hasTimedStream = false;
+        if (state.needsAudio && !state.audioEnded) {
+            buffered = audio.bufferedMilliseconds;
+            hasTimedStream = true;
+        }
+        if (state.needsVideo && !state.videoEnded) {
+            buffered = hasTimedStream
+                ? std::min(buffered, video.bufferedMilliseconds)
+                : video.bufferedMilliseconds;
+            hasTimedStream = true;
+        }
+        if (!hasTimedStream) {
+            buffered = state.targetMilliseconds;
+        }
+        const auto progress = state.buffering
+                && state.targetMilliseconds > 0
+            ? std::clamp(
+                static_cast<double>(buffered)
+                    / static_cast<double>(state.targetMilliseconds),
+                0.0,
+                1.0)
+            : 1.0;
+        const auto memoryBytes = audio.memoryBytes + video.memoryBytes;
+        const auto diskBytes = audio.diskBytes + video.diskBytes;
+        return {
+            state.buffering,
+            state.reason,
+            std::max<std::int64_t>(0, buffered),
+            state.targetMilliseconds,
+            memoryBytes + diskBytes,
+            memoryBytes,
+            diskBytes,
+            packetDiskStore_->path(),
+            progress,
+            state.generation,
+            state.capacityLimited,
+        };
+    }
+
+    static bool materiallyDifferent(
+        const PacketBufferStatus& left,
+        const PacketBufferStatus& right) noexcept
+    {
+        return left.buffering != right.buffering
+            || left.reason != right.reason
+            || left.targetMilliseconds != right.targetMilliseconds
+            || left.presentationGeneration != right.presentationGeneration
+            || left.capacityLimited != right.capacityLimited
+            || std::abs(left.progress - right.progress) >= 0.01
+            || (left.bufferedBytes == 0) != (right.bufferedBytes == 0)
+            || (left.diskBufferedBytes == 0)
+                != (right.diskBufferedBytes == 0)
+            || left.diskCachePath != right.diskCachePath;
+    }
+
+    void publishPacketBufferStatus(bool force = false)
+    {
+        const auto status = currentPacketBufferStatus();
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            if (!force && lastPublishedPacketBufferStatus_
+                && !materiallyDifferent(
+                    *lastPublishedPacketBufferStatus_,
+                    status)) {
+                return;
+            }
+            lastPublishedPacketBufferStatus_ = status;
+        }
+        PacketBufferStatusCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            callback = packetBufferStatusCallback_;
+        }
+        if (callback) {
+            callback(status);
+        }
+    }
+
+    bool beginPacketBuffering(
+        PacketBufferingReason reason,
+        std::uint64_t generation,
+        bool needsAudio,
+        bool needsVideo)
+    {
+        const auto policy = packetBufferPolicy();
+        const auto target = reason == PacketBufferingReason::InitialPlayback
+            ? policy.initialBufferMilliseconds
+            : policy.rebufferMilliseconds;
+        if (!policy.enabled || target <= 0 || (!needsAudio && !needsVideo)) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            if (packetBufferState_.buffering
+                && packetBufferState_.generation == generation) {
+                return true;
+            }
+            packetBufferState_ = {
+                true,
+                reason,
+                target,
+                generation,
+                needsAudio,
+                needsVideo,
+                audioPacketInputEnded_.load(std::memory_order_acquire),
+                videoPacketInputEnded_.load(std::memory_order_acquire),
+                false,
+            };
+            lastPublishedPacketBufferStatus_.reset();
+        }
+        publishPacketBufferStatus(true);
+        publishStatus(MediaStatus::Buffering);
+        packetBufferChanged_.notify_all();
+        return true;
+    }
+
+    void completePacketBuffering(
+        std::uint64_t generation,
+        bool capacityLimited = false)
+    {
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            if (!packetBufferState_.buffering
+                || packetBufferState_.generation != generation) {
+                return;
+            }
+            packetBufferState_.buffering = false;
+            packetBufferState_.capacityLimited = capacityLimited;
+        }
+        packetBufferChanged_.notify_all();
+        audioPacketChanged_.notify_all();
+        videoPacketChanged_.notify_all();
+        publishPacketBufferStatus(true);
+    }
+
+    void updatePacketBuffering(std::uint64_t generation)
+    {
+        const auto status = currentPacketBufferStatus();
+        bool complete = false;
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            if (!packetBufferState_.buffering
+                || packetBufferState_.generation != generation) {
+                return;
+            }
+            const bool audioReady = !packetBufferState_.needsAudio
+                || packetBufferState_.audioEnded
+                || status.bufferedMilliseconds
+                    >= packetBufferState_.targetMilliseconds;
+            const bool videoReady = !packetBufferState_.needsVideo
+                || packetBufferState_.videoEnded
+                || status.bufferedMilliseconds
+                    >= packetBufferState_.targetMilliseconds;
+            complete = audioReady && videoReady;
+        }
+        if (complete) {
+            completePacketBuffering(generation);
+        } else {
+            publishPacketBufferStatus();
+        }
+    }
+
+    void markPacketStreamEnded(
+        std::uint64_t generation,
+        bool video)
+    {
+        bool alreadyEnded = false;
+        if (video) {
+            alreadyEnded = videoPacketInputEnded_.exchange(
+                true,
+                std::memory_order_acq_rel);
+        } else {
+            alreadyEnded = audioPacketInputEnded_.exchange(
+                true,
+                std::memory_order_acq_rel);
+        }
+        if (alreadyEnded) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            if (packetBufferState_.generation != generation) {
+                return;
+            }
+            if (video) {
+                packetBufferState_.videoEnded = true;
+            } else {
+                packetBufferState_.audioEnded = true;
+            }
+        }
+        updatePacketBuffering(generation);
+    }
+
+    void resetPacketBuffering()
+    {
+        bool publishReset = false;
+        {
+            std::lock_guard<std::mutex> lock(packetBufferMutex_);
+            publishReset = packetBufferState_.buffering;
+            packetBufferState_ = {};
+            lastPublishedPacketBufferStatus_.reset();
+        }
+        packetBufferChanged_.notify_all();
+        if (publishReset) {
+            publishPacketBufferStatus(true);
+        }
+    }
+
+    bool waitForPacketBuffering(std::uint64_t generation)
+    {
+        std::unique_lock<std::mutex> lock(packetBufferMutex_);
+        packetBufferChanged_.wait(lock, [this, generation] {
+            return quitting_.load(std::memory_order_acquire)
+                || packetBufferState_.generation != generation
+                || !packetBufferState_.buffering;
+        });
+        return !quitting_.load(std::memory_order_acquire)
+            && generation
+                == presentationGeneration_.load(std::memory_order_acquire)
+            && (packetBufferState_.generation != generation
+                || !packetBufferState_.buffering);
+    }
+
+    bool memoryPacketQueueCanAccept(
+        const PacketQueueMetrics& metrics,
+        std::size_t hardPacketLimit,
+        std::uint64_t packetBytes,
+        const PacketBufferPolicy& policy) const
+    {
+        const auto totalBytes = queuedMemoryPacketBytes_.load(
+            std::memory_order_relaxed);
+        const bool bytesFit = totalBytes == 0
+            || (totalBytes < policy.maximumBufferBytes
+                && packetBytes
+                    <= policy.maximumBufferBytes - totalBytes);
+        return metrics.memoryPackets < hardPacketLimit
+            && metrics.memoryBufferedMilliseconds
+                < policy.maximumBufferMilliseconds
+            && bytesFit;
+    }
+
+    bool diskPacketQueueCanAccept(
+        const PacketQueueMetrics& metrics,
+        const PacketBufferPolicy& policy) const
+    {
+        return policy.diskCache.enabled
+            && policy.diskCache.maximumCacheMilliseconds > 0
+            && !diskCacheUnavailable_.load(std::memory_order_acquire)
+            && metrics.packets < kMaximumQueuedDiskPacketMetadata
+            && metrics.diskBufferedMilliseconds
+                < policy.diskCache.maximumCacheMilliseconds;
+    }
+
+    DiskPacketResult storePacketOnDisk(
+        const std::shared_ptr<AVPacket>& packet,
+        const PacketBufferPolicy& policy)
+    {
+        if (!packet || packet->size <= 0 || !packet->data) {
+            return { {}, {}, true, {} };
+        }
+
+        auto* properties = av_packet_alloc();
+        if (!properties) {
+            return {
+                {},
+                {},
+                false,
+                "Could not allocate packet metadata for the disk cache",
+            };
+        }
+        const int propertiesError = av_packet_copy_props(
+            properties,
+            packet.get());
+        if (propertiesError < 0) {
+            av_packet_free(&properties);
+            return {
+                {},
+                {},
+                false,
+                "Could not copy packet metadata for the disk cache: "
+                    + ffmpegError(propertiesError),
+            };
+        }
+        properties->stream_index = packet->stream_index;
+        auto retainedProperties = std::shared_ptr<AVPacket>(
+            properties,
+            [](AVPacket* owned) { av_packet_free(&owned); });
+        auto stored = packetDiskStore_->store(
+            packet->data,
+            static_cast<std::uint64_t>(packet->size),
+            policy.diskCache.maximumCacheBytes);
+        return {
+            std::move(retainedProperties),
+            std::move(stored.entry),
+            stored.capacityLimited,
+            std::move(stored.error),
+        };
+    }
+
+    void reportPacketDiskCacheError(const std::string& detail)
+    {
+        if (detail.empty()
+            || diskCacheUnavailable_.exchange(
+                true,
+                std::memory_order_acq_rel)) {
+            return;
+        }
+        publishEvent({
+            "packet.disk_cache.error",
+            detail + "; continuing with the in-memory packet buffer",
+            AVERROR(EIO),
+        });
+    }
+
+    bool materializeDiskPacket(QueuedVideoPacket& queued)
+    {
+        if (queued.packet || queued.end) {
+            return true;
+        }
+        if (!queued.diskPacketProperties || !queued.diskEntry) {
+            publishEvent({
+                "packet.disk_cache.read",
+                "A disk-backed packet is missing its cache metadata",
+                AVERROR_INVALIDDATA,
+            });
+            return false;
+        }
+
+        std::vector<std::uint8_t> payload;
+        std::string error;
+        if (!packetDiskStore_->load(queued.diskEntry, payload, error)) {
+            publishEvent({
+                "packet.disk_cache.read",
+                std::move(error),
+                AVERROR(EIO),
+            });
+            return false;
+        }
+        if (queued.diskEntry->size
+            > static_cast<std::uint64_t>(
+                std::numeric_limits<int>::max())) {
+            publishEvent({
+                "packet.disk_cache.read",
+                "A disk-backed packet exceeds FFmpeg's packet-size limit",
+                AVERROR(EINVAL),
+            });
+            return false;
+        }
+
+        auto* packet = av_packet_alloc();
+        int packetError = packet
+            ? av_new_packet(
+                  packet,
+                  static_cast<int>(queued.diskEntry->size))
+            : AVERROR(ENOMEM);
+        if (packetError >= 0) {
+            packetError = av_packet_copy_props(
+                packet,
+                queued.diskPacketProperties.get());
+        }
+        if (packetError < 0) {
+            av_packet_free(&packet);
+            publishEvent({
+                "packet.disk_cache.read",
+                "Could not restore a disk-backed packet: "
+                    + ffmpegError(packetError),
+                packetError,
+            });
+            return false;
+        }
+        if (!payload.empty()) {
+            std::copy(payload.begin(), payload.end(), packet->data);
+        }
+        packet->stream_index =
+            queued.diskPacketProperties->stream_index;
+        queued.packet = std::shared_ptr<AVPacket>(
+            packet,
+            [](AVPacket* owned) { av_packet_free(&owned); });
+        queued.diskEntry.reset();
+        queued.diskPacketProperties.reset();
+        return true;
+    }
+
+    bool packetBufferingActive(std::uint64_t generation) const
+    {
+        std::lock_guard<std::mutex> lock(packetBufferMutex_);
+        return packetBufferState_.buffering
+            && packetBufferState_.generation == generation;
+    }
+
     bool enqueueVideoPacket(
         std::shared_ptr<AVPacket> packet,
         std::uint64_t generation,
+        std::int64_t timestamp,
+        std::int64_t duration,
         bool end)
     {
         while (decodeRequestValid(generation)) {
             std::unique_lock<std::mutex> lock(videoPacketMutex_);
-            if (videoPackets_.size() < kMaximumQueuedVideoPackets) {
+            const auto metrics = packetQueueMetrics(videoPackets_);
+            const auto bytes = packet && packet->size > 0
+                ? static_cast<std::uint64_t>(packet->size)
+                : 0;
+            const auto policy = packetBufferPolicy();
+            if (memoryPacketQueueCanAccept(
+                    metrics,
+                    kMaximumQueuedVideoPackets,
+                    bytes,
+                    policy)) {
                 videoPackets_.push_back({
                     std::move(packet),
+                    {},
+                    {},
                     generation,
+                    timestamp,
+                    duration,
+                    bytes,
                     end,
                 });
+                queuedMemoryPacketBytes_.fetch_add(
+                    bytes,
+                    std::memory_order_relaxed);
                 lock.unlock();
+                if (end) {
+                    markPacketStreamEnded(generation, true);
+                } else {
+                    updatePacketBuffering(generation);
+                }
                 videoPacketChanged_.notify_one();
                 return true;
+            }
+
+            DiskPacketResult diskPacket;
+            if (packet && diskPacketQueueCanAccept(metrics, policy)) {
+                diskPacket = storePacketOnDisk(packet, policy);
+                if (diskPacket.entry) {
+                    videoPackets_.push_back({
+                        {},
+                        std::move(diskPacket.properties),
+                        std::move(diskPacket.entry),
+                        generation,
+                        timestamp,
+                        duration,
+                        bytes,
+                        end,
+                    });
+                    lock.unlock();
+                    updatePacketBuffering(generation);
+                    videoPacketChanged_.notify_one();
+                    return true;
+                }
+            }
+            if (!diskPacket.error.empty()) {
+                const auto error = std::move(diskPacket.error);
+                lock.unlock();
+                reportPacketDiskCacheError(error);
+                if (packetBufferingActive(generation)) {
+                    completePacketBuffering(generation, true);
+                }
+                continue;
+            }
+            if (packetBufferingActive(generation)) {
+                lock.unlock();
+                completePacketBuffering(generation, true);
+                continue;
             }
             videoPacketSpace_.wait_for(lock, Milliseconds(20));
         }
@@ -2906,19 +4871,78 @@ private:
     bool enqueueAudioPacket(
         std::shared_ptr<AVPacket> packet,
         std::uint64_t generation,
+        std::int64_t timestamp,
+        std::int64_t duration,
         bool end)
     {
         while (decodeRequestValid(generation)) {
             std::unique_lock<std::mutex> lock(audioPacketMutex_);
-            if (audioPackets_.size() < kMaximumQueuedAudioPackets) {
+            const auto metrics = packetQueueMetrics(audioPackets_);
+            const auto bytes = packet && packet->size > 0
+                ? static_cast<std::uint64_t>(packet->size)
+                : 0;
+            const auto policy = packetBufferPolicy();
+            if (memoryPacketQueueCanAccept(
+                    metrics,
+                    kMaximumQueuedAudioPackets,
+                    bytes,
+                    policy)) {
                 audioPackets_.push_back({
                     std::move(packet),
+                    {},
+                    {},
                     generation,
+                    timestamp,
+                    duration,
+                    bytes,
                     end,
                 });
+                queuedMemoryPacketBytes_.fetch_add(
+                    bytes,
+                    std::memory_order_relaxed);
                 lock.unlock();
+                if (end) {
+                    markPacketStreamEnded(generation, false);
+                } else {
+                    updatePacketBuffering(generation);
+                }
                 audioPacketChanged_.notify_one();
                 return true;
+            }
+
+            DiskPacketResult diskPacket;
+            if (packet && diskPacketQueueCanAccept(metrics, policy)) {
+                diskPacket = storePacketOnDisk(packet, policy);
+                if (diskPacket.entry) {
+                    audioPackets_.push_back({
+                        {},
+                        std::move(diskPacket.properties),
+                        std::move(diskPacket.entry),
+                        generation,
+                        timestamp,
+                        duration,
+                        bytes,
+                        end,
+                    });
+                    lock.unlock();
+                    updatePacketBuffering(generation);
+                    audioPacketChanged_.notify_one();
+                    return true;
+                }
+            }
+            if (!diskPacket.error.empty()) {
+                const auto error = std::move(diskPacket.error);
+                lock.unlock();
+                reportPacketDiskCacheError(error);
+                if (packetBufferingActive(generation)) {
+                    completePacketBuffering(generation, true);
+                }
+                continue;
+            }
+            if (packetBufferingActive(generation)) {
+                lock.unlock();
+                completePacketBuffering(generation, true);
+                continue;
             }
             audioPacketSpace_.wait_for(lock, Milliseconds(20));
         }
@@ -2974,9 +4998,9 @@ private:
     bool finishQueuedDecoding(std::uint64_t generation)
     {
         const bool videoEndQueued = !media_.video.valid()
-            || enqueueVideoPacket({}, generation, true);
+            || enqueueVideoPacket({}, generation, 0, 0, true);
         const bool audioEndQueued = !media_.audio.valid()
-            || enqueueAudioPacket({}, generation, true);
+            || enqueueAudioPacket({}, generation, 0, 0, true);
         const bool primaryDecodersFinished =
             videoEndQueued && audioEndQueued
             && (!media_.video.valid()
@@ -3025,18 +5049,58 @@ private:
             {
                 std::unique_lock<std::mutex> lock(audioPacketMutex_);
                 while (!quitting_.load(std::memory_order_acquire)) {
-                    audioPacketChanged_.wait(lock, [this] {
-                        return quitting_.load(std::memory_order_acquire)
-                            || !audioPackets_.empty();
-                    });
+                    if (audioPackets_.empty()) {
+                        const auto generation =
+                            presentationGeneration_.load(
+                                std::memory_order_acquire);
+                        if (packetBufferingActive(generation)) {
+                            lock.unlock();
+                            waitForPacketBuffering(generation);
+                            lock.lock();
+                            continue;
+                        }
+                        const auto policy = packetBufferPolicy();
+                        const bool ready = audioPacketChanged_.wait_for(
+                            lock,
+                            Milliseconds(
+                                policy.underflowDetectionMilliseconds),
+                            [this] {
+                                return quitting_.load(
+                                           std::memory_order_acquire)
+                                    || !audioPackets_.empty();
+                            });
+                        if (!ready
+                            && !audioPacketInputEnded_.load(
+                                std::memory_order_acquire)) {
+                            lock.unlock();
+                            const auto packetStreams =
+                                activePacketStreams();
+                            if (packetStreams.first
+                                && decodeRequestValid(generation)
+                                && beginPacketBuffering(
+                                    PacketBufferingReason::Underflow,
+                                    generation,
+                                    packetStreams.first,
+                                    packetStreams.second)) {
+                                beginOutputWait(generation, position());
+                            }
+                            lock.lock();
+                            continue;
+                        }
+                    }
                     if (quitting_.load(std::memory_order_acquire)) {
                         break;
+                    }
+                    if (audioPackets_.empty()) {
+                        continue;
                     }
                     const auto generation =
                         audioPackets_.front().generation;
                     lock.unlock();
+                    const bool bufferReady =
+                        waitForPacketBuffering(generation);
                     const bool mayDecode =
-                        decodeRequestValid(generation);
+                        bufferReady && decodeRequestValid(generation);
                     const bool stale = generation
                         != presentationGeneration_.load(
                             std::memory_order_acquire);
@@ -3057,16 +5121,21 @@ private:
                 queued = std::move(audioPackets_.front());
                 audioPackets_.pop_front();
                 audioPacketInFlight_ = true;
+                if (!queued.diskEntry) {
+                    queuedMemoryPacketBytes_.fetch_sub(
+                        queued.bytes,
+                        std::memory_order_relaxed);
+                }
             }
             audioPacketSpace_.notify_all();
 
-            bool ok = true;
+            bool ok = materializeDiskPacket(queued);
             if (queued.generation
-                == presentationGeneration_.load(
+                    == presentationGeneration_.load(
                     std::memory_order_acquire)) {
-                if (queued.end) {
+                if (ok && queued.end) {
                     flushDecoder(media_.audio, queued.generation);
-                } else if (queued.packet) {
+                } else if (ok && queued.packet) {
                     ok = decodePacket(
                         media_.audio,
                         queued.packet.get(),
@@ -3104,18 +5173,58 @@ private:
             {
                 std::unique_lock<std::mutex> lock(videoPacketMutex_);
                 while (!quitting_.load(std::memory_order_acquire)) {
-                    videoPacketChanged_.wait(lock, [this] {
-                        return quitting_.load(std::memory_order_acquire)
-                            || !videoPackets_.empty();
-                    });
+                    if (videoPackets_.empty()) {
+                        const auto generation =
+                            presentationGeneration_.load(
+                                std::memory_order_acquire);
+                        if (packetBufferingActive(generation)) {
+                            lock.unlock();
+                            waitForPacketBuffering(generation);
+                            lock.lock();
+                            continue;
+                        }
+                        const auto policy = packetBufferPolicy();
+                        const bool ready = videoPacketChanged_.wait_for(
+                            lock,
+                            Milliseconds(
+                                policy.underflowDetectionMilliseconds),
+                            [this] {
+                                return quitting_.load(
+                                           std::memory_order_acquire)
+                                    || !videoPackets_.empty();
+                            });
+                        if (!ready
+                            && !videoPacketInputEnded_.load(
+                                std::memory_order_acquire)) {
+                            lock.unlock();
+                            const auto packetStreams =
+                                activePacketStreams();
+                            if (packetStreams.second
+                                && decodeRequestValid(generation)
+                                && beginPacketBuffering(
+                                    PacketBufferingReason::Underflow,
+                                    generation,
+                                    packetStreams.first,
+                                    packetStreams.second)) {
+                                beginOutputWait(generation, position());
+                            }
+                            lock.lock();
+                            continue;
+                        }
+                    }
                     if (quitting_.load(std::memory_order_acquire)) {
                         break;
+                    }
+                    if (videoPackets_.empty()) {
+                        continue;
                     }
                     const auto generation =
                         videoPackets_.front().generation;
                     lock.unlock();
+                    const bool bufferReady =
+                        waitForPacketBuffering(generation);
                     const bool mayDecode =
-                        decodeRequestValid(generation);
+                        bufferReady && decodeRequestValid(generation);
                     const bool stale = generation
                         != presentationGeneration_.load(
                             std::memory_order_acquire);
@@ -3136,16 +5245,21 @@ private:
                 queued = std::move(videoPackets_.front());
                 videoPackets_.pop_front();
                 videoPacketInFlight_ = true;
+                if (!queued.diskEntry) {
+                    queuedMemoryPacketBytes_.fetch_sub(
+                        queued.bytes,
+                        std::memory_order_relaxed);
+                }
             }
             videoPacketSpace_.notify_all();
 
-            bool ok = true;
+            bool ok = materializeDiskPacket(queued);
             if (queued.generation
-                == presentationGeneration_.load(
+                    == presentationGeneration_.load(
                     std::memory_order_acquire)) {
-                if (queued.end) {
+                if (ok && queued.end) {
                     flushDecoder(media_.video, queued.generation);
-                } else if (queued.packet) {
+                } else if (ok && queued.packet) {
                     const bool paceBeforeDecode =
                         isSurfaceOutputHardwareDevice(
                             media_.video.hardwareDeviceType);
@@ -3669,14 +5783,21 @@ private:
             != presentationGeneration_.load(std::memory_order_acquire)) {
             return;
         }
+        const auto livePolicy = livePlaybackPolicy();
         std::lock_guard<std::mutex> lock(presentationMutex_);
-        const auto maximumQueuedVideoFrames =
+        const auto hardMaximumQueuedVideoFrames =
             item.type == PresentationItem::Type::Video
                 && item.video.hasHardwareFrame()
             ? kMaximumQueuedHardwareVideoFrames
             : kMaximumQueuedSoftwareVideoFrames;
+        const auto maximumQueuedVideoFrames = livePolicy.enabled
+            ? std::min<std::size_t>(
+                hardMaximumQueuedVideoFrames,
+                livePolicy.maximumQueuedVideoFrames)
+            : hardMaximumQueuedVideoFrames;
         if (item.type == PresentationItem::Type::Video
-            && queuedVideoFrames_ >= maximumQueuedVideoFrames) {
+            && queuedVideoFrames_ >= maximumQueuedVideoFrames
+            && !livePolicy.enabled) {
             // Keep the contiguous near-term presentation window. Evicting its
             // oldest frame lets decode bursts, especially after seek, replace
             // frames that are about to be shown with farther-future frames.
@@ -3684,6 +5805,32 @@ private:
                 1,
                 std::memory_order_relaxed);
             return;
+        }
+        while (item.type == PresentationItem::Type::Video
+               && queuedVideoFrames_ >= maximumQueuedVideoFrames) {
+            // A latency-sensitive session instead retains the newest bounded
+            // window. The loop also applies a smaller runtime queue-depth
+            // update without waiting for a generation reset. Do not let a
+            // reordered older arrival displace a newer frame already waiting
+            // for presentation.
+            const auto oldestVideo = std::find_if(
+                presentationQueue_.begin(),
+                presentationQueue_.end(),
+                [](const PresentationItem& candidate) {
+                    return candidate.type == PresentationItem::Type::Video;
+                });
+            videoQueueOverflowDrops_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            lowLatencyVideoQueueDrops_.fetch_add(
+                1,
+                std::memory_order_relaxed);
+            if (oldestVideo == presentationQueue_.end()
+                || item.timestamp() <= oldestVideo->timestamp()) {
+                return;
+            }
+            presentationQueue_.erase(oldestVideo);
+            --queuedVideoFrames_;
         }
         if (item.type == PresentationItem::Type::Subtitle
             && queuedSubtitleFrames_ >= kMaximumQueuedSubtitleFrames) {
@@ -3826,22 +5973,28 @@ private:
         audioQueueDrained_.notify_all();
     }
 
-    bool hasTimelyNewerQueuedVideo(
+    bool hasNewerQueuedVideo(
         std::int64_t timestamp,
         std::int64_t current,
-        std::uint64_t generation) const
+        std::uint64_t generation,
+        std::int64_t lateThreshold,
+        bool requireTimely) const
     {
         std::lock_guard<std::mutex> lock(presentationMutex_);
         return std::any_of(
             presentationQueue_.begin(),
             presentationQueue_.end(),
-            [timestamp, current, generation](
+            [timestamp,
+             current,
+             generation,
+             lateThreshold,
+             requireTimely](
                 const PresentationItem& item) {
                 return item.type == PresentationItem::Type::Video
                     && item.generation == generation
                     && item.timestamp() > timestamp
-                    && current - item.timestamp()
-                        <= kLateVideoFrameThresholdMilliseconds;
+                    && (!requireTimely
+                        || current - item.timestamp() <= lateThreshold);
             });
     }
 
@@ -4029,14 +6182,20 @@ private:
                 enqueuePresentation(std::move(item));
             } else if (waitResult == PresentationWaitResult::Ready) {
                 const auto current = position();
+                const auto livePolicy = livePlaybackPolicy();
+                const auto lateThreshold = livePolicy.enabled
+                    ? livePolicy.lateVideoFrameThresholdMilliseconds
+                    : kLateVideoFrameThresholdMilliseconds;
                 const bool dropLateVideo =
                     item.type == PresentationItem::Type::Video
                     && current - item.timestamp()
-                        > kLateVideoFrameThresholdMilliseconds
-                    && hasTimelyNewerQueuedVideo(
+                        > lateThreshold
+                    && hasNewerQueuedVideo(
                         item.timestamp(),
                         current,
-                        item.generation);
+                        item.generation,
+                        lateThreshold,
+                        !livePolicy.enabled);
                 if (!dropLateVideo) {
                     present(item);
                 } else {
@@ -4077,6 +6236,7 @@ private:
             presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
             clearCurrentVideoFrameSnapshot();
         }
+        resetPacketBuffering();
         invalidateAudioClock();
         audioQueueChanged_.notify_all();
         audioQueueSpace_.notify_all();
@@ -4089,6 +6249,7 @@ private:
         audioPacketChanged_.notify_all();
         audioPacketSpace_.notify_all();
         audioPacketDrained_.notify_all();
+        packetBufferChanged_.notify_all();
     }
 
     void resetPlaybackQueues()
@@ -4096,6 +6257,11 @@ private:
         invalidatePlaybackQueues();
         resetVideoPacketQueue();
         resetAudioPacketQueue();
+        queuedMemoryPacketBytes_.store(0, std::memory_order_relaxed);
+        packetDiskStore_->clear();
+        diskCacheUnavailable_.store(false, std::memory_order_release);
+        audioPacketInputEnded_.store(false, std::memory_order_release);
+        videoPacketInputEnded_.store(false, std::memory_order_release);
         reachedRangeEnd_.store(false, std::memory_order_release);
         outputClockPollRequested_.store(
             false,
@@ -4139,6 +6305,10 @@ private:
         maximumVideoPresentationStarvationMilliseconds_.store(
             0,
             std::memory_order_relaxed);
+        lowLatencyVideoQueueDrops_.store(0, std::memory_order_relaxed);
+        networkRecoveryAttempts_.store(0, std::memory_order_relaxed);
+        successfulNetworkRecoveries_.store(0, std::memory_order_relaxed);
+        failedNetworkRecoveries_.store(0, std::memory_order_relaxed);
     }
 
     void beginOutputWait(
@@ -5142,6 +7312,19 @@ private:
         }
     }
 
+    void publishNetworkRecoveryStatus(NetworkRecoveryStatus status)
+    {
+        NetworkRecoveryStatusCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            networkRecoveryStatus_ = status;
+            callback = networkRecoveryStatusCallback_;
+        }
+        if (callback) {
+            callback(status);
+        }
+    }
+
     std::int64_t clockPositionLocked() const
     {
         if (currentState_ != State::Playing || waitingForOutput_) {
@@ -5195,10 +7378,13 @@ private:
     mutable std::mutex audioClockMutex_;
     mutable std::mutex audioQueueMutex_;
     mutable std::mutex audioPacketMutex_;
+    mutable std::mutex packetBufferMutex_;
     mutable std::mutex presentationMutex_;
     mutable std::mutex videoPacketMutex_;
     std::shared_ptr<AudioSinkCallbackBridge> audioSinkCallbackBridge_ =
         std::make_shared<AudioSinkCallbackBridge>();
+    std::shared_ptr<PacketDiskStore> packetDiskStore_ =
+        std::make_shared<PacketDiskStore>();
     std::condition_variable controlChanged_;
     std::condition_variable stateChanged_;
     std::condition_variable audioQueueChanged_;
@@ -5207,6 +7393,7 @@ private:
     std::condition_variable audioPacketChanged_;
     std::condition_variable audioPacketSpace_;
     std::condition_variable audioPacketDrained_;
+    std::condition_variable packetBufferChanged_;
     std::condition_variable presentationChanged_;
     std::condition_variable presentationDrained_;
     std::condition_variable videoPacketChanged_;
@@ -5228,7 +7415,15 @@ private:
     std::atomic<std::uint64_t> videoPresentationStarvations_ { 0 };
     std::atomic<std::uint64_t>
         maximumVideoPresentationStarvationMilliseconds_ { 0 };
+    std::atomic<std::uint64_t> lowLatencyVideoQueueDrops_ { 0 };
+    std::atomic<std::uint64_t> networkRecoveryAttempts_ { 0 };
+    std::atomic<std::uint64_t> successfulNetworkRecoveries_ { 0 };
+    std::atomic<std::uint64_t> failedNetworkRecoveries_ { 0 };
     std::atomic<bool> outputClockPollRequested_ { false };
+    std::atomic<bool> audioPacketInputEnded_ { false };
+    std::atomic<bool> videoPacketInputEnded_ { false };
+    std::atomic<std::uint64_t> queuedMemoryPacketBytes_ { 0 };
+    std::atomic<bool> diskCacheUnavailable_ { false };
     InterruptContext interrupt_;
 
     std::deque<QueuedAudioFrame> audioQueue_;
@@ -5246,8 +7441,19 @@ private:
     bool videoPacketInFlight_ = false;
     bool videoDecodeFailed_ = false;
     std::uint64_t videoDecodeFailureGeneration_ = 0;
+    PacketBufferState packetBufferState_;
+    std::optional<PacketBufferStatus> lastPublishedPacketBufferStatus_;
     CachedAudioClock cachedAudioClock_;
     MediaContext media_;
+    ReadRecoveryBudget primaryReadRecoveryBudget_;
+    ReadRecoveryBudget externalAudioReadRecoveryBudget_;
+    ReadRecoveryBudget externalSubtitleReadRecoveryBudget_;
+    std::int64_t primaryDemuxProgress_ =
+        std::numeric_limits<std::int64_t>::min();
+    std::int64_t externalAudioDemuxProgress_ =
+        std::numeric_limits<std::int64_t>::min();
+    std::int64_t externalSubtitleDemuxProgress_ =
+        std::numeric_limits<std::int64_t>::min();
     bool hasOpenMedia_ = false;
     std::atomic<bool> reachedRangeEnd_ { false };
     std::string url_;
@@ -5281,10 +7487,16 @@ private:
     std::int64_t rangeStart_ = 0;
     std::int64_t rangeEnd_ = MediaEnd;
     HardwareDecodeConfig hardwareDecodeConfig_;
+    LivePlaybackPolicy livePlaybackPolicy_;
+    NetworkRecoveryPolicy networkRecoveryPolicy_;
+    NetworkRecoveryStatus networkRecoveryStatus_;
+    PacketBufferPolicy packetBufferPolicy_;
 
     std::unordered_map<std::string, std::string> properties_;
     StateCallback stateCallback_;
     StatusCallback statusCallback_;
+    PacketBufferStatusCallback packetBufferStatusCallback_;
+    NetworkRecoveryStatusCallback networkRecoveryStatusCallback_;
     EventCallback eventCallback_;
     VideoFrameCallback videoFrameCallback_;
     AudioFrameCallback audioFrameCallback_;
@@ -5391,6 +7603,59 @@ PlaybackStatistics Player::playbackStatistics() const noexcept
     return impl_->playbackStatistics();
 }
 
+Player& Player::setLivePlaybackPolicy(LivePlaybackPolicy policy)
+{
+    impl_->setLivePlaybackPolicy(policy);
+    return *this;
+}
+
+LivePlaybackPolicy Player::livePlaybackPolicy() const
+{
+    return impl_->livePlaybackPolicy();
+}
+
+Player& Player::setNetworkRecoveryPolicy(NetworkRecoveryPolicy policy)
+{
+    impl_->setNetworkRecoveryPolicy(policy);
+    return *this;
+}
+
+NetworkRecoveryPolicy Player::networkRecoveryPolicy() const
+{
+    return impl_->networkRecoveryPolicy();
+}
+
+NetworkRecoveryStatus Player::networkRecoveryStatus() const
+{
+    return impl_->networkRecoveryStatus();
+}
+
+Player& Player::setPacketBufferPolicy(PacketBufferPolicy policy)
+{
+    impl_->setPacketBufferPolicy(policy);
+    return *this;
+}
+
+PacketBufferPolicy Player::packetBufferPolicy() const
+{
+    return impl_->packetBufferPolicy();
+}
+
+PacketBufferStatus Player::packetBufferStatus() const
+{
+    return impl_->packetBufferStatus();
+}
+
+std::string Player::packetDiskCachePath() const
+{
+    return impl_->packetDiskCachePath();
+}
+
+bool Player::clearPacketDiskCache()
+{
+    return impl_->clearPacketDiskCache();
+}
+
 Player& Player::onStateChanged(StateCallback callback)
 {
     impl_->onStateChanged(std::move(callback));
@@ -5400,6 +7665,19 @@ Player& Player::onStateChanged(StateCallback callback)
 Player& Player::onMediaStatus(StatusCallback callback)
 {
     impl_->onMediaStatus(std::move(callback));
+    return *this;
+}
+
+Player& Player::onPacketBufferStatus(PacketBufferStatusCallback callback)
+{
+    impl_->onPacketBufferStatus(std::move(callback));
+    return *this;
+}
+
+Player& Player::onNetworkRecoveryStatus(
+    NetworkRecoveryStatusCallback callback)
+{
+    impl_->onNetworkRecoveryStatus(std::move(callback));
     return *this;
 }
 

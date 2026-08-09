@@ -1270,3 +1270,224 @@ Dolby Vision processing, display switching, and Windows-native validation.
 - [Intel Iris Xe Vulkan extension support response](https://community.intel.com/t5/Graphics/Vulkan-extensions-support-request/m-p/1688246)
 - [Intel 11th-14th generation Windows graphics driver](https://www.intel.com/content/www/us/en/download/864990/intel-11th-14th-gen-processor-graphics-windows.html)
 - [Microsoft DirectX Advanced Color](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range)
+
+## AD-013: Packet buffering gates both decoders by usable media time
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core demux/decode backpressure, playback time, buffering status, and
+  external-input EOF
+
+### Context
+
+Core already demuxed on its control worker and sent selected compressed audio
+and video packets through independent fixed-capacity queues to decoder workers.
+Those queues isolated codec backpressure, but consumers started immediately.
+A blocked network read could therefore empty one decoder without an explicit
+packet-fill target or packet-specific progress, while the generic
+`MediaStatus::Buffering` also represented seek output and audio-device clock
+re-anchoring.
+
+### Decision
+
+1. Keep FFmpeg input ownership on the playback worker. Do not add a second
+   demux thread or duplicate format-context synchronization.
+2. Measure each existing compressed queue by normalized media time and bytes.
+   During initial play, seek, track switch, or confirmed underflow, hold both
+   A/V consumers behind one presentation-generation gate while demux continues.
+3. Release only when every selected A/V stream reaches its target or its own
+   input reaches EOF. Report the minimum usable stream duration, combined
+   bytes, progress, reason, and generation through `PacketBufferStatus`.
+4. Bound memory and head-of-line blocking by per-stream time, combined bytes,
+   and the existing packet-count limits. If a bound prevents the target from
+   being reached, release with `capacityLimited` rather than deadlocking an
+   interleaved source behind one full stream.
+5. Freeze playback time through the existing output-wait contract until the
+   released generation actually produces output. Packet buffering does not
+   implement low-latency drops, adaptive bitrate selection, or network-error
+   retry policy.
+
+### Consequences
+
+- Local and remote playback share deterministic buffering semantics; callers
+  can disable buffering or set either fill target to zero.
+- A short external audio sidecar can reach EOF independently without blocking a
+  longer primary video stream.
+- Underflow detection and packet progress may be published from a decode
+  worker. Callbacks retain the existing rule that they may request control
+  changes but must not destroy `Player` inline.
+- The next live-stream milestone can choose an explicit late/drop strategy on
+  top of this reservoir without changing its accounting or conflating packet
+  loss with buffering progress.
+
+## AD-014: Optional packet disk cache is a bounded temporary spill tier
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core compressed-packet storage, temporary-file lifecycle, public
+  buffering policy/status, and explicit cache clearing
+
+### Context
+
+The packet reservoir originally retained FFmpeg packet references only in RAM.
+Its public five-second and 32 MiB limits are appropriate defaults, but a caller
+may need a longer prefetch window without retaining every compressed payload in
+memory. Dropping a queued payload is not safe once demux has advanced, and a
+persistent media cache has materially different identity, validation, privacy,
+and eviction requirements.
+
+### Decision
+
+1. Preserve `maximumBufferMilliseconds` and `maximumBufferBytes` as independent
+   public memory limits with their existing five-second/32 MiB defaults.
+2. Add an opt-in `PacketDiskCachePolicy` spill tier, disabled by default, with
+   separately configurable per-stream time and combined-byte limits. Its
+   disabled defaults are 60 seconds and 256 MiB.
+3. Store only compressed packet payloads in one player-specific file below the
+   system temporary directory. Keep FFmpeg packet properties in the bounded
+   in-process queue, materialize the payload on the owning decode worker, and
+   serialize file reads, writes, compaction, and removal internally.
+4. Compact still-live records before the configured byte boundary so physical
+   growth does not accumulate across long playback. Remove the file and its
+   dedicated directory as soon as no disk entries remain and at every normal
+   generation reset or player destruction.
+5. Report total, memory, and disk compressed bytes plus the volatile path. A
+   synchronous clear drains current packet work and re-seeks seekable playback
+   from its current position; it refuses an active non-seekable source rather
+   than silently skipping removed packets.
+
+### Consequences
+
+- Applications can choose a larger network reservoir while keeping the default
+  memory footprint unchanged, and can explicitly remove temporary media data.
+- The spill file is transient and not encrypted by QtAVCore. It is not a
+  persistent download, content-addressed cache, or offline-playback contract.
+- Disk I/O can add decode latency and is intentionally opt-in. File failures
+  emit `packet.disk_cache.error` once per generation and playback continues on
+  the memory tier; corrupt or externally removed live entries are fatal to the
+  affected decode generation.
+- Clearing an active cache is a control operation and must not run inline from
+  a Player callback because it may wait for decoder workers to drain.
+
+## AD-015: Live latency control drops decoded video, not packet history
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core decoded-video queue pressure, presentation timing, public policy,
+  and playback diagnostics
+
+### Context
+
+The ordinary presentation policy retains a contiguous near-term window: when
+its hard queue bound is full, it rejects a farther-future decoded frame, and it
+drops a frame more than 250 ms late only when a timely replacement is already
+queued. That favors continuity for files and seek preroll, but a slow renderer
+or callback can leave live video showing the oldest bounded window instead of
+the newest available one. The compressed-packet reservoir cannot safely evict
+arbitrary inter-frame video packets without a coordinated decoder/keyframe
+generation reset, and dropping audio would break the device-clock contract.
+
+### Decision
+
+1. Add an explicit, disabled-by-default `LivePlaybackPolicy`; do not infer live
+   behavior from URL schemes, duration, or FFmpeg seekability.
+2. When enabled, cap queued decoded video to the caller-selected depth and keep
+   the newest timestamp window. A newer arrival supersedes the oldest queued
+   video; a reordered older arrival cannot displace a newer one.
+3. Use a caller-selected late threshold. Once the current video is beyond that
+   threshold, discard it whenever any newer same-generation video is queued,
+   allowing repeated decisions to converge on the newest available frame.
+4. Preserve packet buffering, decoder reference history, audio, subtitles,
+   device-clock ownership, and playback position. Do not seek or flush merely
+   because decoded video presentation is behind.
+5. Keep accepted `VideoFrameScheduler` frames outside this policy because the
+   application has already assumed direct presentation and output-token
+   lifetime. Retain total queue/late counters and add a low-latency queue-drop
+   subset for diagnostics.
+
+### Consequences
+
+- File playback remains behaviorally unchanged unless the application opts in.
+- Live video can trade visual continuity for a bounded newest-frame latency
+  while audio remains continuous and authoritative.
+- This policy cannot recover latency already held in a network server, FFmpeg
+  demuxer, compressed-packet reservoir, audio device, or an application-owned
+  scheduler. AD-016's recoverable-input policy remains separate, and adaptive
+  rendition selection remains out of scope.
+- Hardware-frame destruction continues through its backend-owned retained
+  lifetime, so superseding a queued surface/native-buffer frame does not map or
+  copy decoded pixels.
+
+## AD-016: Recover network input in two bounded layers
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core network open/read errors, input lifetime, playback generations,
+  packet refill, public recovery policy/status, and diagnostics
+
+### Context
+
+QtAVCore already supplied bounded FFmpeg HTTP(S) `rw_timeout` and reconnect
+options, but those retries were invisible to applications and a returned
+`av_read_frame()` error immediately made the media `Invalid`. The packet
+reservoir could mask a short stalled read until queued packets drained, but it
+did not own the `AVFormatContext` recovery boundary. Arbitrarily retrying a
+failed context is unsafe, while reopening without validating streams or
+invalidating decoder work can leave `AVStream*` references dangling and mix
+packets from incompatible presentation generations.
+
+### Decision
+
+1. Preserve FFmpeg protocol recovery as the first layer. `avformat.*`
+   properties continue to override its HTTP(S) timeout/reconnect options.
+2. Add a separate default-enabled `NetworkRecoveryPolicy` for recognized
+   network URL schemes after open or read returns a recoverable error. Bound
+   it by 1–32 caller-selected fresh-open attempts and capped exponential
+   backoff; do not infer adaptive-stream behavior or retry common permanent
+   HTTP authorization/not-found errors.
+3. Keep every open, demux read, retry wait, and replacement on the existing
+   playback worker. Its condition-variable wait must be interruptible by the
+   asynchronous control path; do not add a second format-context owner.
+4. Before installing a read replacement, require every selected stream from
+   that source to retain its stream index, media type, and codec ID. Drain
+   in-flight decoder work, invalidate the presentation generation, update all
+   decoder `AVStream`/time-base references, and only then close the retired
+   format context. Treat the open as provisional until it returns a selected
+   non-corrupt packet or clean EOF; retain that packet and charge corrupt
+   packets plus an immediate read failure to the same bounded attempt cycle.
+5. Seek a seekable replacement to the frozen media position and realign other
+   active seekable inputs. For a non-seekable input, resume at the new server
+   edge and offset its normalized start time so the public media timeline does
+   not restart at zero.
+6. Reuse the packet reservoir with
+   `PacketBufferingReason::NetworkRecovery` after installation. Freeze the
+   output clock until the new generation really produces output; do not count
+   protocol-internal retries in Player statistics.
+7. Publish `Waiting`, `Reopening`, `Recovered`, `Failed`, and cancellation-to-
+   `Idle` snapshots plus attempt/success/failure counters. Exhaustion remains a
+   terminal reader/open error and transitions media to `Invalid`. Read failures
+   share one attempt budget until the selected demux timeline advances at least
+   500 ms; explicit continuity controls reset that progress interval.
+
+### Consequences
+
+- Buffered playback can continue while the playback worker waits or opens a
+  replacement; if the reservoir drains, the existing underflow/output-wait
+  contract freezes time.
+- Recovery never reuses a returned-error context and never leaves decoder
+  workers holding a stream pointer owned by the closed context.
+- A source that repeatedly opens but cannot return its first relevant packet
+  or make 500 ms of forward demux progress cannot create an unbounded chain of
+  false-positive recoveries.
+- Reopening a seekable compressed stream can repeat keyframe preroll internally,
+  but generation and presentation timing prevent retired output from crossing
+  the recovery boundary.
+- Non-seekable recovery is continuity from a new live edge, not lossless packet
+  repair. Adaptive rendition selection, persistent caching, and application-
+  level download semantics remain out of scope.
+- `onNetworkRecoveryStatus()` follows the playback-worker callback lifetime
+  rule: it may request control, but it must not destroy the Player inline.
+
+### Primary reference
+
+- [FFmpeg protocol options](https://ffmpeg.org/ffmpeg-protocols.html#http)

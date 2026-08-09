@@ -900,10 +900,13 @@ through `OMX.hisi.video.decoder.vvc` before passing its lifecycle and forced-
 software-fallback matrix. Remaining strict OHOS Vulkan raw-plane/Dolby Vision
 precision work is device-gated on a non-opaque multi-plane format. Milestone
 9 active audio/video/subtitle track switching, FFmpeg subtitle packet decode,
-the presentation-timed plain-text callback, the optional libass renderer, and
-external audio/subtitle sidecars are complete. The next local implementation
-task is packet buffering policy and buffering status; do not claim the device-
-gated strict Vulkan item complete without suitable hardware.
+the presentation-timed plain-text callback, the optional libass renderer,
+external audio/subtitle sidecars, bounded packet buffering/status, and the
+opt-in low-latency live-video drop policy are complete, including the optional
+bounded system-temporary-file spill tier, explicit cache clearing, and bounded
+observable network-input recovery are complete. The next local implementation
+task is frame stepping and accurate seek; do not claim the device-gated strict
+Vulkan item complete without suitable hardware.
 
 AD-010 Windows visible-copy checkpoint:
 
@@ -3206,9 +3209,95 @@ Completed external-source checkpoint on 2026-08-09:
   static matrix links the same dependency package successfully, so this is
   not counted as an external-source implementation failure.
 
-- [ ] Packet buffering policy and buffering status.
-- [ ] Low-latency/live-stream drop policy.
-- [ ] Reconnect and recoverable network errors.
+- [x] Packet buffering policy and buffering status.
+
+Completed packet-buffer checkpoint on 2026-08-09:
+
+- `PacketBufferPolicy` supplies independent initial/rebuffer time targets,
+  public memory duration/byte limits with unchanged five-second/32 MiB
+  defaults, underflow detection, and an explicit disable path; invalid values
+  are normalized at the public API boundary;
+- the existing per-stream compressed-packet queues now retain normalized packet
+  timestamps, durations, and byte sizes. Audio/video decode consumers wait at
+  one shared generation gate during initial play, seek, track switch, or a
+  confirmed underflow while the playback worker continues demuxing;
+- the opt-in `PacketDiskCachePolicy` spills compressed payloads beyond the
+  memory limits into one compacting, bounded file below a player-specific
+  system temporary directory. It has independent time/byte configuration,
+  removes empty/reset/destructed caches automatically, and exposes a synchronous
+  clear operation that safely re-seeks active seekable playback;
+- `PacketBufferStatus` reports the minimum usable duration across active A/V
+  streams, total plus memory/disk bytes, the volatile file path, progress,
+  reason, presentation generation, and capacity-limited completion. Independent
+  input EOF prevents a short external sidecar from holding a longer primary
+  stream in buffering;
+- deterministic Windows Release coverage validates policy normalization,
+  initial fill start/completion, nonzero byte progress, playing-seek generation
+  refill, actual disk spill/path reporting, in-playback file removal, and final
+  status convergence. Visual Studio 2026 static/shared matrices pass 43/43
+  with the default 500 ms initial and 750 ms rebuffer policy, and both
+  workspace-local installs export byte-identical updated public headers and
+  CMake packages. Android arm64/API 28 and OHOS arm64/API 23 static cores also
+  cross-build against their repository dependency packages; the OHOS entry
+  re-verifies its installed FFmpeg package before compiling.
+
+- [x] Low-latency/live-stream drop policy.
+
+Completed low-latency/live-stream checkpoint on 2026-08-09:
+
+- `LivePlaybackPolicy` is explicit and disabled by default. Its normalized
+  queue-depth and late-threshold controls apply to subsequent decoded-video
+  presentation decisions without reopening media;
+- an enabled session keeps the newest bounded video-frame window under decode
+  or callback pressure, rejects reordered older arrivals, and repeatedly skips
+  late video toward the newest same-generation frame while leaving compressed
+  packets, decoder history, audio, subtitles, packet-buffer status, and the
+  playback clock unchanged;
+- accepted `VideoFrameScheduler` frames remain application-owned, and
+  `PlaybackStatistics::lowLatencyVideoQueueDrops` distinguishes latest-window
+  pressure drops from the existing total queue and late-presentation counters;
+- deterministic Windows Release coverage uses a 60 fps input and a deliberately
+  slower video callback to prove a maximum queue depth of two, positive latest-
+  window drops, strictly increasing delivered timestamps, and convergence on
+  the end of the stream. Visual Studio 2026 static/shared all-backend Release
+  matrices pass 45/45; separate static/shared installs export the new public
+  API and matching external consumers configure, link, and run. Android
+  arm64/API 28 and OHOS arm64/API 23 static cores cross-build against the
+  repository dependency packages.
+
+- [x] Reconnect and recoverable network errors.
+
+Completed reconnect/recoverable-network checkpoint on 2026-08-09:
+
+- FFmpeg's bounded HTTP(S) timeout/reconnect behavior remains the first layer,
+  with existing `avformat.*` overrides. A separate default-enabled
+  `NetworkRecoveryPolicy` supplies 1–32 fresh-open attempts, capped exponential
+  backoff, and explicit disable behavior for recognized network URL schemes;
+- `NetworkRecoveryStatus` exposes the operation, primary/external input, URL,
+  attempt, delay, error, frozen position, and presentation generation through
+  `Waiting`, `Reopening`, `Recovered`, `Failed`, and cancellation-to-`Idle`
+  states. Statistics distinguish Player-level attempts, successful recovery
+  cycles, and terminal failures from protocol-internal retries;
+- read recovery validates selected stream indices, media types, and codec IDs,
+  seeks a replacement when possible, verifies its first selected non-corrupt
+  packet or clean EOF inside the same bounded attempt cycle, and retains that
+  packet. Repeated failures share the attempt budget until the selected demux
+  timeline advances by 500 ms; explicit continuity controls reset the budget.
+  Installation drains decoder work, invalidates stale presentation, updates
+  replacement-owned stream references, realigns other seekable inputs, and
+  refills through `PacketBufferingReason::NetworkRecovery`; non-seekable input
+  continues from its new server edge without resetting the public timeline;
+- a deterministic loopback HTTP fault server covers initial 503 recovery,
+  mid-read primary truncation, selected external-audio truncation, exhausted
+  opening retries, bounded no-forward-progress read failures,
+  status/statistics, end-of-media continuity, and immediate cancellation of a
+  five-second retry delay from a callback-issued stop;
+- Windows Visual Studio 2026/ClangCL static and shared Release core matrices
+  pass 21/21. Static/shared installs export byte-identical updated public
+  headers, and external `QtAV::Core` consumers compile and run against the new
+  policy/status/statistics API. Android arm64/API 28 and OHOS arm64/API 23
+  static cores cross-build against their repository dependency packages.
+
 - [ ] Frame stepping and accurate seek.
 - [ ] Audio time-stretch for playback rate without pitch change.
 - [ ] Filter/plugin contracts.

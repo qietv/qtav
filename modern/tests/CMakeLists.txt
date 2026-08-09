@@ -136,9 +136,39 @@ add_executable(qtav_core_playback_test playback_test.cpp)
 target_link_libraries(qtav_core_playback_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_playback_test PRIVATE cxx_std_17)
 
+add_executable(qtav_core_packet_buffer_test packet_buffer_test.cpp)
+target_link_libraries(qtav_core_packet_buffer_test PRIVATE QtAV::Core)
+target_compile_features(qtav_core_packet_buffer_test PRIVATE cxx_std_17)
+
+add_executable(
+    qtav_core_live_playback_policy_test
+    live_playback_policy_test.cpp
+)
+target_link_libraries(
+    qtav_core_live_playback_policy_test
+    PRIVATE QtAV::Core
+)
+target_compile_features(
+    qtav_core_live_playback_policy_test
+    PRIVATE cxx_std_17
+)
+
 add_executable(qtav_core_control_test control_test.cpp)
 target_link_libraries(qtav_core_control_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_control_test PRIVATE cxx_std_17)
+
+add_executable(
+    qtav_core_network_recovery_test
+    network_recovery_test.cpp
+)
+target_link_libraries(
+    qtav_core_network_recovery_test
+    PRIVATE QtAV::Core
+)
+target_compile_features(
+    qtav_core_network_recovery_test
+    PRIVATE cxx_std_17
+)
 
 add_executable(qtav_core_track_switch_test track_switch_test.cpp)
 target_link_libraries(
@@ -458,8 +488,118 @@ if(FFMPEG_EXECUTABLE)
         NAME qtav_core_playback
         COMMAND qtav_core_playback_test "${QTAV_CORE_TEST_MEDIA}"
     )
+    add_test(
+        NAME qtav_core_packet_buffer
+        COMMAND qtav_core_packet_buffer_test "${QTAV_CORE_TEST_MEDIA}"
+    )
+    set(
+        QTAV_CORE_LIVE_POLICY_TEST_MEDIA
+        "${CMAKE_CURRENT_BINARY_DIR}/qtav-core-live-policy-test.mp4"
+    )
+    add_test(
+        NAME qtav_core_generate_live_policy_media
+        COMMAND
+            "${FFMPEG_EXECUTABLE}"
+            -hide_banner
+            -loglevel error
+            -y
+            -f lavfi
+            -i testsrc2=size=160x90:rate=60
+            -t 4
+            -c:v mpeg4
+            -g 60
+            "${QTAV_CORE_LIVE_POLICY_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_generate_live_policy_media
+        PROPERTIES FIXTURES_SETUP qtav_core_live_policy_media
+    )
+    add_test(
+        NAME qtav_core_live_playback_policy
+        COMMAND
+            qtav_core_live_playback_policy_test
+            "${QTAV_CORE_LIVE_POLICY_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_live_playback_policy
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_live_policy_media
+            TIMEOUT 20
+    )
+    if(NOT CMAKE_CROSSCOMPILING)
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+    endif()
+    if(Python3_Interpreter_FOUND)
+        set(
+            QTAV_CORE_NETWORK_RECOVERY_TEST_MEDIA
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-core-network-recovery-test.mp4"
+        )
+        set(
+            QTAV_CORE_NETWORK_RECOVERY_TEST_AUDIO
+            "${CMAKE_CURRENT_BINARY_DIR}/qtav-core-network-recovery-test.m4a"
+        )
+        add_test(
+            NAME qtav_core_generate_network_recovery_media
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i testsrc2=size=640x360:rate=30
+                -f lavfi
+                -i sine=frequency=440:sample_rate=48000
+                -t 8
+                -c:v mpeg4
+                -b:v 3M
+                -g 30
+                -c:a aac
+                -b:a 128k
+                -movflags +faststart
+                "${QTAV_CORE_NETWORK_RECOVERY_TEST_MEDIA}"
+        )
+        set_tests_properties(
+            qtav_core_generate_network_recovery_media
+            PROPERTIES FIXTURES_SETUP qtav_core_network_recovery_media
+        )
+        add_test(
+            NAME qtav_core_generate_network_recovery_audio
+            COMMAND
+                "${FFMPEG_EXECUTABLE}"
+                -hide_banner
+                -loglevel error
+                -y
+                -f lavfi
+                -i sine=frequency=660:sample_rate=48000
+                -t 8
+                -c:a aac
+                -b:a 192k
+                -movflags +faststart
+                "${QTAV_CORE_NETWORK_RECOVERY_TEST_AUDIO}"
+        )
+        set_tests_properties(
+            qtav_core_generate_network_recovery_audio
+            PROPERTIES FIXTURES_SETUP qtav_core_network_recovery_media
+        )
+        add_test(
+            NAME qtav_core_network_recovery
+            COMMAND
+                "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/network_recovery_server.py"
+                --player $<TARGET_FILE:qtav_core_network_recovery_test>
+                --media "${QTAV_CORE_NETWORK_RECOVERY_TEST_MEDIA}"
+                --audio "${QTAV_CORE_NETWORK_RECOVERY_TEST_AUDIO}"
+        )
+        set_tests_properties(
+            qtav_core_network_recovery
+            PROPERTIES
+                FIXTURES_REQUIRED qtav_core_network_recovery_media
+                TIMEOUT 80
+        )
+    endif()
     set_tests_properties(
         qtav_core_playback
+        qtav_core_packet_buffer
         PROPERTIES
             FIXTURES_REQUIRED qtav_core_media
             TIMEOUT 15
