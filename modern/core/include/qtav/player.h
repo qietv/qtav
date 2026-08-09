@@ -18,9 +18,11 @@ class AudioSink;
 class AudioFrameConverter;
 class VideoRenderAPI;
 
-// Video scheduling counters accumulated since the current media was set.
-// They distinguish decoded frames from frames discarded inside Player before
-// onVideoFrame() and rendering callbacks are reached.
+// Playback counters accumulated since the current media was set. Video fields
+// distinguish decoded frames from frames discarded inside Player before
+// onVideoFrame() and rendering callbacks are reached. Network fields count
+// Player-level reopen attempts after protocol-level recovery has returned an
+// error to the demuxer.
 struct QTAV_CORE_EXPORT PlaybackStatistics {
     std::uint64_t decodedVideoFrames = 0;
     std::uint64_t videoQueueOverflowDrops = 0;
@@ -29,6 +31,76 @@ struct QTAV_CORE_EXPORT PlaybackStatistics {
     std::uint64_t maximumQueuedVideoFrames = 0;
     std::uint64_t videoPresentationStarvations = 0;
     std::uint64_t maximumVideoPresentationStarvationMilliseconds = 0;
+    // Subset of videoQueueOverflowDrops made while LivePlaybackPolicy keeps
+    // the newest bounded presentation window instead of the oldest one.
+    std::uint64_t lowLatencyVideoQueueDrops = 0;
+    std::uint64_t networkRecoveryAttempts = 0;
+    std::uint64_t successfulNetworkRecoveries = 0;
+    std::uint64_t failedNetworkRecoveries = 0;
+};
+
+// Opt-in decoded-video policy for live and other latency-sensitive playback.
+// It never drops compressed packets, audio, or subtitles. When enabled, the
+// presentation queue keeps the newest bounded video window and skips a late
+// frame whenever a newer frame is already available. Values are normalized by
+// Player: the queue depth is clamped to [1, 24], and a negative late threshold
+// becomes zero. The application owns all scheduling when VideoFrameScheduler
+// accepts a frame, so this policy does not apply to accepted scheduler frames.
+struct QTAV_CORE_EXPORT LivePlaybackPolicy {
+    bool enabled = false;
+    std::uint32_t maximumQueuedVideoFrames = 2;
+    std::int64_t lateVideoFrameThresholdMilliseconds = 80;
+};
+
+// Player-level recovery applied only to recognized network URLs after FFmpeg's
+// protocol-specific recovery has returned an error. maximumAttempts bounds
+// fresh opens until selected demux timestamps advance by 500 ms; seek, track
+// change, or media replacement starts a new continuity interval. Values are
+// normalized by Player: attempts are clamped to [1, 32], negative delays
+// become zero, and maximumRetryDelayMilliseconds is raised to the initial
+// delay.
+struct QTAV_CORE_EXPORT NetworkRecoveryPolicy {
+    bool enabled = true;
+    std::uint32_t maximumAttempts = 3;
+    std::int64_t initialRetryDelayMilliseconds = 250;
+    std::int64_t maximumRetryDelayMilliseconds = 2'000;
+};
+
+enum class NetworkRecoveryState {
+    Idle,
+    Waiting,
+    Reopening,
+    Recovered,
+    Failed,
+};
+
+enum class NetworkRecoveryOperation {
+    Open,
+    Read,
+};
+
+enum class NetworkRecoveryInput {
+    Primary,
+    ExternalAudio,
+    ExternalSubtitle,
+};
+
+// Snapshot for one network input. attempt is one-based while Waiting or
+// Reopening. Recovered reports the successful attempt; Failed reports the
+// number of attempts consumed. retryDelayMilliseconds is nonzero only while
+// Waiting. Stop, seek, pause, media replacement, and track changes interrupt a
+// pending read-recovery wait through the normal asynchronous control path.
+struct QTAV_CORE_EXPORT NetworkRecoveryStatus {
+    NetworkRecoveryState state = NetworkRecoveryState::Idle;
+    NetworkRecoveryOperation operation = NetworkRecoveryOperation::Open;
+    NetworkRecoveryInput input = NetworkRecoveryInput::Primary;
+    std::string url;
+    std::uint32_t attempt = 0;
+    std::uint32_t maximumAttempts = 0;
+    std::int64_t retryDelayMilliseconds = 0;
+    int error = 0;
+    std::int64_t resumePosition = 0;
+    std::uint64_t presentationGeneration = 0;
 };
 
 // Optional spill storage for compressed packets that no longer fit in the
@@ -43,7 +115,7 @@ struct QTAV_CORE_EXPORT PacketDiskCachePolicy {
 };
 
 // Time-based packet buffering remains separate from decoder/output queues and
-// from the later low-latency frame-drop policy. maximumBufferMilliseconds and
+// from LivePlaybackPolicy. maximumBufferMilliseconds and
 // maximumBufferBytes are the public in-memory limits. Values are normalized by
 // Player: negative durations become zero, a zero byte limit uses the default,
 // and the enabled memory-plus-disk duration is raised to the larger fill target.
@@ -63,6 +135,7 @@ enum class PacketBufferingReason {
     Seek,
     TrackSwitch,
     Underflow,
+    NetworkRecovery,
 };
 
 // Snapshot reported while compressed audio/video packets are filling. The
@@ -125,6 +198,8 @@ public:
     using StatusCallback = std::function<bool(MediaStatus, MediaStatus)>;
     using PacketBufferStatusCallback =
         std::function<void(const PacketBufferStatus&)>;
+    using NetworkRecoveryStatusCallback =
+        std::function<void(const NetworkRecoveryStatus&)>;
     using EventCallback = std::function<bool(const MediaEvent&)>;
     using PrepareCallback = std::function<void(std::int64_t, bool*)>;
     using SeekCallback = std::function<void(std::int64_t)>;
@@ -185,6 +260,11 @@ public:
     bool setActiveTrack(MediaType type, int track);
     std::int64_t position() const;
     PlaybackStatistics playbackStatistics() const noexcept;
+    Player& setLivePlaybackPolicy(LivePlaybackPolicy policy);
+    LivePlaybackPolicy livePlaybackPolicy() const;
+    Player& setNetworkRecoveryPolicy(NetworkRecoveryPolicy policy);
+    NetworkRecoveryPolicy networkRecoveryPolicy() const;
+    NetworkRecoveryStatus networkRecoveryStatus() const;
     Player& setPacketBufferPolicy(PacketBufferPolicy policy);
     PacketBufferPolicy packetBufferPolicy() const;
     PacketBufferStatus packetBufferStatus() const;
@@ -199,6 +279,7 @@ public:
     Player& onStateChanged(StateCallback callback);
     Player& onMediaStatus(StatusCallback callback);
     Player& onPacketBufferStatus(PacketBufferStatusCallback callback);
+    Player& onNetworkRecoveryStatus(NetworkRecoveryStatusCallback callback);
     Player& onEvent(EventCallback callback);
     Player& onVideoFrame(VideoFrameCallback callback);
     Player& onAudioFrame(AudioFrameCallback callback);

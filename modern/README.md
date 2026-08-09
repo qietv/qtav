@@ -30,10 +30,13 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - asynchronous `qtav::Player` state machine;
 - FFmpeg 8+ send/receive decoding API;
 - local files and FFmpeg-supported network protocols, with bounded HTTP(S)
-  read timeouts and reconnect defaults that applications can override through
-  `avformat.*` properties;
+  protocol recovery plus a Player-level, observable, interruptible input-reopen
+  policy after protocol recovery returns an error;
 - bounded time/byte compressed-packet buffering with initial, seek/track, and
   underflow fill gates plus reason-aware progress/status callbacks;
+- an opt-in live-playback video policy that keeps a caller-bounded newest-frame
+  window and uses a caller-selected late threshold without dropping compressed
+  packets, audio, or subtitles;
 - one optional external audio input and one optional external subtitle input,
   merged with the main input on normalized media time and exposed through the
   same asynchronous track-selection contract;
@@ -726,8 +729,9 @@ across selected audio/video streams, not their sum; `bufferedBytes` is the
 combined compressed size across both storage tiers. `memoryBufferedBytes` and
 `diskBufferedBytes` split that total, while `diskCachePath` and
 `packetDiskCachePath()` expose the current volatile file path. `reason`
-distinguishes initial playback, seek, track switch, and runtime underflow, and
-`presentationGeneration` rejects stale UI updates. Playback is released when
+distinguishes initial playback, seek, track switch, runtime underflow, and
+network recovery, and `presentationGeneration` rejects stale UI updates.
+Playback is released when
 every active stream reaches its target or EOF. If the fixed packet, duration,
 or byte capacity is reached first, the completed snapshot sets
 `capacityLimited` instead of deadlocking the interleaved demuxer behind one
@@ -744,9 +748,118 @@ Packet buffering changes `MediaStatus` to `Buffering` and freezes playback
 time until output from the released generation really resumes. The same media
 status is also used for audio-device clock re-anchoring, so use the packet
 status callback when a UI needs packet-specific progress. This policy does not
-drop compressed packets or decoded frames, choose an adaptive bitrate, or
-retry failed network I/O; low-latency dropping and recoverable network errors
-remain separate policies.
+drop compressed packets or decoded frames or choose an adaptive bitrate. The
+network policy below reuses the reservoir only after an input has reopened;
+the decoded-video policy remains separate.
+
+### Recoverable network I/O
+
+Network recovery has two bounded layers. FFmpeg's HTTP(S) protocol still uses
+the default 15-second `rw_timeout`, early-disconnect reconnect, connect-error
+reconnect, five retries, two-second maximum delay, and ten-second total delay.
+Applications may override that protocol layer through `avformat.*` properties.
+If open or `av_read_frame()` nevertheless returns a recoverable error,
+`NetworkRecoveryPolicy` controls a fresh Player-level input open:
+
+```cpp
+qtav::NetworkRecoveryPolicy recovery;
+recovery.enabled = true;
+recovery.maximumAttempts = 3;
+recovery.initialRetryDelayMilliseconds = 250;
+recovery.maximumRetryDelayMilliseconds = 2'000;
+
+player
+    .setNetworkRecoveryPolicy(recovery)
+    .onNetworkRecoveryStatus(
+        [](const qtav::NetworkRecoveryStatus& status) {
+            update_network_ui(
+                status.state,
+                status.attempt,
+                status.retryDelayMilliseconds,
+                status.error);
+        });
+```
+
+Player-level recovery is enabled by default for recognized HTTP(S), FTP,
+TCP/TLS, UDP/RTP/RTSP, RTMP, RIST, and SRT URLs. `maximumAttempts` bounds fresh
+opens within one continuity interval and is normalized to 1–32. Negative
+delays become zero; the maximum delay is raised to at least the initial delay.
+Backoff is exponential and capped, so the policy is bounded without a separate
+total-time setting. Read failures that recur before the input's selected demux
+timestamps advance by 500 ms continue consuming the same attempt budget, even
+if an intervening reopen returned an early usable packet. Seek, track change,
+or media replacement starts a new continuity interval. Disabling
+`NetworkRecoveryPolicy` leaves only the selected FFmpeg protocol behavior. The
+common permanent HTTP 400, 401, 403, and 404 errors and local
+allocation/configuration errors are not retried.
+
+`NetworkRecoveryStatus` reports `Waiting`, `Reopening`, `Recovered`, `Failed`,
+or `Idle`, the failed operation and input, URL, one-based attempt, delay, error,
+resume position, and presentation generation. A stop, media replacement, seek,
+pause, prepare, or track change cancels a read-recovery backoff through the
+normal control worker instead of waiting for its timer. An in-progress FFmpeg
+I/O call retains the existing interrupt rules; stop, seek, and media changes
+advance the interrupt epoch immediately. The recovery callback runs on the
+playback worker and follows the ordinary rule that it may request control but
+must not destroy the Player inline.
+
+After a read failure, a replacement input must expose compatible selected
+stream indices, media types, and codec IDs. Seekable inputs reopen at the
+current media position. Non-seekable inputs resume from the newly connected
+server edge and offset their normalized timestamps from the frozen position.
+The fresh open remains `Reopening` until it returns the first selected,
+non-corrupt packet or a clean EOF; an immediate post-open read failure consumes
+the same bounded attempt budget instead of starting an unlimited sequence of
+nominally successful reopens. That first usable packet is retained for the
+replacement generation. Installing the replacement invalidates the old
+presentation generation, flushes decoder/device queues, realigns other
+seekable active inputs, and enters
+`PacketBufferingReason::NetworkRecovery` until the selected A/V reservoir and
+actual output restart. An unrecoverable error or exhausted policy emits
+`network.recovery.failed`, transitions the media to `Invalid`, and preserves
+the terminal recovery snapshot for diagnostics.
+
+`PlaybackStatistics::networkRecoveryAttempts`,
+`successfulNetworkRecoveries`, and `failedNetworkRecoveries` count Player-level
+work only; retries hidden inside a protocol are intentionally not double-
+counted. This is input continuity, not adaptive rendition selection, a
+persistent download/cache, or packet-history repair.
+
+### Low-latency live video
+
+`LivePlaybackPolicy` is disabled by default, preserving the ordinary playback
+policy: software and hardware frames use their existing hard queue bounds, a
+full queue rejects a farther-future arrival, and a video frame more than 250 ms
+late is discarded only when a timely newer frame can replace it. Enable the
+policy for live or other latency-sensitive playback to keep a smaller newest-
+frame window instead. When that window is full, an incoming newer frame
+supersedes its oldest queued video frame; once a frame is late by the configured
+threshold, the presentation worker skips it whenever any newer video frame for
+the same generation is waiting.
+
+```cpp
+qtav::LivePlaybackPolicy live;
+live.enabled = true;
+live.maximumQueuedVideoFrames = 2;
+live.lateVideoFrameThresholdMilliseconds = 80;
+player.setLivePlaybackPolicy(live);
+```
+
+The queue depth is normalized to 1–24 and a negative late threshold becomes
+zero. Policy changes are thread-safe and affect subsequent queue/presentation
+decisions without reopening media. `PlaybackStatistics::videoQueueOverflowDrops`
+continues to count every bounded video-queue drop, while
+`lowLatencyVideoQueueDrops` identifies the subset made by this latest-window
+policy; `lateVideoDrops` remains the presentation-time count.
+
+The policy intentionally drops only decoded video. It does not discard
+compressed packets, audio, or subtitles, alter packet-buffer accounting, seek
+the input, or select an adaptive rendition. Network input recovery is handled
+by the separate policy above. This keeps audio/device time as the master while
+video catches up without corrupting decoder reference chains. If
+`setVideoFrameScheduler()` accepts a frame, the
+application has taken over scheduling before the presentation queue and must
+apply any direct-surface/native-buffer drop policy itself.
 
 `onSubtitleFrame()` publishes decoded UTF-8 plain text for FFmpeg text and
 ASS/SSA subtitle decoders. ASS event fields and override blocks are removed
@@ -1465,8 +1578,10 @@ freeze the fallback clock until the device clock re-anchors. Queue invalidation
 in the public `seek()` call does not wait for the presentation or audio workers
 to release their queue locks. HTTP(S) inputs additionally use a 15-second read
 timeout and bounded FFmpeg reconnect defaults, all overridable through
-`avformat.*`. Those FFmpeg protocol options remain distinct from the packet
-reservoir and are not yet a general recoverable-error policy.
+`avformat.*`. If the protocol still returns a recoverable error,
+`NetworkRecoveryPolicy` performs bounded fresh opens on the playback worker.
+Its timer wait is interruptible, and a successful read recovery invalidates the
+old generation before packet refill and output re-anchoring.
 
 ### CPU image-buffer renderer
 

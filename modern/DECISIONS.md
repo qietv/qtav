@@ -1368,3 +1368,126 @@ and eviction requirements.
   affected decode generation.
 - Clearing an active cache is a control operation and must not run inline from
   a Player callback because it may wait for decoder workers to drain.
+
+## AD-015: Live latency control drops decoded video, not packet history
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core decoded-video queue pressure, presentation timing, public policy,
+  and playback diagnostics
+
+### Context
+
+The ordinary presentation policy retains a contiguous near-term window: when
+its hard queue bound is full, it rejects a farther-future decoded frame, and it
+drops a frame more than 250 ms late only when a timely replacement is already
+queued. That favors continuity for files and seek preroll, but a slow renderer
+or callback can leave live video showing the oldest bounded window instead of
+the newest available one. The compressed-packet reservoir cannot safely evict
+arbitrary inter-frame video packets without a coordinated decoder/keyframe
+generation reset, and dropping audio would break the device-clock contract.
+
+### Decision
+
+1. Add an explicit, disabled-by-default `LivePlaybackPolicy`; do not infer live
+   behavior from URL schemes, duration, or FFmpeg seekability.
+2. When enabled, cap queued decoded video to the caller-selected depth and keep
+   the newest timestamp window. A newer arrival supersedes the oldest queued
+   video; a reordered older arrival cannot displace a newer one.
+3. Use a caller-selected late threshold. Once the current video is beyond that
+   threshold, discard it whenever any newer same-generation video is queued,
+   allowing repeated decisions to converge on the newest available frame.
+4. Preserve packet buffering, decoder reference history, audio, subtitles,
+   device-clock ownership, and playback position. Do not seek or flush merely
+   because decoded video presentation is behind.
+5. Keep accepted `VideoFrameScheduler` frames outside this policy because the
+   application has already assumed direct presentation and output-token
+   lifetime. Retain total queue/late counters and add a low-latency queue-drop
+   subset for diagnostics.
+
+### Consequences
+
+- File playback remains behaviorally unchanged unless the application opts in.
+- Live video can trade visual continuity for a bounded newest-frame latency
+  while audio remains continuous and authoritative.
+- This policy cannot recover latency already held in a network server, FFmpeg
+  demuxer, compressed-packet reservoir, audio device, or an application-owned
+  scheduler. AD-016's recoverable-input policy remains separate, and adaptive
+  rendition selection remains out of scope.
+- Hardware-frame destruction continues through its backend-owned retained
+  lifetime, so superseding a queued surface/native-buffer frame does not map or
+  copy decoded pixels.
+
+## AD-016: Recover network input in two bounded layers
+
+- Date: 2026-08-09
+- Status: Accepted and complete
+- Scope: Core network open/read errors, input lifetime, playback generations,
+  packet refill, public recovery policy/status, and diagnostics
+
+### Context
+
+QtAVCore already supplied bounded FFmpeg HTTP(S) `rw_timeout` and reconnect
+options, but those retries were invisible to applications and a returned
+`av_read_frame()` error immediately made the media `Invalid`. The packet
+reservoir could mask a short stalled read until queued packets drained, but it
+did not own the `AVFormatContext` recovery boundary. Arbitrarily retrying a
+failed context is unsafe, while reopening without validating streams or
+invalidating decoder work can leave `AVStream*` references dangling and mix
+packets from incompatible presentation generations.
+
+### Decision
+
+1. Preserve FFmpeg protocol recovery as the first layer. `avformat.*`
+   properties continue to override its HTTP(S) timeout/reconnect options.
+2. Add a separate default-enabled `NetworkRecoveryPolicy` for recognized
+   network URL schemes after open or read returns a recoverable error. Bound
+   it by 1–32 caller-selected fresh-open attempts and capped exponential
+   backoff; do not infer adaptive-stream behavior or retry common permanent
+   HTTP authorization/not-found errors.
+3. Keep every open, demux read, retry wait, and replacement on the existing
+   playback worker. Its condition-variable wait must be interruptible by the
+   asynchronous control path; do not add a second format-context owner.
+4. Before installing a read replacement, require every selected stream from
+   that source to retain its stream index, media type, and codec ID. Drain
+   in-flight decoder work, invalidate the presentation generation, update all
+   decoder `AVStream`/time-base references, and only then close the retired
+   format context. Treat the open as provisional until it returns a selected
+   non-corrupt packet or clean EOF; retain that packet and charge corrupt
+   packets plus an immediate read failure to the same bounded attempt cycle.
+5. Seek a seekable replacement to the frozen media position and realign other
+   active seekable inputs. For a non-seekable input, resume at the new server
+   edge and offset its normalized start time so the public media timeline does
+   not restart at zero.
+6. Reuse the packet reservoir with
+   `PacketBufferingReason::NetworkRecovery` after installation. Freeze the
+   output clock until the new generation really produces output; do not count
+   protocol-internal retries in Player statistics.
+7. Publish `Waiting`, `Reopening`, `Recovered`, `Failed`, and cancellation-to-
+   `Idle` snapshots plus attempt/success/failure counters. Exhaustion remains a
+   terminal reader/open error and transitions media to `Invalid`. Read failures
+   share one attempt budget until the selected demux timeline advances at least
+   500 ms; explicit continuity controls reset that progress interval.
+
+### Consequences
+
+- Buffered playback can continue while the playback worker waits or opens a
+  replacement; if the reservoir drains, the existing underflow/output-wait
+  contract freezes time.
+- Recovery never reuses a returned-error context and never leaves decoder
+  workers holding a stream pointer owned by the closed context.
+- A source that repeatedly opens but cannot return its first relevant packet
+  or make 500 ms of forward demux progress cannot create an unbounded chain of
+  false-positive recoveries.
+- Reopening a seekable compressed stream can repeat keyframe preroll internally,
+  but generation and presentation timing prevent retired output from crossing
+  the recovery boundary.
+- Non-seekable recovery is continuity from a new live edge, not lossless packet
+  repair. Adaptive rendition selection, persistent caching, and application-
+  level download semantics remain out of scope.
+- `onNetworkRecoveryStatus()` follows the playback-worker callback lifetime
+  rule: it may request control, but it must not destroy the Player inline.
+
+### Primary reference
+
+- [FFmpeg protocol options](https://ffmpeg.org/ffmpeg-protocols.html#http)
