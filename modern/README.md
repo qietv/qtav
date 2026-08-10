@@ -12,7 +12,10 @@ code is used.
 The current system structure is documented in
 [`ARCHITECTURE.md`](ARCHITECTURE.md). Durable architecture choices and their
 consequences are recorded in [`DECISIONS.md`](DECISIONS.md), while milestone
-status and the active next task live in [`PLAN.md`](PLAN.md).
+status and the active next task live in [`PLAN.md`](PLAN.md). Completed
+checklists, investigation narratives, device matrices, and historical
+validation evidence are retained in
+[`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md).
 
 ## Supported targets
 
@@ -2567,8 +2570,8 @@ platform backends should target this module rather than adding more Qt
 dependencies to the legacy library.
 
 See [MIGRATION.md](MIGRATION.md) for the QtAV API mapping, current limitations,
-and threading contract. See [PLAN.md](PLAN.md) for the persistent milestone
-status, next task, and backend implementation order. The accepted Windows
+and threading contract. See [PLAN.md](PLAN.md) for active milestone status,
+the next task, and backend implementation order. The accepted Windows
 D3D11VA device, frame-lifetime, and zero-CPU-copy interop design is recorded in
 [D3D11VA.md](D3D11VA.md).
 The shared Android/OHOS mobile renderer, native lifecycle, hardware-output,

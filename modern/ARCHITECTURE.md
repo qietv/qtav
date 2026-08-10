@@ -4,14 +4,21 @@ This document describes the current structure and ownership boundaries of the
 active Qt-free rewrite under `modern/`. Milestone status and task ordering live
 in [`PLAN.md`](PLAN.md); durable trade-offs live in
 [`DECISIONS.md`](DECISIONS.md); migration from legacy QtAV is documented in
-[`MIGRATION.md`](MIGRATION.md).
+[`MIGRATION.md`](MIGRATION.md). Completed checklists, investigation narratives,
+device matrices, and historical validation evidence live in
+[`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md), not in this current
+state description.
 
 ## Supported scope
 
 QtAVCore's maintained support matrix remains Windows, Android, and OHOS. The
-implemented production paths today are Windows and Android; OHOS production
-implementation is deferred. macOS and iOS code is archived under
-`../archived_apple/`, and Linux is outside the support matrix.
+implemented production paths cover Windows, Android, and the current OHOS
+policy. OHOS strict direct multi-plane Vulkan wrapping and its corresponding
+Dolby Vision validation remain gated on suitable explicit-format hardware;
+that narrower gate does not make the implemented OHOS software, audio,
+direct-surface, OpenGL ES, or bounded opaque-format Vulkan paths provisional.
+macOS and iOS code is archived under `../archived_apple/`, and Linux is outside
+the support matrix.
 
 The active implementation has these non-negotiable boundaries:
 
@@ -53,8 +60,9 @@ modern/
 │   │   ├── opengl/               libplacebo OpenGL ES renderer
 │   │   └── mobile/               Vulkan/OpenGL selection and recovery
 │   ├── audio/                    resample, file, WASAPI, AAudio, and OHAudio
-│   ├── hwaccel/                  D3D11VA and MediaCodec decoder adapters
-│   ├── interop/                  D3D11 and MediaCodec GPU-frame bridges
+│   ├── subtitle/                 optional libass text/ASS rasterization
+│   ├── hwaccel/                  D3D11VA, MediaCodec, and OHCodec adapters
+│   ├── interop/                  D3D11, MediaCodec, and OHCodec GPU bridges
 │   └── output/d3d11/             high-level Windows composition output
 ├── platform/                     small Windows/Android/OHOS OS helpers
 ├── examples/                     integration applications and harnesses
@@ -109,12 +117,59 @@ timeline normalized by each input's start time, while the main input remains
 the duration/end-of-media authority. Seek, loop, track replacement, and media
 replacement reset all active demux states at one presentation-generation
 boundary. Public track selectors are unique across inputs; the actual
-per-input stream index remains diagnostic metadata only.
+per-input stream index remains diagnostic metadata only. These ownership and
+identity rules are governed by
+[AD-017](DECISIONS.md#ad-017-the-main-input-owns-the-timeline-while-sidecars-share-one-track-namespace).
+
+Audio, video, and subtitle track switches use the same asynchronous control
+boundary. A switch validates the public selector synchronously, invalidates the
+retired presentation generation, replaces only the affected decoder state,
+restores the media position, and renegotiates the audio sink when required.
+Decoded text subtitles are normalized and timed in the core; optional libass
+rasterization is a separate backend that consumes retained ASS header/event
+data and returns application-owned coverage bitmaps.
+
+Accurate seek and frame stepping are refinements of the same generation model,
+not separate synchronous decode entry points. An accurate seek starts at a
+preceding keyframe, suppresses pre-target audio/video/subtitle output, and makes
+the first video frame at or after the target an immediate, non-droppable
+presentation anchor. Its callback reports the actual published timestamp.
+Forward and backward steps publish exactly one adjacent frame, keep device
+audio paused, and leave Player paused; backward stepping reconstructs history
+when the predecessor is not retained. Accepted control work takes precedence
+over concurrent natural-end teardown. See
+[AD-018](DECISIONS.md#ad-018-accurate-seek-and-frame-stepping-use-presentation-generations-and-an-anchor-frame).
 
 Decoded `AudioFrame` and `VideoFrame` objects are cheap reference-counted
 views. Copying a frame retains its backing FFmpeg frame or hardware token. A
 pending hardware import must retain the exact decoded frame it is correlating;
 it may not substitute the player's newer current frame.
+
+## Buffering, live latency, and recoverable input
+
+Compressed packets remain owned by the control/demux worker and the existing
+bounded per-stream queues. One usable-media-time gate releases both selected
+A/V decoders for initial playback, seek, track switching, network recovery, or
+confirmed underflow. Capacity-limited completion is explicit, and a short
+external source may reach its own EOF without holding the main input. AD-013
+defines that shared gate.
+
+The optional disk tier in AD-014 spills compressed payloads, not decoder state,
+into one bounded player-specific system-temporary file. It is volatile
+prefetch, automatically removed across generation resets and destruction, and
+is not a persistent download or offline cache.
+
+Low-latency playback and network recovery are deliberately independent:
+
+- AD-015 may keep a bounded newest decoded-video window and drop late video;
+  it never removes compressed packet history, audio, subtitles, or clock state;
+- AD-016 first lets FFmpeg protocol recovery run, then performs a bounded fresh
+  open on the sole format-context owner, validates selected stream identity,
+  installs new stream references only after decoder drain and generation
+  invalidation, and refills through the packet-buffer gate.
+
+No policy may silently convert a non-seekable reopen into lossless recovery,
+adaptive streaming, or unbounded retry.
 
 ## Rendering contract
 
@@ -344,15 +399,28 @@ application-side tone mapping.
 ## OHOS hardware-frame interop
 
 OHCodec direct-surface presentation remains separate from application-rendered
-texture interop. `QtAV::InteropOHCodecVulkan` implements the preferred strict
-Vulkan route. It owns a private `OH_ConsumerSurface`, presents exactly one
-retained OHCodec output into that surface, acquires the corresponding
-`OHNativeWindowBuffer`, retains its `OH_NativeBuffer`, imports the acquire sync
-fd and memory through `VK_OHOS_external_memory`, and releases the consumer
-buffer only after renderer GPU completion. This path accepts only an explicit
-sampled two- or three-plane `VkFormat` that libplacebo can wrap directly. An
-opaque external format is rejected rather than normalized, so the target does
-not claim a weaker result than strict no-intermediate source zero-copy.
+texture interop. `QtAV::InteropOHCodecVulkan` owns a private
+`OH_ConsumerSurface`, presents exactly one retained OHCodec output into that
+surface, acquires the corresponding `OHNativeWindowBuffer`, retains its
+`OH_NativeBuffer`, imports acquire synchronization and memory through
+`VK_OHOS_external_memory`, and releases the consumer buffer only after renderer
+GPU completion.
+
+The Vulkan interop has three explicitly reported format routes:
+
+1. A queried explicit sampled multi-plane `VkFormat` may be wrapped directly by
+   libplacebo. This is the preferred strict no-intermediate route.
+2. `VK_FORMAT_UNDEFINED` may use the standards-based
+   `VkExternalFormatOHOS`/`VkSamplerYcbcrConversion` route and a GPU-only raw-
+   representation normalization pass. This remains zero-CPU-copy but is not
+   strict source zero-copy.
+3. [AD-009](DECISIONS.md#ad-009-ohos-external-format-guessing-is-a-bounded-workaround)
+   permits a production-default, closed-allowlist Huawei workaround for known
+   video-YUV external IDs. It still gates native format family, usage, sampled-
+   image features, image creation, import/bind, views, synchronization, and
+   actual sampling at runtime, retains an application kill switch, and falls
+   back one-way to OpenGL ES or software decode on failure. It is not a portable
+   promise that an arbitrary external ID equals a `VkFormat`.
 
 The OHOS OpenGL ES fallback target is raw import through
 `GL_EXT_YUV_target`, followed by a crop-aware RGBA16F GPU normalization of raw
@@ -362,12 +430,17 @@ it hides the source representation from libplacebo and cannot preserve the raw
 contract required for Dolby Vision. OHCodec/NativeImage may propagate the codec
 PTS unchanged in microseconds, so the interop compares the observed value and
 its microsecond-to-nanosecond candidate against the exact queued-frame PTS set,
-then stores and correlates the selected value in nanoseconds. The connected
-Mate 60 Pro exposes only `VK_FORMAT_UNDEFINED` plus an opaque external-format
-ID for real H.264 and HEVC outputs. Its strict `UNSUPPORTED` result validates
-the fail-closed gate; a texture-interop success remains unclaimed until an
-explicit multi-plane format is imported, sampled, and released after GPU
-completion on suitable hardware.
+then stores and correlates the selected value in nanoseconds.
+
+The connected Mate 60 Pro and Pura X Max expose H.264/NV12 and HEVC/P010 as
+`VK_FORMAT_UNDEFINED` with the same two observed opaque external IDs. Opaque
+import/sampling, the separately diagnosed explicit-format/direct-plane route,
+and the bounded production workaround have each passed their recorded 60-frame
+matrices with zero decoded-source CPU map, transfer, staging, or upload. These
+results validate the named devices and bounded policy, not a general explicit-
+plane contract. Strict direct wrapping remains open until a device reports a
+non-opaque sampled multi-plane format and passes import, sampling, precision,
+and GPU-release validation.
 
 The connected Profile 5 and Profile 8.4 OpenGL ES runs each rendered 45 HEVC
 frames with `45/45/45` Dolby Vision queued/timestamp-matched/released counts,
@@ -376,7 +449,7 @@ upload calls. Profile 8.4 exercises MMR reshaping; the repository libplacebo
 overlay corrects its generated GLES array-index types and third-order branch
 syntax so the strict Maleoon shader compiler accepts that path. This validates
 the raw OpenGL ES half of the Dolby Vision route. The strict Vulkan half stays
-open because this device reports the P010 consumer buffer only as
+open because the tested devices report the P010 consumer buffer only as
 `VK_FORMAT_UNDEFINED` plus an opaque external-format ID.
 
 ## Audio architecture
@@ -412,29 +485,35 @@ that backend. The extension and retirement condition are governed by
 Public targets expose only their required installed dependencies. Build-tree,
 NDK, SDK, and producer-machine paths must not leak into exported CMake targets.
 Static and shared installs are validated with external `find_package` consumers.
+Optional backends remain compile-time targets in this repository while their
+interfaces evolve. Runtime loading, cross-toolchain C++ ABI exposure, and
+repository splitting are not current architecture; the conditions for a later
+versioned C ABI or split are governed by
+[AD-019](DECISIONS.md#ad-019-backends-remain-compile-time-modules-until-a-runtime-boundary-is-justified).
 
 ## Platform status and next work
 
 Windows D3D11/D3D11VA/WASAPI and Android Vulkan/OpenGL ES/MediaCodec/AAudio
-are the completed production paths. OHOS now has Vulkan and OpenGL ES software
-presentation, shared selector fallback, OHAudio output, and explicit OHCodec
-H.264/HEVC decoder selection plus single-decision present/drop/timed surface
-output on a retained window generation. The surface-output decoder shares the
-MediaCodec packet-feed and output-retention bounds, but its OHOS SDK types and
-native lifetime remain backend-local. Direct surface output remains separate
-from the optional native-buffer interop targets.
+are complete production paths. The AD-010 Windows visible-copy policy and its
+NVIDIA/AMD default/direct matrix are closed. A separate Intel post-seek
+performance workstream remains external and must not be described as closed
+until its administrator trace, correction, and same-revision cross-vendor gate
+pass.
 
-Direct `OHNativeWindow` present/drop scheduling and its lifecycle matrix are
-connected-device validated. The Vulkan-first interop code, shared/static
-package consumption, exact consumer-buffer acquisition, and opaque-format
-rejection are also validated. The current device cannot exercise the final
-direct-plane import/sampling/GPU-release gate, so no OHOS Vulkan texture PASS
-is claimed yet. [`PLAN.md`](PLAN.md) remains the source of truth for task
-ordering. The transferred Intel Windows investigation traced the persistent
-post-seek stall to redundant D3D11VA decoder teardown and repaired it with the
-compatible frames-context/decoder policy above. The remaining Windows gate is
-the same final Release revision on NVIDIA and AMD, `legend.mkv` only, with
-`directDecoderTextureSampling` both off and on.
+OHOS has Vulkan and OpenGL ES software presentation, shared selector fallback,
+OHAudio output, OHCodec H.264/HEVC and capability-gated VVC/H.266 selection,
+single-decision direct-surface present/drop/timed output, raw OpenGL ES
+hardware-frame interop, and the AD-009 bounded Vulkan policy. These paths and
+their fallback/lifecycle matrices are connected-device validated. The remaining
+native-buffer item is the narrower explicit-plane direct-wrap/precision gate on
+suitable hardware, followed by strict Vulkan Dolby Vision validation.
+
+Core feature work is complete through active audio/video/subtitle track
+switching, external audio/subtitle sources, optional libass rasterization,
+packet buffering/cache, live-latency control, bounded network recovery,
+frame-accurate seek, and forward/backward stepping. [`PLAN.md`](PLAN.md) remains
+the source of truth for task ordering; pitch-preserving audio time-stretch is
+the next local implementation task.
 
 ## Architectural invariants for changes
 
@@ -456,4 +535,9 @@ Before accepting a backend change, verify that:
    changing color interpretation or copying decoded pixels;
 10. Windows repeated format selection reuses a decoder only after every Core
     frames-context and FFmpeg decoder/configuration compatibility gate passes,
-    and the paired overlay ABI remains install-verified.
+    and the paired overlay ABI remains install-verified;
+11. timeline-changing control work invalidates the retired presentation
+    generation before output can cross the boundary, and the main input remains
+    the duration/range/end-of-media authority when sidecars are active;
+12. optional backends remain responsibility-specific compile-time targets until
+    a separately accepted versioned runtime boundary exists.

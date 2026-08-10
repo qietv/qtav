@@ -797,7 +797,8 @@ reacquire the recursive immediate-context lock before a timer-only retry.
   longer reads, clears, and re-aggregates renderer atomics after every frame;
   retry behavior remains identical when statistics are off.
 - The correction was subsequently validated across the recorded Intel,
-  NVIDIA, and AMD policy matrices in `PLAN.md`.
+  NVIDIA, and AMD policy matrices in the
+  [frozen plan history](PLAN_HISTORY_2026-08-10.md).
 
 ### Windows validation
 
@@ -829,8 +830,10 @@ with 57-75 ms libplacebo draw maxima and later audio underruns after prolonged
 build/UI-capture load. After an idle interval, a fresh process restored
 `legend.mkv` to 24.9-25.1 fps and `wednesday.mp4` to 23.8-24.1 fps with zero
 steady coalescing, busy, superseded, or terminal counts; warm draw maxima were
-about 35-43 ms. `PLAN.md` therefore records the high-load result as an
-environmental caution and keeps only the Intel performance comparison open.
+about 35-43 ms. The
+[frozen plan history](PLAN_HISTORY_2026-08-10.md) therefore records the
+high-load result as an environmental caution; the active
+[`PLAN.md`](PLAN.md) keeps only the Intel performance comparison open.
 
 ## AD-009: OHOS external-format guessing is a bounded workaround
 
@@ -1076,9 +1079,10 @@ sampling only as an opt-in and warns that D3D11 does not guarantee this use.
 - Static/shared CTest and WinUI Release remain build gates. The native policy
   matrix passed on the same Release revision on NVIDIA and AMD with
   `directDecoderTextureSampling` both off and on, using only `legend.mkv`, as
-  recorded in `PLAN.md`. On 2026-08-08 the user waived repeating those cells
-  after removal of investigation-only probes because that cleanup changed only
-  diagnostics and their presentation, not playback behavior.
+  recorded in the [frozen plan history](PLAN_HISTORY_2026-08-10.md). On
+  2026-08-08 the user waived repeating those cells after removal of
+  investigation-only probes because that cleanup changed only diagnostics and
+  their presentation, not playback behavior.
 
 ### Primary references
 
@@ -1169,7 +1173,8 @@ could not prevent a driver-wide shared-device serialization.
   in-flight backpressure rather than releasing that frame on the render thread.
 - The directly affected Windows FFmpeg build, install verifier, fresh static
   and shared QtAVCore 37/37 CTest runs, WinUI Release build, lifecycle tests,
-  and cooled Intel ETW/cadence evidence are recorded in `PLAN.md`.
+  and cooled Intel ETW/cadence evidence are recorded in the
+  [frozen plan history](PLAN_HISTORY_2026-08-10.md).
 
 ### Retirement condition
 
@@ -1243,8 +1248,9 @@ Dolby Vision processing, display switching, and Windows-native validation.
    OHOS. Sharing that engine across mobile targets is not a reason to create a
    Windows Vulkan product backend.
 4. The uncommitted investigation implementation is discarded. Its negative
-   capability results remain recorded here and in `PLAN.md`; no public target,
-   API, example, package export, or compatibility promise survives it.
+   capability results remain recorded here and in the
+   [frozen plan history](PLAN_HISTORY_2026-08-10.md); no public target, API,
+   example, package export, or compatibility promise survives it.
 5. Reconsideration requires a concrete Windows product requirement plus a new
    architecture decision backed by native multi-vendor hardware-decode,
    external-memory/synchronization, SDR/HDR, lifecycle, and packaging evidence.
@@ -1491,3 +1497,155 @@ packets from incompatible presentation generations.
 ### Primary reference
 
 - [FFmpeg protocol options](https://ffmpeg.org/ffmpeg-protocols.html#http)
+
+## AD-017: The main input owns the timeline while sidecars share one track namespace
+
+- Date: 2026-08-10
+- Status: Accepted and complete
+- Scope: Core input ownership, external audio/subtitle sources, track identity,
+  timestamp ordering, and playback lifecycle
+
+### Context
+
+Post-load track switching already used each main-input FFmpeg stream index as
+the public selector. Adding one external audio input and one external subtitle
+input introduced independent format contexts, overlapping stream indices,
+different start times, and possibly shorter EOF boundaries. Treating each
+sidecar as a separate Player would duplicate clocks and control state; treating
+its local stream index as globally unique would select the wrong source. A
+sidecar must also not shorten or extend the primary program's range merely
+because its duration differs.
+
+### Decision
+
+1. The main input remains the authority for media duration, A-B range, loop,
+   seekability, and end-of-media. One optional external audio input and one
+   optional external subtitle input may contribute selected tracks.
+2. The control worker exclusively owns all active format contexts. It
+   timestamp-orders selected packets after normalizing each input against its
+   own start time; no second demux owner or cross-context FFmpeg pointer is
+   exposed.
+3. `MediaInfo::tracks` is one public selector namespace. Main-input
+   `TrackInfo::index` values retain their container stream indices. External
+   tracks receive non-overlapping selector IDs, while `streamIndex`,
+   `sourceUrl`, and `external` preserve their actual diagnostic identity.
+4. Track switching, external-source replacement/removal, seek, loop, and main-
+   media replacement cross one presentation-generation boundary. Retired
+   packets and decoded frames cannot appear after the new selection is
+   accepted.
+5. Changing a sidecar while media is loaded asynchronously reopens and
+   realigns inputs at the current position while preserving play/pause intent.
+   A changed audio selection renegotiates the sink format.
+6. A short sidecar reaches EOF independently. It neither holds packet
+   buffering open nor becomes the program end authority. If the main input has
+   no audio or subtitle, the best eligible sidecar track may be selected
+   automatically; otherwise main-input best-stream selection keeps priority.
+
+### Consequences
+
+- Applications use the same `setActiveTrack()` contract for main and external
+  tracks without learning FFmpeg format-context ownership.
+- Runtime sidecar replacement is a bounded asynchronous continuity operation,
+  not an in-place mutation of decoder-owned stream pointers.
+- The single-timeline model does not provide arbitrary numbers of external
+  sources, independent sidecar clocks, playlist concatenation, or sidecar-
+  defined playback duration.
+- Packet buffering and network recovery must evaluate EOF and replacement
+  compatibility per input while still publishing one presentation generation.
+
+## AD-018: Accurate seek and frame stepping use presentation generations and an anchor frame
+
+- Date: 2026-08-10
+- Status: Accepted and complete
+- Scope: Core seek semantics, frame stepping, presentation queues, audio/subtitle
+  suppression, callbacks, and natural-end races
+
+### Context
+
+An ordinary demux seek can report success after positioning near a target, but
+it does not identify the exact decoded video frame an editor or paused player
+will show. Implementing accurate seek as a synchronous decode call would break
+Player's asynchronous control model and bypass bounded decode/presentation
+workers. Ordinary late-frame and queue-capacity policies could also discard the
+very target frame that completes the request. Backward stepping cannot assume
+the previous frame is still retained, especially across keyframe boundaries.
+
+### Decision
+
+1. `SeekFlag::Accurate` refines the existing asynchronous seek. Player seeks to
+   a preceding keyframe, decodes forward, suppresses pre-target video, audio,
+   and subtitle delivery, and selects the first decoded video frame at or after
+   the requested position.
+2. The selected frame is installed as the immediate presentation anchor for
+   the new generation. It bypasses ordinary late-frame and queue-capacity drops
+   but still uses the application scheduler or normal presentation worker.
+3. Completion runs on the playback worker only after that frame has been
+   handed to presentation, and reports its actual timestamp. With no active
+   video track, completion falls back to the demux-seek result.
+4. A playing accurate seek preserves play intent and re-enters the normal
+   packet/output-clock anchoring path. A paused accurate seek publishes the
+   anchor without starting audio and remains paused.
+5. `stepForward()` and `stepBackward()` invalidate the retired generation,
+   keep the audio device paused, publish exactly one adjacent video frame, and
+   leave Player paused. Backward stepping uses retained predecessor history or
+   reconstructs it by decoding from the active range start.
+6. The control path publishes its interrupt epoch and new presentation
+   generation before the playback worker can consume the request. Natural-end
+   teardown rechecks accepted control work before committing EOF, so an
+   accepted seek or step cannot be lost to a concurrent drain.
+
+### Consequences
+
+- Accurate seek is deterministic at the decoded-frame boundary without adding
+  a synchronous decoder API or a second media pipeline.
+- Audio and subtitles below the target cannot leak across the seek generation,
+  and the target frame cannot disappear because ordinary presentation is late.
+- Backward stepping may perform bounded asynchronous reconstruction and is not
+  guaranteed to complete at the cost of only one cached frame.
+- Applications must use the completion timestamp rather than assuming that the
+  requested millisecond exactly names a decoded frame.
+
+## AD-019: Backends remain compile-time modules until a runtime boundary is justified
+
+- Date: 2026-08-10
+- Status: Accepted
+- Scope: Repository ownership, optional backend linkage, package ABI, runtime
+  loading, and possible future repository splits
+
+### Context
+
+QtAVCore's backend contracts are still evolving across three supported target
+families and several native SDKs. Compile-time CMake targets already let an
+application select only the render, audio, hardware-decode, interop, subtitle,
+and high-level output modules it needs. Introducing runtime plugins now would
+freeze discovery, versioning, allocation, threading, and lifetime boundaries;
+exporting STL or C++ virtual ABI across arbitrary compilers would add a support
+promise that the current package does not need.
+
+### Decision
+
+1. Keep optional backends in this repository and expose them as separately
+   linkable CMake targets while interfaces evolve. The core does not scan for
+   or load runtime plugins.
+2. Version the core C++ API and installed CMake package before treating backend
+   interfaces as a stable release boundary.
+3. If runtime-loaded plugins become necessary, define a versioned C ABI with
+   explicit ownership, capability, threading, and error contracts. Do not
+   expose STL containers, exceptions, or C++ virtual ABI across arbitrary
+   toolchains.
+4. Split a backend into another repository only when it has an independent
+   license, team, release cycle, or closed-source delivery requirement. A
+   directory boundary or optional dependency alone is insufficient.
+
+### Consequences
+
+- Current applications keep deterministic compile-time linkage and installed
+  target discovery; no runtime loader or plugin search path enters the core.
+- Backend contracts may evolve with the monorepo while static/shared install
+  and external-consumer tests remain the compatibility gate.
+- A future plugin system requires a separate accepted design and cannot be
+  inferred from the current `VideoRenderAPI`, `AudioSink`, or C++ backend
+  classes.
+- Release CI and API/package versioning remain open tasks in
+  [`PLAN.md`](PLAN.md), while the repository/runtime boundary itself is no
+  longer an unchecked planning choice.

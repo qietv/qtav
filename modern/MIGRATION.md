@@ -3,7 +3,9 @@
 The current component and ownership model is documented in
 [`ARCHITECTURE.md`](ARCHITECTURE.md); implementation order lives in
 [`PLAN.md`](PLAN.md), and durable decisions live in
-[`DECISIONS.md`](DECISIONS.md).
+[`DECISIONS.md`](DECISIONS.md). The detailed completed implementation and
+validation record is archived in
+[`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md).
 
 QtAVCore is an incremental replacement, not a compatibility wrapper. Legacy
 QtAV remains buildable while callers move to the new API one integration at a
@@ -448,8 +450,9 @@ seek, shutdown, cadence, and stage-timing regression. A separately reported
 visual 4K cadence issue on an AMD integrated GPU remains a performance
 investigation rather than an imported-frame correctness regression. The Intel
 Iris Xe same-build investigation localized and removed redundant decoder
-teardown; the remaining final-device work is the Radeon regression recorded in
-`PLAN.md`.
+teardown. The closed AD-010 matrix and earlier device evidence are retained in
+[`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md); the separate open
+Intel performance workstream is tracked in [`PLAN.md`](PLAN.md).
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
