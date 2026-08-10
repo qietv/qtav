@@ -84,37 +84,37 @@ The following accepted decisions constrain all remaining work:
   presentation. The optional `QtAV::AudioFilter` volume backend, deterministic
   lifecycle/failure tests, and Windows/Android/OHOS static/shared package
   consumption pass.
+- QtAVCore 2.0.0 is formalized as the first rewrite release. A generated public
+  version header, unconditional package variables, same-major discovery rules,
+  coherent shared-target metadata, deterministic version probes, and separate
+  installed-package consumers pass on Windows, Android, and OHOS. Compatibility
+  remains scoped to documented C++/CMake boundaries and does not create a
+  plugin ABI.
 
-## Next task — formalize the core C++ API and CMake package version contract
+Detailed implementation and validation evidence for the version contract is in
+[`PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md`](PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md).
 
-- [ ] Audit and formalize the existing QtAVCore 2.0.0 project/package version
-  without changing runtime behavior or prematurely introducing a plugin ABI.
+## Next task — add supported-target continuous integration
 
-Keep C++ source compatibility, shared-library ABI compatibility, package
-discovery compatibility, and any future runtime plugin ABI as separate claims.
-This task versions the currently exported C++ libraries and CMake package; it
-does not authorize dynamic plugin loading or a stable C ABI.
+- [ ] Add repeatable CI for the supported Windows, Android, and OHOS build,
+  test, install, and package-consumer matrix without converting device-only
+  validation into a false hosted pass.
 
 Acceptance criteria:
 
-1. [ ] Confirm whether 2.0.0 is the intended first rewrite release, then define
-   compatibility promises and increment rules for public C++ headers, shared
-   libraries, exported CMake targets, and package-config discovery.
-2. [ ] Make the project/package version available to CMake consumers and
-   application code without exposing build-system or platform types through
-   core public headers.
-3. [ ] Give shared targets coherent version metadata on supported platforms;
-   do not claim cross-compiler C++ ABI compatibility or add a runtime plugin
-   boundary.
-4. [ ] Add deterministic build/package tests for exact, compatible, and
-   rejected version requests plus a separate installed-package consumer.
-5. [ ] Pass proportional Windows static/shared tests and Android/OHOS
-   static/shared cross-build/package checks, then document upgrade and release
-   policy in the public, migration, architecture, and decision records that own
-   it.
-
-Detailed implementation and validation evidence is in
-[`PLAN_HISTORY_2026-08-10_PROCESSING_CONTRACTS.md`](PLAN_HISTORY_2026-08-10_PROCESSING_CONTRACTS.md).
+1. [ ] Build and test Windows static/shared Release packages, including the
+   staged installed-package consumer and deterministic version requests.
+2. [ ] Cross-build and install Android arm64/API 28 and OHOS arm64/API 23
+   static/shared packages from the repository dependency prefixes, then build
+   their standalone package consumers.
+3. [ ] Use the repository platform dependency build and verification scripts;
+   do not download workflow artifacts as a local dependency fallback.
+4. [ ] Keep signed-device playback, native HDR, physical audio, and strict
+   native-buffer gates explicitly separate from hosted CI and never report an
+   unavailable device check as a pass.
+5. [ ] Pin or record toolchain inputs, use bounded caches that cannot bypass
+   install verification, publish useful failure logs, and document the CI
+   ownership and local reproduction commands.
 
 ## Active incomplete and external gates
 
@@ -184,7 +184,6 @@ rendering.
 AD-019 keeps optional backends in this repository as compile-time targets while
 interfaces evolve. The remaining release work is:
 
-- [ ] Version the core C++ API and CMake package (current local task above).
 - [ ] Add continuous integration for all supported host/target combinations.
 - [ ] Define a versioned C ABI only if runtime-loaded plugins become necessary.
 - [ ] Split a backend into another repository only when it has an independent
@@ -231,12 +230,13 @@ is intentionally short:
 | Milestone 7: OHOS production path | Implemented through current opaque-format policy; explicit-plane strict Vulkan and broader validation remain open above |
 | Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step, pitch-preserving time-stretch | Complete and verified on Windows plus Android/OHOS static/shared cross-builds |
 | General audio/video processing contracts and reference volume filter | Complete and verified on Windows plus Android/OHOS static/shared package consumption |
+| Core C++ API and CMake package version contract | Complete at 2.0.0 with deterministic discovery and supported-target package consumers |
 | Milestone 10: software Dolby decode and HDR/Dolby Vision metadata paths | Partial; passthrough, Atmos, strict OHOS Vulkan, licensing, and certification remain open |
 
 ## Task selection rules
 
-1. Formalize the core C++ API and CMake package version contract unless the
-   user gives a different priority.
+1. Add supported-target continuous integration unless the user gives a
+   different priority.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.
 3. The external Intel workstream may proceed in parallel on its designated

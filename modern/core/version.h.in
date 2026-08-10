@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+#pragma once
+
+#include <string_view>
+
+#define QTAV_CORE_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define QTAV_CORE_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define QTAV_CORE_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define QTAV_CORE_VERSION_STRING "@PROJECT_VERSION@"
+
+namespace qtav {
+
+struct Version final {
+    int major = 0;
+    int minor = 0;
+    int patch = 0;
+};
+
+constexpr bool operator==(Version left, Version right) noexcept
+{
+    return left.major == right.major
+        && left.minor == right.minor
+        && left.patch == right.patch;
+}
+
+constexpr bool operator!=(Version left, Version right) noexcept
+{
+    return !(left == right);
+}
+
+inline constexpr Version coreVersion {
+    QTAV_CORE_VERSION_MAJOR,
+    QTAV_CORE_VERSION_MINOR,
+    QTAV_CORE_VERSION_PATCH,
+};
+
+inline constexpr std::string_view coreVersionString {
+    QTAV_CORE_VERSION_STRING,
+};
+
+} // namespace qtav

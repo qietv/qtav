@@ -16,6 +16,9 @@ status and the active next task live in [`PLAN.md`](PLAN.md). Completed
 checklists, investigation narratives, device matrices, and historical
 validation evidence are retained in
 [`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md).
+The supported-target CI matrix, runner contract, local reproduction commands,
+cache boundary, and device-only exclusions are documented in
+[`CI.md`](CI.md).
 
 ## Supported targets
 
@@ -367,6 +370,69 @@ Requirements:
   D3D11 renderer;
 - `pkg-config` is required for a libplacebo renderer and recommended for
   resolving static FFmpeg dependency closures.
+
+The supported Windows, Android, and OHOS continuous-integration matrix is in
+[`CI.md`](CI.md). Its checked-in PowerShell drivers can reproduce the complete
+jobs locally on a configured 64-bit Windows host. Cross-built Android/OHOS
+tests are compiled but not executed on Windows; signing, installation, native
+HDR/audio, codec, and physical-device validation remain separate gates and are
+never reported as hosted passes.
+
+### Version and package compatibility
+
+QtAVCore 2.0.0 is the first formal release version for the Qt-free rewrite.
+The CMake project version is the single source for the installed package,
+public version header, and library metadata. Applications can query it without
+including FFmpeg, CMake-generated platform declarations, or a native SDK:
+
+```cpp
+#include <qtav/version.h>
+
+static_assert(QTAV_CORE_VERSION_MAJOR == 2);
+static_assert(qtav::coreVersion == qtav::Version { 2, 0, 0 });
+static_assert(qtav::coreVersionString == "2.0.0");
+```
+
+Installed CMake packages always define `QtAVCore_VERSION` and its
+`_MAJOR`, `_MINOR`, and `_PATCH` components. Request an exact release when the
+application requires one, or the oldest acceptable release within major 2:
+
+```cmake
+find_package(QtAVCore 2.0.0 EXACT CONFIG REQUIRED)
+# or
+find_package(QtAVCore 2.0 CONFIG REQUIRED)
+target_link_libraries(my_player PRIVATE QtAV::Core)
+```
+
+Package discovery uses CMake `SameMajorVersion` compatibility: an installed
+package must be at least the requested version and have the same major version.
+That selection rule is not, by itself, a C++ binary-compatibility proof.
+Compatibility claims are deliberately separate:
+
+- patch releases preserve public source and shared-library interfaces and are
+  reserved for compatible fixes;
+- minor releases may add public headers, APIs, or exported targets while
+  preserving existing source contracts and the shared ABI within one supported
+  ABI domain;
+- major releases may remove or change public C++ contracts, structure layouts,
+  virtual interfaces, exported target names, or other shared ABI boundaries;
+- a shared ABI domain requires the same target architecture, compiler ABI and
+  compatible toolset, C++ standard library/runtime mode, relevant build mode,
+  and dependency ABI. QtAVCore does not promise cross-compiler, cross-runtime,
+  or cross-architecture C++ ABI compatibility, and static consumers rebuild;
+- existing exported CMake target names remain available through a major
+  release. Adding an optional target is compatible; removing or incompatibly
+  redefining one requires a major release.
+
+Every supported shared target carries CMake `VERSION` equal to the complete
+QtAVCore release and `SOVERSION` equal to its major version. This supplies the
+PE image version on Windows and the ELF major soname plus versioned library
+names on OHOS. Android's NDK intentionally emits the platform-standard
+unversioned `.so` filename and soname even when those target properties are
+set, so the public header and CMake package remain the Android release-version
+authority. None of this introduces a runtime plugin ABI: optional backends
+remain compile-time C++ targets, and a future loader still requires a
+separately designed versioned C ABI.
 
 ```sh
 cmake -S modern -B build/modern -DQTAV_CORE_BUILD_TESTS=ON

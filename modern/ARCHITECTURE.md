@@ -528,6 +528,25 @@ that backend. The extension and retirement condition are governed by
 Public targets expose only their required installed dependencies. Build-tree,
 NDK, SDK, and producer-machine paths must not leak into exported CMake targets.
 Static and shared installs are validated with external `find_package` consumers.
+QtAVCore 2.0.0 is the first formal rewrite release. The root CMake project
+version generates the public `<qtav/version.h>`, unconditional
+`QtAVCore_VERSION*` package variables, the `SameMajorVersion` discovery file,
+and every supported shared target's full `VERSION` plus major `SOVERSION`.
+Configuration recursively verifies those shared-target properties before
+examples or tests introduce non-package targets.
+Windows maps the full property to its PE image version, and OHOS emits the
+major ELF soname plus full/major/unversioned library names. Android keeps the
+NDK's required unversioned `.so` name and soname; its release identity comes
+from the same generated header and installed CMake package.
+
+Package discovery compatibility, source compatibility after rebuilding, and
+shared-library binary compatibility are distinct boundaries. Same-major
+package discovery requires an installed version at least as new as the request.
+Shared ABI compatibility is limited to the same target architecture, compiler
+ABI/toolset family, standard library/runtime mode, relevant build mode, and
+dependency ABI; static linkage and cross-compiler C++ ABI are not covered.
+Release increments and exported-target compatibility are governed by
+[AD-022](DECISIONS.md#ad-022-qtavcore-200-starts-the-versioned-c-and-cmake-package-contract).
 Optional backends remain compile-time targets in this repository while their
 interfaces evolve. Runtime loading, cross-toolchain C++ ABI exposure, and
 repository splitting are not current architecture; the conditions for a later

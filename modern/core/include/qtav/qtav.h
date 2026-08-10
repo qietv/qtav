@@ -12,3 +12,4 @@
 #include <qtav/player.h>
 #include <qtav/video_processor.h>
 #include <qtav/video_render_api.h>
+#include <qtav/version.h>

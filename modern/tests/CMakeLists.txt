@@ -3,6 +3,93 @@ target_link_libraries(qtav_core_api_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_api_test PRIVATE cxx_std_17)
 add_test(NAME qtav_core_api COMMAND qtav_core_api_test)
 
+if(QTAV_CORE_INSTALL AND NOT CMAKE_CROSSCOMPILING)
+    include(GNUInstallDirs)
+
+    foreach(package_version_mode IN ITEMS
+            EXACT
+            COMPATIBLE
+            REJECT_NEWER
+            REJECT_OTHER_MAJOR)
+        string(
+            TOLOWER
+            "${package_version_mode}"
+            package_version_mode_lower
+        )
+        set(package_version_probe_command
+            "${CMAKE_COMMAND}"
+            -S "${CMAKE_CURRENT_SOURCE_DIR}/package_version"
+            -B
+                "${CMAKE_CURRENT_BINARY_DIR}/package-version-${package_version_mode_lower}"
+            -G "${CMAKE_GENERATOR}"
+            "-DQTAV_CORE_VERSION_FILE=${PROJECT_BINARY_DIR}/QtAVCoreConfigVersion.cmake"
+            "-DQTAV_CORE_PROBE_MODE=${package_version_mode}"
+        )
+        if(CMAKE_GENERATOR_PLATFORM)
+            list(APPEND package_version_probe_command
+                -A "${CMAKE_GENERATOR_PLATFORM}")
+        endif()
+        if(CMAKE_GENERATOR_TOOLSET)
+            list(APPEND package_version_probe_command
+                -T "${CMAKE_GENERATOR_TOOLSET}")
+        endif()
+        add_test(
+            NAME
+                "qtav_core_package_version_${package_version_mode_lower}"
+            COMMAND ${package_version_probe_command}
+        )
+        set_tests_properties(
+            "qtav_core_package_version_${package_version_mode_lower}"
+            PROPERTIES TIMEOUT 30
+        )
+    endforeach()
+
+    set(
+        QTAV_CORE_TEST_INSTALL_PREFIX
+        "${CMAKE_CURRENT_BINARY_DIR}/package-install/$<CONFIG>"
+    )
+    add_test(
+        NAME qtav_core_package_install
+        COMMAND
+            "${CMAKE_COMMAND}"
+            --install "${PROJECT_BINARY_DIR}"
+            --config "$<CONFIG>"
+            --prefix "${QTAV_CORE_TEST_INSTALL_PREFIX}"
+    )
+    set_tests_properties(
+        qtav_core_package_install
+        PROPERTIES
+            FIXTURES_SETUP qtav_core_installed_package
+            TIMEOUT 60
+    )
+
+    add_test(
+        NAME qtav_core_installed_package_consumer
+        COMMAND
+            "${CMAKE_COMMAND}"
+            "-DQTAV_CORE_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/install_consumer"
+            "-DQTAV_CORE_CONSUMER_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/install-consumer/$<CONFIG>"
+            "-DQTAV_CORE_INSTALL_PREFIX=${QTAV_CORE_TEST_INSTALL_PREFIX}"
+            "-DQTAV_CORE_INSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}"
+            "-DQTAV_CORE_CONSUMER_CONFIG=$<CONFIG>"
+            "-DQTAV_CORE_CONSUMER_GENERATOR=${CMAKE_GENERATOR}"
+            "-DQTAV_CORE_CONSUMER_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+            "-DQTAV_CORE_CONSUMER_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
+            "-DQTAV_CORE_CONSUMER_TOOLCHAIN=${CMAKE_TOOLCHAIN_FILE}"
+            "-DQTAV_CORE_CONSUMER_VCPKG_TRIPLET=${VCPKG_TARGET_TRIPLET}"
+            "-DQTAV_CORE_CONSUMER_VCPKG_INSTALLED_DIR=${VCPKG_INSTALLED_DIR}"
+            "-DQTAV_CORE_CONSUMER_PKG_CONFIG=${PKG_CONFIG_EXECUTABLE}"
+            -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/run_install_consumer.cmake"
+    )
+    set_tests_properties(
+        qtav_core_installed_package_consumer
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_installed_package
+            TIMEOUT 120
+    )
+endif()
+
 find_package(FFmpeg REQUIRED COMPONENTS avutil)
 add_executable(
     qtav_core_hardware_decode_device_test

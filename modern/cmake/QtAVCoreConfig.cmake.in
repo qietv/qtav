@@ -1,5 +1,10 @@
 @PACKAGE_INIT@
 
+set(QtAVCore_VERSION "@PROJECT_VERSION@")
+set(QtAVCore_VERSION_MAJOR "@PROJECT_VERSION_MAJOR@")
+set(QtAVCore_VERSION_MINOR "@PROJECT_VERSION_MINOR@")
+set(QtAVCore_VERSION_PATCH "@PROJECT_VERSION_PATCH@")
+
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 

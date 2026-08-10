@@ -50,6 +50,10 @@ add_subdirectory(core)
 add_subdirectory(platform)
 add_subdirectory(backends)
 
+# Every supported shared library belongs to the same QtAVCore release and ABI
+# major. Verify this before examples or tests add non-package targets.
+qtav_verify_shared_library_versions("${CMAKE_CURRENT_SOURCE_DIR}")
+
 if(QTAV_CORE_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()

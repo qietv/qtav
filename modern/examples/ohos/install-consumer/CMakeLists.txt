@@ -2,7 +2,12 @@ cmake_minimum_required(VERSION 3.20)
 
 project(QtAVCoreOHOSRenderInstallConsumer LANGUAGES CXX)
 
-find_package(QtAVCore CONFIG REQUIRED)
+find_package(QtAVCore 2.0 CONFIG REQUIRED)
+
+if(NOT QtAVCore_VERSION STREQUAL "2.0.0")
+    message(FATAL_ERROR
+        "Unexpected QtAVCore package version: ${QtAVCore_VERSION}")
+endif()
 
 add_library(qtav_ohos_render_install_consumer SHARED consumer.cpp)
 target_compile_features(

@@ -8,11 +8,18 @@
 #include <qtav/ohos_vulkan_video_renderer.h>
 #include <qtav/ohaudio_audio_sink.h>
 #include <qtav/swresample_audio_converter.h>
+#include <qtav/version.h>
 #include <qtav/volume_audio_frame_processor.h>
 
 #include <memory>
 #include <string>
 #include <utility>
+
+static_assert(QTAV_CORE_VERSION_MAJOR == 2);
+static_assert(QTAV_CORE_VERSION_MINOR == 0);
+static_assert(QTAV_CORE_VERSION_PATCH == 0);
+static_assert(qtav::coreVersion == qtav::Version { 2, 0, 0 });
+static_assert(qtav::coreVersionString == "2.0.0");
 
 extern "C" __attribute__((visibility("default")))
 int qtav_ohos_render_install_consumer()

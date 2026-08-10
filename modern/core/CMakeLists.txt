@@ -12,6 +12,12 @@ if(FFmpeg_avcodec_VERSION_MAJOR
         "(libavcodec major ${QTAV_MINIMUM_FFMPEG_AVCODEC_MAJOR}+)")
 endif()
 
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/include/qtav/version.h"
+    @ONLY
+)
+
 add_library(qtav_core
     src/backend.cpp
     src/frame.cpp
@@ -25,6 +31,7 @@ target_compile_definitions(qtav_core PRIVATE QTAV_CORE_BUILDING_LIBRARY)
 target_include_directories(qtav_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -76,5 +83,10 @@ if(QTAV_CORE_INSTALL)
     install(
         DIRECTORY include/
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+    )
+    install(
+        FILES
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/include/qtav/version.h"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/qtav"
     )
 endif()

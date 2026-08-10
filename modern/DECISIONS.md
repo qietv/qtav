@@ -1783,3 +1783,78 @@ The reference volume backend verifies sample values, format/timestamp
 preservation, reset/drain, and invalid-format rejection. Supported-target
 cross-build and installed-package results are recorded in the dated plan
 history referenced by [`PLAN.md`](PLAN.md).
+
+## AD-022: QtAVCore 2.0.0 starts the versioned C++ and CMake package contract
+
+- Date: 2026-08-10
+- Status: Accepted and complete
+- Scope: Public C++ API versions, shared-library ABI metadata, exported CMake
+  targets, package discovery, release increments, and plugin-boundary limits
+
+### Context
+
+The standalone rewrite project has declared version 2.0.0 since its initial
+repository commit, and its libraries already carried matching CMake `VERSION`
+and major `SOVERSION` properties. The version was not available through a
+public C++ header, package variables were not guaranteed when no version was
+requested, compatibility promises were undocumented, and exact/compatible/
+rejected package requests had no deterministic test. Treating CMake package
+selection, C++ source compatibility, arbitrary-toolchain binary compatibility,
+and a future plugin ABI as one promise would make the release boundary broader
+than the current architecture supports.
+
+### Decision
+
+1. Confirm 2.0.0 as the first formal release version of QtAVCore, independent
+   of the legacy QtAV ABI. The root CMake project version is the single source
+   for generated public, package, and binary metadata.
+2. Generate `<qtav/version.h>` with preprocessor components plus
+   `qtav::coreVersion` and `qtav::coreVersionString`. Installed package configs
+   always publish `QtAVCore_VERSION` and its major/minor/patch components.
+3. Keep CMake package discovery on `SameMajorVersion`: an installed package is
+   compatible only when its major matches and its version is not older than the
+   request. `EXACT` remains available for deployment locks. Existing exported
+   target names remain valid within a major release; additive optional targets
+   are compatible, while removal or incompatible redefinition is major.
+4. Use patch releases for fixes that preserve public source and shared-library
+   interfaces. Minor releases may add APIs or targets while preserving existing
+   source contracts and the shared ABI inside one supported ABI domain. Any
+   incompatible public signature, layout, virtual interface, ownership rule,
+   inline contract, or exported-target change increments the major version.
+5. Set every supported shared target's `VERSION` to the full release and
+   `SOVERSION` to the major release, and fail configuration if a production
+   shared target diverges. Windows uses the resulting PE image version and
+   OHOS uses the major ELF soname plus versioned library names. Android keeps
+   its NDK-standard unversioned `.so` name and soname, with release identity in
+   the public header and package config. None is an arbitrary-toolchain ABI
+   guarantee.
+6. Limit a shared ABI domain to the same architecture, compiler ABI and
+   compatible toolset, C++ standard library/runtime mode, relevant build mode,
+   and dependency ABI. Static consumers rebuild. No cross-compiler,
+   cross-runtime, or cross-architecture C++ ABI compatibility is promised.
+7. Do not infer a runtime plugin ABI from this version. AD-019 remains in force:
+   optional backends are compile-time C++ targets, and runtime loading requires
+   a separately accepted versioned C ABI with explicit ownership and threading.
+
+### Consequences
+
+- Applications and build systems can compare the same release value without
+  importing FFmpeg, graphics, window-system, audio, or CMake implementation
+  types into core public headers.
+- Compatible package discovery is predictable, but deployment code must still
+  respect the narrower shared ABI domain and rebuild static or structurally
+  affected consumers.
+- Windows shared images and OHOS ELF libraries carry their platform's
+  release/major metadata; Android keeps one unversioned native name while
+  reporting the same release through its header and package.
+- Plugin discovery, allocation, capabilities, and lifetime remain unfrozen.
+
+### Validation
+
+Core API compilation asserts the generated values. CMake configure tests cover
+2.0.0 exact acceptance, 2.0 compatible acceptance, 2.1 rejection, and previous-
+major rejection. A separate staged-install consumer validates package variables,
+the installed header, `QtAV::Core`, compilation, and final linking. Windows
+static/shared tests and Android/OHOS static/shared package consumers provide the
+supported-target gate; detailed commands and results are retained in the dated
+plan history referenced by [`PLAN.md`](PLAN.md).

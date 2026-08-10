@@ -27,6 +27,30 @@ Linux `HardwareDeviceType::VAAPI` value and ALSA/PulseAudio/VAAPI placeholder
 options were removed at the same time. Consumers must not probe or request
 those identifiers from the active headers.
 
+## Version and upgrade contract
+
+QtAVCore 2.0.0 is the first formal release of the independent Qt-free rewrite;
+it is not a continuation of the legacy QtAV library ABI. New integrations
+should request the oldest acceptable major-2 package with
+`find_package(QtAVCore 2.0 CONFIG REQUIRED)`, or use `EXACT` when deployment
+requires one release. The package reports `QtAVCore_VERSION` and component
+variables, while `<qtav/version.h>` exposes `QTAV_CORE_VERSION_*`,
+`qtav::coreVersion`, and `qtav::coreVersionString` to C++ code.
+
+Within major 2, patch releases preserve public source and shared-library
+interfaces; minor releases may add APIs or CMake targets without removing or
+incompatibly changing existing ones. Breaking public header/layout/virtual-ABI
+or exported-target changes require a new major version. Shared-library ABI
+compatibility is claimed only inside the same target/compiler/runtime/dependency
+ABI domain, never across arbitrary compilers or build modes. Static consumers
+must rebuild, and any consumer whose public structures or inline contracts
+changed should rebuild even when package discovery remains compatible.
+
+This C++ and package contract does not create a runtime plugin boundary.
+Backends remain compile-time targets; [AD-022](DECISIONS.md#ad-022-qtavcore-200-starts-the-versioned-c-and-cmake-package-contract)
+owns the release rules, while [AD-019](DECISIONS.md#ad-019-backends-remain-compile-time-modules-until-a-runtime-boundary-is-justified)
+continues to govern any future plugin design.
+
 ## API mapping
 
 | Legacy QtAV | QtAVCore |
