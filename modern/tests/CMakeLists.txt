@@ -209,6 +209,38 @@ add_executable(qtav_core_audio_sink_player_test audio_sink_player_test.cpp)
 target_link_libraries(qtav_core_audio_sink_player_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_audio_sink_player_test PRIVATE cxx_std_17)
 
+add_executable(
+    qtav_core_audio_time_stretch_player_test
+    audio_time_stretch_player_test.cpp
+)
+target_link_libraries(
+    qtav_core_audio_time_stretch_player_test
+    PRIVATE QtAV::Core
+)
+target_compile_features(
+    qtav_core_audio_time_stretch_player_test
+    PRIVATE cxx_std_17
+)
+
+if(TARGET qtav_audio_timestretch)
+    add_executable(
+        qtav_audio_timestretch_test
+        audio_time_stretcher_test.cpp
+    )
+    target_link_libraries(
+        qtav_audio_timestretch_test
+        PRIVATE QtAV::AudioTimeStretch
+    )
+    target_compile_features(
+        qtav_audio_timestretch_test
+        PRIVATE cxx_std_17
+    )
+    add_test(
+        NAME qtav_audio_timestretch
+        COMMAND qtav_audio_timestretch_test
+    )
+endif()
+
 if(TARGET qtav_audio_file)
     add_executable(qtav_audio_file_test wav_audio_sink_test.cpp)
     target_link_libraries(qtav_audio_file_test PRIVATE QtAV::AudioFile)
@@ -449,6 +481,16 @@ if(TARGET qtav_audio_resample)
         qtav_simulated_audio_sink_player_test
         PRIVATE cxx_std_17
     )
+    if(TARGET qtav_audio_timestretch)
+        target_link_libraries(
+            qtav_simulated_audio_sink_player_test
+            PRIVATE QtAV::AudioTimeStretch
+        )
+        target_compile_definitions(
+            qtav_simulated_audio_sink_player_test
+            PRIVATE QTAV_TEST_HAS_AUDIO_TIMESTRETCH
+        )
+    endif()
 
     if(TARGET qtav_audio_file)
         add_executable(
@@ -766,8 +808,15 @@ if(FFMPEG_EXECUTABLE)
         NAME qtav_core_audio_sink_player
         COMMAND qtav_core_audio_sink_player_test "${QTAV_CORE_TEST_MEDIA}"
     )
+    add_test(
+        NAME qtav_core_audio_time_stretch_player
+        COMMAND
+            qtav_core_audio_time_stretch_player_test
+            "${QTAV_CORE_TEST_MEDIA}"
+    )
     set_tests_properties(
         qtav_core_audio_sink_player
+        qtav_core_audio_time_stretch_player
         PROPERTIES
             FIXTURES_REQUIRED qtav_core_media
             TIMEOUT 15

@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 include(FindPackageHandleStandardArgs)
+include(QtAVPkgConfig)
 
-set(_ffmpeg_known_components avformat avcodec avutil swresample swscale)
+set(_ffmpeg_known_components
+    avformat
+    avcodec
+    avfilter
+    avutil
+    swresample
+    swscale
+)
 set(_ffmpeg_requested_components ${FFmpeg_FIND_COMPONENTS})
 if(NOT _ffmpeg_requested_components)
     set(_ffmpeg_requested_components ${_ffmpeg_known_components})
@@ -56,6 +64,9 @@ foreach(_component IN LISTS _ffmpeg_requested_components)
             GLOBAL
             "lib${_component}"
         )
+
+        qtav_sanitize_android_pkg_config_target(
+            PkgConfig::PC_FFMPEG_${_component})
     endif()
 
     find_path(

@@ -11,6 +11,8 @@ The example demonstrates:
 - play, pause, stop, and asynchronous seek;
 - a progress slider that does not issue a seek for every pointer movement;
 - WASAPI audio with the device presentation clock as playback master;
+- pitch-preserving programmatic playback-rate changes through the optional
+  FFmpeg `atempo` audio processor (the focused UI has no speed control yet);
 - D3D11VA hardware decode and zero-CPU-map raw NV12/P010 presentation through
   libplacebo's D3D11 renderer when the media and device support them, with the
   library's software fallback;
@@ -69,6 +71,7 @@ HDR10 presentation model commonly used by dedicated video renderers.
 | Media control, demux, decode, clocks, and queues | `qtav::Player` |
 | Device audio | `QtAV::AudioWASAPI` |
 | Audio format conversion | `QtAV::AudioResample` |
+| Pitch-preserving audio rate | `QtAV::AudioTimeStretch` |
 | High-level Windows video output | `QtAV::OutputD3D11` |
 | Video rendering | `QtAV::RenderD3D11` |
 | Hardware decoding | `QtAV::HWD3D11VA` |
@@ -207,6 +210,8 @@ log format.
 
 - This is a focused example, not a production media-browser UI.
 - There are no subtitle controls or post-load track selectors.
+- The time-stretch backend is connected, but the focused UI does not expose a
+  playback-speed selector.
 - There is no adaptive bitrate policy, download cache, or detailed network
   buffering UI.
 - Only Windows x64 Debug and Release project configurations are supplied.

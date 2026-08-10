@@ -74,10 +74,11 @@ QTAV_HOST_PKG_CONFIG
 ```
 
 Before running the script, build the local dependency package with
-`ffmpeg/scripts/build-android.sh` or extract the latest successful workflow
-artifact into
-`ffmpeg/build/arm64-android-28-static/vcpkg_installed/`. The player build does
-not download or independently compile target FFmpeg, OpenSSL, or libplacebo.
+`ffmpeg/scripts/build-android.sh` on macOS or
+`ffmpeg/scripts/build-android.ps1` on Windows. The package must exist under
+`ffmpeg/build/arm64-android-28-static/vcpkg_installed/`; workflow artifacts are
+not a supported fallback. The player build does not download or independently
+compile target FFmpeg, OpenSSL, or libplacebo.
 
 ## Install gate
 

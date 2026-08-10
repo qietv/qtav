@@ -8,6 +8,7 @@ It builds FFmpeg 8.1.2 and the player dependency closure for these targets:
 | Build host | Target | vcpkg triplet |
 | --- | --- | --- |
 | macOS | Android arm64-v8a, API 28 | `arm64-android-28-static` |
+| 64-bit Windows with Android Studio | Android arm64-v8a, API 28 | `arm64-android-28-static` |
 | macOS | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows | Windows x64, Visual Studio ABI | `x64-windows-static-md` |
@@ -45,7 +46,8 @@ toolchains, overlay ports, verification rules, or output layout.
   verifier synchronized when dependencies or features change.
 - Keep source and text files UTF-8 without BOM and use LF line endings.
 - Preserve `scripts/build-android.sh`, `scripts/build-ohos.sh`, and
-  `scripts/build-ohos.ps1` as stable, directly callable local entry points.
+  `scripts/build-android.ps1`, `scripts/build-ohos.ps1`, and
+  `scripts/build-windows.ps1` as stable, directly callable local entry points.
   CI must use one of the supported target entry points.
 - Preserve the default package layout under
   `build/<triplet>/vcpkg_installed/<triplet>/`.
@@ -76,20 +78,30 @@ OHOS packaging requires a macOS-native `patchelf`. Install it with
 `brew install patchelf`.
 
 On Windows, run from PowerShell on a machine with Visual Studio C++ and C++
-Clang tools installed:
+Clang tools, Android Studio, or DevEco Studio as required by the selected
+target:
 
 ```powershell
+./ffmpeg/scripts/build-android.ps1
 ./ffmpeg/scripts/build-ohos.ps1
 ./ffmpeg/scripts/build-windows.ps1
 ```
 
-The first command cross-compiles OHOS with the DevEco native SDK; the second
-builds the Windows x64 package. Use `QTAV_FFMPEG_INSTALL_ROOT` on macOS or
-`-InstallRoot` on Windows only when an alternate package location is required.
+The Android entry point consumes an already installed Android Studio SDK/NDK;
+it never installs or replaces SDK components. The OHOS entry point uses the
+DevEco native SDK, and the final command builds the Windows x64 package. Use
+`QTAV_FFMPEG_INSTALL_ROOT` on macOS or `-InstallRoot` on Windows only when an
+alternate package location is required.
+
+Local dependency resolution is strict: use a verified matching prefix when it
+exists, otherwise run the matching local entry point. Do not download an
+Actions artifact as a build dependency fallback.
 
 ## Toolchain invariants
 
-- Android is arm64-v8a/API 28 with NDK r29 and static dependency libraries.
+- Android is arm64-v8a/API 28 with static dependency libraries. Local scripts
+  use an explicitly supplied NDK or discover an NDK already installed by
+  Android Studio, print its exact revision, and never install one implicitly.
 - OHOS is arm64-v8a/API 23. vcpkg's Linux compatibility model is an
   implementation detail; all compilation must use the OHOS SDK toolchain and
   must never resolve host headers or libraries.
@@ -123,8 +135,9 @@ baseline requires them.
 
 ## Validation before finishing
 
-1. Run the directly affected native build script. Android and OHOS validation
-   must run on macOS; Windows validation must run on Windows.
+1. Run the directly affected native build script. Android validation may run
+   on macOS or 64-bit Windows, OHOS validation may run on macOS or 64-bit
+   Windows, and the Windows x64 target must run on Windows.
 2. The script must finish `cmake/verify-install.cmake` successfully.
 3. Confirm FFmpeg 8/libavcodec 62, OpenSSL, libsmb2, libass, libplacebo,
    glslang, OpenGL/OpenGL ES, Dolby Vision reshaping, dav1d, and Vulkan outputs

@@ -17,6 +17,10 @@
 #  include <qtav/wasapi_audio_sink.h>
 #endif
 
+#if defined(QTAV_CORE_CONSOLE_HAS_AUDIO_TIMESTRETCH)
+#  include <qtav/atempo_audio_time_stretcher.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -188,6 +192,10 @@ int main(int argc, char** argv)
             std::make_shared<qtav::SwresampleAudioConverter>())
         .setAudioSink(
             std::make_shared<qtav::WasapiAudioSink>());
+#endif
+#if defined(QTAV_CORE_CONSOLE_HAS_AUDIO_TIMESTRETCH)
+    player.setAudioTimeStretcher(
+        std::make_shared<qtav::AtempoAudioTimeStretcher>());
 #endif
 
 #if defined(QTAV_CORE_CONSOLE_HAS_D3D11_VIDEO)

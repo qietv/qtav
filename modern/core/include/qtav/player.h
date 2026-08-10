@@ -16,6 +16,7 @@ namespace qtav {
 
 class AudioSink;
 class AudioFrameConverter;
+class AudioTimeStretcher;
 class VideoRenderAPI;
 
 // Playback counters accumulated since the current media was set. Video fields
@@ -294,6 +295,11 @@ public:
     Player& setAudioSink(std::shared_ptr<AudioSink> sink);
     Player& setAudioFrameConverter(
         std::shared_ptr<AudioFrameConverter> converter);
+    // Installs the optional pitch-preserving stage used for device output at
+    // playback rates other than 1.0. Decoded onAudioFrame() callbacks retain
+    // the original PCM and are not processed by this stage.
+    Player& setAudioTimeStretcher(
+        std::shared_ptr<AudioTimeStretcher> stretcher);
     Player& setHardwareDecodeConfig(HardwareDecodeConfig config);
     HardwareDecodeConfig hardwareDecodeConfig() const;
     Player& setVideoFrameScheduler(VideoFrameScheduler scheduler);

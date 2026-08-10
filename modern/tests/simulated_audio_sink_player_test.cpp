@@ -5,12 +5,18 @@
 #include <qtav/player.h>
 #include <qtav/swresample_audio_converter.h>
 
+#if defined(QTAV_TEST_HAS_AUDIO_TIMESTRETCH)
+#  include <qtav/atempo_audio_time_stretcher.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -20,6 +26,19 @@
 namespace {
 
 using Snapshot = qtav::test::SimulatedAudioSinkSnapshot;
+
+#define require(condition)                                               \
+    do {                                                                 \
+        if (!(condition)) {                                              \
+            std::fprintf(                                                \
+                stderr,                                                  \
+                "require failed at %s:%d: %s\n",                        \
+                __FILE__,                                                \
+                __LINE__,                                                \
+                #condition);                                             \
+            std::abort();                                                \
+        }                                                                \
+    } while (false)
 
 void waitForSeek(
     qtav::Player& player,
@@ -240,7 +259,6 @@ void testInvalidDeviceClockFallsBackToMonotonic(const char* media)
             }));
         })
         .setAudioSink(sink);
-    player.setPlaybackRate(20.0F);
     player.setMedia(media);
     player.setState(qtav::State::Playing);
 
@@ -256,6 +274,66 @@ void testInvalidDeviceClockFallsBackToMonotonic(const char* media)
     assert(videoFrames.load() > 0);
 }
 
+#if defined(QTAV_TEST_HAS_AUDIO_TIMESTRETCH)
+
+void testTimeStretchMapsPhysicalDeviceClock(const char* media)
+{
+    auto sink = std::make_shared<qtav::test::SimulatedAudioSink>(
+        qtav::test::SimulatedAudioSinkConfig {
+            {
+                48'000,
+                2,
+                qtav::SampleFormat::S16,
+                "stereo",
+            },
+            500,
+            20,
+            0,
+            5,
+            true,
+            true,
+            true,
+            true,
+        });
+    qtav::Player player;
+    player
+        .onEvent([](const qtav::MediaEvent& event) {
+            if (event.category.find("audio.") == 0) {
+                std::fprintf(
+                    stderr,
+                    "%s: %s\n",
+                    event.category.c_str(),
+                    event.detail.c_str());
+            }
+            return false;
+        })
+        .setAudioFrameConverter(
+            std::make_shared<qtav::SwresampleAudioConverter>())
+        .setAudioTimeStretcher(
+            std::make_shared<qtav::AtempoAudioTimeStretcher>())
+        .setAudioSink(sink);
+    player.setLoop(-1);
+    player.setPlaybackRate(2.0F);
+    player.setMedia(media);
+    player.setState(qtav::State::Playing);
+
+    require(sink->waitFor([](const Snapshot& state) {
+        return state.writeCount >= 5
+            && state.clockPositionMilliseconds >= 25;
+    }));
+    const auto state = sink->snapshot();
+    const auto mediaPosition = player.position();
+    require(mediaPosition + 15
+        >= state.clockPositionMilliseconds * 2);
+    require(mediaPosition
+        <= state.clockPositionMilliseconds * 2 + 80);
+
+    player.setState(qtav::State::Stopped);
+    require(player.waitFor(qtav::State::Stopped, 5'000));
+}
+
+#endif
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -265,5 +343,8 @@ int main(int argc, char** argv)
     testSeekAndMediaReplacement(argv[1]);
     testLoopReanchorsDeviceClock(argv[1]);
     testInvalidDeviceClockFallsBackToMonotonic(argv[1]);
+#if defined(QTAV_TEST_HAS_AUDIO_TIMESTRETCH)
+    testTimeStretchMapsPhysicalDeviceClock(argv[1]);
+#endif
     return 0;
 }

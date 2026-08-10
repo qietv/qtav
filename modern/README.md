@@ -73,6 +73,9 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   redraw-coalescing thread, D3D11VA/interop wiring, reason-aware rendering,
   `Present()`, resize, and teardown;
 - optional libswresample converter for negotiated interleaved PCM output;
+- optional pitch-preserving streaming audio time stretch after format
+  conversion, with an FFmpeg `atempo` reference backend and no mandatory DSP
+  dependency in the core;
 - optional RIFF/WAVE PCM diagnostic file sink;
 - optional Windows WASAPI shared-mode device sink with native playback timing;
 - optional Android AAudio device sink with callback-safe bounded buffering,
@@ -164,6 +167,10 @@ Current backend integration boundary:
 - `AudioFrameConverter` is connected through
   `Player::setAudioFrameConverter()` when a sink negotiates different PCM;
   `QtAV::AudioResample` supplies the portable libswresample implementation;
+- `AudioTimeStretcher` is connected through
+  `Player::setAudioTimeStretcher()` after PCM conversion and before the sink;
+  `QtAV::AudioTimeStretch` supplies the FFmpeg `atempo` implementation for
+  pitch-preserving rates other than 1.0, while 1.0 bypasses the stage;
 - `QtAV::AudioFile` writes negotiated interleaved PCM to a standard RIFF/WAVE
   file for diagnostics without becoming a playback clock;
 - `QtAV::SubtitleLibass` consumes the ASS header/events retained by
@@ -399,7 +406,8 @@ clear error. Current switches are:
 - render: `QTAV_RENDER_CPU`, `QTAV_RENDER_MOBILE`, `QTAV_RENDER_OPENGL`,
   `QTAV_RENDER_VULKAN`, and `QTAV_RENDER_D3D11`;
 - audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_AAUDIO`,
-  `QTAV_AUDIO_OHAUDIO`, `QTAV_AUDIO_RESAMPLE`, and `QTAV_AUDIO_FILE`;
+  `QTAV_AUDIO_OHAUDIO`, `QTAV_AUDIO_RESAMPLE`,
+  `QTAV_AUDIO_TIMESTRETCH`, and `QTAV_AUDIO_FILE`;
 - subtitle: `QTAV_SUBTITLE_LIBASS`;
 - hardware decode: `QTAV_HW_D3D11VA`, `QTAV_HW_MEDIACODEC`, and
   `QTAV_HW_OHCODEC`;
@@ -420,7 +428,9 @@ OHOS (`QtAV::RenderVulkanOHOS`). The Android and OHOS harnesses require this
 backend explicitly,
 `QTAV_RENDER_D3D11=AUTO` builds the native software-frame renderer on Windows,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
-available, `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
+available, `QTAV_AUDIO_TIMESTRETCH=AUTO` builds the pitch-preserving
+`QtAV::AudioTimeStretch` backend when libavfilter is available,
+`QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
 `QTAV_SUBTITLE_LIBASS=AUTO` builds `QtAV::SubtitleLibass` when libass 0.17.0
 or newer is available,
 `QTAV_AUDIO_WASAPI=AUTO` builds the shared-mode device sink on Windows,
@@ -623,13 +633,17 @@ semantics, diagnostics, and manual test guidance.
 
 ```cpp
 #include <qtav/player.h>
+#include <qtav/atempo_audio_time_stretcher.h>
 #include <qtav/swresample_audio_converter.h>
 
 qtav::Player player;
 auto converter = std::make_shared<qtav::SwresampleAudioConverter>();
+auto timeStretcher =
+    std::make_shared<qtav::AtempoAudioTimeStretcher>();
 
 player
     .setAudioFrameConverter(converter)
+    .setAudioTimeStretcher(timeStretcher)
     .setAudioSink(audioSink)
     .onVideoFrame([](const qtav::VideoFrame& frame, int track) {
         // Inspect, filter, or forward the decoded frame.
@@ -976,6 +990,41 @@ player
         std::make_shared<qtav::SwresampleAudioConverter>())
     .setAudioSink(sink);
 ```
+
+### Pitch-preserving playback rate
+
+Link `QtAV::AudioTimeStretch` and inject its streaming processor when device
+audio must follow `setPlaybackRate()` without changing pitch:
+
+```cpp
+#include <qtav/atempo_audio_time_stretcher.h>
+
+player.setAudioTimeStretcher(
+    std::make_shared<qtav::AtempoAudioTimeStretcher>());
+player.setPlaybackRate(1.5F);
+```
+
+The processor sits after `AudioFrameConverter` and before `AudioSink`. It
+keeps the negotiated PCM format, changes the physical sample count, and keeps
+each output buffer's timestamp and duration on the media timeline. Player
+maps the sink's physical device-clock delta back to media time by the active
+rate, so audio remains the A/V master. A rate change on seekable loaded media
+flushes the old device queue and accurately re-decodes from the current
+position before reopening the processor at the new rate.
+
+Rate 1.0 is an exact Player bypass: the processor is not opened or called.
+For a non-1.0 rate without a configured processor, decoded frame callbacks
+continue, but device audio is disabled and Player reports
+`audio.time_stretch.unavailable`; this avoids presenting unstretched PCM as an
+incorrect A/V master. `AtempoAudioTimeStretcher` accepts interleaved U8, S16,
+S32, Float32, and Float64 PCM and composes bounded `atempo` stages for rates
+outside one filter's native range.
+
+Pause/resume preserves processor and queued-device state. Prepare, seek,
+track/external-audio changes, loop or range transitions, media replacement,
+and stop discard buffered processor state; natural segment end drains the
+converter, then the time stretcher, then the sink. Calls are serialized with
+conversion and sink writes on the existing audio-output/lifecycle boundary.
 
 ### WASAPI device sink
 
@@ -2345,6 +2394,16 @@ worker. Converter and sink calls are serialized without the player mutex held;
 control-driven lifecycle calls run on the playback worker, while conversion
 and ordinary writes run on the audio-output worker.
 
+`AudioTimeStretcher` is an optional format-preserving streaming stage between
+the converter and sink. `open()` fixes one PCM format and playback rate;
+`process()` may buffer input and return zero or more processor-owned output
+views; `drain()` is repeated until it returns no output; `reset()` discards a
+discontinuity without renegotiating the format. Output sample counts describe
+physical device PCM, while timestamps and durations remain media time.
+`QtAV::AudioTimeStretch` implements this contract with FFmpeg's `atempo`
+filter. The core links no mandatory DSP library and bypasses the stage exactly
+at rate 1.0.
+
 `QtAV::AudioFile` implements `WavAudioSink`. It negotiates interleaved U8, S16,
 S32, float, or double PCM, writes a little-endian RIFF/WAVE stream, and
 finalizes its size fields on close. Its configured zero sample-rate or channel
@@ -2398,18 +2457,21 @@ slice, dimensions, and source device before exposing borrowed native pointers.
 Its decoder and mapping calls use FFmpeg lock callbacks connected to the same
 recursive context lock as rendering.
 
-`AudioSinkClock` fields are measured in milliseconds on the media timeline.
-`positionMilliseconds` is the sample position currently presented by the
-device, while `latencyMilliseconds` is informational and must not already be
-folded into that position. A sink that advertises a device clock becomes the
-playback master whenever `clock()` returns a valid value; otherwise the player
-falls back to its monotonic software clock. Ordinary sink writes and their
-clock samples run on the dedicated audio-output worker. When a playing seek or
-underrun recovery is waiting for the first valid post-flush timestamp, that
-same worker polls the sink until it becomes valid; presentation never calls the
-backend. A blocking backend write is therefore never allowed to stall video
-scheduling. Repeated device samples are monotonically extrapolated, bounded by
-submitted audio, and published as a generation-checked cache, so
+`AudioSinkClock` fields are measured in milliseconds on the sink's physical
+PCM timeline, anchored to the media timestamp of the first accepted buffer
+after open or flush. `latencyMilliseconds` is informational and must not
+already be folded into `positionMilliseconds`. At rate 1.0 that clock is also
+media time. With time stretching, Player multiplies only the physical delta
+from the anchor by the active rate before using it as playback master. A sink
+that advertises a device clock becomes the master whenever `clock()` returns a
+valid value; otherwise the player falls back to its monotonic software clock.
+Ordinary sink writes and their clock samples run on the dedicated audio-output
+worker. When a playing seek or underrun recovery is waiting for the first valid
+post-flush timestamp, that same worker polls the sink until it becomes valid;
+presentation never calls the backend. A blocking backend write is therefore
+never allowed to stall video scheduling. Repeated device samples are
+monotonically extrapolated at the active rate, bounded by submitted media time,
+and published as a generation-checked cache, so
 `Player::position()` never waits for a sink write or calls into a platform
 backend. Sink lifecycle and segment-end `drain()` run on the playback worker,
 serialized with writes and without the player mutex held; `drain()` may block
@@ -2456,13 +2518,17 @@ The test-only simulated sink adds configurable format negotiation, capacity,
 latency, explicit or query-driven buffer consumption, underrun, flush, and
 drain behavior without a wall clock. Its player tests cover resampling, A/V
 device-master timing, seek, loop, media replacement, natural-end drain, and
-monotonic fallback.
+monotonic fallback. Its physical-PCM mode also verifies that a time-stretched
+device clock is mapped back to media time.
 The playback test also verifies that two keyed `VideoRenderAPI` instances and
 the legacy `setVideoRenderer()` callback can render the same decoded frame
 without replacing one another. CPU-renderer tests decode a lossless RGB frame
 and verify scaled BGRA, RGBA, and Gray8 output plus padded-stride safety.
 Audio-resample tests convert deterministic 8 kHz mono PCM to 16 kHz stereo S16
 and verify channel data, drain timing, sample counts, and seek reset behavior.
+Audio-time-stretch tests verify 0.75x and 1.5x output duration, 440 Hz pitch,
+timestamp discontinuities, reset/drain behavior, mid-playback rate changes,
+physical-device-clock mapping, and the exact 1.0 Player bypass.
 Audio-file tests verify RIFF/WAVE headers and little-endian samples, then run
 the player and converter to produce an exact 64,000-byte 16 kHz stereo S16
 payload from deterministic 8 kHz mono input.
@@ -2542,7 +2608,9 @@ Player facade
   │    ├─ audio-decode worker
   │    └─ video-decode worker
   ├─ bounded decoded-audio queue
-  │    └─ audio-output worker + device-clock snapshots
+  │    └─ audio-output worker
+  │         ├─ optional PCM conversion + pitch-preserving time stretch
+  │         └─ physical device-clock snapshots mapped to media time
   ├─ bounded timestamp-ordered presentation queue
   │    └─ video/frame notification worker with late-frame dropping
   ├─ audio-device master clock with monotonic fallback
@@ -2554,6 +2622,7 @@ Player facade
        ├─ D3D11 software-frame renderer with borrowed Windows resources
        ├─ mobile Vulkan/OpenGL ES selection and bounded recovery policy
        ├─ libswresample interleaved PCM converter
+       ├─ FFmpeg atempo pitch-preserving audio time stretcher
        ├─ libass text/ASS owning coverage-bitmap rasterizer
        ├─ RIFF/WAVE diagnostic PCM file sink
        ├─ WASAPI shared-mode device sink with IAudioClock clocking

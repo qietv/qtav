@@ -72,32 +72,43 @@ The following accepted decisions constrain all remaining work:
 - Dolby AC-3, E-AC-3, and TrueHD software decoding is decoded-PCM support only;
   it is not compressed passthrough, Atmos rendering, licensing, or
   certification.
+- Pitch-preserving playback-rate audio is implemented as an optional
+  post-conversion `AudioTimeStretcher` stage. Windows static/shared tests,
+  installed-package consumption, WinUI integration, and OHOS static/shared
+  cross-builds pass. Android arm64/API 28 static/shared cross-builds also pass
+  against the locally built and verified repository dependency prefix.
 
-## Next task — pitch-preserving audio time-stretch
+## Next task — define general filter and processing contracts
 
-- [ ] Add audio time-stretch for playback rates other than 1.0 without changing
-  pitch.
+- [ ] Define optional audio/video filter and processing contracts without
+  adding a mandatory DSP, FFmpeg, graphics, or platform dependency to core.
 
-This is the next local implementation task. It must remain separate from audio
-device ownership and from the existing channel-layout/sample-format/sample-rate
-conversion responsibility of `QtAV::AudioResample`.
+The completed time-stretch boundary is the first concrete processing stage: it
+remains separate from audio-device ownership and from the existing channel-
+layout/sample-format/sample-rate conversion responsibility of
+`QtAV::AudioResample`. Generalize only the lifecycle and ownership concepts that
+are shared by real filter use cases; do not turn `AudioTimeStretcher` into a
+generic byte/frame callback or expose FFmpeg filter types in public headers.
 
-Required design and acceptance:
+Acceptance criteria:
 
-1. Define the optional processing contract and lifecycle before selecting or
-   integrating an implementation. Keep the core free of a mandatory new DSP
-   dependency.
-2. Preserve media timestamps, device-clock ownership, A/V synchronization, and
-   bounded audio queues across rate changes.
-3. Reset or drain the processor correctly for prepare, seek, pause/resume,
-   track switch, loop/range boundary, media replacement, stop, and natural end.
-4. Cover at least rates below and above 1.0, mid-playback rate changes, audible
-   pitch preservation, output-duration tolerance, discontinuity handling, and
-   unchanged 1.0-rate behavior with deterministic tests.
-5. Validate proportional Windows static/shared builds and tests, installed
-   package consumption, and Android/OHOS cross-builds if public or shared core
-   contracts change. Update public and migration documentation for any API or
-   threading change.
+1. [ ] Identify the first supported audio and video filter use cases, their
+   insertion points, frame/timestamp semantics, and whether processing is
+   synchronous, queued, or application-scheduled.
+2. [ ] Keep processing contracts optional, Qt-free, and free of FFmpeg and
+   platform SDK types; preserve reference-counted frame lifetime and existing
+   backend responsibility boundaries.
+3. [ ] Define reset, drain, discontinuity, seek, track switch, loop/range,
+   media replacement, stop, and natural-end behavior before implementation.
+4. [ ] Add deterministic contract tests for ordering, timestamps, bypass,
+   backpressure, failure, and lifecycle; add one narrow reference backend only
+   after its dependency and ownership boundary are accepted.
+5. [ ] Pass proportional Windows tests and Android/OHOS static/shared
+   cross-builds, installed-package consumption where targets are exported, and
+   update public API/migration/threading documentation.
+
+Detailed implementation and validation evidence is in
+[`PLAN_HISTORY_2026-08-10_AUDIO_TIME_STRETCH.md`](PLAN_HISTORY_2026-08-10_AUDIO_TIME_STRETCH.md).
 
 ## Active incomplete and external gates
 
@@ -149,12 +160,6 @@ substitute Windows Vulkan work or silently reinterpret an unknown format.
 This external workstream does not block the next local task, but it must not be
 described as closed until its evidence-backed correction and same-revision
 cross-vendor gate pass.
-
-### Remaining playback feature parity
-
-- [ ] Define filter and processing contracts after the audio time-stretch
-  boundary is stable. Keep optional processing modules out of the mandatory
-  core dependency surface.
 
 ### Dolby and device-output scope
 
@@ -218,12 +223,12 @@ is intentionally short:
 | Milestone 5: Windows D3D11/D3D11VA/WASAPI | Complete; separate Intel performance workstream remains external |
 | Milestone 6: Android Vulkan/OpenGL ES/MediaCodec/AAudio | Complete and retained as the mobile regression baseline |
 | Milestone 7: OHOS production path | Implemented through current opaque-format policy; explicit-plane strict Vulkan and broader validation remain open above |
-| Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step | Complete through frame stepping and accurate seek; time-stretch is next |
+| Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step, pitch-preserving time-stretch | Complete and verified on Windows plus Android/OHOS static/shared cross-builds |
 | Milestone 10: software Dolby decode and HDR/Dolby Vision metadata paths | Partial; passthrough, Atmos, strict OHOS Vulkan, licensing, and certification remain open |
 
 ## Task selection rules
 
-1. Start with pitch-preserving audio time-stretch unless the user gives a
+1. Define the general filter and processing contracts unless the user gives a
    different priority.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.

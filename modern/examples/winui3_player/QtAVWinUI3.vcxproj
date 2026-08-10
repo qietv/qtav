@@ -114,6 +114,7 @@
         $(QtAVModernRoot)\backends\render\d3d11\include;
         $(QtAVModernRoot)\backends\audio\wasapi\include;
         $(QtAVModernRoot)\backends\audio\resample\include;
+        $(QtAVModernRoot)\backends\audio\timestretch\include;
         $(QtAVModernRoot)\backends\hwaccel\d3d11va\include;
         $(QtAVModernRoot)\backends\interop\d3d11\include;
         %(AdditionalIncludeDirectories)
@@ -129,6 +130,7 @@
         $(QtAVBuildDir)\backends\render\d3d11\$(Configuration);
         $(QtAVBuildDir)\backends\audio\wasapi\$(Configuration);
         $(QtAVBuildDir)\backends\audio\resample\$(Configuration);
+        $(QtAVBuildDir)\backends\audio\timestretch\$(Configuration);
         $(QtAVBuildDir)\backends\hwaccel\d3d11va\$(Configuration);
         $(QtAVBuildDir)\backends\interop\d3d11\$(Configuration);
         %(AdditionalLibraryDirectories)
@@ -140,6 +142,7 @@
         qtav_render_d3d11.lib;
         qtav_audio_wasapi.lib;
         qtav_audio_resample.lib;
+        qtav_audio_timestretch.lib;
         qtav_hw_d3d11va.lib;
         qtav_interop_d3d11.lib;
         d3d11.lib;

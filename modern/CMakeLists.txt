@@ -44,6 +44,7 @@ set(QTAV_MINIMUM_FFMPEG_AVCODEC_MAJOR 62)
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(QtAVBackend)
+include(QtAVPkgConfig)
 
 add_subdirectory(core)
 add_subdirectory(platform)
@@ -73,6 +74,9 @@ if(QTAV_CORE_INSTALL)
     endif()
     if(TARGET qtav_audio_resample)
         list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS swresample)
+    endif()
+    if(TARGET qtav_audio_timestretch)
+        list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS avfilter)
     endif()
     if(TARGET qtav_render_vulkan)
         set(QTAV_CORE_PACKAGE_NEEDS_VULKAN TRUE)
@@ -108,6 +112,7 @@ if(QTAV_CORE_INSTALL)
             "${CMAKE_CURRENT_BINARY_DIR}/QtAVCoreConfig.cmake"
             "${CMAKE_CURRENT_BINARY_DIR}/QtAVCoreConfigVersion.cmake"
             "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindFFmpeg.cmake"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/QtAVPkgConfig.cmake"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/QtAVCore"
     )
 endif()

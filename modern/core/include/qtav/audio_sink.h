@@ -53,7 +53,9 @@ struct QTAV_CORE_EXPORT AudioSinkEvent {
 
 struct QTAV_CORE_EXPORT AudioSinkClock {
     bool valid = false;
-    // Media-timeline position currently presented by the device.
+    // Device PCM position currently presented, anchored to the media
+    // timestamp of the first accepted buffer after open/flush. Player maps
+    // the physical elapsed portion back to media time when time stretching.
     std::int64_t positionMilliseconds = 0;
     // Informational queued/device latency; not included in the position.
     std::int64_t latencyMilliseconds = 0;

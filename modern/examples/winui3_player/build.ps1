@@ -41,6 +41,7 @@ $requiredTargets = @(
     'qtav_render_d3d11',
     'qtav_audio_wasapi',
     'qtav_audio_resample',
+    'qtav_audio_timestretch',
     'qtav_hw_d3d11va',
     'qtav_interop_d3d11'
 )

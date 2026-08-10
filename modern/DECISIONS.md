@@ -1649,3 +1649,71 @@ promise that the current package does not need.
 - Release CI and API/package versioning remain open tasks in
   [`PLAN.md`](PLAN.md), while the repository/runtime boundary itself is no
   longer an unchecked planning choice.
+
+## AD-020: Audio time stretch is an optional post-conversion stage
+
+- Date: 2026-08-10
+- Status: Accepted and complete
+- Scope: Playback rate, PCM processing, device clocks, A/V synchronization,
+  audio lifecycle, and optional backend linkage
+
+### Context
+
+Changing Player's monotonic video clock without changing device PCM duration
+leaves audio at its original speed and makes its device clock an invalid master.
+Changing the sink sample rate would alter pitch and overload format conversion
+with a semantic processing responsibility. A solution also has to preserve the
+core's optional-backend boundary and behave deterministically across seeks,
+loops, track changes, and rate changes after PCM has already entered a device
+queue.
+
+### Decision
+
+1. `AudioTimeStretcher` is an optional core contract placed after
+   `AudioFrameConverter` and before `AudioSink`. It preserves the negotiated PCM
+   format and media timestamps while changing the physical sample count. Core
+   does not link a mandatory DSP implementation.
+2. `QtAV::AudioTimeStretch` is the reference backend. It owns an FFmpeg
+   `atempo` filter graph and composes bounded 0.5-2.0 stages for rates outside
+   one filter's native range. It accepts the interleaved PCM families already
+   produced by `QtAV::AudioResample`.
+3. Rate 1.0 bypasses the processor exactly. A non-1.0 rate without a configured
+   processor keeps decoded-audio callbacks active but disables device output
+   with `audio.time_stretch.unavailable`; unstretched PCM must not become an
+   incorrect playback master.
+4. A sink clock remains the physical device PCM position anchored to the first
+   media timestamp after open or flush. Player maps only the elapsed delta by
+   the active rate, caps it at submitted media time, and publishes that mapped
+   cache as the A/V master.
+5. A live rate change increments the audio-chain generation. Seekable loaded
+   media accurately re-decodes from the current position before the sink and
+   processor reopen, preventing PCM submitted at the previous rate from being
+   skipped or heard after the transition.
+6. Pause/resume preserves processor and sink state. Prepare, seek, audio-track
+   or external-audio change, loop/range transition, media replacement, stop,
+   and discontinuous input reset buffered processing. Natural segment end
+   drains the converter, then the time stretcher, then the sink. All calls use
+   the existing serialized audio-output/lifecycle boundary.
+
+### Consequences
+
+- Format conversion, semantic time processing, and platform device ownership
+  remain independently replaceable responsibilities.
+- Windows, Android, and OHOS device backends continue measuring native PCM
+  frames and require no rate-specific DSP or platform API changes.
+- Applications that offer speed control and device audio should link and inject
+  a time-stretch backend; applications using only decoded-frame callbacks do
+  not need it.
+- Mid-playback rate changes on seekable inputs are continuity operations and
+  can incur one accurate-seek/reopen transition rather than mixing two rates in
+  a queued device stream.
+
+### Validation
+
+Deterministic tests measure 440 Hz output and media/physical duration at 0.75x
+and 1.5x, verify reset, discontinuity, repeated drain, exact 1.0 bypass,
+mid-playback changes, seek/stop/natural-end lifecycle, and physical-device-clock
+mapping. Windows static/shared tests and install consumers pass, as do OHOS and
+Android static/shared cross-builds against their repository dependency
+prefixes. Detailed evidence is retained with the dated implementation history
+referenced by [`PLAN.md`](PLAN.md).

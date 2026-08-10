@@ -7,6 +7,7 @@ if(PkgConfig_FOUND)
         GLOBAL
         "libplacebo>=7.351.0"
     )
+    qtav_sanitize_android_pkg_config_target(PkgConfig::QTAV_LIBPLACEBO)
 endif()
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil)
 

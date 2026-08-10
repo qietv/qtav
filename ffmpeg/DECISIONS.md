@@ -400,3 +400,70 @@ hardware-capability-gated OHCodec VVC wrapper with MP4-to-Annex-B conversion
 and the same surface-output contract. Rebuild and verify the dependency
 package, rebuild QtAVCore, and repeat the complete connected 600-frame plus
 forced-software-fallback lifecycle before adopting it.
+
+## FD-007: Resolve target dependencies through verified local builds
+
+- Date: 2026-08-10
+- Status: Accepted
+- Scope: Windows, Android, and OHOS dependency acquisition and Android Windows host support
+
+### Context
+
+QtAVCore previously allowed a missing target prefix to be restored from the
+newest successful GitHub Actions artifact before attempting a local build.
+That made local validation depend on workflow retention, transfer reliability,
+and a second package provenance path. Android dependency production was also
+documented as macOS-only even though the pinned vcpkg model and Android NDK
+toolchain can cross-compile the same arm64/API 28 triplet from Windows.
+
+### Decision
+
+Dependency resolution is local-first and local-only: consume a matching prefix
+only when its sibling vcpkg database and installed-package contract are valid;
+otherwise run the target's repository entry point and pass
+`cmake/verify-install.cmake`. Do not download an Actions artifact as a local
+dependency fallback. CI may still upload artifacts for diagnostics or archival
+inspection, but parent builds do not consume them.
+
+Add `scripts/build-android.ps1` as the Windows Android entry point. It discovers
+the SDK, an already installed NDK, and CMake from Android Studio or explicit
+arguments/environment variables. It prints the exact NDK revision and never
+installs, upgrades, or replaces SDK components. Android remains arm64-v8a/API
+28 with static dependencies and `c++_static`; the target prefix and vcpkg
+triplet do not change.
+
+### Rejected alternatives
+
+- Retaining artifact fallback would preserve two dependency-resolution paths
+  and would not prove that the current checkout can reproduce its package.
+- Automatically invoking `sdkmanager` would mutate the developer machine and
+  obscure which NDK the user selected in Android Studio.
+- Treating an incomplete artifact download as a local prefix would bypass the
+  vcpkg status database and installed-package verifier.
+- Reusing OHOS or Windows libraries for Android would violate the target ABI
+  and prefix-isolation contract.
+
+### Consequences and validation
+
+The first local build can take longer and may download upstream source archives
+through vcpkg, but the produced binaries always come from the current checkout,
+overlay set, triplet, and local toolchain. Android package provenance includes
+the printed NDK revision. Windows, OHOS, and Android keep independent install
+databases and work roots.
+
+Validation requires the directly affected local entry point and
+`cmake/verify-install.cmake`. A Windows-hosted Android policy change additionally
+requires QtAVCore static and shared arm64/API 28 cross-builds using that local
+prefix. No physical-device installation is part of this dependency contract.
+
+The Windows entry point was exercised with Android Studio CMake 4.1.2 and the
+already installed NDK `30.0.15729638-beta2`. It locally produced and verified
+the FFmpeg 8.1.2 arm64/API 28 prefix, after which QtAVCore static and shared
+cross-builds completed against that prefix. No Actions artifact and no SDK/NDK
+installation or replacement was used.
+
+### Review condition
+
+Reconsider this policy only if the project adopts a signed, content-addressed
+dependency distribution with equivalent checkout provenance and verification.
+Until then, workflow artifacts remain outputs rather than build inputs.

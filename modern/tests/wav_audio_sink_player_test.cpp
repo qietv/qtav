@@ -101,7 +101,6 @@ int main(int argc, char** argv)
         })
         .setAudioFrameConverter(converter)
         .setAudioSink(sink);
-    player.setPlaybackRate(20.0F);
     player.setMedia(media);
     player.setState(qtav::State::Playing);
 

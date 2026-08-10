@@ -27,6 +27,17 @@ if(TARGET qtav_audio_wasapi AND TARGET qtav_audio_resample)
     )
 endif()
 
+if(TARGET qtav_audio_timestretch)
+    target_link_libraries(
+        qtav_core_console
+        PRIVATE QtAV::AudioTimeStretch
+    )
+    target_compile_definitions(
+        qtav_core_console
+        PRIVATE QTAV_CORE_CONSOLE_HAS_AUDIO_TIMESTRETCH
+    )
+endif()
+
 if(TARGET qtav_interop_d3d11
    AND TARGET qtav_hw_d3d11va
    AND TARGET qtav_render_d3d11)

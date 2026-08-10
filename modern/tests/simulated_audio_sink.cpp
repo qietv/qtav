@@ -129,6 +129,7 @@ struct SimulatedAudioSink::Impl {
     bool needsAnchor = true;
     bool underrunActive = false;
     std::int64_t clockPosition = 0;
+    std::int64_t nextQueueTimestamp = 0;
     std::int64_t queuedDuration = 0;
     std::int64_t startupDelayRemaining = 0;
     int openCount = 0;
@@ -205,6 +206,7 @@ AudioSinkOpenResult SimulatedAudioSink::open(
             impl_->config.initialClockPositionMilliseconds);
         impl_->clockValid = impl_->config.clockInitiallyValid;
         impl_->needsAnchor = true;
+        impl_->nextQueueTimestamp = impl_->clockPosition;
         impl_->underrunActive = false;
         impl_->open = true;
         impl_->paused = false;
@@ -255,6 +257,7 @@ void SimulatedAudioSink::flush()
         impl_->startupDelayRemaining =
             impl_->config.deviceLatencyMilliseconds;
         impl_->needsAnchor = true;
+        impl_->nextQueueTimestamp = impl_->clockPosition;
         impl_->underrunActive = false;
         ++impl_->flushCount;
     }
@@ -271,8 +274,15 @@ bool SimulatedAudioSink::write(const AudioBufferView& buffer)
             ++impl_->rejectedWriteCount;
             return false;
         }
+        const auto sampleDuration = static_cast<std::int64_t>(
+            (static_cast<std::int64_t>(buffer.samplesPerChannel) * 1000
+             + buffer.format.sampleRate / 2)
+            / buffer.format.sampleRate);
+        const auto queuedBufferDuration = impl_->config.useSampleDuration
+            ? std::max<std::int64_t>(1, sampleDuration)
+            : buffer.duration;
         if (impl_->config.queueCapacityMilliseconds > 0
-            && impl_->queuedDuration + buffer.duration
+            && impl_->queuedDuration + queuedBufferDuration
                 > impl_->config.queueCapacityMilliseconds) {
             ++impl_->rejectedWriteCount;
             return false;
@@ -280,14 +290,20 @@ bool SimulatedAudioSink::write(const AudioBufferView& buffer)
         if (impl_->needsAnchor) {
             impl_->clockPosition =
                 std::max<std::int64_t>(0, buffer.timestamp);
+            impl_->nextQueueTimestamp = impl_->clockPosition;
             impl_->needsAnchor = false;
         }
         impl_->queue.push_back({
-            buffer.timestamp,
-            buffer.duration,
+            impl_->config.useSampleDuration
+                ? impl_->nextQueueTimestamp
+                : buffer.timestamp,
+            queuedBufferDuration,
             0,
         });
-        impl_->queuedDuration += buffer.duration;
+        if (impl_->config.useSampleDuration) {
+            impl_->nextQueueTimestamp += queuedBufferDuration;
+        }
+        impl_->queuedDuration += queuedBufferDuration;
         impl_->writeTimestamps.push_back(buffer.timestamp);
         impl_->underrunActive = false;
         ++impl_->writeCount;

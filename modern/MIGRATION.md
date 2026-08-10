@@ -88,6 +88,8 @@ already own a graphics context or require multiple/custom render targets:
 - compile-time video-render, audio-sink, and hardware-frame interop contracts;
 - optional audio-sink playback output with device-master clock fallback;
 - optional libswresample conversion to negotiated interleaved PCM;
+- optional pitch-preserving streaming time stretch for playback rates other
+  than 1.0 through `QtAV::AudioTimeStretch`, with an exact 1.0 bypass;
 - optional `WavAudioSink` diagnostic output through `QtAV::AudioFile`;
 - optional Windows `WasapiAudioSink` shared-mode device output through
   `QtAV::AudioWASAPI`;
@@ -236,11 +238,15 @@ matches them to hardware output presentation timestamps before creating each
 `AudioSink` can use an injected `AudioFrameConverter` when decoded and device
 PCM formats differ. Applications link `QtAV::AudioResample` and pass a
 `SwresampleAudioConverter` through `Player::setAudioFrameConverter()`.
+For pitch-preserving non-1.0 playback, applications additionally link
+`QtAV::AudioTimeStretch` and pass `AtempoAudioTimeStretcher` through
+`Player::setAudioTimeStretcher()`. The processor runs after format conversion
+and before the sink; the core remains free of a mandatory DSP dependency.
 `AudioSink::drain()` is called after each completed playback segment, including
-a loop boundary, after the converter is drained and before the final sink
-close; the default implementation is a no-op for existing synchronous or
-non-queuing sinks. The CPU renderer currently supports full-surface `Stretch`
-rendering with no rotation.
+a loop boundary, after the converter and time stretcher are drained and before
+the final sink close; the default implementation is a no-op for existing
+synchronous or non-queuing sinks. The CPU renderer currently supports
+full-surface `Stretch` rendering with no rotation.
 
 On Windows, `WasapiAudioSink` follows the default multimedia render endpoint
 or accepts an explicit owning `WasapiEndpointId`. It negotiates interleaved
@@ -466,7 +472,6 @@ or pace playback. Decoded planar audio therefore normally uses
   wrapping, plus broader raw `GL_EXT_YUV_target`
   OpenGL ES device coverage;
 - bitmap subtitle delivery;
-- audio time-stretch without pitch change;
 - compressed Dolby passthrough, Atmos object rendering, Dolby Vision
   enhancement-layer residual reconstruction, display tunnelling, licensing,
   and certification.
@@ -642,7 +647,8 @@ responsibility and lifecycle boundaries in [`MOBILE.md`](MOBILE.md).
 
 The current audio callback exposes the decoder's native sample format and
 reference-counted planes. A platform audio sink should convert/resample only
-when its device format requires it.
+when its device format requires it. Time stretching is downstream of this
+callback, so callback consumers continue to receive the original decoded PCM.
 
 ### Dolby formats
 
@@ -777,14 +783,17 @@ implementation.
   by the backend and may request another player state;
 - compressed audio packets cross a bounded queue to their decode worker, then
   decoded audio crosses a second bounded queue to the dedicated audio-output worker;
-  ordinary conversion, sink writes, and primary device-clock sampling run
-  there without the player mutex held and cannot be blocked by application
-  rendering; when a playing seek awaits the first valid device timestamp, the
-  same audio-output worker polls it briefly while presentation uses only the
-  cached sample;
-- audio-sink/converter lifecycle and segment-end drain calls run on the
-  playback worker, serialized with audio-output calls; `drain()` may block
-  until queued audio is presented;
+  ordinary conversion, time stretching, sink writes, and primary device-clock
+  sampling run there without the player mutex held and cannot be blocked by
+  application rendering; when a playing seek awaits the first valid device
+  timestamp, the same audio-output worker polls it briefly while presentation
+  uses only the cached sample;
+- audio-sink/converter/time-stretcher lifecycle and segment-end drain calls run
+  on the playback worker, serialized with audio-output calls; `drain()` may
+  block until queued audio is presented;
+- a non-1.0 rate change flushes submitted PCM and accurately re-decodes from
+  the current position for seekable media; Player maps the sink's physical
+  device-clock delta back to media time at the active rate;
 - player shutdown synchronizes its quitting predicate with each worker
   condition-variable mutex before notification, preventing a worker from
   sleeping after the final wake-up;
@@ -812,16 +821,18 @@ implementation.
    software path.
 3. Keep the interleaved PCM libswresample backend as the reference when a sink
    negotiates a different format.
-4. Use the completed Windows D3D11VA device/frame and zero-CPU-copy interop
+4. Keep the FFmpeg `atempo` backend as the optional pitch-preserving reference
+   after PCM conversion and before device output.
+5. Use the completed Windows D3D11VA device/frame and zero-CPU-copy interop
    contracts as the native desktop reference.
-5. Use the completed Android renderer, audio, MediaCodec, and interop paths as
+6. Use the completed Android renderer, audio, MediaCodec, and interop paths as
    the mobile reference.
-6. Continue the OHOS native-buffer milestone on hardware that exposes an
+7. Continue the OHOS native-buffer milestone on hardware that exposes an
    explicit sampled multi-plane Vulkan format, then broaden OpenGL ES/HDR
    coverage using the same shared mobile contracts.
-7. Keep the completed audio/video/subtitle switching, plain-text callback, and
+8. Keep the completed audio/video/subtitle switching, plain-text callback, and
    optional libass rasterizer as the base for external tracks.
-8. Keep frame stepping and accurate seek covered on top of the asynchronous
+9. Keep frame stepping and accurate seek covered on top of the asynchronous
    seek and generation contracts.
 
 Each backend should remain optional so the core library never acquires a GUI

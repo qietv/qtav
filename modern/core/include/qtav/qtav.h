@@ -3,6 +3,7 @@
 
 #include <qtav/audio_converter.h>
 #include <qtav/audio_sink.h>
+#include <qtav/audio_time_stretcher.h>
 #include <qtav/frame.h>
 #include <qtav/hardware_decoder.h>
 #include <qtav/hardware_frame.h>

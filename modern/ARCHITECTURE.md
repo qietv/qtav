@@ -59,7 +59,7 @@ modern/
 │   │   ├── vulkan/               libplacebo Vulkan renderer
 │   │   ├── opengl/               libplacebo OpenGL ES renderer
 │   │   └── mobile/               Vulkan/OpenGL selection and recovery
-│   ├── audio/                    resample, file, WASAPI, AAudio, and OHAudio
+│   ├── audio/                    resample, time stretch, file, and device sinks
 │   ├── subtitle/                 optional libass text/ASS rasterization
 │   ├── hwaccel/                  D3D11VA, MediaCodec, and OHCodec adapters
 │   ├── interop/                  D3D11, MediaCodec, and OHCodec GPU bridges
@@ -91,7 +91,9 @@ demux/control worker
        │                                  │
        │                                  ▼
        │                            audio-output worker
-       │                            + device-clock cache
+       │                            ├─ optional format conversion
+       │                            ├─ optional pitch-preserving time stretch
+       │                            └─ physical device-clock cache
        │
        └── bounded video packets ──► video decode worker
                                           │
@@ -456,7 +458,22 @@ open because the tested devices report the P010 consumer buffer only as
 
 `AudioSink` is a platform-neutral lifecycle and timing contract. Decoded PCM
 crosses a bounded queue to an audio-output worker. If the device negotiates a
-different format, `QtAV::AudioResample` performs conversion before submission.
+different format, `QtAV::AudioResample` performs conversion. For a non-1.0
+playback rate, an injected `AudioTimeStretcher` then changes the physical PCM
+sample count without changing pitch or media timestamps before submission.
+
+`QtAV::AudioTimeStretch` is the reference implementation and owns an FFmpeg
+`atempo` graph. It is a separate optional target; core owns only the streaming
+contract and lifecycle. Rate 1.0 bypasses the processor. A live rate change
+reopens the audio chain and, for seekable loaded media, crosses an accurate
+seek generation at the current position so PCM already submitted at the old
+rate cannot leak into the new one.
+
+The sink clock measures actual device PCM elapsed from the first media
+timestamp after open or flush. Player owns the rate mapping from that physical
+delta back to media time and caps it at submitted media time. This keeps
+WASAPI, AAudio, and OHAudio responsible only for device timing and keeps the
+same mapped media clock as the A/V master.
 
 - `QtAV::AudioWASAPI` owns Windows shared-mode device output and clocking;
 - `QtAV::AudioAAudio` feeds Android's realtime callback from a bounded SPSC
@@ -511,9 +528,9 @@ suitable hardware, followed by strict Vulkan Dolby Vision validation.
 Core feature work is complete through active audio/video/subtitle track
 switching, external audio/subtitle sources, optional libass rasterization,
 packet buffering/cache, live-latency control, bounded network recovery,
-frame-accurate seek, and forward/backward stepping. [`PLAN.md`](PLAN.md) remains
-the source of truth for task ordering; pitch-preserving audio time-stretch is
-the next local implementation task.
+frame-accurate seek, forward/backward stepping, and optional pitch-preserving
+audio time stretch. [`PLAN.md`](PLAN.md) remains the source of truth for task
+ordering and incomplete gates.
 
 ## Architectural invariants for changes
 

@@ -22,82 +22,38 @@ examples must resolve the package in this order:
 
 1. use the matching local target prefix when it and the sibling vcpkg status
    database already exist;
-2. otherwise download the matching artifact from the newest successful
-   completed `main` run of the FFmpeg dependencies workflow;
-3. build the package locally with the platform entry script only when neither
-   a valid local package nor the current CI artifact can be obtained.
+2. otherwise build and verify the package locally with the matching platform
+   entry script.
+
+GitHub Actions artifacts are not a supported dependency fallback. CI may still
+publish them for diagnostics or archival purposes, but local builds and
+examples must not download or consume them.
 
 Independently of that consumption order, a change that modifies anything under
 `ffmpeg/**` must rerun the affected platform build script locally and pass its
 installed-package verifier before the change is considered validated.
 
-The supported target prefixes and their GitHub Actions artifacts are:
+The supported target prefixes are:
 
-| Target | Local target prefix | Artifact |
-| --- | --- | --- |
-| Android arm64/API 28 | `ffmpeg/build/arm64-android-28-static/vcpkg_installed/arm64-android-28-static` | `qtav-ffmpeg-arm64-android-28-static` |
-| OHOS arm64/API 23 | `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static` | `qtav-ffmpeg-arm64-ohos-23-static` |
-| Windows x64 | `ffmpeg/build/x64-windows-static-md/vcpkg_installed/x64-windows-static-md` | `qtav-ffmpeg-x64-windows-static-md` |
+| Target | Local target prefix |
+| --- | --- |
+| Android arm64/API 28 | `ffmpeg/build/arm64-android-28-static/vcpkg_installed/arm64-android-28-static` |
+| OHOS arm64/API 23 | `ffmpeg/build/arm64-ohos-23-static/vcpkg_installed/arm64-ohos-23-static` |
+| Windows x64 | `ffmpeg/build/x64-windows-static-md/vcpkg_installed/x64-windows-static-md` |
 
-When a local prefix is absent, query Actions at download time as shown below.
-Do not hardcode a run ID, commit SHA, artifact URL, or reuse an older successful
-run when a newer one is available. On macOS, download Android and OHOS with:
-
-```sh
-run_id="$(gh run list \
-  --repo qietv/qtav \
-  --workflow ffmpeg-dependencies.yml \
-  --branch main \
-  --status success \
-  --limit 1 \
-  --json databaseId \
-  --jq '.[0].databaseId')"
-test -n "$run_id"
-
-gh run download "$run_id" \
-  --repo qietv/qtav \
-  --name qtav-ffmpeg-arm64-android-28-static \
-  --dir ffmpeg/build/arm64-android-28-static/vcpkg_installed
-gh run download "$run_id" \
-  --repo qietv/qtav \
-  --name qtav-ffmpeg-arm64-ohos-23-static \
-  --dir ffmpeg/build/arm64-ohos-23-static/vcpkg_installed
-```
-
-On Windows, run the equivalent PowerShell commands from the repository root:
+Build a missing prefix locally from the repository root:
 
 ```powershell
-$runId = gh run list `
-  --repo qietv/qtav `
-  --workflow ffmpeg-dependencies.yml `
-  --branch main `
-  --status success `
-  --limit 1 `
-  --json databaseId `
-  --jq '.[0].databaseId'
-if (-not $runId) { throw 'No successful FFmpeg dependency workflow run found.' }
-
-gh run download $runId `
-  --repo qietv/qtav `
-  --name qtav-ffmpeg-x64-windows-static-md `
-  --dir ffmpeg/build/x64-windows-static-md/vcpkg_installed
-
-# When Windows is the OHOS cross-compilation host instead:
-gh run download $runId `
-  --repo qietv/qtav `
-  --name qtav-ffmpeg-arm64-ohos-23-static `
-  --dir ffmpeg/build/arm64-ohos-23-static/vcpkg_installed
+./ffmpeg/scripts/build-android.ps1
+./ffmpeg/scripts/build-ohos.ps1
+./ffmpeg/scripts/build-windows.ps1
 ```
 
-The platform build scripts remain the source of those artifacts. If both local
-lookup and artifact download fail, run `ffmpeg/scripts/build-android.sh` or
-`ffmpeg/scripts/build-ohos.sh` on macOS, `ffmpeg/scripts/build-ohos.ps1` for an
-OHOS cross-build on Windows, or `ffmpeg/scripts/build-windows.ps1` for the
-Windows x64 target. Run the corresponding script unconditionally when the
-current change modifies `ffmpeg/**`.
-
-The same artifacts can be downloaded manually from the
-[FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml).
+The Android PowerShell entry point discovers the SDK, an already installed NDK,
+and CMake from Android Studio; it never installs or replaces them. On macOS,
+use `ffmpeg/scripts/build-android.sh` or `ffmpeg/scripts/build-ohos.sh`. Run the
+corresponding native script unconditionally when the current change modifies
+`ffmpeg/**`.
 
 
 **I'm not developing QtAV, patches are still welcome.** You can try my new [sdk](https://sourceforge.net/projects/mdk-sdk/files/nightly/) [which is actively developed](https://github.com/wang-bin/mdk-sdk)

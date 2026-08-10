@@ -14,13 +14,19 @@ Supported build hosts and targets:
 | Host | Target | Triplet |
 | --- | --- | --- |
 | macOS | Android arm64-v8a, API 28 | `arm64-android-28-static` |
+| 64-bit Windows with Android Studio | Android arm64-v8a, API 28 | `arm64-android-28-static` |
 | macOS | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows with DevEco Studio | OHOS arm64-v8a, API 23 | `arm64-ohos-23-static` |
 | 64-bit Windows with Visual Studio and Clang tools | Windows x64 | `x64-windows-static-md` |
 
 macOS itself is not a QtAVCore target. Windows dependencies must be built and
 validated on Windows; `build-windows.ps1` is not a cross-compiler. The separate
-`build-ohos.ps1` entry point uses the DevEco native SDK to cross-compile OHOS.
+PowerShell entry points use Android Studio or DevEco SDKs to cross-compile
+Android or OHOS.
+
+Dependency resolution is local-first and local-only: consume an existing
+verified prefix, otherwise invoke the matching build entry point. Do not
+download a GitHub Actions artifact as a dependency fallback.
 
 ## Pinned dependency policy
 
@@ -114,6 +120,23 @@ For a non-standard installation, pass the NDK root directly or set
 ./ffmpeg/scripts/build-android.sh /absolute/path/to/android-ndk
 ```
 
+## Android on Windows
+
+Run from 64-bit PowerShell with Android Studio and an NDK/CMake component
+already selected in its SDK Manager:
+
+```powershell
+git submodule update --init ffmpeg/vcpkg
+./ffmpeg/scripts/build-android.ps1
+```
+
+The script discovers `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or Android Studio's
+standard user SDK directory, then selects an already installed NDK and prints
+its exact revision. Use `-SdkRoot` or `-NdkRoot` to select a non-standard or
+specific existing installation. The script never installs, upgrades, or
+replaces Android SDK/NDK components. `-InstallRoot` and `-WorkRoot` select
+alternate package and space-free work directories.
+
 ## OHOS on macOS
 
 The script automatically checks `$HOME/Library/OpenHarmony/Sdk/23`. A
@@ -206,14 +229,18 @@ Point a QtAVCore target build at the same install root and overlay triplet:
 ```sh
 cmake -S modern -B build/modern-android \
   -DCMAKE_TOOLCHAIN_FILE="$PWD/ffmpeg/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+  -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
   -DVCPKG_TARGET_TRIPLET=arm64-android-28-static \
   -DVCPKG_OVERLAY_TRIPLETS="$PWD/ffmpeg/triplets" \
-  -DVCPKG_INSTALLED_DIR="$PWD/ffmpeg/build/arm64-android-28-static/vcpkg_installed"
+  -DVCPKG_INSTALLED_DIR="$PWD/ffmpeg/build/arm64-android-28-static/vcpkg_installed" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-28 \
+  -DANDROID_STL=c++_static
 ```
 
 Use the corresponding OHOS or Windows triplet for those targets. The build
 scripts accept `QTAV_FFMPEG_INSTALL_ROOT` on macOS and `-InstallRoot` on
-Windows when a different artifact directory is needed. For a Windows-hosted
+Windows when a different local package directory is needed. For a Windows-hosted
 OHOS parent build, prefer `modern/scripts/build-ohos.ps1`, which supplies the
 required vcpkg and OHOS chainload toolchains together.
 
@@ -229,4 +256,6 @@ self-hosted macOS arm64 runner and Windows on a self-hosted Visual Studio
 runner. The OHOS job uses `OHOS_SDK_ROOT` when set and otherwise checks
 `$HOME/Library/OpenHarmony/Sdk/23`; macOS-native `patchelf` must be installed.
 This describes the current CI assignment only; local OHOS builds are supported
-on both macOS and Windows.
+on both macOS and Windows, and local Android builds are supported on both
+macOS and Windows. CI artifacts are diagnostic/archive outputs, not local
+dependency inputs.

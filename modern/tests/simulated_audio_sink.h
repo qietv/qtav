@@ -21,6 +21,9 @@ struct SimulatedAudioSinkConfig {
     bool supportsPause = true;
     bool hasDeviceClock = true;
     bool clockInitiallyValid = true;
+    // Model a real device after time stretching: queue and clock duration are
+    // derived from PCM samples, while writeTimestamps retain media time.
+    bool useSampleDuration = false;
 };
 
 struct SimulatedAudioSinkSnapshot {

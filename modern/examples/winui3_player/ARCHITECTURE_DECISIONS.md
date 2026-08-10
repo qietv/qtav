@@ -107,6 +107,7 @@ never advances the media clock.
 
 - **Status:** Accepted
 - **Date:** 2026-08-03
+- **Amended:** 2026-08-10 to include Player-owned playback-rate clock mapping
 
 ### Context
 
@@ -117,10 +118,12 @@ threads.
 
 ### Decision
 
-Install `WasapiAudioSink` and `SwresampleAudioConverter` on Player. When the
-sink exposes a valid device presentation clock, Player uses it as master and
-publishes a cached clock snapshot. The UI reads only `Player::position()`.
-Player owns underrun freeze/recovery and seek re-anchoring.
+Install `WasapiAudioSink`, `SwresampleAudioConverter`, and the optional
+`AtempoAudioTimeStretcher` on Player. When the sink exposes a valid physical
+device presentation clock, Player maps its delta to media time at the active
+rate, uses it as master, and publishes a cached clock snapshot. Rate 1.0
+bypasses time stretching. The UI reads only `Player::position()`. Player owns
+underrun freeze/recovery, rate transitions, and seek re-anchoring.
 
 ### Consequences
 

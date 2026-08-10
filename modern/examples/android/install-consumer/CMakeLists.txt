@@ -13,6 +13,7 @@ target_link_libraries(
         QtAV::RenderMobile
         QtAV::RenderOpenGLAndroid
         QtAV::AudioAAudio
+        QtAV::AudioTimeStretch
         QtAV::HWMediaCodec
         QtAV::InteropMediaCodecOpenGL
         QtAV::InteropMediaCodecVulkan

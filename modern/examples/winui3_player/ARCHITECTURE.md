@@ -25,7 +25,7 @@ flowchart LR
     UI["WinUI UI thread\nMainWindow + DebugWindow"]
     Bridge["UiBridge\nDispatcherQueue + lifetime gate"]
     Player["qtav::Player\ncontrol, demux, decode, clocks"]
-    Audio["AudioResample + AudioWASAPI\nPCM conversion and device output"]
+    Audio["AudioResample + AudioTimeStretch + AudioWASAPI\nPCM conversion, rate, and device output"]
     Output["OutputD3D11\nprivate render thread"]
     GPU["D3D11 renderer + D3D11VA + interop\ncomposition swap chain"]
     Recycler["D3D11 frame recycler\nbounded deferred release"]
@@ -87,7 +87,8 @@ dispatcher from applying backpressure to audio or video delivery.
 ### Startup and media replacement
 
 1. `MainWindowPrivate` creates Player and installs
-   `SwresampleAudioConverter` plus `WasapiAudioSink`.
+   `SwresampleAudioConverter`, `AtempoAudioTimeStretcher`, and
+   `WasapiAudioSink`.
 2. It registers callbacks, starts UI timers, and observes panel/slider events.
 3. When `SwapChainPanel` is loaded, it creates `D3D11VideoOutput`, supplies the
    HWND and `SetSwapChain` callback, opens it, and attaches Player.
@@ -109,8 +110,9 @@ context/decoder through the ordinary path.
 
 ```text
 FFmpeg packet -> audio decode worker -> bounded audio queue
-              -> audio-output worker -> libswresample -> WASAPI
-              -> cached device presentation clock -> Player position/A-V timing
+              -> audio-output worker -> libswresample -> optional atempo
+              -> WASAPI physical device clock -> rate-mapped cached media clock
+              -> Player position/A-V timing
 ```
 
 Audio submission is independent of the UI and video render threads. A valid
@@ -118,6 +120,9 @@ WASAPI presentation clock becomes playback master; `Player::position()` reads
 a cached snapshot and does not query the device from the UI thread. During
 underrun or a seek generation change, Player freezes or re-anchors the clock
 rather than allowing an arbitrary UI timer to advance playback.
+Rate 1.0 bypasses the time stretcher. A programmatic non-1.0 rate uses it to
+change physical PCM duration without changing pitch, while Player maps the
+WASAPI clock delta back to media time.
 
 ### Video path
 

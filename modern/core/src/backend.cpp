@@ -2,6 +2,7 @@
 
 #include <qtav/audio_converter.h>
 #include <qtav/audio_sink.h>
+#include <qtav/audio_time_stretcher.h>
 #include <qtav/hardware_frame.h>
 #include <qtav/video_render_api.h>
 
@@ -35,6 +36,7 @@ bool AudioSink::drain()
 }
 
 AudioFrameConverter::~AudioFrameConverter() = default;
+AudioTimeStretcher::~AudioTimeStretcher() = default;
 
 AudioFormat audioFormat(const AudioFrame& frame)
 {

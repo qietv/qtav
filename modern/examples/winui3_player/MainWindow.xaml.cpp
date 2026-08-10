@@ -16,6 +16,7 @@
 
 #include <qtav/d3d11_video_output.h>
 #include <qtav/player.h>
+#include <qtav/atempo_audio_time_stretcher.h>
 #include <qtav/swresample_audio_converter.h>
 #include <qtav/wasapi_audio_sink.h>
 
@@ -273,6 +274,8 @@ struct MainWindowPrivate final {
         player_
             ->setAudioFrameConverter(
                 std::make_shared<qtav::SwresampleAudioConverter>())
+            .setAudioTimeStretcher(
+                std::make_shared<qtav::AtempoAudioTimeStretcher>())
             .setAudioSink(
                 std::make_shared<qtav::WasapiAudioSink>());
 

@@ -14,11 +14,12 @@ Windows outputs are independent and are never interchangeable.
 ## Build flow
 
 ```text
-build-android.sh ─┐
-build-ohos.sh ────┼─> install-unix.sh ─┐
-build-ohos.ps1 ───┤                    │
-build-windows.ps1 ┘                    │
-                                      v
+build-android.sh ───┐
+build-ohos.sh ──────┼─> install-unix.sh ─┐
+build-android.ps1 ──┤                    │
+build-ohos.ps1 ─────┤                    │
+build-windows.ps1 ──┘                    │
+                                        v
           vcpkg manifest + pinned registry baseline
                      + overlay ports
                      + target triplet
@@ -86,14 +87,18 @@ not FFmpeg executables or one combined shared object.
 
 ### Android
 
-- Build host: macOS.
+- Build host: macOS or 64-bit Windows.
 - Target: arm64-v8a, API 28.
-- Toolchain: Android NDK r29 (`29.0.14206865`).
+- Toolchain: an explicitly selected or Android Studio-installed NDK. Each
+  entry point prints the resolved path/revision; it never installs or replaces
+  an SDK component.
 - vcpkg triplet: `arm64-android-28-static`.
 - Dependencies: release-only static archives with the static C++ runtime.
-- Default SDK discovery:
-  `$ANDROID_SDK_ROOT/ndk/29.0.14206865`, falling back to Android Studio's
-  standard SDK path under the user's Library.
+- Default SDK discovery uses `ANDROID_SDK_ROOT`/`ANDROID_HOME` and then the
+  standard Android Studio SDK directory. The Windows entry point selects the
+  newest already installed NDK unless `-NdkRoot`, `ANDROID_NDK_HOME`, or
+  `ANDROID_NDK_ROOT` chooses one explicitly. The macOS entry point retains its
+  explicit/default NDK selection for existing CI reproducibility.
 
 ### OHOS
 
@@ -233,9 +238,12 @@ The verifier checks:
 The root GitHub Actions workflow runs automatically for changes to
 `ffmpeg/**`: Android and OHOS use self-hosted macOS arm64 runners, while
 Windows uses a self-hosted Visual Studio runner. Successful target prefixes
-and the vcpkg status database are uploaded as artifacts for parent-project
-builds and inspection. That is the current CI topology, not a local-host
-restriction; the OHOS package also has a supported Windows PowerShell entry.
+and the vcpkg status database may be uploaded as artifacts for CI diagnostics
+and archival inspection. They are not a supported dependency fallback for
+local parent-project builds: those builds use an existing verified prefix or
+invoke the matching local entry point. That is the current CI topology, not a
+local-host restriction; Android and OHOS both have supported Windows
+PowerShell cross-build entries.
 
 These fixed self-hosted runners retain vcpkg's default local binary archive
 directory between jobs. CI intentionally does not use `actions/cache` for that

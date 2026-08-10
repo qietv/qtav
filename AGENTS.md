@@ -52,31 +52,18 @@ the associated vcpkg status database is the sibling `vcpkg/` directory under
 this order:
 
 1. use a valid matching local prefix when present;
-2. if it is missing, download the matching artifact from the latest successful
-   `main` run of the
-   [FFmpeg dependencies workflow](https://github.com/qietv/qtav/actions/workflows/ffmpeg-dependencies.yml);
-3. if neither the local package nor the current artifact can be obtained, run
-   the matching platform build script locally.
+2. if it is missing or fails verification, run the matching platform build
+   script locally and consume the package it produces.
 
-The artifact names are:
-
-- Android artifact: `qtav-ffmpeg-arm64-android-28-static`
-- OHOS artifact: `qtav-ffmpeg-arm64-ohos-23-static`
-- Windows artifact: `qtav-ffmpeg-x64-windows-static-md`
-
-Resolve the workflow run at download time and select the newest successful
-completed `main` run. Never pin or reuse a run ID, commit SHA, artifact URL, or
-an older successful run when a newer successful build is available.
-
-Extract the artifact directly into the corresponding triplet's
-`vcpkg_installed/` directory so the target prefix and sibling status database
-retain the layout above. See the root README and `ffmpeg/ARCHITECTURE.md` for
-download commands and the complete consumption contract.
+Do not download a GitHub Actions artifact as a dependency fallback. Workflow
+artifacts may remain CI outputs for diagnostics or archival purposes, but they
+are not part of the supported local package-resolution path.
 
 Regardless of the resolution order above, any task that modifies `ffmpeg/**`
 must run the directly affected native build script locally and pass
 `cmake/verify-install.cmake`. Use `ffmpeg/scripts/build-android.sh` or
 `ffmpeg/scripts/build-ohos.sh` on macOS,
+`ffmpeg/scripts/build-android.ps1` for an Android cross-build on Windows,
 `ffmpeg/scripts/build-ohos.ps1` for an OHOS cross-build on Windows, and
 `ffmpeg/scripts/build-windows.ps1` for the Windows x64 target.
 
