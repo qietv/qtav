@@ -16,8 +16,8 @@ status and the active next task live in [`PLAN.md`](PLAN.md). Completed
 checklists, investigation narratives, device matrices, and historical
 validation evidence are retained in
 [`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md).
-The supported-target CI matrix, runner contract, local reproduction commands,
-cache boundary, and device-only exclusions are documented in
+The current CI scope, runner contract, local reproduction commands, cache
+boundary, and device-only exclusions are documented in
 [`CI.md`](CI.md).
 
 ## Supported targets
@@ -371,12 +371,13 @@ Requirements:
 - `pkg-config` is required for a libplacebo renderer and recommended for
   resolving static FFmpeg dependency closures.
 
-The supported Windows, Android, and OHOS continuous-integration matrix is in
-[`CI.md`](CI.md). Its checked-in PowerShell drivers can reproduce the complete
-jobs locally on a configured 64-bit Windows host. Cross-built Android/OHOS
-tests are compiled but not executed on Windows; signing, installation, native
-HDR/audio, codec, and physical-device validation remain separate gates and are
-never reported as hosted passes.
+The GitHub Actions workflow currently runs the Windows shared/static build,
+CTest, install, and package-consumer gate only. The checked-in Android and
+OHOS PowerShell drivers remain available for explicit local cross-builds, but
+their Actions jobs are temporarily disabled. Cross-built Android/OHOS tests
+are never executed on Windows; signing, installation, native HDR/audio, codec,
+and physical-device validation remain separate gates and are never reported as
+CI passes. See [`CI.md`](CI.md) for the exact active and suspended boundaries.
 
 ### Version and package compatibility
 

@@ -92,32 +92,35 @@ The following accepted decisions constrain all remaining work:
   installed-package consumers pass on Windows, Android, and OHOS. Compatibility
   remains scoped to documented C++/CMake boundaries and does not create a
   plugin ABI.
-- Supported-target CI workflow and local drivers are implemented. Current-
-  revision reproduction passes Windows shared/static Release CTest (60/60
-  each) plus Android arm64/API 28 and OHOS arm64/API 23 shared/static build,
-  install, and installed-package consumers. The first GitHub Actions run is
-  pending publication, so the CI task remains partial.
+- Supported-target CI drivers are implemented and local reproduction passes
+  Windows shared/static Release CTest (60/60 each) plus Android arm64/API 28
+  and OHOS arm64/API 23 shared/static build, install, and installed-package
+  consumers. The first published Actions run exposed runner-environment
+  failures. By project direction, Actions now temporarily runs only the
+  Windows gate; Android/OHOS jobs are suspended without changing target
+  support or their retained local validation.
 
 Detailed implementation and validation evidence for the version contract is in
 [`PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md`](PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md).
 The CI implementation and local validation record is in
 [`PLAN_HISTORY_2026-08-10_CI.md`](PLAN_HISTORY_2026-08-10_CI.md).
+The first published run and temporary Windows-only scope are recorded in
+[`PLAN_HISTORY_2026-08-10_WINDOWS_ONLY_CI.md`](PLAN_HISTORY_2026-08-10_WINDOWS_ONLY_CI.md).
 
-## Next task — add supported-target continuous integration
+## Next task — stabilize the temporary Windows-only CI gate
 
-- [~] Add repeatable CI for the supported Windows, Android, and OHOS build,
-  test, install, and package-consumer matrix without converting device-only
-  validation into a false hosted pass. The implementation and local
-  runner-equivalent matrix pass; publication and the first GitHub Actions run
-  remain the named completion gate.
+- [~] Publish and pass the repeatable Windows shared/static build, test,
+  install, and package-consumer gate on the configured self-hosted runner.
+  Android and OHOS Actions execution is temporarily disabled by explicit
+  project direction; restoring those jobs remains a separate incomplete gate.
 
 Acceptance criteria:
 
 1. [x] Build and test Windows static/shared Release packages, including the
    staged installed-package consumer and deterministic version requests.
-2. [x] Cross-build and install Android arm64/API 28 and OHOS arm64/API 23
-   static/shared packages from the repository dependency prefixes, then build
-   their standalone package consumers.
+2. [x] Retain locally reproducible Android arm64/API 28 and OHOS arm64/API 23
+   static/shared package, install, and standalone-consumer drivers while their
+   Actions jobs are suspended.
 3. [x] Use the repository platform dependency build and verification scripts;
    do not download workflow artifacts as a local dependency fallback.
 4. [x] Keep signed-device playback, native HDR, physical audio, and strict
@@ -148,12 +151,13 @@ The connected Huawei devices currently expose real decoder output as
 fail-closed/workaround behavior but cannot complete the strict gate. Do not
 substitute Windows Vulkan work or silently reinterpret an unknown format.
 
-### OHOS hardening and automation
+### Android/OHOS CI suspension and OHOS hardening
 
-- [~] Add QtAVCore OHOS CI execution. The workflow/driver implementation and
-  local runner-equivalent shared/static cross-build, install, and package-
-  consumer gate pass. Local signed-HAP playback and the current connected-
-  device matrices are complete; the first GitHub execution awaits publication.
+- [~] Restore Android and OHOS Actions execution only after project direction
+  re-enables deployment and their pinned SDKs are available to the runner
+  service. The retained workflow drivers and local shared/static build,
+  install, and package-consumer gates pass; no disabled job is reported as a
+  CI pass.
 - [~] Broaden real-device software-frame coverage beyond the validated YUV420,
   fit/redraw, SDR Vulkan/OpenGL ES, native-window recreation, forced OpenGL ES,
   and fatal one-way fallback cases. Remaining coverage includes other upload
@@ -198,8 +202,8 @@ AD-019 keeps optional backends in this repository as compile-time targets while
 interfaces evolve. The remaining release work is:
 
 - [~] Add continuous integration for all supported host/target combinations;
-  implementation and local reproduction pass, while publication and the first
-  workflow run remain open.
+  drivers and local reproduction pass, while Actions is intentionally limited
+  to Windows and Android/OHOS execution remains suspended.
 - [ ] Define a versioned C ABI only if runtime-loaded plugins become necessary.
 - [ ] Split a backend into another repository only when it has an independent
   license, team, release cycle, or closed-source delivery requirement.
@@ -250,8 +254,8 @@ is intentionally short:
 
 ## Task selection rules
 
-1. Add supported-target continuous integration unless the user gives a
-   different priority.
+1. Complete the temporary Windows-only CI gate; restore Android/OHOS Actions
+   only after project direction re-enables them.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.
 3. The external Intel workstream may proceed in parallel on its designated

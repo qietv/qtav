@@ -315,6 +315,24 @@ DeviceResources makeDevice()
     return result;
 }
 
+bool hasInteractiveWindowStation()
+{
+    const HWINSTA windowStation = GetProcessWindowStation();
+    if (!windowStation) {
+        return false;
+    }
+
+    USEROBJECTFLAGS flags {};
+    DWORD bytesNeeded = 0;
+    return GetUserObjectInformationW(
+               windowStation,
+               UOI_FLAGS,
+               &flags,
+               sizeof(flags),
+               &bytesNeeded)
+        && (flags.dwFlags & WSF_VISIBLE) != 0;
+}
+
 std::vector<DXGI_OUTPUT_DESC> attachedOutputs(IDXGIAdapter* adapter)
 {
     std::vector<DXGI_OUTPUT_DESC> result;
@@ -424,6 +442,13 @@ SwapChainTarget makeCompositionTarget(
 
 int main()
 {
+    if (!hasInteractiveWindowStation()) {
+        std::cout
+            << "No interactive Windows desktop; Advanced Color display "
+               "test skipped\n";
+        return 77;
+    }
+
     const DeviceResources resources = makeDevice();
     if (!resources.device || !resources.context
         || !resources.adapter || !resources.factory) {
