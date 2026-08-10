@@ -17,6 +17,8 @@ Document ownership is intentionally separated:
   threading, lifetime, and data-flow model;
 - [`DECISIONS.md`](DECISIONS.md): durable choices, rejected alternatives, and
   their consequences;
+- [`CI.md`](CI.md): supported-target workflow ownership, runner/toolchain
+  contract, cache boundary, local reproduction, and device-only exclusions;
 - [`README.md`](README.md): public build, API, and backend usage;
 - [`MIGRATION.md`](MIGRATION.md): migration from legacy QtAV.
 
@@ -90,29 +92,38 @@ The following accepted decisions constrain all remaining work:
   installed-package consumers pass on Windows, Android, and OHOS. Compatibility
   remains scoped to documented C++/CMake boundaries and does not create a
   plugin ABI.
+- Supported-target CI workflow and local drivers are implemented. Current-
+  revision reproduction passes Windows shared/static Release CTest (60/60
+  each) plus Android arm64/API 28 and OHOS arm64/API 23 shared/static build,
+  install, and installed-package consumers. The first GitHub Actions run is
+  pending publication, so the CI task remains partial.
 
 Detailed implementation and validation evidence for the version contract is in
 [`PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md`](PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md).
+The CI implementation and local validation record is in
+[`PLAN_HISTORY_2026-08-10_CI.md`](PLAN_HISTORY_2026-08-10_CI.md).
 
 ## Next task — add supported-target continuous integration
 
-- [ ] Add repeatable CI for the supported Windows, Android, and OHOS build,
+- [~] Add repeatable CI for the supported Windows, Android, and OHOS build,
   test, install, and package-consumer matrix without converting device-only
-  validation into a false hosted pass.
+  validation into a false hosted pass. The implementation and local
+  runner-equivalent matrix pass; publication and the first GitHub Actions run
+  remain the named completion gate.
 
 Acceptance criteria:
 
-1. [ ] Build and test Windows static/shared Release packages, including the
+1. [x] Build and test Windows static/shared Release packages, including the
    staged installed-package consumer and deterministic version requests.
-2. [ ] Cross-build and install Android arm64/API 28 and OHOS arm64/API 23
+2. [x] Cross-build and install Android arm64/API 28 and OHOS arm64/API 23
    static/shared packages from the repository dependency prefixes, then build
    their standalone package consumers.
-3. [ ] Use the repository platform dependency build and verification scripts;
+3. [x] Use the repository platform dependency build and verification scripts;
    do not download workflow artifacts as a local dependency fallback.
-4. [ ] Keep signed-device playback, native HDR, physical audio, and strict
+4. [x] Keep signed-device playback, native HDR, physical audio, and strict
    native-buffer gates explicitly separate from hosted CI and never report an
    unavailable device check as a pass.
-5. [ ] Pin or record toolchain inputs, use bounded caches that cannot bypass
+5. [x] Pin or record toolchain inputs, use bounded caches that cannot bypass
    install verification, publish useful failure logs, and document the CI
    ownership and local reproduction commands.
 
@@ -139,8 +150,10 @@ substitute Windows Vulkan work or silently reinterpret an unknown format.
 
 ### OHOS hardening and automation
 
-- [~] Add QtAVCore OHOS CI execution. Local signed-HAP playback and the current
-  connected-device matrices are complete; repeatable CI execution is pending.
+- [~] Add QtAVCore OHOS CI execution. The workflow/driver implementation and
+  local runner-equivalent shared/static cross-build, install, and package-
+  consumer gate pass. Local signed-HAP playback and the current connected-
+  device matrices are complete; the first GitHub execution awaits publication.
 - [~] Broaden real-device software-frame coverage beyond the validated YUV420,
   fit/redraw, SDR Vulkan/OpenGL ES, native-window recreation, forced OpenGL ES,
   and fatal one-way fallback cases. Remaining coverage includes other upload
@@ -184,7 +197,9 @@ rendering.
 AD-019 keeps optional backends in this repository as compile-time targets while
 interfaces evolve. The remaining release work is:
 
-- [ ] Add continuous integration for all supported host/target combinations.
+- [~] Add continuous integration for all supported host/target combinations;
+  implementation and local reproduction pass, while publication and the first
+  workflow run remain open.
 - [ ] Define a versioned C ABI only if runtime-loaded plugins become necessary.
 - [ ] Split a backend into another repository only when it has an independent
   license, team, release cycle, or closed-source delivery requirement.

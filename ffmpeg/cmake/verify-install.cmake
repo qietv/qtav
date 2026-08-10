@@ -103,6 +103,15 @@ if(TRIPLET MATCHES "windows"
     message(FATAL_ERROR "Windows libplacebo is missing its SPIRV-Cross dependency")
 endif()
 if(TRIPLET MATCHES "windows")
+    file(READ "${PREFIX}/lib/pkgconfig/libplacebo.pc"
+         LIBPLACEBO_PKG_CONFIG)
+    if(LIBPLACEBO_PKG_CONFIG MATCHES
+       "Cflags:[^\r\n]*-I[A-Za-z]:")
+        message(FATAL_ERROR
+            "Windows libplacebo pkg-config metadata leaks an absolute build-machine include path"
+        )
+    endif()
+
     file(READ "${PREFIX}/include/libavutil/hwcontext_d3d11va.h"
          FFMPEG_D3D11VA_HEADER)
     if(NOT FFMPEG_D3D11VA_HEADER MATCHES "int[ \t]+reuse_decoder;")

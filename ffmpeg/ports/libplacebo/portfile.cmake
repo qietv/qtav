@@ -104,6 +104,18 @@ if(VCPKG_TARGET_IS_WINDOWS)
         LIBPLACEBO_PC_CONTENT
         "${LIBPLACEBO_PC_CONTENT}"
     )
+
+    # Meson may discover Vulkan through VULKAN_SDK and serialize that build
+    # machine's absolute Windows include path with backslashes. pkgconf treats
+    # those backslashes as escapes, and the installed package must not depend
+    # on an external SDK path in any case. The vcpkg prefix already owns the
+    # Vulkan headers used by the public libplacebo contract.
+    string(REGEX REPLACE
+        "Cflags:[^\r\n]*"
+        "Cflags: \"-I\${includedir}\" -DPL_STATIC"
+        LIBPLACEBO_PC_CONTENT
+        "${LIBPLACEBO_PC_CONTENT}"
+    )
 endif()
 file(WRITE "${LIBPLACEBO_PC}" "${LIBPLACEBO_PC_CONTENT}")
 
