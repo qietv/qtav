@@ -1717,3 +1717,69 @@ mapping. Windows static/shared tests and install consumers pass, as do OHOS and
 Android static/shared cross-builds against their repository dependency
 prefixes. Detailed evidence is retained with the dated implementation history
 referenced by [`PLAN.md`](PLAN.md).
+
+## AD-021: General processing starts with bounded audio and video contracts
+
+- Date: 2026-08-10
+- Status: Accepted and complete
+- Scope: Audio effects, video transforms, lifecycle, scheduling, timestamps,
+  optional backend linkage, and filter migration
+
+### Context
+
+The legacy tree exposed mutable Qt-oriented audio and video filters, while the
+rewrite already had three distinct processing boundaries: decoded-frame
+callbacks, direct hardware-frame scheduling, and render-thread graphics APIs.
+A single generic frame callback would conflate ownership, backpressure,
+timeline, and thread requirements. The first supported use cases are streaming
+PCM effects such as gain/equalization and synchronous software-video transforms
+such as pixel or geometry changes; delayed cadence conversion and native-GPU
+effects require different schedulers.
+
+### Decision
+
+1. `AudioFrameProcessor` is an optional core contract after format conversion
+   and `AudioTimeStretcher`, before `AudioSink`. It preserves negotiated PCM
+   format, media-timeline order, and total physical samples per completed
+   segment, while allowing zero-or-more output views per input for bounded
+   buffering and repartitioning.
+2. `VideoFrameProcessor` is an optional synchronous, one-input/one-output core
+   contract on the video-decode worker. `VideoFrameScheduler` retains first
+   refusal for direct codec-surface presentation. An ordinary processed result
+   preserves timestamp and duration exactly; format-level and per-frame bypass
+   are explicit.
+3. Public contracts contain no Qt, FFmpeg, graphics, or platform SDK types.
+   Processor-owned audio output lives through the next processor operation;
+   copied `VideoFrame` objects retain reference-counted storage normally.
+4. Pause/resume preserves state. Timeline discontinuities reset buffered state;
+   natural segment end drains it; track/media or live processor replacement
+   closes and reopens at a clean generation boundary. Stop resets and closes.
+   Contract violations fail closed and publish categorized media events.
+5. Queued video cadence conversion is deferred to a future queue/scheduler
+   contract. Native graphics-context effects remain `VideoRenderAPI` work on
+   the application's render thread.
+6. `QtAV::AudioFilter` is the narrow reference backend. It owns an FFmpeg
+   `volume` graph and exposes a constant non-negative linear gain without
+   accepting an arbitrary graph string or leaking FFmpeg types into core.
+
+### Consequences
+
+- Raw decoded audio callbacks stay upstream of conversion and processing;
+  ordinary video callbacks and renderers observe processed frames, except when
+  direct scheduling accepted the decoder frame first.
+- Audio backpressure is explicit through zero-output process results and
+  repeated drain. Video buffering is forbidden by the first contract, keeping
+  presentation cadence and generation invalidation deterministic.
+- Applications link no new mandatory dependency. They may inject their own
+  processors, link the optional reference audio target, or omit processing
+  completely.
+
+### Validation
+
+Deterministic player tests cover buffered audio ordering and equal sample
+counts, natural drain, pause preservation, seek reset, stop close, video
+one-to-one processing, explicit format bypass, and fail-closed processor errors.
+The reference volume backend verifies sample values, format/timestamp
+preservation, reset/drain, and invalid-format rejection. Supported-target
+cross-build and installed-package results are recorded in the dated plan
+history referenced by [`PLAN.md`](PLAN.md).

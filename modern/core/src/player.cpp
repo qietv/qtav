@@ -2,8 +2,10 @@
 
 #include <qtav/player.h>
 #include <qtav/audio_converter.h>
+#include <qtav/audio_processor.h>
 #include <qtav/audio_sink.h>
 #include <qtav/audio_time_stretcher.h>
+#include <qtav/video_processor.h>
 #include <qtav/video_render_api.h>
 
 #include <algorithm>
@@ -717,7 +719,13 @@ public:
         if (videoDecodeWorker_.joinable()) {
             videoDecodeWorker_.join();
         }
-        replaceAudioSink(nullptr, nullptr, nullptr, audioSinkSerial_);
+        replaceAudioSink(
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            audioSinkSerial_);
+        closeVideoFrameProcessor();
         packetDiskStore_->clear();
         media_.reset();
         avformat_network_deinit();
@@ -1694,6 +1702,52 @@ public:
         controlChanged_.notify_all();
     }
 
+    void setAudioFrameProcessor(
+        std::shared_ptr<AudioFrameProcessor> processor)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            audioFrameProcessor_ = std::move(processor);
+            ++audioSinkSerial_;
+        }
+        controlChanged_.notify_all();
+    }
+
+    void setVideoFrameProcessor(
+        std::shared_ptr<VideoFrameProcessor> processor)
+    {
+        const auto reopenPosition = position();
+        bool reopen = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (videoFrameProcessor_ == processor) {
+                return;
+            }
+            videoFrameProcessor_ = std::move(processor);
+            ++videoFrameProcessorSerial_;
+            if (!url_.empty() && requestedState_ != State::Stopped) {
+                ++mediaSerial_;
+                loadedSerial_ = 0;
+                seekRequest_.reset();
+                trackSwitchRequests_.clear();
+                accurateSeek_.reset();
+                seekCompletion_.reset();
+                prepareRequest_ = PrepareRequest {
+                    ++requestSerial_,
+                    reopenPosition,
+                    SeekFlag::KeyFrame,
+                    {},
+                };
+                reopen = true;
+            }
+        }
+        if (reopen) {
+            invalidatePlaybackQueues();
+            interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        controlChanged_.notify_all();
+    }
+
     void setHardwareDecodeConfig(HardwareDecodeConfig config)
     {
         {
@@ -2117,9 +2171,15 @@ private:
                 const auto sink = audioSink_;
                 const auto converter = audioFrameConverter_;
                 const auto stretcher = audioTimeStretcher_;
+                const auto processor = audioFrameProcessor_;
                 const auto serial = audioSinkSerial_;
                 lock.unlock();
-                replaceAudioSink(sink, converter, stretcher, serial);
+                replaceAudioSink(
+                    sink,
+                    converter,
+                    stretcher,
+                    processor,
+                    serial);
                 continue;
             }
 
@@ -2694,6 +2754,7 @@ private:
         resetPlaybackQueues();
         resetReadRecoveryTracking();
         closeAudioSink(true);
+        closeVideoFrameProcessor();
         media_.reset();
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -3346,6 +3407,9 @@ private:
         // sink and optional converter. This is also safe for video switches
         // and keeps a single A/V generation boundary.
         closeAudioSink(true);
+        if (request.type == MediaType::Video) {
+            closeVideoFrameProcessor();
+        }
 
         if (request.type == MediaType::Audio) {
             media_.audio = std::move(replacement);
@@ -5897,6 +5961,180 @@ private:
         currentPosition_ = std::max(currentPosition_, timestamp);
     }
 
+    bool processVideoFrame(
+        VideoFrame& video,
+        std::uint64_t generation)
+    {
+        std::string eventCode;
+        std::string eventDetail;
+        int eventError = 0;
+        bool success = true;
+        {
+            std::lock_guard<std::mutex> processorLock(
+                videoProcessorCallMutex_);
+            std::shared_ptr<VideoFrameProcessor> configured;
+            std::uint64_t serial = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                configured = videoFrameProcessor_;
+                serial = videoFrameProcessorSerial_;
+            }
+            if (activeVideoFrameProcessorSerial_ != serial
+                || activeVideoFrameProcessor_ != configured) {
+                if (activeVideoFrameProcessor_
+                    && videoFrameProcessorOpen_) {
+                    activeVideoFrameProcessor_->close();
+                }
+                activeVideoFrameProcessor_ = std::move(configured);
+                activeVideoFrameProcessorSerial_ = serial;
+                videoFrameProcessorOpen_ = false;
+                videoFrameProcessorBypass_ = false;
+                activeVideoProcessorFormat_ = {};
+            }
+            if (!activeVideoFrameProcessor_) {
+                return true;
+            }
+
+            const auto format = videoProcessorFormat(video);
+            const bool formatChanged = !videoFrameProcessorOpen_
+                || activeVideoProcessorFormat_.width != format.width
+                || activeVideoProcessorFormat_.height != format.height
+                || activeVideoProcessorFormat_.pixelFormat
+                    != format.pixelFormat
+                || activeVideoProcessorFormat_.hardwareFrame
+                    != format.hardwareFrame
+                || activeVideoProcessorFormat_.hardwareDevice
+                    != format.hardwareDevice;
+            if (formatChanged) {
+                if (videoFrameProcessorOpen_) {
+                    activeVideoFrameProcessor_->close();
+                }
+                const auto opened = activeVideoFrameProcessor_->open(format);
+                videoFrameProcessorOpen_ = opened.success;
+                videoFrameProcessorBypass_ =
+                    opened.success && opened.bypass;
+                activeVideoProcessorFormat_ =
+                    opened.success ? format : VideoProcessorFormat {};
+                if (!opened.success) {
+                    eventCode = "video.processor.open";
+                    eventDetail = opened.error.empty()
+                        ? "The video frame processor could not be opened"
+                        : opened.error;
+                    eventError = AVERROR_EXTERNAL;
+                    success = false;
+                } else if (opened.bypass) {
+                    eventCode = "video.processor.bypass";
+                    eventDetail =
+                        "The video frame processor explicitly bypassed the "
+                        "current input format";
+                }
+            }
+            if (success && !videoFrameProcessorBypass_) {
+                const auto processed =
+                    activeVideoFrameProcessor_->process(video);
+                if (!processed.success) {
+                    eventCode = "video.processor.process";
+                    eventDetail = processed.error.empty()
+                        ? "The video frame processor rejected a frame"
+                        : processed.error;
+                    eventError = AVERROR_EXTERNAL;
+                    success = false;
+                } else if (!processed.bypass) {
+                    if (!processed.frame
+                        || processed.frame.timestamp() != video.timestamp()
+                        || processed.frame.duration() != video.duration()) {
+                        eventCode = "video.processor.contract";
+                        eventDetail =
+                            "The video frame processor violated the "
+                            "one-to-one timestamp contract";
+                        eventError = AVERROR_INVALIDDATA;
+                        success = false;
+                    } else {
+                        video = processed.frame;
+                    }
+                }
+            }
+            if (!success && activeVideoFrameProcessor_
+                && videoFrameProcessorOpen_) {
+                activeVideoFrameProcessor_->close();
+                videoFrameProcessorOpen_ = false;
+                videoFrameProcessorBypass_ = false;
+                activeVideoProcessorFormat_ = {};
+            }
+        }
+        if (!eventCode.empty()) {
+            publishEvent({
+                std::move(eventCode),
+                std::move(eventDetail),
+                eventError,
+            });
+        }
+        return success
+            && generation
+                == presentationGeneration_.load(std::memory_order_acquire);
+    }
+
+    void resetVideoFrameProcessor()
+    {
+        std::string error;
+        {
+            std::lock_guard<std::mutex> processorLock(
+                videoProcessorCallMutex_);
+            if (!activeVideoFrameProcessor_ || !videoFrameProcessorOpen_) {
+                return;
+            }
+            if (!videoFrameProcessorBypass_
+                && !activeVideoFrameProcessor_->reset()) {
+                error = "The video frame processor could not be reset";
+                activeVideoFrameProcessor_->close();
+                videoFrameProcessorOpen_ = false;
+                videoFrameProcessorBypass_ = false;
+                activeVideoProcessorFormat_ = {};
+            }
+        }
+        if (!error.empty()) {
+            publishEvent({
+                "video.processor.reset",
+                std::move(error),
+                AVERROR_EXTERNAL,
+            });
+        }
+    }
+
+    bool drainVideoFrameProcessor()
+    {
+        bool drained = true;
+        {
+            std::lock_guard<std::mutex> processorLock(
+                videoProcessorCallMutex_);
+            if (activeVideoFrameProcessor_ && videoFrameProcessorOpen_
+                && !videoFrameProcessorBypass_) {
+                drained = activeVideoFrameProcessor_->drain();
+            }
+        }
+        if (!drained) {
+            publishEvent({
+                "video.processor.drain",
+                "The video frame processor could not finish the segment",
+                AVERROR_EXTERNAL,
+            });
+        }
+        return drained;
+    }
+
+    void closeVideoFrameProcessor() noexcept
+    {
+        std::lock_guard<std::mutex> processorLock(videoProcessorCallMutex_);
+        if (activeVideoFrameProcessor_ && videoFrameProcessorOpen_) {
+            activeVideoFrameProcessor_->close();
+        }
+        activeVideoFrameProcessor_.reset();
+        activeVideoFrameProcessorSerial_ = 0;
+        videoFrameProcessorOpen_ = false;
+        videoFrameProcessorBypass_ = false;
+        activeVideoProcessorFormat_ = {};
+    }
+
     bool submitVideoFrame(
         VideoFrame video,
         int track,
@@ -5944,6 +6182,13 @@ private:
                 }
                 return true;
             }
+        }
+
+        if (!processVideoFrame(video, generation)) {
+            if (completesAccurateSeek) {
+                failAccurateSeek(generation);
+            }
+            return false;
         }
 
         enqueuePresentation(PresentationItem {
@@ -6870,6 +7115,7 @@ private:
         invalidatePlaybackQueues();
         resetVideoPacketQueue();
         resetAudioPacketQueue();
+        resetVideoFrameProcessor();
         queuedMemoryPacketBytes_.store(0, std::memory_order_relaxed);
         packetDiskStore_->clear();
         diskCacheUnavailable_.store(false, std::memory_order_release);
@@ -7271,34 +7517,42 @@ private:
         const std::shared_ptr<AudioSink>& sink,
         const std::shared_ptr<AudioFrameConverter>& converter,
         const std::shared_ptr<AudioTimeStretcher>& stretcher,
+        const std::shared_ptr<AudioFrameProcessor>& processor,
         std::uint64_t serial)
     {
         invalidateAudioClock();
         std::shared_ptr<AudioSink> previous;
         std::shared_ptr<AudioFrameConverter> previousConverter;
         std::shared_ptr<AudioTimeStretcher> previousStretcher;
+        std::shared_ptr<AudioFrameProcessor> previousProcessor;
         bool previousOpen = false;
         bool previousConverterOpen = false;
         bool previousStretcherOpen = false;
+        bool previousProcessorOpen = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             previous = activeAudioSink_;
             previousConverter = activeAudioFrameConverter_;
             previousStretcher = activeAudioTimeStretcher_;
+            previousProcessor = activeAudioFrameProcessor_;
             previousOpen = audioSinkOpen_;
             previousConverterOpen = audioFrameConverterOpen_;
             previousStretcherOpen = audioTimeStretcherOpen_;
+            previousProcessorOpen = audioFrameProcessorOpen_;
             activeAudioSink_.reset();
             activeAudioFrameConverter_.reset();
             activeAudioTimeStretcher_.reset();
+            activeAudioFrameProcessor_.reset();
             audioSinkOpen_ = false;
             audioSinkOpenAttempted_ = false;
             audioSinkHasClock_ = false;
             audioFrameConverterOpen_ = false;
             audioTimeStretcherOpen_ = false;
+            audioFrameProcessorOpen_ = false;
         }
 
-        if (previous || previousConverter || previousStretcher) {
+        if (previous || previousConverter || previousStretcher
+            || previousProcessor) {
             std::lock_guard<std::mutex> sinkLock(audioSinkCallMutex_);
             if (previous) {
                 previous->setEventCallback({});
@@ -7310,6 +7564,15 @@ private:
                 previousStretcher->reset();
                 previousStretcher->close();
             }
+            if (previousProcessor && previousProcessorOpen) {
+                previousProcessor->reset();
+                previousProcessor->close();
+            }
+            audioProcessorInputSamples_ = 0;
+            audioProcessorOutputSamples_ = 0;
+            audioProcessorLastTimestamp_ = 0;
+            audioProcessorHasTimestamp_ = false;
+            audioProcessorFormat_ = {};
             if (previousConverter && previousConverterOpen) {
                 previousConverter->reset();
                 previousConverter->close();
@@ -7324,6 +7587,7 @@ private:
             activeAudioSink_ = sink;
             activeAudioFrameConverter_ = converter;
             activeAudioTimeStretcher_ = stretcher;
+            activeAudioFrameProcessor_ = processor;
             appliedAudioSinkSerial_ = serial;
         }
         if (sink) {
@@ -7350,25 +7614,31 @@ private:
         std::shared_ptr<AudioSink> sink;
         std::shared_ptr<AudioFrameConverter> converter;
         std::shared_ptr<AudioTimeStretcher> stretcher;
+        std::shared_ptr<AudioFrameProcessor> processor;
         bool wasOpen = false;
         bool converterWasOpen = false;
         bool stretcherWasOpen = false;
+        bool processorWasOpen = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             sink = activeAudioSink_;
             converter = activeAudioFrameConverter_;
             stretcher = activeAudioTimeStretcher_;
+            processor = activeAudioFrameProcessor_;
             wasOpen = audioSinkOpen_;
             converterWasOpen = audioFrameConverterOpen_;
             stretcherWasOpen = audioTimeStretcherOpen_;
+            processorWasOpen = audioFrameProcessorOpen_;
             audioSinkOpen_ = false;
             audioSinkOpenAttempted_ = false;
             audioSinkHasClock_ = false;
             audioFrameConverterOpen_ = false;
             audioTimeStretcherOpen_ = false;
+            audioFrameProcessorOpen_ = false;
         }
         if ((!sink || !wasOpen) && (!converter || !converterWasOpen)
-            && (!stretcher || !stretcherWasOpen)) {
+            && (!stretcher || !stretcherWasOpen)
+            && (!processor || !processorWasOpen)) {
             return;
         }
         std::lock_guard<std::mutex> sinkLock(audioSinkCallMutex_);
@@ -7381,6 +7651,17 @@ private:
             }
             stretcher->close();
         }
+        if (processor && processorWasOpen) {
+            if (flush) {
+                processor->reset();
+            }
+            processor->close();
+        }
+        audioProcessorInputSamples_ = 0;
+        audioProcessorOutputSamples_ = 0;
+        audioProcessorLastTimestamp_ = 0;
+        audioProcessorHasTimestamp_ = false;
+        audioProcessorFormat_ = {};
         if (converter && converterWasOpen) {
             if (flush) {
                 converter->reset();
@@ -7398,8 +7679,10 @@ private:
         std::shared_ptr<AudioSink> sink;
         std::shared_ptr<AudioFrameConverter> converter;
         std::shared_ptr<AudioTimeStretcher> stretcher;
+        std::shared_ptr<AudioFrameProcessor> processor;
         bool converterOpen = false;
         bool stretcherOpen = false;
+        bool processorOpen = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!audioSinkOpen_) {
@@ -7408,8 +7691,10 @@ private:
             sink = activeAudioSink_;
             converter = activeAudioFrameConverter_;
             stretcher = activeAudioTimeStretcher_;
+            processor = activeAudioFrameProcessor_;
             converterOpen = audioFrameConverterOpen_;
             stretcherOpen = audioTimeStretcherOpen_;
+            processorOpen = audioFrameProcessorOpen_;
         }
         bool reset = true;
         if (sink) {
@@ -7417,6 +7702,13 @@ private:
             sink->flush();
             if (stretcher && stretcherOpen) {
                 reset = stretcher->reset();
+            }
+            if (processor && processorOpen) {
+                reset = processor->reset() && reset;
+                audioProcessorInputSamples_ = 0;
+                audioProcessorOutputSamples_ = 0;
+                audioProcessorLastTimestamp_ = 0;
+                audioProcessorHasTimestamp_ = false;
             }
             if (converter && converterOpen) {
                 reset = converter->reset() && reset;
@@ -7426,7 +7718,8 @@ private:
             closeAudioSink(false);
             publishEvent({
                 "audio.output.reset",
-                "The audio converter or time stretcher could not be reset",
+                "The audio converter, time stretcher, or frame processor "
+                "could not be reset",
                 AVERROR_EXTERNAL,
             });
         }
@@ -7458,11 +7751,13 @@ private:
         std::shared_ptr<AudioSink> sink;
         std::shared_ptr<AudioFrameConverter> converter;
         std::shared_ptr<AudioTimeStretcher> stretcher;
+        std::shared_ptr<AudioFrameProcessor> processor;
         std::uint64_t serial = 0;
         bool open = false;
         bool attempted = false;
         bool converterOpen = false;
         bool stretcherOpen = false;
+        bool processorOpen = false;
         bool hasClock = false;
         double playbackRate = 1.0;
         {
@@ -7473,6 +7768,7 @@ private:
             sink = activeAudioSink_;
             converter = activeAudioFrameConverter_;
             stretcher = activeAudioTimeStretcher_;
+            processor = activeAudioFrameProcessor_;
             serial = appliedAudioSinkSerial_;
             if (serial != audioSinkSerial_) {
                 return;
@@ -7481,6 +7777,7 @@ private:
             attempted = audioSinkOpenAttempted_;
             converterOpen = audioFrameConverterOpen_;
             stretcherOpen = audioTimeStretcherOpen_;
+            processorOpen = audioFrameProcessorOpen_;
             hasClock = audioSinkHasClock_;
             playbackRate = playbackRate_;
         }
@@ -7494,11 +7791,13 @@ private:
             AudioSinkOpenResult result;
             AudioConverterOpenResult converterResult;
             AudioTimeStretchOpenResult stretcherResult;
+            AudioProcessorOpenResult processorResult;
             bool conversionNeeded = false;
             bool converterOpened = false;
             const bool stretchNeeded =
                 std::abs(playbackRate - 1.0) > 0.000001;
             bool stretcherOpened = false;
+            bool processorOpened = false;
             {
                 std::lock_guard<std::mutex> sinkLock(audioSinkCallMutex_);
                 capabilities = sink->capabilities();
@@ -7521,18 +7820,34 @@ private:
                         playbackRate);
                     stretcherOpened = stretcherResult.success;
                 }
+                if (result.success && result.deviceFormat.isValid()
+                    && (!conversionNeeded || converterOpened)
+                    && (!stretchNeeded || stretcherOpened)
+                    && processor) {
+                    processorResult = processor->open(result.deviceFormat);
+                    processorOpened = processorResult.success;
+                    if (processorOpened) {
+                        audioProcessorFormat_ = result.deviceFormat;
+                        audioProcessorInputSamples_ = 0;
+                        audioProcessorOutputSamples_ = 0;
+                        audioProcessorLastTimestamp_ = 0;
+                        audioProcessorHasTimestamp_ = false;
+                    }
+                }
             }
 
             bool formatSupported = result.success
                 && result.deviceFormat.isValid()
                 && (!conversionNeeded || converterOpened)
-                && (!stretchNeeded || stretcherOpened);
+                && (!stretchNeeded || stretcherOpened)
+                && (!processor || processorOpened);
             bool stillActive = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 stillActive = activeAudioSink_ == sink
                     && activeAudioFrameConverter_ == converter
                     && activeAudioTimeStretcher_ == stretcher
+                    && activeAudioFrameProcessor_ == processor
                     && appliedAudioSinkSerial_ == serial
                     && audioSinkSerial_ == serial
                     && requestedState_ == State::Playing
@@ -7548,6 +7863,8 @@ private:
                         formatSupported && converterOpened;
                     audioTimeStretcherOpen_ =
                         formatSupported && stretcherOpened;
+                    audioFrameProcessorOpen_ =
+                        formatSupported && processorOpened;
                 }
             }
 
@@ -7555,6 +7872,9 @@ private:
                 std::lock_guard<std::mutex> sinkLock(audioSinkCallMutex_);
                 if (stretcher && stretcherOpened) {
                     stretcher->close();
+                }
+                if (processor && processorOpened) {
+                    processor->close();
                 }
                 if (converter && converterOpened) {
                     converter->close();
@@ -7598,19 +7918,27 @@ private:
                             : converterResult.error,
                         AVERROR_EXTERNAL,
                     });
-                } else if (!stretcher) {
+                } else if (stretchNeeded && !stretcher) {
                     publishEvent({
                         "audio.time_stretch.unavailable",
                         "Playback-rate audio requires an injected time "
                         "stretcher; device output is disabled",
                         AVERROR(ENOSYS),
                     });
-                } else {
+                } else if (stretchNeeded && !stretcherOpened) {
                     publishEvent({
                         "audio.time_stretch.open",
                         stretcherResult.error.empty()
                             ? "The audio time stretcher could not be opened"
                             : stretcherResult.error,
+                        AVERROR_EXTERNAL,
+                    });
+                } else if (processor && !processorOpened) {
+                    publishEvent({
+                        "audio.processor.open",
+                        processorResult.error.empty()
+                            ? "The audio frame processor could not be opened"
+                            : processorResult.error,
                         AVERROR_EXTERNAL,
                     });
                 }
@@ -7624,6 +7952,7 @@ private:
             open = true;
             converterOpen = converterOpened;
             stretcherOpen = stretcherOpened;
+            processorOpen = processorOpened;
             hasClock = capabilities.hasDeviceClock;
         }
 
@@ -7637,6 +7966,8 @@ private:
             {},
         };
         AudioTimeStretchResult stretched { true, {}, {} };
+        AudioProcessingResult processed { true, {}, {} };
+        std::string processingError;
         bool written = true;
         AudioSinkClock clockBefore;
         AudioSinkClock clockAfter;
@@ -7663,20 +7994,64 @@ private:
                     if (!buffer.isValid()) {
                         continue;
                     }
-                    if (!sink->write(buffer)) {
-                        written = false;
+                    processed = { true, {}, {} };
+                    if (processor && processorOpen) {
+                        audioProcessorInputSamples_ +=
+                            buffer.samplesPerChannel;
+                        processed = processor->process(buffer);
+                    } else {
+                        processed.buffers.push_back(buffer);
+                    }
+                    if (!processed.success
+                        || processed.buffers.size() > 32) {
+                        processingError = processed.error;
+                        if (processingError.empty()
+                            && processed.buffers.size() > 32) {
+                            processingError =
+                                "The audio frame processor produced more "
+                                "than 32 buffers for one input";
+                        }
                         break;
                     }
-                    if (!submitted) {
-                        submittedStart = buffer.timestamp;
-                        submitted = true;
+                    for (const auto& output : processed.buffers) {
+                        if (!output.isValid()
+                            || !sameAudioFormat(
+                                output.format,
+                                buffer.format)
+                            || output.duration < 0
+                            || (audioProcessorHasTimestamp_
+                                && output.timestamp
+                                    < audioProcessorLastTimestamp_)) {
+                            processed.success = false;
+                            processingError =
+                                "The audio frame processor violated its "
+                                "format or timestamp contract";
+                            break;
+                        }
+                        if (processor && processorOpen) {
+                            audioProcessorOutputSamples_ +=
+                                output.samplesPerChannel;
+                            audioProcessorLastTimestamp_ = output.timestamp;
+                            audioProcessorHasTimestamp_ = true;
+                        }
+                        if (!sink->write(output)) {
+                            written = false;
+                            break;
+                        }
+                        if (!submitted) {
+                            submittedStart = output.timestamp;
+                            submitted = true;
+                        }
+                        submittedUntil = std::max(
+                            submittedUntil,
+                            output.timestamp
+                                + std::max<std::int64_t>(
+                                    0,
+                                    output.duration));
                     }
-                    submittedUntil = std::max(
-                        submittedUntil,
-                        buffer.timestamp
-                            + std::max<std::int64_t>(
-                                0,
-                                buffer.duration));
+                    if (!processed.success || !written) {
+                        break;
+                    }
                 }
             }
             if (hasClock) {
@@ -7737,6 +8112,24 @@ private:
             });
             return;
         }
+        if (!processed.success) {
+            closeAudioSink(false);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (activeAudioSink_ == sink
+                    && appliedAudioSinkSerial_ == serial) {
+                    audioSinkOpenAttempted_ = true;
+                }
+            }
+            publishEvent({
+                "audio.processor.process",
+                processingError.empty()
+                    ? "The audio frame processor rejected a PCM buffer"
+                    : processingError,
+                AVERROR_EXTERNAL,
+            });
+            return;
+        }
         if (!conversion.buffer.isValid() || !submitted) {
             return;
         }
@@ -7762,10 +8155,12 @@ private:
         std::shared_ptr<AudioSink> sink;
         std::shared_ptr<AudioFrameConverter> converter;
         std::shared_ptr<AudioTimeStretcher> stretcher;
+        std::shared_ptr<AudioFrameProcessor> processor;
         std::uint64_t serial = 0;
         bool hasClock = false;
         bool converterOpen = false;
         bool stretcherOpen = false;
+        bool processorOpen = false;
         double playbackRate = 1.0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -7775,10 +8170,12 @@ private:
             sink = activeAudioSink_;
             converter = activeAudioFrameConverter_;
             stretcher = activeAudioTimeStretcher_;
+            processor = activeAudioFrameProcessor_;
             serial = appliedAudioSinkSerial_;
             hasClock = audioSinkHasClock_;
             converterOpen = audioFrameConverterOpen_;
             stretcherOpen = audioTimeStretcherOpen_;
+            processorOpen = audioFrameProcessorOpen_;
             playbackRate = playbackRate_;
         }
         if (!sink) {
@@ -7792,13 +8189,27 @@ private:
             std::int64_t submittedUntil = 0;
             AudioSinkClock clock;
         };
-        auto submit = [&sink, hasClock](
-                          const AudioTimeStretchResult& result) {
+        auto submit = [this, &sink, hasClock, processorOpen](
+                          const std::vector<AudioBufferView>& buffers) {
             AudioSubmission submission;
-            submission.written = result.success;
-            for (const auto& buffer : result.buffers) {
-                if (!buffer.isValid()) {
-                    continue;
+            for (const auto& buffer : buffers) {
+                if (!buffer.isValid()
+                    || (processorOpen
+                        && (!sameAudioFormat(
+                                buffer.format,
+                                audioProcessorFormat_)
+                            || buffer.duration < 0
+                            || (audioProcessorHasTimestamp_
+                                && buffer.timestamp
+                                    < audioProcessorLastTimestamp_)))) {
+                    submission.written = false;
+                    break;
+                }
+                if (processorOpen) {
+                    audioProcessorOutputSamples_ +=
+                        buffer.samplesPerChannel;
+                    audioProcessorLastTimestamp_ = buffer.timestamp;
+                    audioProcessorHasTimestamp_ = true;
                 }
                 if (!sink->write(buffer)) {
                     submission.written = false;
@@ -7817,6 +8228,66 @@ private:
                 submission.clock = sink->clock();
             }
             return submission;
+        };
+        struct ProcessedSubmission {
+            bool success = true;
+            std::string error;
+            AudioSubmission submission;
+        };
+        auto processAndSubmit = [this,
+                                 &processor,
+                                 processorOpen,
+                                 &submit](
+                                    const std::vector<AudioBufferView>& inputs) {
+            ProcessedSubmission result;
+            for (const auto& input : inputs) {
+                AudioProcessingResult processed { true, {}, {} };
+                if (processor && processorOpen) {
+                    if (!input.isValid()
+                        || !sameAudioFormat(
+                            input.format,
+                            audioProcessorFormat_)) {
+                        result.success = false;
+                        result.error =
+                            "The audio frame processor received an invalid "
+                            "or renegotiated format";
+                        break;
+                    }
+                    audioProcessorInputSamples_ += input.samplesPerChannel;
+                    processed = processor->process(input);
+                } else {
+                    processed.buffers.push_back(input);
+                }
+                if (!processed.success || processed.buffers.size() > 32) {
+                    result.success = false;
+                    result.error = processed.error;
+                    if (result.error.empty()
+                        && processed.buffers.size() > 32) {
+                        result.error =
+                            "The audio frame processor produced more than 32 "
+                            "buffers for one input";
+                    }
+                    break;
+                }
+                const auto submitted = submit(processed.buffers);
+                result.submission.written =
+                    result.submission.written && submitted.written;
+                if (submitted.submitted) {
+                    if (!result.submission.submitted) {
+                        result.submission.submittedStart =
+                            submitted.submittedStart;
+                        result.submission.submitted = true;
+                    }
+                    result.submission.submittedUntil = std::max(
+                        result.submission.submittedUntil,
+                        submitted.submittedUntil);
+                }
+                result.submission.clock = submitted.clock;
+                if (!submitted.written) {
+                    break;
+                }
+            }
+            return result;
         };
         auto cacheSubmission = [this,
                                 hasClock,
@@ -7844,8 +8315,8 @@ private:
             bool converterFinished = false;
             for (int iteration = 0; iteration < 32; ++iteration) {
                 AudioConversionResult converted;
-                AudioTimeStretchResult processed { true, {}, {} };
-                AudioSubmission submission;
+                AudioTimeStretchResult stretched { true, {}, {} };
+                ProcessedSubmission processed;
                 const auto generation = presentationGeneration_.load(
                     std::memory_order_acquire);
                 {
@@ -7855,17 +8326,17 @@ private:
                     if (converted.success
                         && converted.buffer.isValid()) {
                         if (stretcher && stretcherOpen) {
-                            processed = stretcher->process(
+                            stretched = stretcher->process(
                                 converted.buffer);
                         } else {
-                            processed.buffers.push_back(converted.buffer);
+                            stretched.buffers.push_back(converted.buffer);
                         }
                     }
-                    if (converted.success && processed.success) {
-                        submission = submit(processed);
+                    if (converted.success && stretched.success) {
+                        processed = processAndSubmit(stretched.buffers);
                     }
                 }
-                cacheSubmission(submission, generation);
+                cacheSubmission(processed.submission, generation);
                 if (!converted.success) {
                     publishEvent({
                         "audio.converter.drain",
@@ -7876,17 +8347,27 @@ private:
                     });
                     return false;
                 }
-                if (!processed.success) {
+                if (!stretched.success) {
                     publishEvent({
                         "audio.time_stretch.process",
-                        processed.error.empty()
+                        stretched.error.empty()
                             ? "The audio time stretcher rejected drained PCM"
+                            : stretched.error,
+                        AVERROR_EXTERNAL,
+                    });
+                    return false;
+                }
+                if (!processed.success) {
+                    publishEvent({
+                        "audio.processor.process",
+                        processed.error.empty()
+                            ? "The audio frame processor rejected drained PCM"
                             : processed.error,
                         AVERROR_EXTERNAL,
                     });
                     return false;
                 }
-                if (!submission.written) {
+                if (!processed.submission.written) {
                     publishEvent({
                         "audio.sink.write",
                         "The audio sink rejected a drained audio buffer",
@@ -7913,7 +8394,7 @@ private:
             bool stretcherFinished = false;
             for (int iteration = 0; iteration < 32; ++iteration) {
                 AudioTimeStretchResult result;
-                AudioSubmission submission;
+                ProcessedSubmission processed;
                 const auto generation = presentationGeneration_.load(
                     std::memory_order_acquire);
                 {
@@ -7921,10 +8402,10 @@ private:
                         audioSinkCallMutex_);
                     result = stretcher->drain();
                     if (result.success) {
-                        submission = submit(result);
+                        processed = processAndSubmit(result.buffers);
                     }
                 }
-                cacheSubmission(submission, generation);
+                cacheSubmission(processed.submission, generation);
                 if (!result.success) {
                     publishEvent({
                         "audio.time_stretch.drain",
@@ -7935,7 +8416,18 @@ private:
                     });
                     return false;
                 }
-                if (!submission.written) {
+                if (!processed.success) {
+                    publishEvent({
+                        "audio.processor.process",
+                        processed.error.empty()
+                            ? "The audio frame processor rejected stretched "
+                              "drain output"
+                            : processed.error,
+                        AVERROR_EXTERNAL,
+                    });
+                    return false;
+                }
+                if (!processed.submission.written) {
                     publishEvent({
                         "audio.sink.write",
                         "The audio sink rejected stretched drain output",
@@ -7953,6 +8445,65 @@ private:
                     "audio.time_stretch.drain",
                     "The audio time stretcher did not finish draining",
                     AVERROR_EXTERNAL,
+                });
+                return false;
+            }
+        }
+
+        if (processor && processorOpen) {
+            bool processorFinished = false;
+            for (int iteration = 0; iteration < 32; ++iteration) {
+                AudioProcessingResult result;
+                AudioSubmission submission;
+                const auto generation = presentationGeneration_.load(
+                    std::memory_order_acquire);
+                {
+                    std::lock_guard<std::mutex> sinkLock(
+                        audioSinkCallMutex_);
+                    result = processor->drain();
+                    if (result.success && result.buffers.size() <= 32) {
+                        submission = submit(result.buffers);
+                    }
+                }
+                cacheSubmission(submission, generation);
+                if (!result.success || result.buffers.size() > 32) {
+                    publishEvent({
+                        "audio.processor.drain",
+                        result.error.empty()
+                            ? "The audio frame processor could not be drained"
+                            : result.error,
+                        AVERROR_EXTERNAL,
+                    });
+                    return false;
+                }
+                if (!submission.written) {
+                    publishEvent({
+                        "audio.sink.write",
+                        "The audio sink rejected processor drain output",
+                        AVERROR_EXTERNAL,
+                    });
+                    return false;
+                }
+                if (result.buffers.empty()) {
+                    processorFinished = true;
+                    break;
+                }
+            }
+            if (!processorFinished) {
+                publishEvent({
+                    "audio.processor.drain",
+                    "The audio frame processor did not finish draining",
+                    AVERROR_EXTERNAL,
+                });
+                return false;
+            }
+            if (audioProcessorInputSamples_
+                != audioProcessorOutputSamples_) {
+                publishEvent({
+                    "audio.processor.samples",
+                    "The audio frame processor changed the completed "
+                    "segment sample count",
+                    AVERROR_INVALIDDATA,
                 });
                 return false;
             }
@@ -8081,8 +8632,11 @@ private:
         if (!waitForAudioQueueDrained(generation)) {
             return;
         }
-        drainAudioPipeline();
-        drainAudioSink();
+        if (!drainAudioPipeline() || !drainAudioSink()
+            || !drainVideoFrameProcessor()) {
+            stopPlayback(false, true);
+            return;
+        }
         if (!waitForPresentationDrained(generation)
             || generation
                 != presentationGeneration_.load(std::memory_order_acquire)) {
@@ -8147,6 +8701,7 @@ private:
             resetClockLocked(currentPosition_);
         }
         closeAudioSink(false);
+        closeVideoFrameProcessor();
         publishState(State::Stopped);
         publishStatus(invalid
                 ? MediaStatus::Invalid
@@ -8300,6 +8855,7 @@ private:
     mutable std::mutex renderBindingsMutex_;
     mutable std::mutex videoFrameSnapshotMutex_;
     mutable std::mutex audioSinkCallMutex_;
+    mutable std::mutex videoProcessorCallMutex_;
     mutable std::mutex audioClockMutex_;
     mutable std::mutex audioQueueMutex_;
     mutable std::mutex audioPacketMutex_;
@@ -8439,6 +8995,8 @@ private:
     std::shared_ptr<AudioFrameConverter> activeAudioFrameConverter_;
     std::shared_ptr<AudioTimeStretcher> audioTimeStretcher_;
     std::shared_ptr<AudioTimeStretcher> activeAudioTimeStretcher_;
+    std::shared_ptr<AudioFrameProcessor> audioFrameProcessor_;
+    std::shared_ptr<AudioFrameProcessor> activeAudioFrameProcessor_;
     std::uint64_t audioSinkSerial_ = 1;
     std::uint64_t appliedAudioSinkSerial_ = 0;
     bool audioSinkOpen_ = false;
@@ -8446,6 +9004,19 @@ private:
     bool audioSinkHasClock_ = false;
     bool audioFrameConverterOpen_ = false;
     bool audioTimeStretcherOpen_ = false;
+    bool audioFrameProcessorOpen_ = false;
+    AudioFormat audioProcessorFormat_;
+    std::int64_t audioProcessorInputSamples_ = 0;
+    std::int64_t audioProcessorOutputSamples_ = 0;
+    std::int64_t audioProcessorLastTimestamp_ = 0;
+    bool audioProcessorHasTimestamp_ = false;
+    std::shared_ptr<VideoFrameProcessor> videoFrameProcessor_;
+    std::shared_ptr<VideoFrameProcessor> activeVideoFrameProcessor_;
+    std::uint64_t videoFrameProcessorSerial_ = 1;
+    std::uint64_t activeVideoFrameProcessorSerial_ = 0;
+    VideoProcessorFormat activeVideoProcessorFormat_;
+    bool videoFrameProcessorOpen_ = false;
+    bool videoFrameProcessorBypass_ = false;
     std::shared_ptr<const RenderBindingsSnapshot> renderBindings_ =
         std::make_shared<const RenderBindingsSnapshot>();
     std::shared_ptr<const VideoFrameSnapshot> currentVideoFrameSnapshot_;
@@ -8666,6 +9237,20 @@ Player& Player::setAudioTimeStretcher(
     std::shared_ptr<AudioTimeStretcher> stretcher)
 {
     impl_->setAudioTimeStretcher(std::move(stretcher));
+    return *this;
+}
+
+Player& Player::setAudioFrameProcessor(
+    std::shared_ptr<AudioFrameProcessor> processor)
+{
+    impl_->setAudioFrameProcessor(std::move(processor));
+    return *this;
+}
+
+Player& Player::setVideoFrameProcessor(
+    std::shared_ptr<VideoFrameProcessor> processor)
+{
+    impl_->setVideoFrameProcessor(std::move(processor));
     return *this;
 }
 

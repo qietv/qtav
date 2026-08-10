@@ -17,6 +17,8 @@ namespace qtav {
 class AudioSink;
 class AudioFrameConverter;
 class AudioTimeStretcher;
+class AudioFrameProcessor;
+class VideoFrameProcessor;
 class VideoRenderAPI;
 
 // Playback counters accumulated since the current media was set. Video fields
@@ -300,6 +302,16 @@ public:
     // the original PCM and are not processed by this stage.
     Player& setAudioTimeStretcher(
         std::shared_ptr<AudioTimeStretcher> stretcher);
+    // Installs an optional format- and timeline-preserving PCM-effect stage
+    // after conversion/time stretch and before device output. Decoded audio
+    // callbacks retain the original PCM.
+    Player& setAudioFrameProcessor(
+        std::shared_ptr<AudioFrameProcessor> processor);
+    // Installs an optional synchronous video transform. A live replacement
+    // reopens seekable media at the current position so one presentation
+    // generation never mixes processor configurations.
+    Player& setVideoFrameProcessor(
+        std::shared_ptr<VideoFrameProcessor> processor);
     Player& setHardwareDecodeConfig(HardwareDecodeConfig config);
     HardwareDecodeConfig hardwareDecodeConfig() const;
     Player& setVideoFrameScheduler(VideoFrameScheduler scheduler);

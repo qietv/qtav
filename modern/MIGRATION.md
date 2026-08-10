@@ -248,6 +248,24 @@ the final sink close; the default implementation is a no-op for existing
 synchronous or non-queuing sinks. The CPU renderer currently supports
 full-surface `Stretch` rendering with no rotation.
 
+Legacy `AudioFilter`/`VideoFilter` subclasses do not migrate as mutable Qt frame
+callbacks. Use `Player::setAudioFrameProcessor()` for streaming, negotiated-PCM
+effects after conversion and time stretch. Use
+`Player::setVideoFrameProcessor()` for synchronous one-to-one transforms after
+direct frame scheduling declines the frame and before ordinary presentation.
+Audio processors may buffer but must preserve format, timeline order, and total
+segment sample count. Video processors may change pixels, geometry, software
+format, and color metadata but must preserve one input timestamp/duration in
+one output frame. Render-thread GPU effects remain `VideoRenderAPI` work; queued
+cadence conversion is deliberately not implied by either first contract.
+
+`QtAV::AudioFilter` provides `VolumeAudioFrameProcessor` as a narrow reference
+backend. It owns an FFmpeg `volume` graph and exposes only a fixed linear gain,
+not FFmpeg types or arbitrary filter descriptions. Decoded audio callbacks stay
+upstream of processing, while ordinary video callbacks receive the processed
+frame. Applications that only inspect raw decoded frames need not install a
+processor.
+
 On Windows, `WasapiAudioSink` follows the default multimedia render endpoint
 or accepts an explicit owning `WasapiEndpointId`. It negotiates interleaved
 Float32 mono/stereo PCM at the endpoint mix rate, so decoded formats normally
@@ -700,6 +718,13 @@ implementation.
   switch, and media replacement cancel a pending read-retry wait;
 - `setVideoFrameScheduler()` runs on the video-decode worker before ordinary video
   delivery; an accepted frame is not sent to `onVideoFrame()` or renderers;
+- `VideoFrameProcessor::open/process/reset/drain/close` are serialized on the
+  video-decode/lifecycle boundary after a scheduler declines the frame and
+  before the presentation queue. Processing is synchronous; do not wait on a
+  render thread or retain non-owning input data;
+- `AudioFrameProcessor::open/process/drain/reset/close` are serialized with the
+  converter, time stretcher, and sink on the audio-output/lifecycle boundary.
+  Returned buffer storage must remain valid through the synchronous sink write;
 - `LivePlaybackPolicy` is an opt-in presentation-worker policy. It bounds the
   queued decoded-video window, retains its newest timestamps under pressure,
   and uses the configured late threshold to catch video up to the existing

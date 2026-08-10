@@ -454,13 +454,39 @@ the raw OpenGL ES half of the Dolby Vision route. The strict Vulkan half stays
 open because the tested devices report the P010 consumer buffer only as
 `VK_FORMAT_UNDEFINED` plus an opaque external-format ID.
 
+## General processing architecture
+
+General effects are optional core contracts, not a new ownership layer.
+`AudioFrameProcessor` runs on the audio-output worker after negotiated format
+conversion and pitch-preserving time stretch, and before the sink. It can
+buffer PCM, but it preserves format, media-timeline order, and the completed
+segment's physical sample count. The core serializes process, reset, drain, and
+close without holding the player mutex. The optional `QtAV::AudioFilter`
+reference target owns its FFmpeg `volume` graph; FFmpeg types and arbitrary
+filter descriptions do not cross the core boundary.
+
+`VideoFrameProcessor` is a synchronous one-to-one transform on the video-decode
+worker. Direct `VideoFrameScheduler` handling has priority; a declined frame is
+processed before it enters ordinary presentation. The transform may change
+software pixels, geometry, format, and color metadata, but preserves timestamp
+and duration. It cannot queue delayed frames. Cadence conversion therefore
+requires a future queued contract, while graphics-context effects remain owned
+by `VideoRenderAPI` on the native render thread.
+
+Pause/resume preserves processor state. Timeline discontinuities reset it,
+natural completion drains it, and track/media or live processor replacement
+closes it at a clean serialized generation boundary. Processor failure is
+fail-closed and reported through a categorized media event.
+
 ## Audio architecture
 
 `AudioSink` is a platform-neutral lifecycle and timing contract. Decoded PCM
 crosses a bounded queue to an audio-output worker. If the device negotiates a
 different format, `QtAV::AudioResample` performs conversion. For a non-1.0
 playback rate, an injected `AudioTimeStretcher` then changes the physical PCM
-sample count without changing pitch or media timestamps before submission.
+sample count without changing pitch or media timestamps. An injected
+`AudioFrameProcessor` then applies format- and timeline-preserving effects
+before submission.
 
 `QtAV::AudioTimeStretch` is the reference implementation and owns an FFmpeg
 `atempo` graph. It is a separate optional target; core owns only the streaming

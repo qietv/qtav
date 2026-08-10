@@ -171,6 +171,11 @@ Current backend integration boundary:
   `Player::setAudioTimeStretcher()` after PCM conversion and before the sink;
   `QtAV::AudioTimeStretch` supplies the FFmpeg `atempo` implementation for
   pitch-preserving rates other than 1.0, while 1.0 bypasses the stage;
+- `AudioFrameProcessor` adds an optional streaming PCM-effect stage after time
+  stretch, while `VideoFrameProcessor` adds an optional synchronous software-
+  frame transform after direct scheduling declines a frame and before ordinary
+  presentation; `QtAV::AudioFilter` supplies the narrow FFmpeg-backed constant-
+  gain reference implementation;
 - `QtAV::AudioFile` writes negotiated interleaved PCM to a standard RIFF/WAVE
   file for diagnostics without becoming a playback clock;
 - `QtAV::SubtitleLibass` consumes the ASS header/events retained by
@@ -407,7 +412,7 @@ clear error. Current switches are:
   `QTAV_RENDER_VULKAN`, and `QTAV_RENDER_D3D11`;
 - audio: `QTAV_AUDIO_WASAPI`, `QTAV_AUDIO_AAUDIO`,
   `QTAV_AUDIO_OHAUDIO`, `QTAV_AUDIO_RESAMPLE`,
-  `QTAV_AUDIO_TIMESTRETCH`, and `QTAV_AUDIO_FILE`;
+  `QTAV_AUDIO_TIMESTRETCH`, `QTAV_AUDIO_FILTER`, and `QTAV_AUDIO_FILE`;
 - subtitle: `QTAV_SUBTITLE_LIBASS`;
 - hardware decode: `QTAV_HW_D3D11VA`, `QTAV_HW_MEDIACODEC`, and
   `QTAV_HW_OHCODEC`;
@@ -430,6 +435,8 @@ backend explicitly,
 `QTAV_AUDIO_RESAMPLE=AUTO` builds the PCM converter when libswresample is
 available, `QTAV_AUDIO_TIMESTRETCH=AUTO` builds the pitch-preserving
 `QtAV::AudioTimeStretch` backend when libavfilter is available,
+`QTAV_AUDIO_FILTER=AUTO` builds the format-preserving `QtAV::AudioFilter`
+reference backend when libavfilter is available,
 `QTAV_AUDIO_FILE=AUTO` builds the dependency-free diagnostic sink,
 `QTAV_SUBTITLE_LIBASS=AUTO` builds `QtAV::SubtitleLibass` when libass 0.17.0
 or newer is available,
@@ -635,15 +642,19 @@ semantics, diagnostics, and manual test guidance.
 #include <qtav/player.h>
 #include <qtav/atempo_audio_time_stretcher.h>
 #include <qtav/swresample_audio_converter.h>
+#include <qtav/volume_audio_frame_processor.h>
 
 qtav::Player player;
 auto converter = std::make_shared<qtav::SwresampleAudioConverter>();
 auto timeStretcher =
     std::make_shared<qtav::AtempoAudioTimeStretcher>();
+auto audioProcessor =
+    std::make_shared<qtav::VolumeAudioFrameProcessor>(0.75);
 
 player
     .setAudioFrameConverter(converter)
     .setAudioTimeStretcher(timeStretcher)
+    .setAudioFrameProcessor(audioProcessor)
     .setAudioSink(audioSink)
     .onVideoFrame([](const qtav::VideoFrame& frame, int track) {
         // Inspect, filter, or forward the decoded frame.
@@ -1025,6 +1036,52 @@ track/external-audio changes, loop or range transitions, media replacement,
 and stop discard buffered processor state; natural segment end drains the
 converter, then the time stretcher, then the sink. Calls are serialized with
 conversion and sink writes on the existing audio-output/lifecycle boundary.
+
+### General audio and video processing
+
+`AudioFrameProcessor` is the first general audio-effect boundary. Player opens
+it with the sink's negotiated PCM format after conversion and time stretch, and
+calls it before `AudioSink::write()`. A processor may buffer input and return
+zero or more processor-owned `AudioBufferView` objects. Output must preserve the
+opened format, media-timeline order, and the completed segment's physical sample
+count. This supports gain, equalization, channel balance, and analysis with
+passthrough output without assigning device ownership or playback-rate control
+to the effect. Decoded `onAudioFrame()` callbacks remain upstream and receive
+the original decoder PCM.
+
+`VideoFrameProcessor` is intentionally narrower: it is synchronous and
+one-input/one-output on the video-decode worker. Player calls an accepted
+`setVideoFrameScheduler()` first because direct codec-surface presentation owns
+that frame. If the scheduler declines it, the processor runs before the normal
+presentation queue, `onVideoFrame()`, and renderers. A non-bypass result may
+change pixels, software format, geometry, and color metadata, but it must return
+one valid frame with exactly the input timestamp and duration. Queued cadence
+conversion is not part of this contract, and graphics-context effects remain a
+`VideoRenderAPI` responsibility on the application's render thread.
+
+Both contracts are optional and their public headers contain no FFmpeg,
+graphics, Qt, or platform SDK type. Pause/resume preserves state. Prepare,
+seek, loop/range discontinuities, and stop reset buffered state; track/media or
+live processor replacement closes and reopens the affected stage at a clean
+generation boundary. Natural completion drains downstream in order. Format-
+level and per-frame video bypass are explicit. Contract violations and backend
+failures report `audio.processor.*` or `video.processor.*` events and close the
+affected output path instead of silently forwarding partially processed data.
+
+For a minimal reference implementation, link `QtAV::AudioFilter`:
+
+```cpp
+#include <qtav/volume_audio_frame_processor.h>
+
+player.setAudioFrameProcessor(
+    std::make_shared<qtav::VolumeAudioFrameProcessor>(0.5));
+```
+
+`VolumeAudioFrameProcessor` owns an FFmpeg `volume` graph, accepts interleaved
+U8, S16, S32, Float32, or Float64 PCM, and applies a fixed non-negative linear
+gain without changing format, sample count, timestamps, or duration. It does
+not expose arbitrary FFmpeg graph strings; applications needing a different
+effect implement the core contract or provide another optional backend.
 
 ### WASAPI device sink
 
@@ -2403,6 +2460,18 @@ physical device PCM, while timestamps and durations remain media time.
 `QtAV::AudioTimeStretch` implements this contract with FFmpeg's `atempo`
 filter. The core links no mandatory DSP library and bypasses the stage exactly
 at rate 1.0.
+
+`AudioFrameProcessor` follows time stretch and precedes the sink. Its output
+storage remains valid through the synchronous sink write, and it may buffer PCM
+until `drain()`. Player verifies format, monotonic timestamps, bounded output,
+and equal completed-segment sample counts. `QtAV::AudioFilter` implements a
+constant-gain reference processor with an internal FFmpeg `volume` graph.
+
+`VideoFrameProcessor` runs synchronously after an optional direct
+`VideoFrameScheduler` declines the frame and before the presentation queue. It
+has explicit format/per-frame bypass and preserves timestamp and duration in a
+strict one-to-one result. Reset/drain/close are serialized with processing;
+render-thread effects and delayed cadence transforms are separate contracts.
 
 `QtAV::AudioFile` implements `WavAudioSink`. It negotiates interleaved U8, S16,
 S32, float, or double PCM, writes a little-endian RIFF/WAVE stream, and

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <qtav/audio_converter.h>
+#include <qtav/audio_processor.h>
 #include <qtav/audio_sink.h>
 #include <qtav/audio_time_stretcher.h>
 #include <qtav/hardware_frame.h>
+#include <qtav/video_processor.h>
 #include <qtav/video_render_api.h>
 
 #include <cstddef>
@@ -37,6 +39,8 @@ bool AudioSink::drain()
 
 AudioFrameConverter::~AudioFrameConverter() = default;
 AudioTimeStretcher::~AudioTimeStretcher() = default;
+AudioFrameProcessor::~AudioFrameProcessor() = default;
+VideoFrameProcessor::~VideoFrameProcessor() = default;
 
 AudioFormat audioFormat(const AudioFrame& frame)
 {
@@ -66,6 +70,21 @@ AudioBufferView audioBufferView(const AudioFrame& frame)
         result.lineSizes.push_back(frame.lineSize(plane));
     }
     return result;
+}
+
+VideoProcessorFormat videoProcessorFormat(const VideoFrame& frame) noexcept
+{
+    if (!frame) {
+        return {};
+    }
+    const auto hardware = frame.hardwareFrame();
+    return {
+        frame.width(),
+        frame.height(),
+        frame.format(),
+        frame.hasHardwareFrame(),
+        hardware ? hardware.deviceType() : HardwareDeviceType::Unknown,
+    };
 }
 
 HardwareFrame::HardwareFrame(std::shared_ptr<const HardwareFrameData> data)

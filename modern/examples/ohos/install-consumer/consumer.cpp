@@ -8,6 +8,7 @@
 #include <qtav/ohos_vulkan_video_renderer.h>
 #include <qtav/ohaudio_audio_sink.h>
 #include <qtav/swresample_audio_converter.h>
+#include <qtav/volume_audio_frame_processor.h>
 
 #include <memory>
 #include <string>
@@ -20,6 +21,7 @@ int qtav_ohos_render_install_consumer()
         qtav::OpenGLOutputPreference::SdrOnly);
     qtav::OHAudioAudioSink audioSink;
     qtav::SwresampleAudioConverter audioConverter;
+    qtav::VolumeAudioFrameProcessor audioFilter(0.5);
     qtav::MobileRendererSelectorConfig selectorConfig;
     selectorConfig.openGLES = [] {
         return qtav::MobileRendererCandidate {
@@ -62,6 +64,7 @@ int qtav_ohos_render_install_consumer()
             && audioCapabilities.hasDeviceClock
             && audioCapabilities.supportsPause
             && audioCapabilities.maximumChannels == 2
+            && audioFilter.gain() == 0.5
             && audioConverter.open(
                 { 48'000, 1, qtav::SampleFormat::Float, "mono" },
                 { 48'000, 2, qtav::SampleFormat::Float, "stereo" })

@@ -77,38 +77,44 @@ The following accepted decisions constrain all remaining work:
   installed-package consumption, WinUI integration, and OHOS static/shared
   cross-builds pass. Android arm64/API 28 static/shared cross-builds also pass
   against the locally built and verified repository dependency prefix.
+- General processing is implemented through optional Qt-free
+  `AudioFrameProcessor` and `VideoFrameProcessor` contracts. The bounded audio
+  stage supports buffered zero-or-more output before the sink; the synchronous
+  video stage supports explicit format/frame bypass before ordinary
+  presentation. The optional `QtAV::AudioFilter` volume backend, deterministic
+  lifecycle/failure tests, and Windows/Android/OHOS static/shared package
+  consumption pass.
 
-## Next task — define general filter and processing contracts
+## Next task — formalize the core C++ API and CMake package version contract
 
-- [ ] Define optional audio/video filter and processing contracts without
-  adding a mandatory DSP, FFmpeg, graphics, or platform dependency to core.
+- [ ] Audit and formalize the existing QtAVCore 2.0.0 project/package version
+  without changing runtime behavior or prematurely introducing a plugin ABI.
 
-The completed time-stretch boundary is the first concrete processing stage: it
-remains separate from audio-device ownership and from the existing channel-
-layout/sample-format/sample-rate conversion responsibility of
-`QtAV::AudioResample`. Generalize only the lifecycle and ownership concepts that
-are shared by real filter use cases; do not turn `AudioTimeStretcher` into a
-generic byte/frame callback or expose FFmpeg filter types in public headers.
+Keep C++ source compatibility, shared-library ABI compatibility, package
+discovery compatibility, and any future runtime plugin ABI as separate claims.
+This task versions the currently exported C++ libraries and CMake package; it
+does not authorize dynamic plugin loading or a stable C ABI.
 
 Acceptance criteria:
 
-1. [ ] Identify the first supported audio and video filter use cases, their
-   insertion points, frame/timestamp semantics, and whether processing is
-   synchronous, queued, or application-scheduled.
-2. [ ] Keep processing contracts optional, Qt-free, and free of FFmpeg and
-   platform SDK types; preserve reference-counted frame lifetime and existing
-   backend responsibility boundaries.
-3. [ ] Define reset, drain, discontinuity, seek, track switch, loop/range,
-   media replacement, stop, and natural-end behavior before implementation.
-4. [ ] Add deterministic contract tests for ordering, timestamps, bypass,
-   backpressure, failure, and lifecycle; add one narrow reference backend only
-   after its dependency and ownership boundary are accepted.
-5. [ ] Pass proportional Windows tests and Android/OHOS static/shared
-   cross-builds, installed-package consumption where targets are exported, and
-   update public API/migration/threading documentation.
+1. [ ] Confirm whether 2.0.0 is the intended first rewrite release, then define
+   compatibility promises and increment rules for public C++ headers, shared
+   libraries, exported CMake targets, and package-config discovery.
+2. [ ] Make the project/package version available to CMake consumers and
+   application code without exposing build-system or platform types through
+   core public headers.
+3. [ ] Give shared targets coherent version metadata on supported platforms;
+   do not claim cross-compiler C++ ABI compatibility or add a runtime plugin
+   boundary.
+4. [ ] Add deterministic build/package tests for exact, compatible, and
+   rejected version requests plus a separate installed-package consumer.
+5. [ ] Pass proportional Windows static/shared tests and Android/OHOS
+   static/shared cross-build/package checks, then document upgrade and release
+   policy in the public, migration, architecture, and decision records that own
+   it.
 
 Detailed implementation and validation evidence is in
-[`PLAN_HISTORY_2026-08-10_AUDIO_TIME_STRETCH.md`](PLAN_HISTORY_2026-08-10_AUDIO_TIME_STRETCH.md).
+[`PLAN_HISTORY_2026-08-10_PROCESSING_CONTRACTS.md`](PLAN_HISTORY_2026-08-10_PROCESSING_CONTRACTS.md).
 
 ## Active incomplete and external gates
 
@@ -178,7 +184,7 @@ rendering.
 AD-019 keeps optional backends in this repository as compile-time targets while
 interfaces evolve. The remaining release work is:
 
-- [ ] Version the core C++ API and CMake package.
+- [ ] Version the core C++ API and CMake package (current local task above).
 - [ ] Add continuous integration for all supported host/target combinations.
 - [ ] Define a versioned C ABI only if runtime-loaded plugins become necessary.
 - [ ] Split a backend into another repository only when it has an independent
@@ -224,12 +230,13 @@ is intentionally short:
 | Milestone 6: Android Vulkan/OpenGL ES/MediaCodec/AAudio | Complete and retained as the mobile regression baseline |
 | Milestone 7: OHOS production path | Implemented through current opaque-format policy; explicit-plane strict Vulkan and broader validation remain open above |
 | Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step, pitch-preserving time-stretch | Complete and verified on Windows plus Android/OHOS static/shared cross-builds |
+| General audio/video processing contracts and reference volume filter | Complete and verified on Windows plus Android/OHOS static/shared package consumption |
 | Milestone 10: software Dolby decode and HDR/Dolby Vision metadata paths | Partial; passthrough, Atmos, strict OHOS Vulkan, licensing, and certification remain open |
 
 ## Task selection rules
 
-1. Define the general filter and processing contracts unless the user gives a
-   different priority.
+1. Formalize the core C++ API and CMake package version contract unless the
+   user gives a different priority.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.
 3. The external Intel workstream may proceed in parallel on its designated

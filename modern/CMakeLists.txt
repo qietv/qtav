@@ -78,6 +78,9 @@ if(QTAV_CORE_INSTALL)
     if(TARGET qtav_audio_timestretch)
         list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS avfilter)
     endif()
+    if(TARGET qtav_audio_filter)
+        list(APPEND QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS avfilter)
+    endif()
     if(TARGET qtav_render_vulkan)
         set(QTAV_CORE_PACKAGE_NEEDS_VULKAN TRUE)
     endif()
@@ -89,6 +92,7 @@ if(QTAV_CORE_INSTALL)
     if(TARGET qtav_subtitle_libass)
         set(QTAV_CORE_PACKAGE_NEEDS_LIBASS TRUE)
     endif()
+    list(REMOVE_DUPLICATES QTAV_CORE_PACKAGE_FFMPEG_COMPONENTS)
 
     install(
         EXPORT QtAVCoreTargets

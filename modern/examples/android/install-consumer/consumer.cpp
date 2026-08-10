@@ -6,6 +6,7 @@
 #include <qtav/mediacodec_opengl_interop.h>
 #include <qtav/mediacodec_vulkan_interop.h>
 #include <qtav/mobile_video_renderer.h>
+#include <qtav/volume_audio_frame_processor.h>
 
 #include <memory>
 #include <string>
@@ -17,6 +18,7 @@ int qtav_android_opengl_install_consumer()
     qtav::AndroidOpenGLVideoRenderer renderer(
         qtav::OpenGLOutputPreference::PreferHdr);
     qtav::AAudioAudioSink audioSink;
+    qtav::VolumeAudioFrameProcessor audioFilter(0.5);
     const qtav::MediaCodecSurface emptyMediaCodecSurface;
     const qtav::HardwareDecodeConfig mediaCodecConfig =
         qtav::mediaCodecHardwareDecodeConfig(
@@ -47,6 +49,7 @@ int qtav_android_opengl_install_consumer()
             && audioCapabilities.supportsPause
             && audioCapabilities.hasDeviceClock
             && audioCapabilities.maximumChannels == 2
+            && audioFilter.gain() == 0.5
             && renderer.outputColorSpace()
                 == qtav::OpenGLOutputColorSpace::SdrSrgb
             && !renderer.hdrOutputActive()

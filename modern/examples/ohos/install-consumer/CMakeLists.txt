@@ -11,6 +11,7 @@ target_link_libraries(
     qtav_ohos_render_install_consumer
     PRIVATE
         QtAV::AudioOHAudio
+        QtAV::AudioFilter
         QtAV::AudioResample
         QtAV::HWOHCodec
         QtAV::InteropOHCodecOpenGL
