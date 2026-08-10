@@ -39,6 +39,10 @@ enum class SeekFlag : std::uint32_t {
     FromNow = 1U << 0U,
     KeyFrame = 1U << 1U,
     AnyFrame = 1U << 2U,
+    // Decode forward from the preceding keyframe and publish the first video
+    // frame whose timestamp is at or after the requested position. This takes
+    // precedence over KeyFrame and AnyFrame.
+    Accurate = 1U << 3U,
 };
 
 constexpr SeekFlag operator|(SeekFlag lhs, SeekFlag rhs) noexcept

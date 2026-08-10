@@ -32,6 +32,7 @@ those identifiers from the active headers.
 | `QtAV::AVPlayer` | `qtav::Player` |
 | `setFile(QString)` | `setMedia(std::string)` |
 | `play()`, `pause()`, `stop()` | `setState(qtav::State)` |
+| `AccurateSeek`, `stepForward()`, `stepBackward()` | `seek(position, SeekFlag::Accurate)`, `stepForward()`, `stepBackward()`; callbacks report the actual published frame timestamp |
 | Qt signals | `std::function` callbacks |
 | `QVariant` properties | string properties |
 | `VideoRenderer::receive()` | `onVideoFrame()` |
@@ -64,7 +65,8 @@ already own a graphics context or require multiple/custom render targets:
 ## Implemented
 
 - asynchronous load and playback state;
-- prepare, pause/resume, seek, stop, playback rate;
+- prepare, pause/resume, demux or explicit frame-accurate seek, asynchronous
+  forward/backward frame stepping, stop, playback rate;
 - A-B range and finite/infinite looping;
 - FFmpeg protocol and demux support;
 - two-layer network recovery: bounded FFmpeg HTTP(S) protocol retries followed
@@ -708,6 +710,22 @@ implementation.
   valid post-flush clock sample before playback time resumes, while
   callback-only playback resumes after the first new-generation item is
   delivered;
+- `SeekFlag::Accurate` on `seek()` or `prepare()` decodes from the preceding
+  keyframe and suppresses
+  pre-target video, audio, and subtitle delivery. Its callback remains on the
+  playback worker but runs only after the selected video frame is handed to
+  the video scheduler or presentation worker; it reports that actual frame
+  timestamp rather than merely echoing the request. The selected frame is the
+  immediate new presentation anchor and is exempt from ordinary late/queue
+  drops;
+- `stepForward()` and `stepBackward()` use the same generation and accurate-
+  decode boundary, keep the audio device paused, publish one adjacent video
+  frame through the normal scheduler/presentation path, and leave playback
+  paused. Backward stepping reconstructs exact predecessor history from the
+  active range start when no retained predecessor is available;
+- accepted seek, prepare, track-switch, and state requests take precedence
+  over concurrent natural-end teardown, preserving their asynchronous
+  completion contract;
 - initial playback still falls back to the monotonic clock after the first
   delivered buffer when a clock-capable sink has not yet produced a valid
   device-clock sample;
@@ -800,7 +818,7 @@ implementation.
    coverage using the same shared mobile contracts.
 7. Keep the completed audio/video/subtitle switching, plain-text callback, and
    optional libass rasterizer as the base for external tracks.
-8. Add frame stepping and accurate seek on top of the completed asynchronous
+8. Keep frame stepping and accurate seek covered on top of the asynchronous
    seek and generation contracts.
 
 Each backend should remain optional so the core library never acquires a GUI

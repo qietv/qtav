@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-09
+Last updated: 2026-08-10
 
 Status legend:
 
@@ -904,9 +904,10 @@ the presentation-timed plain-text callback, the optional libass renderer,
 external audio/subtitle sidecars, bounded packet buffering/status, and the
 opt-in low-latency live-video drop policy are complete, including the optional
 bounded system-temporary-file spill tier, explicit cache clearing, and bounded
-observable network-input recovery are complete. The next local implementation
-task is frame stepping and accurate seek; do not claim the device-gated strict
-Vulkan item complete without suitable hardware.
+observable network-input recovery plus frame stepping and explicit frame-
+accurate seek are complete. The next local implementation task is pitch-
+preserving audio time-stretch for playback rate; do not claim the device-gated
+strict Vulkan item complete without suitable hardware.
 
 AD-010 Windows visible-copy checkpoint:
 
@@ -3298,7 +3299,42 @@ Completed reconnect/recoverable-network checkpoint on 2026-08-09:
   policy/status/statistics API. Android arm64/API 28 and OHOS arm64/API 23
   static cores cross-build against their repository dependency packages.
 
-- [ ] Frame stepping and accurate seek.
+- [x] Frame stepping and accurate seek.
+
+Completed frame-step/accurate-seek checkpoint on 2026-08-10:
+
+- `SeekFlag::Accurate` on `seek()` or `prepare()` now seeks to a preceding
+  keyframe, suppresses pre-target video/audio/subtitle output, and publishes
+  the first decoded video frame at or after the requested position. Its
+  callback remains asynchronous on the playback worker and reports the actual
+  published frame timestamp;
+- paused accurate seek publishes through the existing video scheduler or
+  presentation worker without starting audio. Playing accurate seek preserves
+  play intent plus buffering/output-clock re-anchoring, and its completion can
+  interrupt an already-running end-of-stream drain before playback continues;
+- `stepForward()` and `stepBackward()` invalidate the old presentation
+  generation, keep the device paused, publish exactly one adjacent video frame,
+  and leave Player paused. Backward stepping uses retained predecessor history
+  or reconstructs it from the active range start;
+- deterministic 10 fps A/V coverage verifies paused accurate seek, history and
+  reconstructed-history backward stepping, repeated forward/backward stepping,
+  playing accurate seek from a video callback, actual-timestamp callbacks,
+  stale-generation rejection, position/state preservation, target-frame
+  protection from ordinary late/queue drops, and the absence of post-request
+  audio below the target. The core-only Release test also passes 100 consecutive
+  executions of this combined scenario.
+- seek/step requests publish their interrupt epoch and presentation generation
+  before the playback worker can consume them. Natural-end teardown rechecks
+  accepted control work at commit time, and the selected accurate frame is an
+  immediate, non-droppable presentation anchor, closing the request/EOF and
+  target-frame requeue races found by the repeated test;
+- final Windows validation passes the shared Release suite 50/50, the
+  all-optional-backends-disabled Release suite 23/23, a static Release
+  control/native-playback subset 8/8, and 20 consecutive frame-step/accurate-
+  seek executions in each static and shared configuration. Static/shared
+  installs contain the updated headers, a shared external consumer compiles,
+  links, and runs, and Android arm64/API 28 plus OHOS arm64/API 23 static cores
+  cross-build against their repository dependency packages.
 - [ ] Audio time-stretch for playback rate without pitch change.
 - [ ] Filter/plugin contracts.
 

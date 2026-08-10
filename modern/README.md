@@ -49,6 +49,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   D3D11, Vulkan, and OpenGL ES GPU renderers, including color conversion,
   Dolby Vision reshaping, tone/gamut mapping, scaling, and output encoding;
 - `prepare`, `seek`, pause/resume/stop, playback rate, A-B range, and loop;
+- explicit frame-accurate video seek plus asynchronous forward/backward frame
+  stepping that leaves playback paused;
 - media/track information, asynchronous post-load audio/video/subtitle track
   switching, and `avformat.*` property forwarding;
 - decoder-driven `setRenderCallback()` plus reason-aware render-thread
@@ -644,6 +646,45 @@ player.setExternalMedia(qtav::MediaType::Subtitle, "captions.srt");
 player.setMedia("movie.mkv");
 player.setState(qtav::State::Playing);
 ```
+
+Frame-accurate seek is explicit, so existing demux-level seek behavior remains
+unchanged:
+
+```cpp
+player.seek(
+    12'345,
+    qtav::SeekFlag::Accurate,
+    [](std::int64_t actualFrameTimestamp) {
+        // The selected video frame has now been published. The timestamp is
+        // the first decoded frame at or after 12,345 ms, or -1 on failure.
+    });
+
+player.stepForward();
+player.stepBackward();
+```
+
+`SeekFlag::Accurate` can be passed to `seek()` or `prepare()` and takes
+precedence over `KeyFrame` and `AnyFrame`. For an active video track, Player
+seeks to a preceding keyframe, decodes without
+publishing video frames before the target, and publishes the first frame whose
+timestamp is at or after it. Audio and subtitle frames below the same target
+remain suppressed for that presentation generation. A playing accurate seek
+retains play intent and the normal `Buffering -> Loaded` output re-anchor. In
+both playing and paused states, the selected frame is submitted immediately as
+the new presentation anchor and is not eligible for ordinary late-frame or
+queue-capacity dropping; paused playback remains paused. The callback runs on
+the playback worker after the selected frame has been handed to
+`setVideoFrameScheduler()` or the presentation worker, and receives the actual
+frame timestamp. With no active video track, accurate seek falls back to the
+completed demux seek because there is no video frame to refine.
+
+`stepForward()` and `stepBackward()` require loaded, seekable media with an
+active video track. They invalidate the old presentation generation, keep the
+audio device paused, publish exactly one adjacent video frame, and leave Player
+paused. Backward stepping reuses the retained predecessor when available;
+otherwise it asynchronously decodes from the active range start to identify
+the exact previous frame. The step callback receives the published timestamp,
+or `-1` at the corresponding media/range boundary.
 
 `setExternalMedia()` accepts `MediaType::Audio` or `MediaType::Subtitle`; an
 empty URL removes that sidecar. One input of each type may be configured, and
@@ -1576,8 +1617,16 @@ callback-only playback resumes when the first item from the new presentation
 generation is delivered. Audio-device underruns return to `Buffering` and
 freeze the fallback clock until the device clock re-anchors. Queue invalidation
 in the public `seek()` call does not wait for the presentation or audio workers
-to release their queue locks. HTTP(S) inputs additionally use a 15-second read
-timeout and bounded FFmpeg reconnect defaults, all overridable through
+to release their queue locks. Accurate seek completion interrupts any
+end-of-stream drain already running on the playback worker, delivers the
+`SeekCallback` there, and then resumes draining or playback. Paused accurate
+seek and frame stepping temporarily admit only the target video decode path;
+audio stays paused and the selected frame is still published by the normal
+video scheduler/presentation worker. Accepted seek, prepare, track-switch, or
+state requests win over concurrent natural-end teardown, so a request cannot
+report acceptance and then lose its callback to end-of-media cleanup. HTTP(S)
+inputs additionally use a 15-second read timeout and bounded FFmpeg reconnect
+defaults, all overridable through
 `avformat.*`. If the protocol still returns a recoverable error,
 `NetworkRecoveryPolicy` performs bounded fresh opens on the playback worker.
 Its timer wait is interruptible, and a successful read recovery invalidates the

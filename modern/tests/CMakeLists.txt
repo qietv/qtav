@@ -157,6 +157,13 @@ add_executable(qtav_core_control_test control_test.cpp)
 target_link_libraries(qtav_core_control_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_control_test PRIVATE cxx_std_17)
 
+add_executable(qtav_core_frame_step_seek_test frame_step_seek_test.cpp)
+target_link_libraries(qtav_core_frame_step_seek_test PRIVATE QtAV::Core)
+target_compile_features(
+    qtav_core_frame_step_seek_test
+    PRIVATE cxx_std_17
+)
+
 add_executable(
     qtav_core_network_recovery_test
     network_recovery_test.cpp
@@ -607,6 +614,43 @@ if(FFMPEG_EXECUTABLE)
     add_test(
         NAME qtav_core_control
         COMMAND qtav_core_control_test "${QTAV_CORE_TEST_MEDIA}"
+    )
+    set(
+        QTAV_CORE_FRAME_STEP_TEST_MEDIA
+        "${CMAKE_CURRENT_BINARY_DIR}/qtav-core-frame-step-test.mp4"
+    )
+    add_test(
+        NAME qtav_core_generate_frame_step_media
+        COMMAND
+            "${FFMPEG_EXECUTABLE}"
+            -hide_banner
+            -loglevel error
+            -y
+            -f lavfi
+            -i testsrc2=size=160x90:rate=10
+            -f lavfi
+            -i sine=frequency=440:sample_rate=48000
+            -t 3
+            -c:v mpeg4
+            -g 10
+            -c:a aac
+            "${QTAV_CORE_FRAME_STEP_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_generate_frame_step_media
+        PROPERTIES FIXTURES_SETUP qtav_core_frame_step_media
+    )
+    add_test(
+        NAME qtav_core_frame_step_seek
+        COMMAND
+            qtav_core_frame_step_seek_test
+            "${QTAV_CORE_FRAME_STEP_TEST_MEDIA}"
+    )
+    set_tests_properties(
+        qtav_core_frame_step_seek
+        PROPERTIES
+            FIXTURES_REQUIRED qtav_core_frame_step_media
+            TIMEOUT 20
     )
     set_tests_properties(
         qtav_core_control

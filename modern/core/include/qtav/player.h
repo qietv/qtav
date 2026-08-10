@@ -246,6 +246,12 @@ public:
         std::int64_t position,
         SeekFlag flags = SeekFlag::FromStart,
         SeekCallback callback = {});
+    // Publishes exactly one adjacent video frame and leaves playback paused.
+    // The callback receives that frame's timestamp, or -1 when no adjacent
+    // frame exists. Stepping requires loaded, seekable media with an active
+    // video track.
+    bool stepForward(SeekCallback callback = {});
+    bool stepBackward(SeekCallback callback = {});
 
     void setState(State state);
     State state() const;

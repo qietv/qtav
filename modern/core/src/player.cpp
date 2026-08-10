@@ -913,10 +913,49 @@ public:
     };
 
     struct SeekRequest {
+        enum class Kind {
+            Normal,
+            Accurate,
+            StepForward,
+            StepBackwardExact,
+            StepBackwardScan,
+        };
+
         std::uint64_t id = 0;
         std::int64_t position = 0;
+        std::int64_t selectionTarget = 0;
         SeekFlag flags = SeekFlag::FromStart;
+        Kind kind = Kind::Normal;
         SeekCallback callback;
+    };
+
+    struct AccurateSeekState {
+        std::uint64_t generation = 0;
+        std::int64_t target = 0;
+        SeekRequest::Kind kind = SeekRequest::Kind::Accurate;
+        bool pauseAfter = false;
+        bool selectionQueued = false;
+        VideoFrame previousCandidate;
+        VideoFrame candidateBeforePrevious;
+        SeekCallback callback;
+    };
+
+    struct SeekCompletion {
+        std::int64_t position = -1;
+        SeekCallback callback;
+    };
+
+    struct AccurateVideoDecision {
+        enum class Action {
+            DeliverNormally,
+            Drop,
+            DeliverSelected,
+        };
+
+        Action action = Action::DeliverNormally;
+        VideoFrame frame;
+        bool forceImmediate = false;
+        std::int64_t previousTimestamp = -1;
     };
 
     struct TrackSwitchRequest {
@@ -995,6 +1034,9 @@ public:
         SubtitleFrame subtitle;
         int track = -1;
         std::uint64_t generation = 0;
+        bool forceImmediate = false;
+        bool completesAccurateSeek = false;
+        std::int64_t previousVideoTimestamp = -1;
 
         std::int64_t timestamp() const noexcept
         {
@@ -1028,6 +1070,8 @@ public:
             prepareRequest_.reset();
             seekRequest_.reset();
             trackSwitchRequests_.clear();
+            accurateSeek_.reset();
+            seekCompletion_.reset();
             networkRecoveryStatus_ = {};
             if (url_.empty()) {
                 requestedState_ = State::Stopped;
@@ -1067,6 +1111,8 @@ public:
                 loadedSerial_ = 0;
                 seekRequest_.reset();
                 trackSwitchRequests_.clear();
+                accurateSeek_.reset();
+                seekCompletion_.reset();
                 prepareRequest_ = PrepareRequest {
                     ++requestSerial_,
                     reopenPosition,
@@ -1103,6 +1149,8 @@ public:
     {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            accurateSeek_.reset();
+            seekCompletion_.reset();
             prepareRequest_ = PrepareRequest {
                 ++requestSerial_,
                 std::max<std::int64_t>(0, startPosition),
@@ -1136,17 +1184,92 @@ public:
             if (mediaInfo_.duration > 0) {
                 target = std::min(target, mediaInfo_.duration);
             }
+            accurateSeek_.reset();
+            seekCompletion_.reset();
             seekRequest_ = SeekRequest {
                 ++requestSerial_,
                 target,
+                target,
                 flags,
+                hasFlag(flags, SeekFlag::Accurate)
+                    ? SeekRequest::Kind::Accurate
+                    : SeekRequest::Kind::Normal,
                 std::move(callback),
             };
+            // Publish the discontinuity before the playback worker can take
+            // the request. Otherwise a callback thread can unlock here, let
+            // the worker enter seekMedia(), and only then invalidate its new
+            // interrupt epoch or presentation generation.
+            interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+            invalidatePlaybackGeneration();
         }
-        invalidatePlaybackQueues();
-        interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        notifyPlaybackQueueInvalidation();
         controlChanged_.notify_all();
         return true;
+    }
+
+    bool stepFrame(bool forward, SeekCallback callback)
+    {
+        const auto snapshot = std::atomic_load_explicit(
+            &currentVideoFrameSnapshot_,
+            std::memory_order_acquire);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!hasOpenMedia_ || currentState_ == State::Stopped
+                || !mediaInfo_.seekable
+                || mediaInfo_.activeVideoTrack < 0) {
+                return false;
+            }
+
+            const auto generation = presentationGeneration_.load(
+                std::memory_order_acquire);
+            const bool snapshotCurrent = snapshot && snapshot->frame
+                && snapshot->generation == generation;
+            const auto reference = snapshotCurrent
+                ? snapshot->frame.timestamp()
+                : currentPosition_;
+            const bool exactPrevious = !forward
+                && lastPresentedVideoTimestamp_ == reference
+                && previousPresentedVideoTimestamp_ >= 0
+                && previousPresentedVideoTimestamp_ < reference;
+            const auto selectionTarget = exactPrevious
+                ? previousPresentedVideoTimestamp_
+                : reference;
+            const auto seekPosition = !forward && !exactPrevious
+                ? rangeStart_
+                : selectionTarget;
+
+            accurateSeek_.reset();
+            seekCompletion_.reset();
+            seekRequest_ = SeekRequest {
+                ++requestSerial_,
+                seekPosition,
+                selectionTarget,
+                SeekFlag::Accurate,
+                forward
+                    ? SeekRequest::Kind::StepForward
+                    : (exactPrevious
+                              ? SeekRequest::Kind::StepBackwardExact
+                              : SeekRequest::Kind::StepBackwardScan),
+                std::move(callback),
+            };
+            requestedState_ = State::Paused;
+            interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+            invalidatePlaybackGeneration();
+        }
+        notifyPlaybackQueueInvalidation();
+        controlChanged_.notify_all();
+        return true;
+    }
+
+    bool stepForward(SeekCallback callback)
+    {
+        return stepFrame(true, std::move(callback));
+    }
+
+    bool stepBackward(SeekCallback callback)
+    {
+        return stepFrame(false, std::move(callback));
     }
 
     void setState(State value)
@@ -1154,10 +1277,16 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             requestedState_ = value;
+            if (accurateSeek_
+                && accurateSeek_->kind == SeekRequest::Kind::Accurate) {
+                accurateSeek_->pauseAfter = value != State::Playing;
+            }
             if (value == State::Stopped) {
                 prepareRequest_.reset();
                 seekRequest_.reset();
                 trackSwitchRequests_.clear();
+                accurateSeek_.reset();
+                seekCompletion_.reset();
             }
         }
         if (value == State::Stopped) {
@@ -1265,6 +1394,8 @@ public:
                 track,
                 requestedPosition,
             });
+            accurateSeek_.reset();
+            seekCompletion_.reset();
         }
 
         // Match seek(): public control calls invalidate without waiting. The
@@ -1454,7 +1585,9 @@ public:
                 seekRequest_ = SeekRequest {
                     ++requestSerial_,
                     restartPosition,
+                    restartPosition,
                     SeekFlag::KeyFrame,
+                    SeekRequest::Kind::Normal,
                     {},
                 };
             }
@@ -1979,6 +2112,18 @@ private:
                 continue;
             }
 
+            if (seekCompletion_) {
+                auto completion = std::move(*seekCompletion_);
+                seekCompletion_.reset();
+                lock.unlock();
+                if (completion.callback) {
+                    completion.callback(completion.position);
+                }
+                videoPacketChanged_.notify_all();
+                audioPacketChanged_.notify_all();
+                continue;
+            }
+
             if (!trackSwitchRequests_.empty()) {
                 const auto request = trackSwitchRequests_.front();
                 trackSwitchRequests_.pop_front();
@@ -2065,7 +2210,10 @@ private:
                 continue;
             }
 
-            if (currentState_ != State::Playing) {
+            const bool accuratePausedRead =
+                currentState_ != State::Playing
+                && accurateSeekNeedsInputLocked();
+            if (currentState_ != State::Playing && !accuratePausedRead) {
                 continue;
             }
 
@@ -2076,7 +2224,12 @@ private:
                     false,
                     std::memory_order_acq_rel);
             if (result == DecodeResult::End) {
-                handlePlaybackEnd();
+                const auto generation = presentationGeneration_.load(
+                    std::memory_order_acquire);
+                const bool accurateFailed = failAccurateSeek(generation);
+                if (!accuratePausedRead && !accurateFailed) {
+                    handlePlaybackEnd();
+                }
             } else if (reachedRangeEnd) {
                 const auto generation =
                     presentationGeneration_.load(
@@ -2088,13 +2241,24 @@ private:
                     handlePlaybackEnd();
                 }
             } else if (result == DecodeResult::Error) {
+                const auto generation = presentationGeneration_.load(
+                    std::memory_order_acquire);
+                if (failAccurateSeek(generation)) {
+                    publishEvent({
+                        "seek.accurate",
+                        "Accurate seek could not decode a target video frame",
+                        AVERROR_INVALIDDATA,
+                    });
+                    continue;
+                }
                 bool controlPending = false;
                 {
                     std::lock_guard<std::mutex> stateLock(mutex_);
                     controlPending = requestedState_ != State::Playing
                         || loadedSerial_ != mediaSerial_
                         || !trackSwitchRequests_.empty()
-                        || seekRequest_.has_value();
+                        || seekRequest_.has_value()
+                        || seekCompletion_.has_value();
                 }
                 if (!controlPending) {
                     stopPlayback(false, true);
@@ -2121,6 +2285,7 @@ private:
             return true;
         }
         if (!trackSwitchRequests_.empty() || seekRequest_ || prepareRequest_
+            || seekCompletion_ || accurateSeekNeedsInputLocked()
             || currentState_ != requestedState_) {
             return true;
         }
@@ -2703,6 +2868,11 @@ private:
             updatePacketBuffering(packetBufferGeneration);
         }
 
+        if (prepare && preparedPosition >= 0
+            && hasFlag(prepare->flags, SeekFlag::Accurate)) {
+            handlePrepare(std::move(*prepare));
+            return;
+        }
         if (prepare && prepare->callback) {
             bool boost = true;
             prepare->callback(preparedPosition, &boost);
@@ -3240,22 +3410,84 @@ private:
     void handleSeek(SeekRequest request)
     {
         const int error = seekMedia(request.position, request.flags);
-        const auto result = error < 0 ? static_cast<std::int64_t>(-1)
-                                     : request.position;
         if (error < 0) {
             publishEvent({
                 "seek.error",
                 "Seek failed: " + ffmpegError(error),
                 error,
             });
+            if (request.callback) {
+                request.callback(-1);
+            }
+            return;
         }
-        if (request.callback) {
-            request.callback(result);
+
+        if (request.kind == SeekRequest::Kind::Normal
+            || !media_.video.valid()) {
+            if (request.callback) {
+                request.callback(request.position);
+            }
+            return;
         }
+
+        const auto generation = presentationGeneration_.load(
+            std::memory_order_acquire);
+        bool pauseAfter = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pauseAfter = request.kind != SeekRequest::Kind::Accurate
+                || requestedState_ != State::Playing;
+        }
+        if (pauseAfter) {
+            setAudioSinkPaused(true);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            currentPosition_ = clampPositionLocked(request.selectionTarget);
+            resetClockLocked(currentPosition_);
+            lastPresentedVideoTimestamp_ = -1;
+            previousPresentedVideoTimestamp_ = -1;
+            accurateSeek_ = AccurateSeekState {
+                generation,
+                request.selectionTarget,
+                request.kind,
+                pauseAfter,
+                false,
+                {},
+                {},
+                std::move(request.callback),
+            };
+            accuratePresentationFloorGeneration_ = generation;
+            accuratePresentationFloor_ = request.selectionTarget;
+        }
+        controlChanged_.notify_all();
+        videoPacketChanged_.notify_all();
+        audioPacketChanged_.notify_all();
     }
 
     void handlePrepare(PrepareRequest request)
     {
+        if (hasFlag(request.flags, SeekFlag::Accurate)) {
+            auto callback = std::move(request.callback);
+            handleSeek(SeekRequest {
+                request.id,
+                request.position,
+                request.position,
+                request.flags,
+                SeekRequest::Kind::Accurate,
+                [callback = std::move(callback)](
+                    std::int64_t position) mutable {
+                    if (callback) {
+                        bool boost = position >= 0;
+                        callback(position, &boost);
+                    }
+                },
+            });
+            setAudioSinkPaused(true);
+            publishState(State::Paused);
+            return;
+        }
+
         const int error = seekMedia(request.position, request.flags);
         const auto result = error < 0 ? static_cast<std::int64_t>(-1)
                                      : request.position;
@@ -3272,6 +3504,204 @@ private:
             bool boost = error >= 0;
             request.callback(result, &boost);
         }
+    }
+
+    bool accurateSeekActive(std::uint64_t generation) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return accurateSeek_
+            && accurateSeek_->generation == generation;
+    }
+
+    bool accurateSelectionShouldPresentImmediately(
+        std::uint64_t generation) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return accurateSeek_ && accurateSeek_->generation == generation
+            && accurateSeek_->pauseAfter;
+    }
+
+    bool accurateSeekNeedsInputLocked() const
+    {
+        return accurateSeek_
+            && accurateSeek_->generation
+                == presentationGeneration_.load(std::memory_order_acquire)
+            && !accurateSeek_->selectionQueued;
+    }
+
+    bool shouldDropNonVideoForAccurateSeek(
+        std::int64_t timestamp,
+        std::uint64_t generation) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (accuratePresentationFloorGeneration_ == generation
+            && timestamp < accuratePresentationFloor_) {
+            return true;
+        }
+        return accurateSeek_ && accurateSeek_->generation == generation
+            && accurateSeek_->pauseAfter;
+    }
+
+    AccurateVideoDecision classifyAccurateVideoFrame(
+        VideoFrame frame,
+        std::uint64_t generation)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!accurateSeek_ || accurateSeek_->generation != generation) {
+            return {
+                AccurateVideoDecision::Action::DeliverNormally,
+                std::move(frame),
+                false,
+                -1,
+            };
+        }
+
+        auto& accurate = *accurateSeek_;
+        if (accurate.selectionQueued) {
+            return {
+                accurate.pauseAfter
+                    ? AccurateVideoDecision::Action::Drop
+                    : AccurateVideoDecision::Action::DeliverNormally,
+                accurate.pauseAfter ? VideoFrame {} : std::move(frame),
+                false,
+                -1,
+            };
+        }
+
+        const auto timestamp = frame.timestamp();
+        bool selected = false;
+        VideoFrame selectedFrame;
+        switch (accurate.kind) {
+        case SeekRequest::Kind::Accurate:
+        case SeekRequest::Kind::StepBackwardExact:
+            selected = timestamp >= accurate.target;
+            break;
+        case SeekRequest::Kind::StepForward:
+            selected = timestamp > accurate.target;
+            break;
+        case SeekRequest::Kind::StepBackwardScan:
+            if (timestamp >= accurate.target
+                && accurate.previousCandidate) {
+                selected = true;
+                selectedFrame = accurate.previousCandidate;
+            }
+            break;
+        case SeekRequest::Kind::Normal:
+            break;
+        }
+
+        if (!selected) {
+            if (timestamp < accurate.target
+                || accurate.kind == SeekRequest::Kind::StepForward) {
+                accurate.candidateBeforePrevious =
+                    std::move(accurate.previousCandidate);
+                accurate.previousCandidate = std::move(frame);
+            }
+            return {
+                AccurateVideoDecision::Action::Drop,
+                {},
+                false,
+                -1,
+            };
+        }
+
+        const auto& previousFrame =
+            accurate.kind == SeekRequest::Kind::StepBackwardScan
+            ? accurate.candidateBeforePrevious
+            : accurate.previousCandidate;
+        const auto previousTimestamp = previousFrame
+            ? previousFrame.timestamp()
+            : static_cast<std::int64_t>(-1);
+        if (!selectedFrame) {
+            selectedFrame = std::move(frame);
+        }
+        accurate.selectionQueued = true;
+        accurate.previousCandidate = {};
+        accurate.candidateBeforePrevious = {};
+        return {
+            AccurateVideoDecision::Action::DeliverSelected,
+            std::move(selectedFrame),
+            true,
+            previousTimestamp,
+        };
+    }
+
+    AccurateVideoDecision finishAccurateVideoAtEnd(
+        std::uint64_t generation)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!accurateSeek_ || accurateSeek_->generation != generation
+            || accurateSeek_->selectionQueued
+            || !accurateSeek_->previousCandidate
+            || (accurateSeek_->kind != SeekRequest::Kind::Accurate
+                && accurateSeek_->kind
+                    != SeekRequest::Kind::StepBackwardScan)) {
+            return {
+                AccurateVideoDecision::Action::Drop,
+                {},
+                false,
+                -1,
+            };
+        }
+
+        auto frame = std::move(accurateSeek_->previousCandidate);
+        const auto previousTimestamp =
+            accurateSeek_->candidateBeforePrevious
+            ? accurateSeek_->candidateBeforePrevious.timestamp()
+            : static_cast<std::int64_t>(-1);
+        accurateSeek_->candidateBeforePrevious = {};
+        accurateSeek_->selectionQueued = true;
+        return {
+            AccurateVideoDecision::Action::DeliverSelected,
+            std::move(frame),
+            true,
+            previousTimestamp,
+        };
+    }
+
+    void completeAccurateSeek(
+        std::uint64_t generation,
+        std::int64_t position)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!accurateSeek_ || accurateSeek_->generation != generation
+                || !accurateSeek_->selectionQueued) {
+                return;
+            }
+            if (accurateSeek_->callback) {
+                seekCompletion_ = SeekCompletion {
+                    position,
+                    std::move(accurateSeek_->callback),
+                };
+            }
+            accurateSeek_.reset();
+        }
+        controlChanged_.notify_all();
+        videoPacketChanged_.notify_all();
+        audioPacketChanged_.notify_all();
+    }
+
+    bool failAccurateSeek(std::uint64_t generation)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!accurateSeek_ || accurateSeek_->generation != generation
+                || accurateSeek_->selectionQueued) {
+                return false;
+            }
+            if (accurateSeek_->callback) {
+                seekCompletion_ = SeekCompletion {
+                    -1,
+                    std::move(accurateSeek_->callback),
+                };
+            }
+            accurateSeek_.reset();
+        }
+        controlChanged_.notify_all();
+        videoPacketChanged_.notify_all();
+        audioPacketChanged_.notify_all();
+        return true;
     }
 
     int seekMedia(
@@ -3292,6 +3722,8 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             currentPosition_ = targetMs;
+            lastPresentedVideoTimestamp_ = -1;
+            previousPresentedVideoTimestamp_ = -1;
             resetClockLocked(targetMs);
             waitForData = currentState_ == State::Playing
                 && requestedState_ == State::Playing
@@ -3311,11 +3743,13 @@ private:
 
         interrupt_.epoch = interruptEpoch_.load(std::memory_order_acquire);
         int ffmpegFlags = AVSEEK_FLAG_BACKWARD;
-        if (hasFlag(flags, SeekFlag::AnyFrame)) {
-            ffmpegFlags |= AVSEEK_FLAG_ANY;
-        }
-        if (!hasFlag(flags, SeekFlag::KeyFrame)) {
-            ffmpegFlags &= ~AVSEEK_FLAG_BACKWARD;
+        if (!hasFlag(flags, SeekFlag::Accurate)) {
+            if (hasFlag(flags, SeekFlag::AnyFrame)) {
+                ffmpegFlags |= AVSEEK_FLAG_ANY;
+            }
+            if (!hasFlag(flags, SeekFlag::KeyFrame)) {
+                ffmpegFlags &= ~AVSEEK_FLAG_BACKWARD;
+            }
         }
 
         media_.demux.reset();
@@ -4210,7 +4644,10 @@ private:
                         rangeStart = rangeStart_;
                         rangeEnd = rangeEnd_;
                     }
-                    if (timestampMs >= rangeStart
+                    if (!shouldDropNonVideoForAccurateSeek(
+                            timestampMs,
+                            generation)
+                        && timestampMs >= rangeStart
                         && (rangeEnd == MediaEnd
                             || timestampMs < rangeEnd)) {
                         std::string assHeader;
@@ -4278,7 +4715,10 @@ private:
         }
         std::lock_guard<std::mutex> lock(mutex_);
         return hasOpenMedia_
-            && requestedState_ == State::Playing;
+            && !seekCompletion_
+            && (requestedState_ == State::Playing
+                || (accurateSeek_
+                    && accurateSeek_->generation == generation));
     }
 
     std::pair<bool, bool> activePacketStreams() const
@@ -5073,6 +5513,10 @@ private:
                             && !audioPacketInputEnded_.load(
                                 std::memory_order_acquire)) {
                             lock.unlock();
+                            if (accurateSeekActive(generation)) {
+                                lock.lock();
+                                continue;
+                            }
                             const auto packetStreams =
                                 activePacketStreams();
                             if (packetStreams.first
@@ -5197,6 +5641,10 @@ private:
                             && !videoPacketInputEnded_.load(
                                 std::memory_order_acquire)) {
                             lock.unlock();
+                            if (accurateSeekActive(generation)) {
+                                lock.lock();
+                                continue;
+                            }
                             const auto packetStreams =
                                 activePacketStreams();
                             if (packetStreams.second
@@ -5259,6 +5707,24 @@ private:
                     std::memory_order_acquire)) {
                 if (ok && queued.end) {
                     flushDecoder(media_.video, queued.generation);
+                    auto decision = finishAccurateVideoAtEnd(
+                        queued.generation);
+                    if (decision.action
+                        == AccurateVideoDecision::Action::DeliverSelected) {
+                        VideoFrameScheduler scheduler;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            scheduler = videoFrameScheduler_;
+                        }
+                        ok = submitVideoFrame(
+                            std::move(decision.frame),
+                            media_.video.trackIndex,
+                            queued.generation,
+                            std::move(scheduler),
+                            decision.forceImmediate,
+                            true,
+                            decision.previousTimestamp);
+                    }
                 } else if (ok && queued.packet) {
                     const bool paceBeforeDecode =
                         isSurfaceOutputHardwareDevice(
@@ -5369,6 +5835,94 @@ private:
         return result;
     }
 
+    void recordPresentedVideo(
+        std::int64_t timestamp,
+        std::uint64_t generation,
+        bool accurateSelection,
+        std::int64_t accuratePreviousTimestamp)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation
+            != presentationGeneration_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (accurateSelection) {
+            previousPresentedVideoTimestamp_ = accuratePreviousTimestamp;
+            lastPresentedVideoTimestamp_ = timestamp;
+            currentPosition_ = clampPositionLocked(timestamp);
+            resetClockLocked(currentPosition_);
+            return;
+        }
+        if (timestamp != lastPresentedVideoTimestamp_) {
+            previousPresentedVideoTimestamp_ = lastPresentedVideoTimestamp_;
+            lastPresentedVideoTimestamp_ = timestamp;
+        }
+        currentPosition_ = std::max(currentPosition_, timestamp);
+    }
+
+    bool submitVideoFrame(
+        VideoFrame video,
+        int track,
+        std::uint64_t generation,
+        VideoFrameScheduler scheduler,
+        bool forceImmediate,
+        bool completesAccurateSeek,
+        std::int64_t previousTimestamp)
+    {
+        if (scheduler) {
+            const auto current = position();
+            float rate = 1.0F;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                rate = playbackRate_;
+            }
+            const auto lead = forceImmediate
+                ? static_cast<std::int64_t>(0)
+                : std::max<std::int64_t>(
+                    0,
+                    video.timestamp() - current);
+            const auto deadline = Clock::now()
+                + std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double, std::milli>(
+                        static_cast<double>(lead)
+                        / static_cast<double>(rate)));
+            const auto deadlineNanoseconds =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    deadline.time_since_epoch())
+                    .count();
+            if (scheduler(video, track, deadlineNanoseconds)) {
+                deliveredVideoFrames_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                recordPresentedVideo(
+                    video.timestamp(),
+                    generation,
+                    completesAccurateSeek,
+                    previousTimestamp);
+                if (!forceImmediate && !hasActiveAudioDeviceClock()) {
+                    resumeClockAfterOutput(generation, video.timestamp());
+                }
+                if (completesAccurateSeek) {
+                    completeAccurateSeek(generation, video.timestamp());
+                }
+                return true;
+            }
+        }
+
+        enqueuePresentation(PresentationItem {
+            PresentationItem::Type::Video,
+            {},
+            std::move(video),
+            {},
+            track,
+            generation,
+            forceImmediate,
+            completesAccurateSeek,
+            previousTimestamp,
+        });
+        return true;
+    }
+
     bool deliverFrame(
         Decoder& decoder,
         const AVFrame* frame,
@@ -5445,6 +5999,7 @@ private:
                 && isSurfaceOutputHardwareDevice(
                     decoder.hardwareDeviceType);
             if (!scheduledSurfaceOutput
+                && !accurateSeekActive(generation)
                 && !waitForVideoDecodeWindow(
                     timestampMs,
                     generation,
@@ -5473,54 +6028,29 @@ private:
                         != HardwareDeviceType::Unknown
                     ? decoder.contextLifetime
                     : std::shared_ptr<void> {});
-            completeVideoPreroll(generation);
-            if (scheduler) {
-                const auto current = position();
-                float rate = 1.0F;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    rate = playbackRate_;
-                }
-                const auto lead = std::max<std::int64_t>(
-                    0,
-                    timestampMs - current);
-                const auto deadline = Clock::now()
-                    + std::chrono::duration_cast<Clock::duration>(
-                        std::chrono::duration<double, std::milli>(
-                            static_cast<double>(lead)
-                            / static_cast<double>(rate)));
-                const auto deadlineNanoseconds =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        deadline.time_since_epoch())
-                        .count();
-                if (scheduler(
-                        video,
-                        decoder.trackIndex,
-                        deadlineNanoseconds)) {
-                    deliveredVideoFrames_.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
-                    // A consumed scheduled frame is the first usable output
-                    // just like present(). Without this transition the
-                    // startup output-wait bypasses the decode lead bound and
-                    // can flood an asynchronous hardware-frame queue.
-                    if (!hasActiveAudioDeviceClock()) {
-                        resumeClockAfterOutput(
-                            generation,
-                            video.timestamp());
-                    }
-                    return true;
-                }
-            }
-            enqueuePresentation(PresentationItem {
-                PresentationItem::Type::Video,
-                {},
+            auto decision = classifyAccurateVideoFrame(
                 std::move(video),
-                {},
+                generation);
+            if (decision.action
+                == AccurateVideoDecision::Action::Drop) {
+                return true;
+            }
+            completeVideoPreroll(generation);
+            return submitVideoFrame(
+                std::move(decision.frame),
                 decoder.trackIndex,
                 generation,
-            });
+                std::move(scheduler),
+                decision.forceImmediate,
+                decision.action
+                    == AccurateVideoDecision::Action::DeliverSelected,
+                decision.previousTimestamp);
         } else if (decoder.type == MediaType::Audio) {
+            if (shouldDropNonVideoForAccurateSeek(
+                    timestampMs,
+                    generation)) {
+                return true;
+            }
             auto audio =
                 detail::FrameFactory::audio(frame, timestampMs, durationMs);
             return enqueueAudioFrame(
@@ -5640,11 +6170,18 @@ private:
     {
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
+            const bool accurateDecode = accurateSeek_
+                && accurateSeek_->generation == generation;
             if (quitting_.load(std::memory_order_acquire)
                 || generation
                     != presentationGeneration_.load(std::memory_order_acquire)
-                || requestedState_ != State::Playing || seekRequest_) {
+                || (!accurateDecode
+                    && requestedState_ != State::Playing)
+                || seekRequest_) {
                 return false;
+            }
+            if (accurateDecode) {
+                return true;
             }
             lock.unlock();
             const auto audioPosition = audioClockPosition();
@@ -5700,11 +6237,18 @@ private:
 
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
+            const bool accurateDecode = accurateSeek_
+                && accurateSeek_->generation == generation;
             if (quitting_.load(std::memory_order_acquire)
                 || generation
                     != presentationGeneration_.load(std::memory_order_acquire)
-                || requestedState_ != State::Playing || seekRequest_) {
+                || (!accurateDecode
+                    && requestedState_ != State::Playing)
+                || seekRequest_) {
                 return false;
+            }
+            if (accurateDecode) {
+                return true;
             }
             lock.unlock();
             const auto audioPosition = audioClockPosition();
@@ -5864,7 +6408,8 @@ private:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return requestedState_ == State::Playing
-            && currentState_ == State::Playing && !seekRequest_;
+            && currentState_ == State::Playing && !seekRequest_
+            && !seekCompletion_;
     }
 
     bool hasActiveAudioDeviceClock() const
@@ -6053,10 +6598,13 @@ private:
                 != presentationGeneration_.load(std::memory_order_acquire)) {
                 return;
             }
-            currentPosition_ =
-                std::max(currentPosition_, item.video.timestamp());
             frameCallback = videoFrameCallback_;
         }
+        recordPresentedVideo(
+            item.video.timestamp(),
+            item.generation,
+            item.completesAccurateSeek,
+            item.previousVideoTimestamp);
 
         auto frameSnapshot = std::make_shared<VideoFrameSnapshot>();
         frameSnapshot->frame = item.video;
@@ -6105,8 +6653,13 @@ private:
         if (!renderCallback
             || item.generation
                 != presentationGeneration_.load(std::memory_order_acquire)) {
-            if (!hasActiveAudioDeviceClock()) {
+            if (!item.forceImmediate && !hasActiveAudioDeviceClock()) {
                 resumeClockAfterOutput(
+                    item.generation,
+                    item.video.timestamp());
+            }
+            if (item.completesAccurateSeek) {
+                completeAccurateSeek(
                     item.generation,
                     item.video.timestamp());
             }
@@ -6119,8 +6672,13 @@ private:
                 renderCallback(key);
             }
         }
-        if (!hasActiveAudioDeviceClock()) {
+        if (!item.forceImmediate && !hasActiveAudioDeviceClock()) {
             resumeClockAfterOutput(
+                item.generation,
+                item.video.timestamp());
+        }
+        if (item.completesAccurateSeek) {
+            completeAccurateSeek(
                 item.generation,
                 item.video.timestamp());
         }
@@ -6172,11 +6730,18 @@ private:
                 presentationInFlight_ = true;
             }
 
-            const auto waitResult = waitUntilPresentation(
-                item.timestamp(),
-                item.generation,
-                true,
-                item.type != PresentationItem::Type::Subtitle);
+            if (item.completesAccurateSeek
+                && accurateSelectionShouldPresentImmediately(
+                    item.generation)) {
+                item.forceImmediate = true;
+            }
+            const auto waitResult = item.forceImmediate
+                ? PresentationWaitResult::Ready
+                : waitUntilPresentation(
+                    item.timestamp(),
+                    item.generation,
+                    true,
+                    item.type != PresentationItem::Type::Subtitle);
             if (waitResult
                 == PresentationWaitResult::EarlierItemQueued) {
                 enqueuePresentation(std::move(item));
@@ -6188,6 +6753,7 @@ private:
                     : kLateVideoFrameThresholdMilliseconds;
                 const bool dropLateVideo =
                     item.type == PresentationItem::Type::Video
+                    && !item.completesAccurateSeek
                     && current - item.timestamp()
                         > lateThreshold
                     && hasNewerQueuedVideo(
@@ -6229,13 +6795,17 @@ private:
         presentationChanged_.notify_all();
     }
 
-    void invalidatePlaybackQueues()
+    void invalidatePlaybackGeneration()
     {
         {
             std::lock_guard<std::mutex> lock(videoFrameSnapshotMutex_);
             presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
             clearCurrentVideoFrameSnapshot();
         }
+    }
+
+    void notifyPlaybackQueueInvalidation()
+    {
         resetPacketBuffering();
         invalidateAudioClock();
         audioQueueChanged_.notify_all();
@@ -6250,6 +6820,12 @@ private:
         audioPacketSpace_.notify_all();
         audioPacketDrained_.notify_all();
         packetBufferChanged_.notify_all();
+    }
+
+    void invalidatePlaybackQueues()
+    {
+        invalidatePlaybackGeneration();
+        notifyPlaybackQueueInvalidation();
     }
 
     void resetPlaybackQueues()
@@ -7170,6 +7746,18 @@ private:
     {
         const auto generation =
             presentationGeneration_.load(std::memory_order_acquire);
+        const auto controlPending = [this] {
+            return seekRequest_ || seekCompletion_ || prepareRequest_
+                || !trackSwitchRequests_.empty()
+                || loadedSerial_ != mediaSerial_
+                || requestedState_ != State::Playing;
+        };
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (controlPending()) {
+                return;
+            }
+        }
         if (!waitForAudioQueueDrained(generation)) {
             return;
         }
@@ -7179,6 +7767,12 @@ private:
             || generation
                 != presentationGeneration_.load(std::memory_order_acquire)) {
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (controlPending()) {
+                return;
+            }
         }
 
         int loopCount;
@@ -7211,10 +7805,20 @@ private:
     void stopPlayback(bool naturalEnd, bool invalid = false)
     {
         resetPlaybackQueues();
-        closeAudioSink(false);
-        media_.reset();
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (naturalEnd
+                && (seekRequest_ || seekCompletion_ || prepareRequest_
+                    || !trackSwitchRequests_.empty()
+                    || loadedSerial_ != mediaSerial_
+                    || requestedState_ != State::Playing)) {
+                return;
+            }
+            // Commit the natural stop while holding the same mutex used by
+            // public control requests. A seek that arrived while queues were
+            // draining wins above; one arriving after this point observes the
+            // closed state and is rejected instead of losing its callback.
+            media_.reset();
             hasOpenMedia_ = false;
             loadedSerial_ = 0;
             requestedState_ = State::Stopped;
@@ -7222,6 +7826,7 @@ private:
                 naturalEnd && mediaInfo_.duration > 0 ? mediaInfo_.duration : 0;
             resetClockLocked(currentPosition_);
         }
+        closeAudioSink(false);
         publishState(State::Stopped);
         publishStatus(invalid
                 ? MediaStatus::Invalid
@@ -7464,6 +8069,10 @@ private:
     std::uint64_t requestSerial_ = 0;
     std::optional<PrepareRequest> prepareRequest_;
     std::optional<SeekRequest> seekRequest_;
+    std::optional<AccurateSeekState> accurateSeek_;
+    std::optional<SeekCompletion> seekCompletion_;
+    std::uint64_t accuratePresentationFloorGeneration_ = 0;
+    std::int64_t accuratePresentationFloor_ = 0;
     std::deque<TrackSwitchRequest> trackSwitchRequests_;
 
     State requestedState_ = State::Stopped;
@@ -7471,6 +8080,8 @@ private:
     MediaStatus status_ = MediaStatus::NoMedia;
     MediaInfo mediaInfo_;
     std::int64_t currentPosition_ = 0;
+    std::int64_t lastPresentedVideoTimestamp_ = -1;
+    std::int64_t previousPresentedVideoTimestamp_ = -1;
     bool waitingForOutput_ = false;
     bool outputWaitPrimed_ = false;
     std::uint64_t outputWaitGeneration_ = 0;
@@ -7561,6 +8172,16 @@ bool Player::seek(
     SeekCallback callback)
 {
     return impl_->seek(position, flags, std::move(callback));
+}
+
+bool Player::stepForward(SeekCallback callback)
+{
+    return impl_->stepForward(std::move(callback));
+}
+
+bool Player::stepBackward(SeekCallback callback)
+{
+    return impl_->stepBackward(std::move(callback));
 }
 
 void Player::setState(State state)
