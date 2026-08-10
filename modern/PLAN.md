@@ -98,7 +98,11 @@ The following accepted decisions constrain all remaining work:
   consumers. The first published Actions run exposed runner-environment
   failures. By project direction, Actions now temporarily runs only the
   Windows gate; Android/OHOS jobs are suspended without changing target
-  support or their retained local validation.
+  support or their retained local validation. Windows-only Actions run
+  `31383223536` completed the shared/static Release tests, installs, and
+  installed-package consumers without failure at commit `7e81a0f1`; the
+  non-interactive Advanced Color cases were reported as skips rather than
+  native display passes.
 
 Detailed implementation and validation evidence for the version contract is in
 [`PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md`](PLAN_HISTORY_2026-08-10_VERSION_CONTRACT.md).
@@ -107,12 +111,16 @@ The CI implementation and local validation record is in
 The first published run and temporary Windows-only scope are recorded in
 [`PLAN_HISTORY_2026-08-10_WINDOWS_ONLY_CI.md`](PLAN_HISTORY_2026-08-10_WINDOWS_ONLY_CI.md).
 
-## Next task — stabilize the temporary Windows-only CI gate
+## Next task — gated follow-up after the Windows-only CI pass
 
-- [~] Publish and pass the repeatable Windows shared/static build, test,
+- [x] Publish and pass the repeatable Windows shared/static build, test,
   install, and package-consumer gate on the configured self-hosted runner.
   Android and OHOS Actions execution is temporarily disabled by explicit
   project direction; restoring those jobs remains a separate incomplete gate.
+- [~] Do not start another local implementation solely to fill this slot. The
+  remaining candidates below require explicit Android/OHOS CI re-enablement,
+  eligible OHOS or Intel hardware, physical audio output, or the documented
+  guarded Android HDR condition.
 
 Acceptance criteria:
 
@@ -254,8 +262,8 @@ is intentionally short:
 
 ## Task selection rules
 
-1. Complete the temporary Windows-only CI gate; restore Android/OHOS Actions
-   only after project direction re-enables them.
+1. Preserve the passing temporary Windows-only CI gate; restore Android/OHOS
+   Actions only after project direction re-enables them.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.
 3. The external Intel workstream may proceed in parallel on its designated

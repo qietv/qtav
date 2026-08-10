@@ -60,6 +60,17 @@ jobs:
         shell: pwsh
         run: ./modern/scripts/ci/build-windows.ps1 -Parallel 8
 
+      - name: Expose Git gzip to the cache post-step
+        shell: pwsh
+        run: |
+          $gitCommand = Get-Command git.exe -ErrorAction Stop
+          $gitRoot = Split-Path -Parent (Split-Path -Parent $gitCommand.Source)
+          $gzip = Join-Path $gitRoot 'usr\bin\gzip.exe'
+          if (-not (Test-Path -LiteralPath $gzip -PathType Leaf)) {
+            throw "Git gzip was not found at $gzip"
+          }
+          Split-Path -Parent $gzip | Add-Content -LiteralPath $env:GITHUB_PATH
+
       - name: Record hosted and device-test boundaries
         if: always()
         shell: pwsh

@@ -84,6 +84,9 @@ prefixes.
 Consequently, the Windows job still invokes the repository dependency build
 script and finishes through `verify-install.cmake`, even on a cache hit. It
 does not download another workflow's artifact as a dependency fallback.
+Before the cache post-step, the workflow exposes the configured runner's Git
+`usr/bin` directory so GNU tar can resolve its adjacent `gzip.exe` while
+writing the cache archive.
 Workflow artifacts contain only bounded test/configuration/build logs and are
 retained for seven days. The suspended cross-target drivers preserve the same
 local dependency verification boundary.

@@ -50,8 +50,23 @@ installed their packages, and completed the staged installed-package consumer.
 The Advanced Color test passed on the interactive development desktop in both
 configurations, in 0.57 seconds for shared and 0.52 seconds for static.
 
-## Completion gate
+## Published Windows-only pass
 
-The temporary Windows-only task remains partial until a published GitHub
-Actions run passes the Windows shared/static matrix at the same revision.
-Restoring Android/OHOS Actions execution remains a separate incomplete gate.
+GitHub Actions [run `31383223536`](https://github.com/qietv/qtav/actions/runs/31383223536)
+executed commit
+`7e81a0f1b655ff0c34673fe8b8222ede582ab717`. Its only job was the Windows
+shared/static Release gate. Each configuration completed all 21 tests without
+failure, with the non-interactive Advanced Color test explicitly skipped,
+then installed the package and completed the staged installed-package
+consumer. The run uploaded the bounded `qtavcore-windows-ci-logs` artifact.
+
+The successful run also exposed a non-fatal cache post-step warning: Git GNU
+tar could not find its adjacent `gzip.exe` through the service runner's PATH.
+The workflow now adds that Git `usr/bin` directory to `GITHUB_PATH` after the
+build so subsequent cache saves can resolve the compressor.
+
+## Completion status
+
+The temporary Windows-only build, test, install, and package-consumer task is
+complete. Restoring Android/OHOS Actions execution remains a separate
+incomplete gate that must not resume without explicit project direction.
