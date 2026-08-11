@@ -101,6 +101,13 @@ set(OPTIONS "--enable-pic --disable-doc --enable-runtime-cpudetect --disable-aut
 
 if("qtav-player" IN_LIST FEATURES)
     string(APPEND OPTIONS " --enable-lto --enable-small --disable-iamf")
+    # FFmpeg maps --enable-small to -Oz. That leaves insufficient sustained
+    # HEVC Main10 software-decode headroom on the connected OHOS arm64 device.
+    # Preserve the package feature policy while selecting a throughput-first
+    # compiler optimization level for this target only.
+    if(VCPKG_TARGET_IS_OHOS AND VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+        string(APPEND OPTIONS " --optflags=-O3")
+    endif()
 endif()
 
 # OHCodec is a target capability rather than a generally selectable FFmpeg

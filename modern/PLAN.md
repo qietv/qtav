@@ -60,8 +60,11 @@ The following accepted decisions constrain all remaining work:
   implemented and verified.
 - Windows D3D11/D3D11VA/WASAPI is the complete Windows production path. AD-010
   is closed: visible-region GPU copy is the default decoder-surface policy and
-  direct decoder-texture sampling is explicit opt-in. The separate Intel
-  post-seek performance investigation remains an external-machine workstream.
+  direct decoder-texture sampling is explicit opt-in. The Intel post-seek
+  investigation is complete: ETW localized redundant decoder/output-view
+  teardown, the repository FFmpeg/QtAVCore reuse repair removed the persistent
+  stall, and the broader zero-transient follow-up is no longer required.
+  Detailed evidence remains in the frozen plan history.
 - Android Vulkan/OpenGL ES/MediaCodec/AAudio, application-rendered raw-component
   paths, direct-Surface mode, and one-way renderer fallback are complete and
   retained as the mobile regression baseline.
@@ -71,6 +74,36 @@ The following accepted decisions constrain all remaining work:
   workaround are implemented and connected-device validated. Strict direct
   multi-plane Vulkan wrapping and the corresponding Dolby Vision path remain
   device-gated.
+- The separate OHOS user player demo now implements local-document and URL
+  opening, full screen, pitch-preserving rates, audio/subtitle switching,
+  text-subtitle presentation, system PiP controls, selectable software/OHCodec
+  decode and Vulkan/OpenGL ES rendering, explicit HDR output policy and
+  diagnostics, a closeable 1 Hz media/FPS overlay, and an isolated 250 ms
+  progress/subtitle snapshot that does not rebuild track controls. The new
+  native matrix, OHOS HDR color-space negotiation, ArkTS, and signed debug HAP
+  cross-build pass. The updated signed HAP passed package verification and
+  connected-device deployment: local `legend.mkv`/`wednesday.mp4`, the full
+  soft/hard decode and Vulkan/OpenGL ES diagnostic matrix, live switching,
+  HDR capability reporting, debug-overlay redraw comparison, Vulkan URL
+  playback, successful-presentation FPS, rate/seek/skip, landscape full
+  screen, live desktop PiP, dual-audio switching, subtitle disable/re-enable,
+  and the document picker were exercised. A follow-up
+  `XComponentType.SURFACE` run then passed native HDR through both renderers:
+  Vulkan selected A2B10G10R10 BT.2020/PQ and OpenGL ES selected exact
+  RGB10_A2 BT.2020/PQ, both passed required-HDR policy, and RenderService
+  reported its HDR composition algorithm. Explicit SDR still selected
+  RGBA8/sRGB and reported tone mapping. Subjective audible pitch/track
+  confirmation remains a user manual check.
+- The OHOS software-decode follow-up now keeps FFmpeg LTO/NEON and the shared
+  small-build policy while overriding the effective arm64 optimization from
+  `-Oz` to `-O3`. The demo requests four software-video decoder threads and
+  reports the actual FFmpeg configuration. Connected `legend.mkv` playback
+  sustained the 25 FPS decode cadence through 2:49; profiling assigned 91.6%
+  of sampled cycles to the four HEVC workers and less than 1% to the ArkUI
+  process, ruling out the information panel/progress text as the primary
+  bottleneck. Successful-presentation totals still trail decoded totals, so
+  this result is recorded as a decode-throughput repair rather than a claim of
+  zero end-to-end frame loss.
 - The OpenGL ES follow-up keeps software Y/Cb/Cr planar when a high-bit-depth
   upload needs libswscale normalization, so Dolby Vision metadata is no longer
   applied to already converted RGB components. The raw OHCodec external-image
@@ -134,8 +167,8 @@ The first published run and temporary Windows-only scope are recorded in
   project direction; restoring those jobs remains a separate incomplete gate.
 - [~] Do not start another local implementation solely to fill this slot. The
   remaining candidates below require explicit Android/OHOS CI re-enablement,
-  eligible OHOS or Intel hardware, physical audio output, or the documented
-  guarded Android HDR condition.
+  eligible OHOS hardware, physical audio output, or the documented guarded
+  Android HDR condition.
 
 Acceptance criteria:
 
@@ -174,6 +207,17 @@ The connected Huawei devices currently expose real decoder output as
 fail-closed/workaround behavior but cannot complete the strict gate. Do not
 substitute Windows Vulkan work or silently reinterpret an unknown format.
 
+Research instrumentation prepared on 2026-08-10 keeps the strict result
+separate from general Vulkan-path success, rejects mismatched direct YCbCr/VU
+plane order, and records NativeBuffer usage/stride/colorspace plus Vulkan
+format/memory capabilities. OHOS shared/static cross-builds, installs,
+standalone package consumers, and the isolated probe compile pass. A newly
+signed HAP was installed and the full connected-device validation passed on the
+ALN-AL80 with HarmonyOS 6.1.0.135. The real OHCodec run still reported
+`vkFormat=VK_FORMAT_UNDEFINED`, `directPlanes=0`, `workaroundImports=60`, and
+`normalization=60`, so it correctly emitted `strictExplicitPlane=GATED`; the
+strict gate remains open despite the general Vulkan-path and lifecycle pass.
+
 ### Android/OHOS CI suspension and OHOS hardening
 
 - [~] Restore Android and OHOS Actions execution only after project direction
@@ -182,30 +226,28 @@ substitute Windows Vulkan work or silently reinterpret an unknown format.
   install, and package-consumer gates pass; no disabled job is reported as a
   CI pass.
 - [~] Broaden real-device software-frame coverage beyond the validated YUV420,
-  fit/redraw, SDR Vulkan/OpenGL ES, native-window recreation, forced OpenGL ES,
-  and fatal one-way fallback cases. Remaining coverage includes other upload
-  families, rotation, explicit surface-loss injection, and native HDR.
+  fit/redraw, SDR/native-HDR Vulkan and OpenGL ES, native-window recreation,
+  forced OpenGL ES, and fatal one-way fallback cases. Remaining coverage
+  includes other upload families, rotation, and explicit surface-loss
+  injection.
 - [~] Add shared helpers under `modern/platform/ohos/` only when code is truly
   shared across responsibility-specific OHOS backends. Do not move media,
   graphics, or audio ownership into a combined platform class.
+- [~] Run the OHOS user-player manual acceptance matrix only after the user
+  configures DevEco signing and explicitly approves the first deployment.
+  The 2026-08-11 targeted signed-device pass completed local
+  `legend.mkv`/`wednesday.mp4` soft/hard decode by Vulkan/OpenGL ES, live
+  backend switching, debug-panel closed/open redraw comparison, descriptor
+  lifetime, automatic Vulkan-to-OpenGL ES surface rebind, and explicit HDR
+  capability reporting. Hardware paths held 24--25 FPS with zero Player drops;
+  the follow-up XComponent SURFACE run passed `Require HDR` through Vulkan
+  A2B10G10R10 BT.2020/PQ and OpenGL ES RGB10_A2 BT.2020/PQ, while forced SDR
+  still reported tone mapping. Physical audio identity and the remaining broad
+  manual cells stay open.
 
-### External Intel Windows performance workstream
-
-- [~] On the administrator-capable Intel machine, capture the remaining
-  post-seek failure with WPR/GPUView and objective source/scheduled/rendered,
-  retry, gap, Present, lifecycle, and coarse-stage counters. Establish the
-  first failing stage before changing code.
-- [~] If evidence identifies a repair, keep AD-007 multithread protection and
-  AD-010/AD-011 lifetime policies intact, add a narrow regression, and rerun
-  the same revision on the recorded Intel, NVIDIA, and AMD matrix.
-- [~] Use the supplied HDR10/P010 and Dolby Vision media, controlled seek and
-  lifecycle scenarios, comparable output/power/display conditions, settled
-  cadence windows, and 60–120-second runs. A visual impression or lower output
-  quality is not acceptance evidence.
-
-This external workstream does not block the next local task, but it must not be
-described as closed until its evidence-backed correction and same-revision
-cross-vendor gate pass.
+The four-thread software-decode build, signed-device counters, temperatures,
+and `hiperf` evidence are retained in
+[`PLAN_HISTORY_2026-08-11_OHOS_SOFTWARE_DECODE.md`](PLAN_HISTORY_2026-08-11_OHOS_SOFTWARE_DECODE.md).
 
 ### Dolby and device-output scope
 
@@ -267,7 +309,7 @@ is intentionally short:
 | --- | --- |
 | Milestones 0–3: Qt-free core, decomposition, backend contracts, portable video/audio references | Complete and verified |
 | Milestone 4: former Apple production path | Archived and unsupported |
-| Milestone 5: Windows D3D11/D3D11VA/WASAPI | Complete; separate Intel performance workstream remains external |
+| Milestone 5: Windows D3D11/D3D11VA/WASAPI | Complete, including the Intel post-seek root-cause investigation and repair; AD-010 is closed |
 | Milestone 6: Android Vulkan/OpenGL ES/MediaCodec/AAudio | Complete and retained as the mobile regression baseline |
 | Milestone 7: OHOS production path | Implemented through current opaque-format policy; explicit-plane strict Vulkan and broader validation remain open above |
 | Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step, pitch-preserving time-stretch | Complete and verified on Windows plus Android/OHOS static/shared cross-builds |
@@ -281,10 +323,8 @@ is intentionally short:
    Actions only after project direction re-enables them.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.
-3. The external Intel workstream may proceed in parallel on its designated
-   machine; preserve its unresolved status here.
-4. Do not start the guarded Android HDR external-OES task early.
-5. When a task completes, move detailed evidence to the history/decision/
+3. Do not start the guarded Android HDR external-OES task early.
+4. When a task completes, move detailed evidence to the history/decision/
    architecture document that owns it and keep only a concise status in this
    file.
 

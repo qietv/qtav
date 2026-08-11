@@ -82,6 +82,24 @@ OHCodecVulkanInteropStatistics {
     std::uint64_t externalFormatWorkaroundImports = 0;
 };
 
+// Last acquired decoder allocation and Vulkan format observations. This
+// separate additive API preserves the ABI of OHCodecVulkanInteropStatistics.
+// The values diagnose the strict explicit-plane hardware gate; they do not
+// make an opaque externalFormat a portable VkFormat contract.
+struct QTAV_INTEROP_OHCODEC_VULKAN_EXPORT
+OHCodecVulkanNativeBufferObservation {
+    std::int32_t nativeWidth = 0;
+    std::int32_t nativeHeight = 0;
+    std::int32_t nativeStride = 0;
+    std::uint64_t nativeUsage = 0;
+    std::int32_t nativeColorSpace = 0;
+    std::int32_t nativeColorSpaceResult = 0;
+    std::uint64_t formatFeatures = 0;
+    std::uint64_t optimalTilingFeatures = 0;
+    std::uint64_t allocationSize = 0;
+    std::uint32_t memoryTypeBits = 0;
+};
+
 // Presents one OHCodec output into a private OH_ConsumerSurface, acquires the
 // exact queued OHNativeWindowBuffer, and imports its OH_NativeBuffer through
 // VK_OHOS_external_memory. Explicit two- or three-plane Vulkan formats can be
@@ -119,6 +137,8 @@ public:
         FrameAvailableCallback callback) override;
 
     OHCodecVulkanInteropStatistics statistics() const noexcept;
+    OHCodecVulkanNativeBufferObservation
+    nativeBufferObservation() const noexcept;
 
 private:
     class Impl;

@@ -142,8 +142,8 @@ not claims made by this workflow:
   AAudio, and vendor-driver validation;
 - OHOS OHCodec/NativeBuffer, strict explicit-plane Vulkan, native HDR, OHAudio,
   and signed-HAP validation;
-- Windows vendor GPU cadence, active-display HDR, physical audio audibility,
-  and the external Intel post-seek investigation.
+- Windows vendor GPU cadence, active-display HDR, and physical audio
+  audibility.
 
 Those gates must report their real hardware, driver/system, media, lifecycle,
 and objective counters. Their absence from CI is neither a pass nor a failure

@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "QtAVCore full player demo"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "QtAVCore full player demo"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "QtAVCore Player"
+    }
+  ]
+}

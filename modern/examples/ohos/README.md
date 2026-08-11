@@ -1,5 +1,15 @@
 # QtAVCore OHOS XComponent example
 
+The user-facing player demo is documented separately in
+[`PLAYER_DEMO.md`](PLAYER_DEMO.md). It adds local-document and URL opening,
+full-screen controls, pitch-preserving rates, audio/subtitle switching,
+system picture-in-picture, presentation-timed subtitles, and a closeable 1 Hz
+media/FPS overlay. Its clean HAP template contains no committed signing
+material, and its build script never installs or launches the application;
+local DevEco automatic signing can produce the signed device package. The
+remainder of this file documents the automated production-path validation
+harness.
+
 This example is the OHOS production-path shell. ArkUI owns one `XComponent`;
 its native lifecycle publishes `OHNativeWindow` generations to
 `QtAV::RenderVulkanOHOS` and `QtAV::RenderOpenGLOHOS` through the shared
@@ -49,7 +59,15 @@ The second starts from OHCodec/Vulkan again, clears the hardware-decode
 configuration at the same selector transition, and requires software frames
 to continue through OpenGL ES. These are independent policies: no frame from
 the retired Vulkan surface is retried, mapped, or copied across APIs.
-Native OHOS HDR remains pending. The Vulkan interop retains the exact acquired
+Native OHOS HDR output selection is implemented, cross-build verified, and
+connected-device validated through an ArkUI `XComponentType.SURFACE`. ArkUI's
+HDR brightness hint follows the native HDR policy; both adapters mark the
+`OHNativeWindow` as a video source, set its HDR white point, synchronize the
+selected SDR/HDR color space, and attach HDR type/static metadata before the
+next surface-buffer request. Vulkan presented A2B10G10R10 BT.2020/PQ and
+OpenGL ES presented exact RGB10_A2 BT.2020/PQ; both passed required-HDR mode
+and triggered RenderService's HDR algorithm on the connected device. Explicit
+SDR remained RGBA8/sRGB with deterministic tone mapping. The Vulkan interop retains the exact acquired
 `OHNativeWindowBuffer`/`OH_NativeBuffer`, imports it through
 `VK_OHOS_external_memory`, and can be called strict no-intermediate source
 zero-copy only when the driver exposes an explicit `VkFormat` and plane mapping

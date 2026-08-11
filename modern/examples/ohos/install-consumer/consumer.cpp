@@ -59,6 +59,9 @@ int qtav_ohos_render_install_consumer()
         ohCodecVulkanConfig);
     const qtav::OHCodecVulkanInteropStatistics
         ohCodecVulkanStatistics = ohCodecVulkanInterop.statistics();
+    const qtav::OHCodecVulkanNativeBufferObservation
+        ohCodecVulkanObservation =
+            ohCodecVulkanInterop.nativeBufferObservation();
     return capabilities.customViewport
             && capabilities.rotation
             && capabilities.ownedContext
@@ -100,6 +103,10 @@ int qtav_ohos_render_install_consumer()
             && ohCodecVulkanStatistics.stagingCopies == 0
             && ohCodecVulkanStatistics.rendererUploads == 0
             && ohCodecVulkanStatistics.normalizationPasses == 0
+            && ohCodecVulkanObservation.nativeWidth == 0
+            && ohCodecVulkanObservation.nativeHeight == 0
+            && ohCodecVulkanObservation.nativeUsage == 0
+            && ohCodecVulkanObservation.formatFeatures == 0
             && std::string(
                    qtav::mobileRenderAPIName(
                        qtav::MobileRenderAPI::OpenGLES))

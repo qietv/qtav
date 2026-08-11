@@ -13,7 +13,8 @@ NV12/P010 和 libplacebo direct-plane 路径均已成功。
 ## 文件
 
 - `native_buffer_vulkan_probe.h/.cpp`：NativeBuffer 查询和导入，共用一份代码
-  明确切换 opaque 与 forced-explicit 两种写法；
+  明确切换 opaque 与 forced-explicit 两种写法，并记录 width/height、stride、
+  usage、NativeBuffer colorspace 查询结果和 Vulkan `formatFeatures`；
 - `libplacebo_wrap_probe.h/.cpp`：仅验证 libplacebo 能否把强制后的显式格式
   建立为两个 plane texture；
 - `device-result.txt`：opaque external-format 真机结果；
@@ -94,6 +95,10 @@ Mate 60 Pro / Maleoon 910 / HarmonyOS 6.1.0.135：
 
 三条路径均为 `cpuMap=0 transfer=0 staging=0 upload=0`。libplacebo 路径还满足
 `normalization=0`。
+
+公开的 OHOS NativeBuffer/Vulkan 导入结构不提供底层 allocation modifier 或
+厂商压缩模式；探针不得猜测这两个值。若设备或厂商没有通过另一个有文档的
+接口提供，应在研究记录中明确写为 `not-exposed`。
 
 因此已确认当前设备具有消费能力，libplacebo 也接受两个显式多平面格式。
 剩余问题只有数值映射的正式性、适用范围、稳定性和 P010 raw 10-bit 保证。

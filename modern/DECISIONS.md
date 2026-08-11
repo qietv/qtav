@@ -595,8 +595,8 @@ lifecycle mechanisms rather than per-import workarounds.
   closing the original crash/correctness scope. The user's separate report of
   visually dropped 4K frames on an AMD integrated GPU requires objective
   cadence and stage timing before it is attributed to the renderer. That
-  performance investigation also requires an Intel regression from the same
-  build and workloads before closure.
+  performance investigation included an Intel regression from the same build
+  and workloads before closure.
 - RGB10/PQ avoids the observed scRGB/DWM brightness mismatch for this opaque
   surface but cannot provide premultiplied-alpha video composition.
 - `colorInfo()` remains useful evidence for format, color space, SDR white,
@@ -832,8 +832,9 @@ build/UI-capture load. After an idle interval, a fresh process restored
 steady coalescing, busy, superseded, or terminal counts; warm draw maxima were
 about 35-43 ms. The
 [frozen plan history](PLAN_HISTORY_2026-08-10.md) therefore records the
-high-load result as an environmental caution; the active
-[`PLAN.md`](PLAN.md) keeps only the Intel performance comparison open.
+high-load result as an environmental caution. The subsequent Intel root-cause
+repair and regression record complete that performance comparison and the
+Intel performance task.
 
 ## AD-009: OHOS external-format guessing is a bounded workaround
 
@@ -1858,3 +1859,74 @@ the installed header, `QtAV::Core`, compilation, and final linking. Windows
 static/shared tests and Android/OHOS static/shared package consumers provide the
 supported-target gate; detailed commands and results are retained in the dated
 plan history referenced by [`PLAN.md`](PLAN.md).
+
+## AD-023: OHOS XComponent native HDR requires a three-layer contract
+
+- Date: 2026-08-11
+- Status: Accepted and connected-device validated
+- Scope: ArkUI surface hosting, NativeWindow composition metadata, Vulkan/EGL
+  output selection, HDR policy, and fallback
+
+### Context
+
+The OHOS player already hosted video in an ArkUI `XComponentType.SURFACE`, but
+selecting an HDR-capable shader/output policy alone did not make RenderService
+compose an HDR layer. The platform exposes separate state at ArkUI,
+`OHNativeWindow`, and Vulkan/EGL levels. On the tested system, the Vulkan WSI
+maps A2B10G10R10 plus BT.2020/PQ during swapchain creation while its surface-
+format query advertises the 10-bit format only with SDR/P3 color spaces. Its
+`vkSetHdrMetadataEXT` entry point is also currently a no-op. EGL accepts an
+exact RGB10_A2 BT.2020/PQ surface, but some drivers report the default EGL
+surface color space back after creation even when the NativeWindow retained
+the requested color space.
+
+### Decision
+
+1. ArkUI continues owning one `XComponentType.SURFACE`. Its
+   `hdrBrightness()` value follows the application HDR policy: `1.0` for
+   preferred/required HDR and `0.0` for explicit SDR.
+2. Each graphics adapter marks the retained `OHNativeWindow` as a video
+   source, sets the HDR white-point brightness, verifies its color space, and
+   publishes HDR type/static metadata before the next buffer request. This is
+   platform composition state, not an alternative color shader.
+3. Vulkan may try an unadvertised A2B10G10R10 BT.2020/PQ pair only on OHOS and
+   only when the application declares that `VK_EXT_swapchain_colorspace` was
+   enabled. `RequireHdr` fails closed. `PreferHdr` retries a normally
+   advertised, verified SDR pair when creation or NativeWindow verification
+   fails. The standard HDR-metadata call is submitted once per swapchain for
+   future-compatible implementations; NativeWindow metadata remains the
+   effective per-buffer path on the tested WSI.
+4. OpenGL ES requires an exact RGB10_A2 EGLConfig and advertised BT.2020/PQ or
+   HLG extension. The EGL query is accepted when it matches; if it returns the
+   default value, the adapter accepts the candidate only when the
+   NativeWindow still reports the exact requested HDR color space.
+5. Libplacebo remains the only semantic color, Dolby Vision reshape,
+   tone/gamut, and output-encoding authority. This decision changes native
+   target/composition negotiation only.
+6. This output workaround is independent of the OHCodec source-buffer
+   workaround in AD-009. It does not turn `VK_FORMAT_UNDEFINED` decoder input
+   into a strict explicit-plane source path or complete the strict Dolby
+   Vision Vulkan gate.
+
+### Consequences
+
+- The black ArkUI background stays behind the surface and supplies Fit
+  letterboxing; it cannot cover the native video layer while the XComponent
+  surface is presenting.
+- Runtime diagnostics report the negotiated target format/color space and the
+  ArkUI HDR-brightness hint. A screenshot remains an SDR capture and is not
+  accepted as luminance proof.
+- Older aggregate initializers of `BorrowedOHOSVulkanContext` retain their
+  original field meanings because the new swapchain-colorspace flag is
+  trailing and defaults to false.
+
+### Validation
+
+On the connected HDR-capable OHOS device, `legend.mkv` passed required-HDR
+through Vulkan A2B10G10R10 BT.2020/PQ and OpenGL ES RGB10_A2 BT.2020/PQ at
+about 25 FPS with zero Player drops. `wednesday.mp4` held 24 FPS through
+OHCodec/OpenGL ES and the same HDR target. RenderService logged entry into its
+HDR composition algorithm. Explicit SDR selected RGBA8/sRGB, set the ArkUI
+brightness hint to zero, and reported HDR-to-SDR tone mapping. Video remained
+visible with the debug overlay and black Fit bars, confirming that the ArkUI
+background was not obscuring the hardware-decoded surface.

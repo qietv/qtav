@@ -3376,6 +3376,8 @@ private:
 
         const OHCodecVulkanInteropStatistics statistics =
             interop->statistics();
+        const OHCodecVulkanNativeBufferObservation observation =
+            interop->nativeBufferObservation();
         const std::uint64_t totalRendered =
             ohCodecVulkanH264Rendered_.load(std::memory_order_relaxed)
             + ohCodecVulkanHEVCRendered_.load(
@@ -3491,6 +3493,11 @@ private:
             && statistics.lastExternalFormat != 0;
         const bool vulkanSampled = directPassed || opaqueSampledPassed
             || workaroundSampledPassed;
+        const bool strictExplicitPlanePassed = directPassed
+            && statistics.lastVulkanFormat != VK_FORMAT_UNDEFINED
+            && statistics.forcedVkFormatImports == 0
+            && statistics.externalFormatWorkaroundImports == 0
+            && statistics.opaqueExternalImports == 0;
         const bool passed = commonPassed
             && (vulkanSampled || opaqueUnsupportedPassed);
         if (!passed) {
@@ -3546,6 +3553,8 @@ private:
                 : directPassed ? "explicit-plane"
                 : opaqueSampledPassed ? "opaque-ycbcr-normalized"
                                       : "unsupported")
+            + " strictExplicitPlane="
+            + (strictExplicitPlanePassed ? "PASS" : "GATED")
             + " codecs=h264,hevc h264Rendered="
             + std::to_string(
                 ohCodecVulkanH264Rendered_.load(
@@ -3582,6 +3591,18 @@ private:
             + std::to_string(statistics.outputsReleasedAfterGpu)
             + " nativeFormat="
             + std::to_string(statistics.lastNativeFormat)
+            + " nativeSize="
+            + std::to_string(observation.nativeWidth)
+            + "x"
+            + std::to_string(observation.nativeHeight)
+            + " nativeStride="
+            + std::to_string(observation.nativeStride)
+            + " nativeUsage="
+            + std::to_string(observation.nativeUsage)
+            + " nativeColorSpace="
+            + std::to_string(observation.nativeColorSpace)
+            + " nativeColorSpaceResult="
+            + std::to_string(observation.nativeColorSpaceResult)
             + " vkFormat="
             + std::to_string(
                 static_cast<std::int32_t>(
@@ -3592,6 +3613,16 @@ private:
                     statistics.lastForcedVulkanFormat))
             + " externalFormat="
             + std::to_string(statistics.lastExternalFormat)
+            + " formatFeatures="
+            + std::to_string(observation.formatFeatures)
+            + " optimalFeatures="
+            + std::to_string(observation.optimalTilingFeatures)
+            + " allocationSize="
+            + std::to_string(observation.allocationSize)
+            + " memoryTypeBits="
+            + std::to_string(observation.memoryTypeBits)
+            + " nativeModifier=not-exposed"
+            + " nativeCompression=not-exposed"
             + " exactQueueMax="
             + std::to_string(
                 ohCodecVulkanMaximumScheduledFrames_.load(
@@ -3616,7 +3647,7 @@ private:
             + " cpuMap=0 transfer=0 staging=0 upload=0";
         logMessage(LOG_INFO, vulkanResult);
         setDetail(
-            "Strict OHCodec/Vulkan validation completed; starting selector hardware-frame fallback validation");
+            "OHCodec/Vulkan source-path validation completed; starting selector hardware-frame fallback validation");
         startOHCodecFallbackPhase(
             MobileHardwareFrameFallbackRoute::OpenGLESInterop);
     }

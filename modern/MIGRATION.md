@@ -71,6 +71,12 @@ continues to govern any future plugin design.
 | `QThread` playback workers | standard C++ demux, independent audio/video decode, audio-output, and presentation workers with bounded queues |
 | `QString`, `QList`, `QImage` frame API | STL values and reference-counted frame views |
 
+String properties retain application-level configuration without exposing an
+FFmpeg type. `avformat.*` forwards input/protocol options, while
+`avcodec.video.threads` selects a fixed FFmpeg software-video thread count on
+the next decoder open. Hardware video and audio decoders ignore that property;
+leaving it unset preserves automatic frame/slice thread selection.
+
 For ordinary Windows composition presentation, `QtAV::OutputD3D11` owns the
 D3D11 device, swap chain, render target, redraw coalescing, render thread,
 reason-aware rendering, `Present()`, and Advanced Color policy. The application
@@ -157,13 +163,20 @@ already own a graphics context or require multiple/custom render targets:
   encoding, and FFmpeg-parsed Dolby Vision RPU reshaping;
 - optional OHOS `QtAV::RenderVulkanOHOS` surface/swapchain adaptation using
   an ArkUI/XComponent `OHNativeWindow` and application-owned Vulkan context,
-  plus a minimal signed-HAP integration harness for software-frame playback;
+  plus a signed-HAP player and integration harness. Applications that enable
+  `VK_EXT_swapchain_colorspace` on the borrowed instance report that fact in
+  the trailing `BorrowedOHOSVulkanContext::swapchainColorSpaceEnabled` field;
+  its trailing placement preserves the meaning of older aggregate
+  initializers;
 - optional platform-neutral `QtAV::RenderOpenGL` OpenGL ES 3.x rendering with
   libplacebo color conversion, scaling, tone mapping, output encoding, and
   FFmpeg-parsed Dolby Vision RPU reshaping, plus Android
   `QtAV::RenderOpenGLAndroid` EGL/window adaptation for native RGB10_A2 HDR or
   explicit RGBA8/sRGB fallback and OHOS `QtAV::RenderOpenGLOHOS` adaptation
-  for a capability-verified RGBA8/sRGB baseline. When the GPU cannot directly
+  for capability-verified RGB10_A2 BT.2020/PQ or BT.2020/HLG output with an
+  exact RGBA8/sRGB fallback. Both OHOS graphics adapters now verify the
+  selected `OHNativeWindow` color space and native-HDR presentation has passed
+  connected XComponent/RenderService validation. When the GPU cannot directly
   map a decoded high-bit-depth software plane, the libswscale compatibility
   fallback keeps Y/Cb/Cr sources planar so Dolby Vision metadata still
   describes their components; RGB sources normalize to full-range RGBA.
@@ -499,12 +512,14 @@ keep the default render parameters. Normal flush, resize, media replacement,
 failure cleanup, and teardown still perform the explicit drains required by
 their lifecycles. Changes to this policy require fresh NVIDIA, Intel, and AMD
 seek, shutdown, cadence, and stage-timing regression. A separately reported
-visual 4K cadence issue on an AMD integrated GPU remains a performance
+visual 4K cadence issue on an AMD integrated GPU was treated as a performance
 investigation rather than an imported-frame correctness regression. The Intel
 Iris Xe same-build investigation localized and removed redundant decoder
 teardown. The closed AD-010 matrix and earlier device evidence are retained in
-[`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md); the separate open
-Intel performance workstream is tracked in [`PLAN.md`](PLAN.md).
+[`PLAN_HISTORY_2026-08-10.md`](PLAN_HISTORY_2026-08-10.md). The persistent
+post-seek defect and its root-cause investigation are complete; the broader
+zero-transient follow-up is no longer required. The Intel performance task is
+complete.
 
 For offline PCM inspection, `WavAudioSink` negotiates an interleaved output
 format and writes a standard RIFF/WAVE file. It does not expose a device clock
@@ -513,7 +528,7 @@ or pace playback. Decoded planar audio therefore normally uses
 
 ## Deliberately deferred
 
-- broader OHOS Vulkan/OpenGL ES format, HDR, and lifecycle validation;
+- broader OHOS Vulkan/OpenGL ES upload-format and lifecycle validation;
 - OHOS explicit-multi-plane Vulkan device validation for strict no-intermediate
   wrapping, plus broader raw `GL_EXT_YUV_target`
   OpenGL ES device coverage;
@@ -612,6 +627,16 @@ only the opaque `VkExternalFormatOHOS` route. The workaround recognizes a
 closed set of standard packed and multi-planar Vulkan YCbCr IDs and still
 requires every sampled-format, object-creation, NativeBuffer import, and
 sampling operation to succeed. It is not an arbitrary external-ID cast.
+
+OHOS Vulkan diagnostics can now call the additive
+`OHCodecVulkanInterop::nativeBufferObservation()` method without changing the
+layout of `OHCodecVulkanInteropStatistics`. It exposes the public NativeBuffer
+configuration, color-space query result, and Vulkan format/memory capability
+fields needed to audit a strict explicit-plane candidate. Direct libplacebo
+wrapping additionally rejects a native YCrCb/VU plane order when the explicit
+Vulkan format describes YCbCr/UV. The public OHOS APIs still expose neither a
+vendor compression mode nor an allocation modifier; callers must report those
+as unavailable unless a documented platform mechanism supplies them.
 
 `MobileRendererSelectorConfig::preferredAPI` is a new public field. It
 defaults to `MobileRenderAPI::Vulkan`; use `OpenGLES` for a user-selected

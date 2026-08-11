@@ -1,0 +1,6 @@
+{
+  "name": "libqtav_player.so",
+  "version": "1.0.0",
+  "description": "QtAVCore OHOS player native module",
+  "types": "./index.d.ts"
+}

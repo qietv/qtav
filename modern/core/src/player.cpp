@@ -3110,8 +3110,36 @@ private:
                         0);
                 }
             }
+            AVDictionary* codecOptions = nullptr;
+            std::string requestedSoftwareVideoThreads;
+            if (error >= 0 && !hardware && type == AVMEDIA_TYPE_VIDEO) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto found = properties_.find(
+                    "avcodec.video.threads");
+                if (found != properties_.end()) {
+                    requestedSoftwareVideoThreads = found->second;
+                }
+            }
+            if (error >= 0 && !requestedSoftwareVideoThreads.empty()) {
+                error = av_dict_set(
+                    &codecOptions,
+                    "threads",
+                    requestedSoftwareVideoThreads.c_str(),
+                    0);
+            }
             if (error >= 0) {
-                error = avcodec_open2(context, decoder, nullptr);
+                error = avcodec_open2(context, decoder, &codecOptions);
+            }
+            av_dict_free(&codecOptions);
+            if (error >= 0 && !hardware && type == AVMEDIA_TYPE_VIDEO) {
+                publishEvent({
+                    "decoder.software.configuration",
+                    "Software video decoder threads="
+                        + std::to_string(context->thread_count)
+                        + " activeThreadType="
+                        + std::to_string(context->active_thread_type),
+                    0,
+                });
             }
             if (error < 0) {
                 avcodec_free_context(&context);

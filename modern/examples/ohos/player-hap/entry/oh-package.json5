@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "QtAVCore OHOS player entry",
+  "main": "",
+  "author": "QtAVCore",
+  "license": "LGPL-2.1-or-later",
+  "dependencies": {
+    "libqtav_player.so": "file:./src/main/cpp/types/libqtav_player"
+  }
+}

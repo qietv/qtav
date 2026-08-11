@@ -58,7 +58,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
 - explicit frame-accurate video seek plus asynchronous forward/backward frame
   stepping that leaves playback paused;
 - media/track information, asynchronous post-load audio/video/subtitle track
-  switching, and `avformat.*` property forwarding;
+  switching, `avformat.*` property forwarding, and an
+  `avcodec.video.threads` software-video decoder override;
 - decoder-driven `setRenderCallback()` plus reason-aware render-thread
   `renderVideoDetailed()` and the compatibility `renderVideo()` wrapper;
 - compile-time `VideoRenderAPI`, `AudioSink`, and hardware-frame interop
@@ -113,15 +114,17 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   publishes its output color space, and owns surface/swapchain synchronization;
 - optional OHOS Vulkan surface adapter that retains an ArkUI/XComponent
   `OHNativeWindow`, owns `VK_OHOS_surface` swapchain synchronization, and
-  delegates software-frame rendering to the same platform-neutral Vulkan
-  engine;
+  verifies the selected native-window SDR/HDR color space before delegating
+  rendering to the same platform-neutral Vulkan engine;
 - optional platform-neutral OpenGL ES 3.x renderer using libplacebo for
   software and hardware-frame color conversion, Dolby Vision RPU reshaping,
   tone mapping, gamut mapping, and output encoding, plus separate Android and
   OHOS EGL adapters. Android selects native 10-bit BT.2020/PQ or BT.2020/HLG
-  when available and preserves an explicit RGBA8/sRGB SDR fallback; the first
-  OHOS adapter slice capability-gates an exact RGBA8/sRGB surface and reports
-  required HDR as unavailable until native HDR validation is complete;
+  when available and preserves an explicit RGBA8/sRGB SDR fallback. OHOS now
+  applies the same exact RGB10_A2 BT.2020/PQ or BT.2020/HLG candidate policy,
+  verifies the `OHNativeWindow` color space, and falls back to verified
+  RGBA8/sRGB unless HDR is required; native-HDR validation on a capable OHOS
+  window/device remains a separate gate;
 - optional platform-neutral mobile renderer selector that defaults to
   Vulkan-preferred startup, exposes an OpenGL ES preference, performs bounded
   same-API recovery and fatal one-way fallback, and has an explicit
@@ -148,6 +151,12 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   output retention and stale-generation rejection, native Vulkan-to-OpenGL ES
   OHCodec surface rebind, and an independent software-decode fallback, through
   the repository arm64/API 23 dependency package;
+- a separate user-facing OHOS ArkUI player demo with local document and direct
+  URL opening, full-screen and picture-in-picture surface transfer, accurate
+  seek, pitch-preserving playback rates, post-load audio/subtitle switching,
+  presentation-timed text subtitles, selectable software/OHCodec decode and
+  Vulkan/OpenGL ES rendering, explicit HDR policy/diagnostics, a closeable
+  1 Hz media/FPS overlay, and a separate lightweight progress snapshot;
 - standalone CMake package and headless integration tests.
 
 The core does not open a platform audio device by default. Applications can
@@ -279,9 +288,9 @@ Current backend integration boundary:
   outside core public headers;
 - `QtAV::RenderOpenGLOHOS` retains the current XComponent `OHNativeWindow`
   generation, owns its EGL display, OpenGL ES 3.x context, window surface, and
-  swap, and verifies an exact RGBA8/sRGB native-window contract. Native OHOS
-  HDR EGL selection remains capability-gated and is not claimed by this first
-  adapter slice;
+  swap, prefers exact RGB10_A2 BT.2020/PQ then BT.2020/HLG when the required
+  EGL extensions are exposed, verifies the matching OHOS native-window color
+  space, and falls back to exact RGBA8/sRGB unless HDR is required;
 - `QtAV::RenderMobile` owns no graphics or platform resources. Applications
   supply Vulkan and OpenGL ES renderer factories for the current native-window
   generation; the selector keeps one stable `VideoRenderAPI` attached to
@@ -464,6 +473,20 @@ DevEco project, use:
 ./modern/examples/ohos/build-ohos-hap.ps1 `
   -ProjectRoot C:/path/to/signed-project
 ```
+
+The independent manual player demo builds an unsigned HAP when no local DevEco
+signing configuration is present and never deploys it:
+
+```powershell
+./modern/examples/ohos/build-ohos-player-hap.ps1
+```
+
+After configuring signing in a DevEco project, pass that project through
+`-ProjectRoot`; the script preserves its root signing profile. See
+[`examples/ohos/PLAYER_DEMO.md`](examples/ohos/PLAYER_DEMO.md) for the feature
+and signed-device acceptance matrix. The 2026-08-11 signed-device run covered
+Vulkan HTTPS playback, FPS, rate/skip, full screen, live PiP, dual-audio and
+subtitle switching, and the safe-access document picker.
 
 With one HDC target connected, `run-connected-device.ps1` installs the signed
 HAP, starts its `EntryAbility`, and collects the native PASS/FAIL result. See
@@ -809,6 +832,24 @@ own start time before demux ordering and frame presentation. If the main input
 does not contain audio or subtitles, the best matching external track becomes
 active automatically. Otherwise the main input keeps best-stream priority and
 the application can select a sidecar with `setActiveTrack()`.
+
+### Software-video decoder threads
+
+FFmpeg software video decoding defaults to automatic frame/slice thread
+selection. An application that needs a repeatable device experiment may set
+the decoder thread count before opening media:
+
+```cpp
+player.setProperty("avcodec.video.threads", "4");
+player.setMedia("movie.mkv");
+```
+
+The property is passed as FFmpeg's `threads` decoder option only when opening a
+software video decoder. It does not affect audio or hardware decoders, and a
+change takes effect on the next decoder open. QtAVCore emits the informational
+`decoder.software.configuration` event after a successful open with the actual
+thread count and active FFmpeg thread type. Keep the default automatic value
+for ordinary playback unless device measurements justify a fixed count.
 
 ### Packet buffering
 
@@ -1402,6 +1443,16 @@ player.setHardwareDecodeConfig(
         { false, 8 }));
 ```
 
+`nativeBufferObservation()` returns the most recently acquired decoder
+allocation's dimensions, stride, usage, NativeBuffer color-space query result,
+Vulkan `formatFeatures`, optimal-tiling features, allocation size, and memory-
+type bits. These fields are diagnostic inputs to the strict explicit-plane
+gate; they do not reinterpret an opaque external ID or map the decoded buffer.
+OHOS's public NativeBuffer/Vulkan import contract does not expose the vendor
+compression mode or an allocation modifier, so the connected-device marker
+reports both as `not-exposed` instead of inventing a value. The existing
+`OHCodecVulkanInteropStatistics` layout remains unchanged.
+
 The interop owns a private `OH_ConsumerSurface`. Surface-mode OHCodec outputs
 do not expose native memory through their `OH_AVBuffer`; the interop therefore
 presents exactly one retained output into that surface, waits for its frame
@@ -1411,7 +1462,10 @@ semaphore. The consumer buffer remains retained until the renderer's GPU
 completion timeline retires the texture.
 
 Explicit sampled multi-planar `VkFormat` values are passed directly to
-`pl_vulkan_wrap`. For `VK_FORMAT_UNDEFINED` plus an external-format ID, the
+`pl_vulkan_wrap` only when the OH native format has the same raw component and
+plane order. In particular, YCrCb/VU buffers are not silently accepted as
+YCbCr/UV direct-plane inputs. For `VK_FORMAT_UNDEFINED` plus an external-format
+ID, the
 default production workaround accepts only a closed standard Vulkan YCbCr
 allow-list covering common 8/10/12/16-bit packed and two-/three-plane
 4:2:0/4:2:2/4:4:4 formats. It reinterprets the recognized ID as an explicit
@@ -1980,13 +2034,20 @@ policy layer.
 
 On OHOS, link `QtAV::RenderOpenGLOHOS` and pass the current XComponent window
 to `OHOSOpenGLVideoRenderer::setWindow()`. The adapter takes an OHOS native-
-object reference, selects and verifies an exact RGBA8 EGLConfig and native
-window format, requests and verifies the sRGB color contract, and owns EGL
-surface/context recreation for that window generation. `SdrOnly` and
-`PreferHdr` currently produce SDR sRGB; `RequireHdr` fails explicitly because
-an OHOS native HDR format, EGL colorspace, and compositor contract has not yet
-passed the device capability gate. This keeps HDR-to-SDR tone mapping truthful
-while the broader OHOS HDR matrix remains pending.
+object reference and owns EGL surface/context recreation for that window
+generation. `PreferHdr` first tries exact RGB10_A2 BT.2020/PQ and BT.2020/HLG
+candidates, verifies the selected `OHNativeWindow` color space, and then falls
+back to verified RGBA8/sRGB. `RequireHdr` rejects that SDR fallback. On the
+2026-08-11 connected `XComponentType.SURFACE`, OpenGL ES passed required-HDR
+with exact RGB10_A2 BT.2020/PQ. The matching Vulkan adapter passed with
+A2B10G10R10 BT.2020/PQ even though the OHOS surface-format query omitted the
+HDR pair: when the application declares that `VK_EXT_swapchain_colorspace` was
+enabled, the adapter performs a bounded OHOS-only creation attempt, verifies
+the NativeWindow color space, and retains a normal SDR retry for `PreferHdr`.
+Both adapters publish video-source, HDR-white-point, and per-frame HDR metadata
+to the NativeWindow. The player also aligns ArkUI's `hdrBrightness()` hint with
+the selected HDR/SDR policy, and RenderService reported an active HDR
+composition algorithm during both renderer runs.
 
 `QtAV::RenderOpenGL` is the reusable engine for applications or future
 platform adapters that already own an OpenGL ES 3.x context. Its

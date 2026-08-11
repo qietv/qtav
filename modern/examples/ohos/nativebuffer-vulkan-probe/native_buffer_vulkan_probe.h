@@ -33,6 +33,10 @@ struct Options {
 
 struct Report {
     std::int32_t nativeFormat = 0;
+    std::int32_t nativeStride = 0;
+    std::uint64_t nativeUsage = 0;
+    std::int32_t nativeColorSpace = 0;
+    std::int32_t nativeColorSpaceResult = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     VkFormat queriedFormat = VK_FORMAT_UNDEFINED;

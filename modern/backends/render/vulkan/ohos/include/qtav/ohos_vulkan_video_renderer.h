@@ -20,6 +20,12 @@ struct QTAV_RENDER_VULKAN_OHOS_EXPORT BorrowedOHOSVulkanContext {
     BorrowedVulkanDevice device;
     // True only when VK_EXT_hdr_metadata was enabled at VkDevice creation.
     bool hdrMetadataEnabled = false;
+    // True only when VK_EXT_swapchain_colorspace was enabled at instance
+    // creation. Some OHOS WSI versions accept native HDR color spaces at
+    // swapchain creation without advertising them from the surface query.
+    // Kept after the original fields so existing aggregate initialization
+    // retains its meaning.
+    bool swapchainColorSpaceEnabled = false;
 
     bool isValid() const noexcept;
 };

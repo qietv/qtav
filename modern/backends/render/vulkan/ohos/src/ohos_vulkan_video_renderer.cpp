@@ -2,6 +2,8 @@
 
 #include <qtav/ohos_vulkan_video_renderer.h>
 
+#include <native_buffer/native_buffer.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -108,6 +110,182 @@ VideoSize nativeWindowSize(OHNativeWindow* window) noexcept
     };
 }
 
+OH_NativeBuffer_ColorSpace nativeColorSpace(
+    VkColorSpaceKHR colorSpace) noexcept
+{
+    switch (colorSpace) {
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+        return OH_COLORSPACE_DISPLAY_BT2020_PQ;
+    case VK_COLOR_SPACE_HDR10_HLG_EXT:
+        return OH_COLORSPACE_DISPLAY_BT2020_HLG;
+    case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+        return OH_COLORSPACE_LINEAR_BT2020;
+    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+        return OH_COLORSPACE_LINEAR_SRGB;
+    case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
+    case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+    default:
+        return OH_COLORSPACE_DISPLAY_SRGB;
+    }
+}
+
+bool configureNativeColorSpace(
+    OHNativeWindow* window,
+    VkColorSpaceKHR colorSpace,
+    std::string& error)
+{
+    if (!window) {
+        error = "The OHOS native window is unavailable";
+        return false;
+    }
+    const OH_NativeBuffer_ColorSpace requested =
+        nativeColorSpace(colorSpace);
+    if (OH_NativeWindow_SetColorSpace(window, requested) != 0) {
+        error = "The OHOS native window rejected Vulkan color space "
+            + std::to_string(static_cast<int>(colorSpace));
+        return false;
+    }
+    OH_NativeBuffer_ColorSpace actual = OH_COLORSPACE_NONE;
+    if (OH_NativeWindow_GetColorSpace(window, &actual) != 0
+        || actual != requested) {
+        error = "The OHOS native window did not retain Vulkan color space "
+            + std::to_string(static_cast<int>(colorSpace));
+        return false;
+    }
+    return true;
+}
+
+bool configureNativeWindowRole(
+    OHNativeWindow* window,
+    bool hdrEnabled,
+    std::string& error)
+{
+    if (!window) {
+        error = "The OHOS native window is unavailable";
+        return false;
+    }
+    if (OH_NativeWindow_NativeWindowHandleOpt(
+            window,
+            SET_SOURCE_TYPE,
+            static_cast<int32_t>(OH_SURFACE_SOURCE_VIDEO))
+        != 0) {
+        error = "The OHOS native window rejected the video surface role";
+        return false;
+    }
+    int32_t sourceType = OH_SURFACE_SOURCE_DEFAULT;
+    if (OH_NativeWindow_NativeWindowHandleOpt(
+            window,
+            GET_SOURCE_TYPE,
+            &sourceType)
+            != 0
+        || sourceType != OH_SURFACE_SOURCE_VIDEO) {
+        error = "The OHOS native window did not retain the video surface role";
+        return false;
+    }
+    const float brightness = hdrEnabled ? 1.0F : 0.0F;
+    if (OH_NativeWindow_NativeWindowHandleOpt(
+            window,
+            SET_HDR_WHITE_POINT_BRIGHTNESS,
+            brightness)
+        != 0) {
+        error = "The OHOS native window rejected the HDR white-point brightness";
+        return false;
+    }
+    return true;
+}
+
+bool isOhosHdrSwapchainFormat(VkFormat format) noexcept
+{
+    // OpenHarmony's current swapchain layer maps only A2B10G10R10 to
+    // GRAPHIC_PIXEL_FMT_RGBA_1010102. Do not generalize this compatibility
+    // path to another Vulkan 10-bit layout without an explicit WSI mapping.
+    return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+}
+
+VkSurfaceFormatKHR unadvertisedOhosHdrFormat(
+    const std::vector<VkSurfaceFormatKHR>& formats) noexcept
+{
+    for (const VkSurfaceFormatKHR& format : formats) {
+        if (isOhosHdrSwapchainFormat(format.format)) {
+            // OpenHarmony's swapchain layer maps this pair to
+            // GRAPHIC_PIXEL_FMT_RGBA_1010102 and BT.2020/PQ even on releases
+            // whose surface-format query omits HDR color spaces. Keep this
+            // workaround OHOS-local and always retain a normal SDR retry.
+            return {
+                format.format,
+                VK_COLOR_SPACE_HDR10_ST2084_EXT,
+            };
+        }
+    }
+    return {
+        VK_FORMAT_UNDEFINED,
+        VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+    };
+}
+
+void setNativeHdrMetadata(
+    OHNativeWindow* window,
+    const VideoFrame& frame,
+    VkColorSpaceKHR colorSpace) noexcept
+{
+    if (!window || !vulkanColorSpaceIsHdr(colorSpace)) {
+        return;
+    }
+    OH_NativeBuffer_MetadataType type =
+        colorSpace == VK_COLOR_SPACE_HDR10_HLG_EXT
+        || frame.colorSpaceInfo().transfer == ColorTransfer::HLG
+        ? OH_VIDEO_HDR_HLG
+        : OH_VIDEO_HDR_HDR10;
+    OH_NativeWindow_SetMetadataValue(
+        window,
+        OH_HDR_METADATA_TYPE,
+        static_cast<int32_t>(sizeof(type)),
+        reinterpret_cast<uint8_t*>(&type));
+
+    const MasteringDisplayMetadata mastering =
+        frame.masteringDisplayMetadata();
+    const ContentLightMetadata content = frame.contentLightMetadata();
+    if (!mastering.hasPrimaries && !mastering.hasLuminance
+        && content.maximumContentLightLevel <= 0.0
+        && content.maximumFrameAverageLightLevel <= 0.0) {
+        return;
+    }
+    OH_NativeBuffer_StaticMetadata metadata {};
+    if (mastering.hasPrimaries) {
+        metadata.smpte2086.displayPrimaryRed = {
+            static_cast<float>(mastering.primaries[0].x),
+            static_cast<float>(mastering.primaries[0].y),
+        };
+        metadata.smpte2086.displayPrimaryGreen = {
+            static_cast<float>(mastering.primaries[1].x),
+            static_cast<float>(mastering.primaries[1].y),
+        };
+        metadata.smpte2086.displayPrimaryBlue = {
+            static_cast<float>(mastering.primaries[2].x),
+            static_cast<float>(mastering.primaries[2].y),
+        };
+        metadata.smpte2086.whitePoint = {
+            static_cast<float>(mastering.whitePoint.x),
+            static_cast<float>(mastering.whitePoint.y),
+        };
+    }
+    if (mastering.hasLuminance) {
+        metadata.smpte2086.maxLuminance =
+            static_cast<float>(mastering.maximumLuminance);
+        metadata.smpte2086.minLuminance =
+            static_cast<float>(mastering.minimumLuminance);
+    }
+    metadata.cta861.maxContentLightLevel =
+        static_cast<float>(content.maximumContentLightLevel);
+    metadata.cta861.maxFrameAverageLightLevel =
+        static_cast<float>(content.maximumFrameAverageLightLevel);
+    OH_NativeWindow_SetMetadataValue(
+        window,
+        OH_HDR_STATIC_METADATA,
+        static_cast<int32_t>(sizeof(metadata)),
+        reinterpret_cast<uint8_t*>(&metadata));
+}
+
 } // namespace
 
 bool BorrowedOHOSVulkanContext::isValid() const noexcept
@@ -181,6 +359,7 @@ public:
         extent_ = {};
         format_ = VK_FORMAT_UNDEFINED;
         colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        vulkanHdrMetadataSubmitted_ = false;
     }
 
     void destroySurface() noexcept
@@ -267,6 +446,12 @@ public:
             error = "The OHOS native window is unavailable";
             return false;
         }
+        if (!configureNativeWindowRole(
+                window_,
+                outputPreference_ != VulkanOutputPreference::SdrOnly,
+                error)) {
+            return false;
+        }
         VkSurfaceCreateInfoOHOS info {
             VK_STRUCTURE_TYPE_SURFACE_CREATE_INFO_OHOS,
         };
@@ -349,16 +534,50 @@ public:
                 result);
             return false;
         }
-        const VkSurfaceFormatKHR surfaceFormat =
-            selectVulkanSurfaceFormat(
-                formats.data(),
-                formats.size(),
-                outputPreference_);
+        VkSurfaceFormatKHR surfaceFormat = selectVulkanSurfaceFormat(
+            formats.data(), formats.size(), outputPreference_);
+        bool usedUnadvertisedOhosHdr = false;
+        if (outputPreference_ != VulkanOutputPreference::SdrOnly
+            && !vulkanColorSpaceIsHdr(surfaceFormat.colorSpace)
+            && context_.swapchainColorSpaceEnabled) {
+            const VkSurfaceFormatKHR ohosHdr =
+                unadvertisedOhosHdrFormat(formats);
+            if (ohosHdr.format != VK_FORMAT_UNDEFINED) {
+                surfaceFormat = ohosHdr;
+                usedUnadvertisedOhosHdr = true;
+            }
+        }
         if (surfaceFormat.format == VK_FORMAT_UNDEFINED) {
             error = outputPreference_ == VulkanOutputPreference::RequireHdr
                 ? "The OHOS Vulkan surface has no supported native HDR format/color-space pair"
                 : "The OHOS Vulkan surface has no supported render-target format/color-space pair";
             return false;
+        }
+        std::string colorSpaceError;
+        if (!configureNativeColorSpace(
+                window_,
+                surfaceFormat.colorSpace,
+                colorSpaceError)) {
+            if (outputPreference_ == VulkanOutputPreference::RequireHdr
+                || !vulkanColorSpaceIsHdr(surfaceFormat.colorSpace)) {
+                error = std::move(colorSpaceError);
+                return false;
+            }
+            surfaceFormat = selectVulkanSurfaceFormat(
+                formats.data(),
+                formats.size(),
+                VulkanOutputPreference::SdrOnly);
+            if (surfaceFormat.format == VK_FORMAT_UNDEFINED
+                || !configureNativeColorSpace(
+                    window_,
+                    surfaceFormat.colorSpace,
+                    error)) {
+                if (error.empty()) {
+                    error = "The OHOS Vulkan surface could not fall back to a verified SDR color space";
+                }
+                return false;
+            }
+            usedUnadvertisedOhosHdr = false;
         }
 
         VkExtent2D extent = capabilities.currentExtent;
@@ -401,8 +620,31 @@ public:
             &swapchainInfo,
             nullptr,
             &swapchain_);
+        if (result != VK_SUCCESS && usedUnadvertisedOhosHdr
+            && outputPreference_ == VulkanOutputPreference::PreferHdr) {
+            surfaceFormat = selectVulkanSurfaceFormat(
+                formats.data(),
+                formats.size(),
+                VulkanOutputPreference::SdrOnly);
+            if (surfaceFormat.format != VK_FORMAT_UNDEFINED
+                && configureNativeColorSpace(
+                    window_, surfaceFormat.colorSpace, error)) {
+                swapchainInfo.imageFormat = surfaceFormat.format;
+                swapchainInfo.imageColorSpace = surfaceFormat.colorSpace;
+                result = vkCreateSwapchainKHR(
+                    context_.device.device,
+                    &swapchainInfo,
+                    nullptr,
+                    &swapchain_);
+                usedUnadvertisedOhosHdr = false;
+            }
+        }
         if (result != VK_SUCCESS) {
-            error = resultError("vkCreateSwapchainKHR", result);
+            error = usedUnadvertisedOhosHdr
+                ? resultError(
+                      "vkCreateSwapchainKHR for the OHOS 10-bit HDR WSI path",
+                      result)
+                : resultError("vkCreateSwapchainKHR", result);
             return false;
         }
 
@@ -547,16 +789,22 @@ public:
 
     void applyHdrMetadata(const VideoFrame& frame) noexcept
     {
-        if (!swapchain_ || !vulkanColorSpaceIsHdr(colorSpace_)
-            || !setHdrMetadata_) {
+        if (!swapchain_ || !vulkanColorSpaceIsHdr(colorSpace_)) {
             return;
         }
-        const VkHdrMetadataEXT metadata = hdrMetadata(frame);
-        setHdrMetadata_(
-            context_.device.device,
-            1,
-            &swapchain_,
-            &metadata);
+        // The current OpenHarmony WSI exposes vkSetHdrMetadataEXT but its
+        // implementation is a no-op. NativeWindow metadata is the path that
+        // reaches each requested SurfaceBuffer and RenderService.
+        setNativeHdrMetadata(window_, frame, colorSpace_);
+        if (setHdrMetadata_ && !vulkanHdrMetadataSubmitted_) {
+            const VkHdrMetadataEXT metadata = hdrMetadata(frame);
+            setHdrMetadata_(
+                context_.device.device,
+                1,
+                &swapchain_,
+                &metadata);
+            vulkanHdrMetadataSubmitted_ = true;
+        }
     }
 
     void updateConfigForSurface() noexcept
@@ -629,6 +877,7 @@ public:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkColorSpaceKHR colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     PFN_vkSetHdrMetadataEXT setHdrMetadata_ = nullptr;
+    bool vulkanHdrMetadataSubmitted_ = false;
     std::array<
         FrameSync,
         VulkanVideoRenderer::FramesInFlight> sync_;
@@ -740,7 +989,12 @@ VideoRenderAttemptResult OHOSVulkanVideoRenderer::renderDetailed(
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
         if (!impl_->open_) {
             error = "The OHOS Vulkan renderer is not open";
-        } else if (frame.hasHardwareFrame()) {
+        } else {
+            // NativeWindow copies window metadata into a SurfaceBuffer when
+            // that buffer is requested. Publish it before acquire.
+            impl_->applyHdrMetadata(frame);
+        }
+        if (error.empty() && frame.hasHardwareFrame()) {
             const VulkanHardwareImportStatus status =
                 impl_->renderer_.prepareHardwareFrame(
                     frame,
@@ -770,7 +1024,6 @@ VideoRenderAttemptResult OHOSVulkanVideoRenderer::renderDetailed(
                 // or failed imports retain the default fatal result.
             } else if (!impl_->acquire(error)) {
             } else {
-                impl_->applyHdrMetadata(frame);
                 attempt = impl_->renderer_.renderDetailed(frame);
                 if (!attempt.presented()) {
                     impl_->renderer_.close();
@@ -808,9 +1061,8 @@ VideoRenderAttemptResult OHOSVulkanVideoRenderer::renderDetailed(
                     }
                 }
             }
-        } else if (!impl_->acquire(error)) {
-        } else {
-            impl_->applyHdrMetadata(frame);
+        } else if (error.empty() && !impl_->acquire(error)) {
+        } else if (error.empty()) {
             attempt = impl_->renderer_.renderDetailed(frame);
             if (!attempt.presented()) {
                 // No submission consumed imageAvailable_. Retire this

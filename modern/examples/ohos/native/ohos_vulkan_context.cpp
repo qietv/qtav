@@ -48,6 +48,7 @@ void OHOSVulkanContext::reset() noexcept
     physicalDevice_ = VK_NULL_HANDLE;
     queue_ = VK_NULL_HANDLE;
     queueFamilyIndex_ = 0;
+    swapchainColorSpaceEnabled_ = false;
     hdrMetadataEnabled_ = false;
     nativeBufferExternalMemoryEnabled_ = false;
     foreignQueueFamilyEnabled_ = false;
@@ -98,6 +99,7 @@ bool OHOSVulkanContext::create(
             VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
         enabledExtensions.push_back(
             VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        swapchainColorSpaceEnabled_ = true;
     }
 
     VkApplicationInfo applicationInfo {
@@ -342,6 +344,7 @@ BorrowedOHOSVulkanContext OHOSVulkanContext::borrowed() const noexcept
             true,
         },
         hdrMetadataEnabled_,
+        swapchainColorSpaceEnabled_,
     };
 }
 
@@ -374,6 +377,9 @@ std::string OHOSVulkanContext::description() const
         && foreignQueueFamilyEnabled_
         && syncFdSemaphoreEnabled_) {
         result += " / OH_NativeBuffer external memory";
+    }
+    if (swapchainColorSpaceEnabled_) {
+        result += " / swapchain colorspace";
     }
     return result;
 }

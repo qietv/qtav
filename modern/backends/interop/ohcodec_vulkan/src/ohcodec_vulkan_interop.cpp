@@ -184,6 +184,30 @@ bool nativeFormatMatchesExplicitFormat(
     }
 }
 
+bool nativeFormatHasDirectPlaneOrder(
+    std::int32_t nativeFormat,
+    VkFormat vulkanFormat) noexcept
+{
+    // Direct libplacebo wrapping consumes the component order encoded by the
+    // VkFormat. Unlike the sampler-YCbCr normalization route, it has no
+    // platform component swizzle with which to reinterpret YCrCb buffers.
+    switch (nativeFormat) {
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_422_SP:
+        return vulkanFormat == VK_FORMAT_G8_B8R8_2PLANE_422_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP:
+        return vulkanFormat == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_422_P:
+        return vulkanFormat == VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_420_P:
+        return vulkanFormat == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
+    case NATIVEBUFFER_PIXEL_FMT_YCBCR_P010:
+        return vulkanFormat
+            == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+    default:
+        return false;
+    }
+}
+
 bool probeOpaqueExternalFormatObjects(
     const BorrowedVulkanDevice& device,
     OH_NativeBuffer* nativeBuffer,
@@ -454,7 +478,13 @@ struct AtomicStatistics {
     std::atomic<std::uint64_t> unsupportedFormatsRejected { 0 };
     std::atomic<std::uint64_t> outputsReleasedAfterGpu { 0 };
     std::atomic<std::uint64_t> normalizationPasses { 0 };
+    std::atomic<std::int32_t> lastNativeWidth { 0 };
+    std::atomic<std::int32_t> lastNativeHeight { 0 };
+    std::atomic<std::int32_t> lastNativeStride { 0 };
+    std::atomic<std::uint64_t> lastNativeUsage { 0 };
     std::atomic<std::int32_t> lastNativeFormat { 0 };
+    std::atomic<std::int32_t> lastNativeColorSpace { 0 };
+    std::atomic<std::int32_t> lastNativeColorSpaceResult { 0 };
     std::atomic<std::int32_t> lastVulkanFormat {
         static_cast<std::int32_t>(VK_FORMAT_UNDEFINED),
     };
@@ -462,6 +492,10 @@ struct AtomicStatistics {
         static_cast<std::int32_t>(VK_FORMAT_UNDEFINED),
     };
     std::atomic<std::uint64_t> lastExternalFormat { 0 };
+    std::atomic<std::uint64_t> lastFormatFeatures { 0 };
+    std::atomic<std::uint64_t> lastOptimalTilingFeatures { 0 };
+    std::atomic<std::uint64_t> lastAllocationSize { 0 };
+    std::atomic<std::uint32_t> lastMemoryTypeBits { 0 };
 };
 
 struct FrameKey {
@@ -773,9 +807,32 @@ private:
     {
         OH_NativeBuffer_Config nativeConfig {};
         OH_NativeBuffer_GetConfig(nativeBuffer_, &nativeConfig);
+        state_->statistics.lastNativeWidth.store(
+            nativeConfig.width,
+            std::memory_order_relaxed);
+        state_->statistics.lastNativeHeight.store(
+            nativeConfig.height,
+            std::memory_order_relaxed);
+        state_->statistics.lastNativeStride.store(
+            nativeConfig.stride,
+            std::memory_order_relaxed);
+        state_->statistics.lastNativeUsage.store(
+            static_cast<std::uint32_t>(nativeConfig.usage),
+            std::memory_order_relaxed);
         state_->statistics.lastNativeFormat.store(
             nativeConfig.format,
             std::memory_order_relaxed);
+        OH_NativeBuffer_ColorSpace nativeColorSpace = OH_COLORSPACE_NONE;
+        const std::int32_t colorSpaceResult =
+            OH_NativeBuffer_GetColorSpace(nativeBuffer_, &nativeColorSpace);
+        state_->statistics.lastNativeColorSpaceResult.store(
+            colorSpaceResult,
+            std::memory_order_relaxed);
+        if (colorSpaceResult == 0) {
+            state_->statistics.lastNativeColorSpace.store(
+                static_cast<std::int32_t>(nativeColorSpace),
+                std::memory_order_relaxed);
+        }
         if (nativeConfig.width <= 0 || nativeConfig.height <= 0
             || nativeConfig.width < frameWidth_
             || nativeConfig.height < frameHeight_) {
@@ -874,6 +931,15 @@ private:
         state_->statistics.lastExternalFormat.store(
             formatProperties.externalFormat,
             std::memory_order_relaxed);
+        state_->statistics.lastFormatFeatures.store(
+            formatProperties.formatFeatures,
+            std::memory_order_relaxed);
+        state_->statistics.lastAllocationSize.store(
+            properties.allocationSize,
+            std::memory_order_relaxed);
+        state_->statistics.lastMemoryTypeBits.store(
+            properties.memoryTypeBits,
+            std::memory_order_relaxed);
         const bool queriedOpaqueExternal =
             formatProperties.format == VK_FORMAT_UNDEFINED;
         const bool diagnosticForceVkFormat = queriedOpaqueExternal
@@ -892,6 +958,7 @@ private:
             && state_->externalFormatProbeMode
                 == OHCodecVulkanExternalFormatProbeMode::ForcedVkFormatLibplacebo;
         VkFormat importFormat = formatProperties.format;
+        VkFormatProperties explicitProperties {};
         if (reinterpretExternalFormat) {
             importFormat = explicitFormatFromOpaqueId(
                 formatProperties.externalFormat);
@@ -921,7 +988,6 @@ private:
                     std::memory_order_relaxed);
                 return false;
             }
-            VkFormatProperties explicitProperties {};
             vkGetPhysicalDeviceFormatProperties(
                 state_->device.physicalDevice,
                 importFormat,
@@ -939,6 +1005,16 @@ private:
                 return false;
             }
         }
+        if (importFormat != VK_FORMAT_UNDEFINED
+            && !reinterpretExternalFormat) {
+            vkGetPhysicalDeviceFormatProperties(
+                state_->device.physicalDevice,
+                importFormat,
+                &explicitProperties);
+        }
+        state_->statistics.lastOptimalTilingFeatures.store(
+            explicitProperties.optimalTilingFeatures,
+            std::memory_order_relaxed);
         const bool useOpaqueExternalFormat =
             queriedOpaqueExternal && !reinterpretExternalFormat;
         const bool createYcbcrSampler =
@@ -1052,15 +1128,26 @@ private:
                 return false;
             }
         } else if (!directPlaneFormat(importFormat)
+            || !nativeFormatHasDirectPlaneOrder(
+                nativeConfig.format,
+                importFormat)
             || (formatProperties.formatFeatures
+                & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+                == 0U
+            || (explicitProperties.optimalTilingFeatures
                 & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
                 == 0U) {
             status = VulkanHardwareImportStatus::Unsupported;
-            error = "OH_NativeBuffer exposes no supported sampled Vulkan 4:2:0 plane format: VkFormat="
+            error = "OH_NativeBuffer exposes no exact sampled direct-plane contract: nativeFormat="
+                + std::to_string(nativeConfig.format)
+                + " VkFormat="
                 + std::to_string(
                     static_cast<std::int32_t>(importFormat))
                 + " features="
-                + std::to_string(formatProperties.formatFeatures);
+                + std::to_string(formatProperties.formatFeatures)
+                + " optimalFeatures="
+                + std::to_string(
+                    explicitProperties.optimalTilingFeatures);
             state_->statistics.unsupportedFormatsRejected.fetch_add(
                 1,
                 std::memory_order_relaxed);
@@ -1711,6 +1798,39 @@ OHCodecVulkanInterop::statistics() const noexcept
         source.lastForcedVulkanFormat.load(
             std::memory_order_relaxed));
     result.lastExternalFormat = source.lastExternalFormat.load(
+        std::memory_order_relaxed);
+    return result;
+}
+
+OHCodecVulkanNativeBufferObservation
+OHCodecVulkanInterop::nativeBufferObservation() const noexcept
+{
+    OHCodecVulkanNativeBufferObservation result;
+    if (!isValid()) {
+        return result;
+    }
+    const AtomicStatistics& source = impl_->state_->statistics;
+    result.nativeWidth = source.lastNativeWidth.load(
+        std::memory_order_relaxed);
+    result.nativeHeight = source.lastNativeHeight.load(
+        std::memory_order_relaxed);
+    result.nativeStride = source.lastNativeStride.load(
+        std::memory_order_relaxed);
+    result.nativeUsage = source.lastNativeUsage.load(
+        std::memory_order_relaxed);
+    result.nativeColorSpace = source.lastNativeColorSpace.load(
+        std::memory_order_relaxed);
+    result.nativeColorSpaceResult =
+        source.lastNativeColorSpaceResult.load(
+            std::memory_order_relaxed);
+    result.formatFeatures = source.lastFormatFeatures.load(
+        std::memory_order_relaxed);
+    result.optimalTilingFeatures =
+        source.lastOptimalTilingFeatures.load(
+            std::memory_order_relaxed);
+    result.allocationSize = source.lastAllocationSize.load(
+        std::memory_order_relaxed);
+    result.memoryTypeBits = source.lastMemoryTypeBits.load(
         std::memory_order_relaxed);
     return result;
 }

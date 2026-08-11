@@ -79,6 +79,17 @@ bool probeNativeBuffer(
 
     Report observation;
     observation.nativeFormat = nativeConfig.format;
+    observation.nativeStride = nativeConfig.stride;
+    observation.nativeUsage = static_cast<std::uint32_t>(
+        nativeConfig.usage);
+    OH_NativeBuffer_ColorSpace nativeColorSpace = OH_COLORSPACE_NONE;
+    observation.nativeColorSpaceResult = OH_NativeBuffer_GetColorSpace(
+        nativeBuffer,
+        &nativeColorSpace);
+    if (observation.nativeColorSpaceResult == 0) {
+        observation.nativeColorSpace = static_cast<std::int32_t>(
+            nativeColorSpace);
+    }
     observation.width = static_cast<std::uint32_t>(nativeConfig.width);
     observation.height = static_cast<std::uint32_t>(nativeConfig.height);
     observation.queriedFormat = formatProperties.format;

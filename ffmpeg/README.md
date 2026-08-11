@@ -47,7 +47,9 @@ The FFmpeg overlay applies this policy:
   API required by installed-package verification;
 - FFmpeg's native VVC/H.266 decoder remains enabled because the build never
   disables the native decoder set; no external VVC encoder is included;
-- `--enable-lto --enable-small --disable-avdevice --disable-iamf`;
+- `--enable-lto --enable-small --disable-avdevice --disable-iamf`; OHOS arm64
+  additionally uses `--optflags=-O3` so the size-policy switch does not reduce
+  FFmpeg's native software-decode optimization level to `-Oz`;
 - FFmpeg command-line programs are omitted because the parent player links the
   libraries directly.
 

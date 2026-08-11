@@ -467,3 +467,71 @@ installation or replacement was used.
 Reconsider this policy only if the project adopts a signed, content-addressed
 dependency distribution with equivalent checkout provenance and verification.
 Until then, workflow artifacts remain outputs rather than build inputs.
+
+## FD-008: Prefer decode throughput over size optimization on OHOS arm64
+
+- Date: 2026-08-11
+- Status: Accepted
+- Scope: OHOS arm64 FFmpeg native software decoding
+
+### Context
+
+The player dependency feature retained `--enable-small` together with LTO and
+the target toolchain's release `-O2`. FFmpeg interprets `--enable-small` as a
+request to optimize for size and appends `-Oz`, overriding the earlier `-O2`.
+On the connected OHOS arm64 device, a freshly opened low-complexity segment of
+4K HEVC Main10 could initially reach its 25 FPS source cadence, but higher
+bitrate/complexity segments lost real-time throughput while HEVC residual,
+deblocking, and loop-filter functions dominated sampled CPU cycles. ARM64 ASM,
+NEON, runtime CPU detection, and LTO were already active, so this was not a
+Debug, scalar, or accidentally single-threaded build.
+
+### Decision
+
+Keep the shared `qtav-player` feature policy, including `--enable-small` and
+LTO, but append `--optflags=-O3` for the OHOS arm64 triplet. This uses FFmpeg's
+supported explicit optimization override and leaves Android and Windows
+packages unchanged. Keep runtime CPU detection and generic ARM64 code
+generation; do not select one device-specific `-mcpu` or instruction-set
+extension for a distributable package.
+
+QtAVCore separately exposes the string property
+`avcodec.video.threads` for software-video decoder experiments. Thread-count
+selection belongs to the player session, not the dependency package.
+
+### Rejected alternatives
+
+- Retaining effective `-Oz` prioritizes binary size over the measured 4K
+  software-decode workload.
+- Removing ASM, NEON, or LTO would reduce decode throughput and would not
+  address the observed optimization-level mismatch.
+- Selecting a device-specific CPU target would make the package unsafe for
+  other supported OHOS arm64 devices.
+- Applying `-O3` to every target without target evidence would broaden the
+  change beyond the measured regression.
+
+### Consequences and validation
+
+Any change to this policy must run `scripts/build-ohos.ps1` locally and pass
+`cmake/verify-install.cmake`. The resulting FFmpeg configure record must show
+both the retained feature flags and effective `--optflags=-O3`. QtAVCore and
+the signed OHOS player HAP must then be rebuilt against that verified prefix,
+and the connected-device result must report the requested software-decoder
+thread count before comparing `legend.mkv` presentation cadence, CPU load, and
+thermal behavior.
+
+The 2026-08-11 validation completed that sequence. The installed configuration
+contained `-O3`, LTO, AArch64, and NEON without `-Oz`; the signed player reported
+four active frame threads and decoded 4,204 `legend.mkv` frames by position
+2:49 (24.9 FPS average). A ten-second device profile attributed 91.6% of cycles
+to the four HEVC workers and less than 1% to ArkUI. Presentation totals remained
+below decoded totals, so this validates the compiler/thread experiment without
+claiming zero end-to-end drops. Detailed counters are retained in
+`modern/PLAN_HISTORY_2026-08-11_OHOS_SOFTWARE_DECODE.md`.
+
+### Review condition
+
+Revisit the target-specific override when FFmpeg changes the semantics of
+`--enable-small`, when binary-size limits require a separate dependency
+profile, or when repeatable device measurements show that `-O2` or another
+portable optimization level provides better sustained throughput.

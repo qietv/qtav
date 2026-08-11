@@ -67,3 +67,48 @@ target_compile_options(qtav_ohos_xcomponent_example
         -Wno-missing-field-initializers)
 target_link_options(
     qtav_ohos_xcomponent_example PRIVATE -Wl,-Bsymbolic)
+
+if(TARGET qtav_audio_timestretch)
+    add_library(qtav_ohos_player_demo SHARED
+        native/ohos_player_napi.cpp
+        native/ohos_vulkan_context.cpp
+    )
+    target_compile_features(
+        qtav_ohos_player_demo PRIVATE cxx_std_17)
+    target_compile_definitions(
+        qtav_ohos_player_demo PRIVATE VK_USE_PLATFORM_OHOS)
+    target_include_directories(
+        qtav_ohos_player_demo PRIVATE native)
+    target_link_libraries(qtav_ohos_player_demo
+        PRIVATE
+            "${QTAV_OHOS_ACE_NAPI_LIBRARY}"
+            "${QTAV_OHOS_HILOG_LIBRARY}"
+            ace_ndk.z
+            native_window
+            QtAV::Core
+            QtAV::AudioOHAudio
+            QtAV::AudioResample
+            QtAV::AudioTimeStretch
+            QtAV::HWOHCodec
+            QtAV::InteropOHCodecOpenGL
+            QtAV::InteropOHCodecVulkan
+            QtAV::RenderMobile
+            QtAV::RenderOpenGLOHOS
+            QtAV::RenderVulkanOHOS
+    )
+    set_target_properties(qtav_ohos_player_demo PROPERTIES
+        CXX_EXTENSIONS OFF
+        OUTPUT_NAME qtav_player
+    )
+    target_compile_options(qtav_ohos_player_demo
+        PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wno-missing-field-initializers)
+    target_link_options(
+        qtav_ohos_player_demo PRIVATE -Wl,-Bsymbolic)
+else()
+    message(STATUS
+        "The OHOS player demo is disabled because AudioTimeStretch is unavailable")
+endif()

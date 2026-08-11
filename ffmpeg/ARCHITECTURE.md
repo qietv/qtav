@@ -78,10 +78,13 @@ FFmpeg's native decoders remain enabled, including native VVC/H.266 decoding.
 VVenC is an encoder and is intentionally absent. The verifier rejects both
 wolfSSL and VVenC if they appear in an installed prefix.
 
-The FFmpeg policy also enables GPLv3/version3, Vulkan, LTO, and small-build
-optimizations while disabling `avdevice`, IAMF, and command-line programs.
-The package therefore contains modular libraries for direct player linkage,
-not FFmpeg executables or one combined shared object.
+The FFmpeg policy also enables GPLv3/version3, Vulkan, LTO, and the small-build
+feature policy while disabling `avdevice`, IAMF, and command-line programs.
+OHOS arm64 explicitly selects `-O3` through FFmpeg's `--optflags` so
+`--enable-small` does not replace the toolchain's release optimization with
+`-Oz` on the sustained 4K software-decode path. The package therefore contains
+modular libraries for direct player linkage, not FFmpeg executables or one
+combined shared object.
 
 ## Target models
 

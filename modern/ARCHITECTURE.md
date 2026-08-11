@@ -358,6 +358,38 @@ The user-facing HDR policy selects the application renderer's output target:
   and Android composition and bypasses libplacebo, so renderer HDR/tone-map
   controls do not apply to it.
 
+## OHOS XComponent HDR presentation
+
+ArkUI owns a `XComponentType.SURFACE`; native code receives and retains its
+current `OHNativeWindow` generation. The page's black background is behind the
+separate surface layer and is only the Fit/letterbox color. Debug text and
+controls are ordinary ArkUI overlays; they do not become the renderer target
+or replace the decoder surface.
+
+Native HDR presentation requires one coherent contract across three layers:
+
+```text
+ArkUI XComponent SURFACE + hdrBrightness(HDR/SDR policy)
+  -> OHNativeWindow video-source role + white point + color space + HDR metadata
+  -> Vulkan A2B10G10R10 or EGL RGB10_A2 BT.2020/PQ or HLG target
+  -> libplacebo output encoding
+  -> RenderService HDR composition
+```
+
+Vulkan/EGL publish NativeWindow HDR metadata before acquiring or requesting
+the next surface buffer, because the window metadata is copied into each
+producer buffer. `SdrOnly` clears the HDR-brightness request, selects an
+RGBA8/sRGB target, and leaves semantic HDR-to-SDR mapping to libplacebo.
+
+The tested OHOS Vulkan swapchain layer accepts A2B10G10R10 plus BT.2020/PQ at
+swapchain creation but omits HDR color spaces from its surface-format query.
+[AD-023](DECISIONS.md#ad-023-ohos-xcomponent-native-hdr-requires-a-three-layer-contract)
+therefore permits a narrow OHOS-only creation attempt when the application
+confirms that `VK_EXT_swapchain_colorspace` was enabled. Required HDR fails
+closed; preferred HDR retains a verified SDR retry. This output compatibility
+rule is separate from OHCodec source-buffer format interpretation and does not
+weaken the strict explicit-plane gate below.
+
 ## Android hardware-frame paths
 
 Hardware decode is provided by `QtAV::HWMediaCodec`; it owns codec interaction
@@ -557,10 +589,10 @@ versioned C ABI or split are governed by
 
 Windows D3D11/D3D11VA/WASAPI and Android Vulkan/OpenGL ES/MediaCodec/AAudio
 are complete production paths. The AD-010 Windows visible-copy policy and its
-NVIDIA/AMD default/direct matrix are closed. A separate Intel post-seek
-performance workstream remains external and must not be described as closed
-until its administrator trace, correction, and same-revision cross-vendor gate
-pass.
+NVIDIA/AMD default/direct matrix are closed. The Intel post-seek investigation
+is also complete: administrator ETW localized redundant decoder/output-view
+teardown, the repository FFmpeg/QtAVCore reuse repair removed the persistent
+stall, and the broader zero-transient follow-up is no longer required.
 
 OHOS has Vulkan and OpenGL ES software presentation, shared selector fallback,
 OHAudio output, OHCodec H.264/HEVC and capability-gated VVC/H.266 selection,

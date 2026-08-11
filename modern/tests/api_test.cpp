@@ -121,6 +121,8 @@ int main()
     player.setProperty("custom.value", "42");
     assert(player.property("custom.value") == "42");
     assert(player.property("missing", "fallback") == "fallback");
+    player.setProperty("avcodec.video.threads", "4");
+    assert(player.property("avcodec.video.threads") == "4");
 
     player.setPlaybackRate(1.5F);
     assert(player.playbackRate() == 1.5F);

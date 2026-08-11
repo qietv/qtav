@@ -35,6 +35,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queueFamilyIndex_ = 0;
+    bool swapchainColorSpaceEnabled_ = false;
     bool hdrMetadataEnabled_ = false;
     bool nativeBufferExternalMemoryEnabled_ = false;
     bool foreignQueueFamilyEnabled_ = false;

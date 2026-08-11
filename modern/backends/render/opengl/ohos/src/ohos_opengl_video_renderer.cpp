@@ -111,20 +111,134 @@ bool hasExtension(
     return false;
 }
 
-bool chooseSdrConfig(
+struct EGLSurfaceCandidate {
+    OpenGLOutputColorSpace colorSpace =
+        OpenGLOutputColorSpace::SdrSrgb;
+    EGLint eglColorSpace = EGL_GL_COLORSPACE_SRGB_KHR;
+    OH_NativeBuffer_ColorSpace nativeColorSpace =
+        OH_COLORSPACE_DISPLAY_SRGB;
+    int componentBits = 8;
+    const char* name = "SDR sRGB";
+};
+
+bool configureNativeWindowRole(
+    OHNativeWindow* window,
+    bool hdrEnabled,
+    std::string& error)
+{
+    if (!window) {
+        error = "The OHOS native window is unavailable";
+        return false;
+    }
+    if (OH_NativeWindow_NativeWindowHandleOpt(
+            window,
+            SET_SOURCE_TYPE,
+            static_cast<int32_t>(OH_SURFACE_SOURCE_VIDEO))
+        != 0) {
+        error = "The OHOS native window rejected the video surface role";
+        return false;
+    }
+    int32_t sourceType = OH_SURFACE_SOURCE_DEFAULT;
+    if (OH_NativeWindow_NativeWindowHandleOpt(
+            window,
+            GET_SOURCE_TYPE,
+            &sourceType)
+            != 0
+        || sourceType != OH_SURFACE_SOURCE_VIDEO) {
+        error = "The OHOS native window did not retain the video surface role";
+        return false;
+    }
+    const float brightness = hdrEnabled ? 1.0F : 0.0F;
+    if (OH_NativeWindow_NativeWindowHandleOpt(
+            window,
+            SET_HDR_WHITE_POINT_BRIGHTNESS,
+            brightness)
+        != 0) {
+        error = "The OHOS native window rejected the HDR white-point brightness";
+        return false;
+    }
+    return true;
+}
+
+void setNativeHdrMetadata(
+    OHNativeWindow* window,
+    const VideoFrame& frame,
+    OpenGLOutputColorSpace colorSpace) noexcept
+{
+    if (!window || !openGLColorSpaceIsHdr(colorSpace)) {
+        return;
+    }
+    OH_NativeBuffer_MetadataType type =
+        colorSpace == OpenGLOutputColorSpace::HDR10HLG
+        || frame.colorSpaceInfo().transfer == ColorTransfer::HLG
+        ? OH_VIDEO_HDR_HLG
+        : OH_VIDEO_HDR_HDR10;
+    OH_NativeWindow_SetMetadataValue(
+        window,
+        OH_HDR_METADATA_TYPE,
+        static_cast<int32_t>(sizeof(type)),
+        reinterpret_cast<uint8_t*>(&type));
+
+    const MasteringDisplayMetadata mastering =
+        frame.masteringDisplayMetadata();
+    const ContentLightMetadata content = frame.contentLightMetadata();
+    if (!mastering.hasPrimaries && !mastering.hasLuminance
+        && content.maximumContentLightLevel <= 0.0
+        && content.maximumFrameAverageLightLevel <= 0.0) {
+        return;
+    }
+    OH_NativeBuffer_StaticMetadata metadata {};
+    if (mastering.hasPrimaries) {
+        metadata.smpte2086.displayPrimaryRed = {
+            static_cast<float>(mastering.primaries[0].x),
+            static_cast<float>(mastering.primaries[0].y),
+        };
+        metadata.smpte2086.displayPrimaryGreen = {
+            static_cast<float>(mastering.primaries[1].x),
+            static_cast<float>(mastering.primaries[1].y),
+        };
+        metadata.smpte2086.displayPrimaryBlue = {
+            static_cast<float>(mastering.primaries[2].x),
+            static_cast<float>(mastering.primaries[2].y),
+        };
+        metadata.smpte2086.whitePoint = {
+            static_cast<float>(mastering.whitePoint.x),
+            static_cast<float>(mastering.whitePoint.y),
+        };
+    }
+    if (mastering.hasLuminance) {
+        metadata.smpte2086.maxLuminance =
+            static_cast<float>(mastering.maximumLuminance);
+        metadata.smpte2086.minLuminance =
+            static_cast<float>(mastering.minimumLuminance);
+    }
+    metadata.cta861.maxContentLightLevel =
+        static_cast<float>(content.maximumContentLightLevel);
+    metadata.cta861.maxFrameAverageLightLevel =
+        static_cast<float>(content.maximumFrameAverageLightLevel);
+    OH_NativeWindow_SetMetadataValue(
+        window,
+        OH_HDR_STATIC_METADATA,
+        static_cast<int32_t>(sizeof(metadata)),
+        reinterpret_cast<uint8_t*>(&metadata));
+}
+
+bool chooseConfig(
     EGLDisplay display,
+    int componentBits,
     EGLConfig& result,
     EGLint& nativeVisual,
     std::string& error,
     EGLint& errorCode)
 {
+    const EGLint alphaBits = componentBits == 10 ? 2 : 8;
     const EGLint attributes[] {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
+        EGL_RED_SIZE, componentBits,
+        EGL_GREEN_SIZE, componentBits,
+        EGL_BLUE_SIZE, componentBits,
+        EGL_ALPHA_SIZE, alphaBits,
         EGL_DEPTH_SIZE, 0,
         EGL_STENCIL_SIZE, 0,
         EGL_NONE,
@@ -133,7 +247,9 @@ bool chooseSdrConfig(
     if (eglChooseConfig(
             display, attributes, nullptr, 0, &count) != EGL_TRUE
         || count <= 0) {
-        error = "No exact RGBA8 OpenGL ES 3 OHOS window EGLConfig is available";
+        error = componentBits == 10
+            ? "No exact RGB10_A2 OpenGL ES 3 OHOS window EGLConfig is available"
+            : "No exact RGBA8 OpenGL ES 3 OHOS window EGLConfig is available";
         return false;
     }
     std::vector<EGLConfig> configs(static_cast<std::size_t>(count));
@@ -168,14 +284,17 @@ bool chooseSdrConfig(
                    &visual) != EGL_TRUE) {
             continue;
         }
-        if (red == 8 && green == 8 && blue == 8 && alpha == 8
+        if (red == componentBits && green == componentBits
+            && blue == componentBits && alpha == alphaBits
             && visual != 0) {
             result = config;
             nativeVisual = visual;
             return true;
         }
     }
-    error = "The OHOS EGL display exposes no exact RGBA8 native-window config";
+    error = componentBits == 10
+        ? "The OHOS EGL display exposes no exact RGB10_A2 native-window config"
+        : "The OHOS EGL display exposes no exact RGBA8 native-window config";
     return false;
 }
 
@@ -190,7 +309,7 @@ public:
                   0,
                   surfaceSize_,
                   generation_,
-                  OpenGLOutputColorSpace::SdrSrgb,
+                  outputColorSpace_,
               };
           })
     {
@@ -263,14 +382,59 @@ public:
         return true;
     }
 
+    std::vector<EGLSurfaceCandidate> surfaceCandidates() const
+    {
+        std::vector<EGLSurfaceCandidate> result;
+        const bool colorspace = hasExtension(
+            extensions_.c_str(),
+            "EGL_KHR_gl_colorspace");
+        if (outputPreference_ != OpenGLOutputPreference::SdrOnly
+            && colorspace) {
+            if (hasExtension(
+                    extensions_.c_str(),
+                    "EGL_EXT_gl_colorspace_bt2020_pq")) {
+                result.push_back({
+                    OpenGLOutputColorSpace::HDR10PQ,
+                    EGL_GL_COLORSPACE_BT2020_PQ_EXT,
+                    OH_COLORSPACE_DISPLAY_BT2020_PQ,
+                    10,
+                    "BT.2020/PQ",
+                });
+            }
+            if (hasExtension(
+                    extensions_.c_str(),
+                    "EGL_EXT_gl_colorspace_bt2020_hlg")) {
+                result.push_back({
+                    OpenGLOutputColorSpace::HDR10HLG,
+                    EGL_GL_COLORSPACE_BT2020_HLG_EXT,
+                    OH_COLORSPACE_DISPLAY_BT2020_HLG,
+                    10,
+                    "BT.2020/HLG",
+                });
+            }
+        }
+        if (outputPreference_ != OpenGLOutputPreference::RequireHdr) {
+            result.push_back({
+                OpenGLOutputColorSpace::SdrSrgb,
+                EGL_GL_COLORSPACE_SRGB_KHR,
+                OH_COLORSPACE_DISPLAY_SRGB,
+                8,
+                "SDR sRGB",
+            });
+        }
+        return result;
+    }
+
     bool configureNativeWindow(
+        const EGLSurfaceCandidate& candidate,
         EGLint nativeVisual,
         std::string& error)
     {
         if (OH_NativeWindow_NativeWindowHandleOpt(
                 window_, SET_FORMAT, nativeVisual)
             != 0) {
-            error = "The OHOS native window rejected the RGBA8 EGL visual";
+            error = "The OHOS native window rejected the selected "
+                + std::string(candidate.name) + " EGL visual";
             return false;
         }
         int32_t actualFormat = 0;
@@ -278,40 +442,42 @@ public:
                 window_, GET_FORMAT, &actualFormat)
                 != 0
             || actualFormat != nativeVisual) {
-            error = "The OHOS native window did not retain the RGBA8 EGL visual";
+            error = "The OHOS native window did not retain the selected "
+                + std::string(candidate.name) + " EGL visual";
             return false;
         }
-        if (OH_NativeWindow_NativeWindowHandleOpt(
+        if (OH_NativeWindow_SetColorSpace(
                 window_,
-                SET_COLOR_GAMUT,
-                static_cast<int32_t>(NATIVEBUFFER_COLOR_GAMUT_SRGB))
-            != 0) {
-            error = "The OHOS native window rejected the sRGB color gamut";
+                candidate.nativeColorSpace) != 0) {
+            error = "The OHOS native window rejected the selected "
+                + std::string(candidate.name) + " color space";
             return false;
         }
-        int32_t actualGamut = 0;
-        if (OH_NativeWindow_NativeWindowHandleOpt(
-                window_, GET_COLOR_GAMUT, &actualGamut)
-                != 0
-            || actualGamut
-                != static_cast<int32_t>(
-                    NATIVEBUFFER_COLOR_GAMUT_SRGB)) {
-            error = "The OHOS native window did not retain the sRGB color gamut";
+        OH_NativeBuffer_ColorSpace actualColorSpace = OH_COLORSPACE_NONE;
+        if (OH_NativeWindow_GetColorSpace(
+                window_,
+                &actualColorSpace) != 0
+            || actualColorSpace != candidate.nativeColorSpace) {
+            error = "The OHOS native window did not retain the selected "
+                + std::string(candidate.name) + " color space";
             return false;
         }
         return true;
     }
 
-    bool createWindowSurface(std::string& error)
+    bool createWindowSurface(
+        const EGLSurfaceCandidate& candidate,
+        EGLint nativeVisual,
+        std::string& error)
     {
-        if (!configureNativeWindow(nativeVisual_, error)) {
+        if (!configureNativeWindow(candidate, nativeVisual, error)) {
             return false;
         }
         const bool explicitColorSpace = hasExtension(
             extensions_.c_str(), "EGL_KHR_gl_colorspace");
         const EGLint surfaceAttributes[] {
             EGL_GL_COLORSPACE_KHR,
-            EGL_GL_COLORSPACE_SRGB_KHR,
+            candidate.eglColorSpace,
             EGL_NONE,
         };
         surface_ = eglCreateWindowSurface(
@@ -325,16 +491,31 @@ public:
         }
         if (explicitColorSpace) {
             EGLint actualColorSpace = EGL_GL_COLORSPACE_DEFAULT_EXT;
-            if (eglQuerySurface(
+            const bool eglColorSpaceMatches =
+                eglQuerySurface(
                     display_,
                     surface_,
                     EGL_GL_COLORSPACE_KHR,
-                    &actualColorSpace) != EGL_TRUE
-                || actualColorSpace != EGL_GL_COLORSPACE_SRGB_KHR) {
-                error = "The OHOS EGL surface did not retain the requested sRGB color space";
-                eglDestroySurface(display_, surface_);
-                surface_ = EGL_NO_SURFACE;
-                return false;
+                    &actualColorSpace) == EGL_TRUE
+                && actualColorSpace == candidate.eglColorSpace;
+            if (!eglColorSpaceMatches) {
+                // HarmonyOS EGL accepts the BT.2020/PQ or HLG attribute at
+                // creation but some drivers report the default value back.
+                // The compositor-visible NativeWindow state remains the
+                // authoritative check for this platform.
+                OH_NativeBuffer_ColorSpace actualNativeColorSpace =
+                    OH_COLORSPACE_NONE;
+                if (OH_NativeWindow_GetColorSpace(
+                        window_, &actualNativeColorSpace)
+                        != 0
+                    || actualNativeColorSpace
+                        != candidate.nativeColorSpace) {
+                    error = "Neither EGL nor the OHOS native window retained the requested "
+                        + std::string(candidate.name) + " color space";
+                    eglDestroySurface(display_, surface_);
+                    surface_ = EGL_NO_SURFACE;
+                    return false;
+                }
             }
         }
 
@@ -351,8 +532,51 @@ public:
             return false;
         }
         surfaceSize_ = { width, height };
+        outputColorSpace_ = candidate.colorSpace;
+        colorComponentBits_ = candidate.componentBits;
+        activeCandidate_ = candidate;
+        nativeVisual_ = nativeVisual;
         ++generation_;
         return true;
+    }
+
+    bool createCandidate(
+        const EGLSurfaceCandidate& candidate,
+        std::string& error)
+    {
+        EGLConfig config = nullptr;
+        EGLint nativeVisual = 0;
+        if (!chooseConfig(
+                display_,
+                candidate.componentBits,
+                config,
+                nativeVisual,
+                error,
+                lastEglError_)) {
+            return false;
+        }
+        const EGLint contextAttributes[] {
+            EGL_CONTEXT_CLIENT_VERSION, 3,
+            EGL_NONE,
+        };
+        eglConfig_ = config;
+        context_ = eglCreateContext(
+            display_,
+            eglConfig_,
+            EGL_NO_CONTEXT,
+            contextAttributes);
+        if (context_ == EGL_NO_CONTEXT) {
+            error = eglError("eglCreateContext", lastEglError_);
+            eglConfig_ = nullptr;
+            return false;
+        }
+        if (createWindowSurface(candidate, nativeVisual, error)) {
+            return true;
+        }
+        eglDestroyContext(display_, context_);
+        context_ = EGL_NO_CONTEXT;
+        eglConfig_ = nullptr;
+        return false;
     }
 
     bool createSurface(std::string& error)
@@ -364,47 +588,46 @@ public:
             error = "The OHOS native window is unavailable";
             return false;
         }
+        if (!configureNativeWindowRole(
+                window_,
+                outputPreference_ != OpenGLOutputPreference::SdrOnly,
+                error)) {
+            return false;
+        }
         if (!initializeDisplay(error)) {
             return false;
         }
-        if (outputPreference_ == OpenGLOutputPreference::RequireHdr) {
-            error = "Native OHOS EGL HDR output has not passed the required format, color-space, and compositor capability gate";
-            return false;
-        }
         if (context_ != EGL_NO_CONTEXT && eglConfig_) {
-            return createWindowSurface(error);
+            return createWindowSurface(
+                activeCandidate_,
+                nativeVisual_,
+                error);
         }
 
-        if (!chooseSdrConfig(
-                display_,
-                eglConfig_,
-                nativeVisual_,
-                error,
-                lastEglError_)) {
+        const std::vector<EGLSurfaceCandidate> candidates =
+            surfaceCandidates();
+        if (candidates.empty()) {
+            error =
+                "The OHOS EGL display exposes no implemented native HDR color-space extension";
             return false;
         }
-        const EGLint contextAttributes[] {
-            EGL_CONTEXT_CLIENT_VERSION, 3,
-            EGL_NONE,
-        };
-        context_ = eglCreateContext(
-            display_,
-            eglConfig_,
-            EGL_NO_CONTEXT,
-            contextAttributes);
-        if (context_ == EGL_NO_CONTEXT) {
-            error = eglError("eglCreateContext", lastEglError_);
-            eglConfig_ = nullptr;
-            nativeVisual_ = 0;
-            return false;
+        std::string failures;
+        for (const EGLSurfaceCandidate& candidate : candidates) {
+            std::string candidateError;
+            if (createCandidate(candidate, candidateError)) {
+                return true;
+            }
+            if (!failures.empty()) {
+                failures += "; ";
+            }
+            failures += candidate.name;
+            failures += ": ";
+            failures += candidateError.empty()
+                ? "unavailable"
+                : candidateError;
         }
-        if (createWindowSurface(error)) {
-            return true;
-        }
-        eglDestroyContext(display_, context_);
-        context_ = EGL_NO_CONTEXT;
-        eglConfig_ = nullptr;
-        nativeVisual_ = 0;
+        error = "No OHOS EGL output candidate could be created: "
+            + failures;
         return false;
     }
 
@@ -502,7 +725,10 @@ public:
         }
         display_ = EGL_NO_DISPLAY;
         eglConfig_ = nullptr;
+        activeCandidate_ = {};
         nativeVisual_ = 0;
+        outputColorSpace_ = OpenGLOutputColorSpace::SdrSrgb;
+        colorComponentBits_ = 0;
         extensions_.clear();
         lastEglError_ = EGL_SUCCESS;
     }
@@ -537,7 +763,11 @@ public:
     VideoSize surfaceSize_;
     std::uint64_t generation_ = 0;
     std::string extensions_;
+    EGLSurfaceCandidate activeCandidate_;
     EGLint nativeVisual_ = 0;
+    OpenGLOutputColorSpace outputColorSpace_ =
+        OpenGLOutputColorSpace::SdrSrgb;
+    int colorComponentBits_ = 0;
     VideoRenderConfig renderConfig_;
     bool open_ = false;
     bool engineOpen_ = false;
@@ -647,9 +877,15 @@ VideoRenderAttemptResult OHOSOpenGLVideoRenderer::renderDetailed(
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
         if (!impl_->open_) {
             error = "The OHOS OpenGL ES renderer is not open";
-        } else if (!impl_->makeCurrent(error)) {
-            eglCode = impl_->lastEglError_;
         } else {
+            // NativeWindow applies window metadata when EGL requests the
+            // next SurfaceBuffer, so publish it before rendering/present.
+            setNativeHdrMetadata(
+                impl_->window_, frame, impl_->outputColorSpace_);
+        }
+        if (error.empty() && !impl_->makeCurrent(error)) {
+            eglCode = impl_->lastEglError_;
+        } else if (error.empty()) {
             impl_->lastEngineError_.clear();
             impl_->lastPresentEglError_ = EGL_SUCCESS;
             OpenGLHardwareImportStatus hardwareStatus =
@@ -802,12 +1038,22 @@ std::uint64_t OHOSOpenGLVideoRenderer::surfaceGeneration() const noexcept
 OpenGLOutputColorSpace
 OHOSOpenGLVideoRenderer::outputColorSpace() const noexcept
 {
-    return OpenGLOutputColorSpace::SdrSrgb;
+    if (!impl_) {
+        return OpenGLOutputColorSpace::SdrSrgb;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->outputColorSpace_;
 }
 
 bool OHOSOpenGLVideoRenderer::hdrOutputActive() const noexcept
 {
-    return false;
+    if (!impl_) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    return impl_->surface_ != EGL_NO_SURFACE
+        && impl_->colorComponentBits_ >= 10
+        && openGLColorSpaceIsHdr(impl_->outputColorSpace_);
 }
 
 int OHOSOpenGLVideoRenderer::colorComponentBits() const noexcept
@@ -816,7 +1062,9 @@ int OHOSOpenGLVideoRenderer::colorComponentBits() const noexcept
         return 0;
     }
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
-    return impl_->surface_ != EGL_NO_SURFACE ? 8 : 0;
+    return impl_->surface_ != EGL_NO_SURFACE
+        ? impl_->colorComponentBits_
+        : 0;
 }
 
 void OHOSOpenGLVideoRenderer::setHardwareFrameInterop(
