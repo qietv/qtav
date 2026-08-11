@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 This is the active, executable plan for the Qt-free rewrite. It contains only
 current status, task ordering, incomplete gates, and the acceptance criteria
@@ -71,6 +71,21 @@ The following accepted decisions constrain all remaining work:
   workaround are implemented and connected-device validated. Strict direct
   multi-plane Vulkan wrapping and the corresponding Dolby Vision path remain
   device-gated.
+- The OpenGL ES follow-up keeps software Y/Cb/Cr planar when a high-bit-depth
+  upload needs libswscale normalization, so Dolby Vision metadata is no longer
+  applied to already converted RGB components. The raw OHCodec external-image
+  normalization plane is also marked vertically flipped at the libplacebo
+  input boundary. OHOS shared/static builds, the signed player HAP package,
+  and the Android native regression harness cross-build pass. The signed HAP
+  was then installed with explicit approval on the connected ALN-AL80.
+  `wednesday.mp4` passed software/OpenGL ES with correct Dolby Vision color and
+  orientation, OHCodec/OpenGL ES passed upright at 24 FPS with zero Player
+  drops, and software/Vulkan provided a normal-color control. `legend.mkv`
+  passed both software/OpenGL ES at 24.4 FPS and, after a clean pipeline
+  rebuild, OHCodec/OpenGL ES upright at 25.1 FPS. Six rapid consecutive seeks
+  could still transiently retire the forced OHCodec/OpenGL ES renderer until a
+  pipeline rebuild; that lifecycle observation is separate from the completed
+  color and orientation repair.
 - Dolby AC-3, E-AC-3, and TrueHD software decoding is decoded-PCM support only;
   it is not compressed passthrough, Atmos rendering, licensing, or
   certification.

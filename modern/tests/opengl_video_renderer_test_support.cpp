@@ -13,11 +13,14 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
 extern "C" {
+#include <libavutil/dovi_meta.h>
 #include <libavutil/frame.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -395,6 +398,99 @@ VideoFrame makeUploadFrame(AVPixelFormat format)
     return result;
 }
 
+VideoFrame makeDoviSoftwareUploadFrame()
+{
+    AVFrame* native = av_frame_alloc();
+    if (!native) {
+        return {};
+    }
+    native->width = 4;
+    native->height = 4;
+    native->format = AV_PIX_FMT_P010LE;
+    if (av_frame_get_buffer(native, 32) < 0) {
+        av_frame_free(&native);
+        return {};
+    }
+
+    constexpr std::uint16_t Y = 128;
+    constexpr std::uint16_t Cb = 384;
+    constexpr std::uint16_t Cr = 640;
+    for (int row = 0; row < native->height; ++row) {
+        auto* luma = reinterpret_cast<std::uint16_t*>(
+            native->data[0] + row * native->linesize[0]);
+        std::fill_n(luma, native->width, std::uint16_t { Y << 6U });
+    }
+    for (int row = 0; row < native->height / 2; ++row) {
+        auto* chroma = reinterpret_cast<std::uint16_t*>(
+            native->data[1] + row * native->linesize[1]);
+        for (int column = 0; column < native->width / 2; ++column) {
+            chroma[column * 2] = std::uint16_t { Cb << 6U };
+            chroma[column * 2 + 1] = std::uint16_t { Cr << 6U };
+        }
+    }
+    native->color_range = AVCOL_RANGE_JPEG;
+    native->colorspace = AVCOL_SPC_BT2020_NCL;
+    native->color_primaries = AVCOL_PRI_BT2020;
+    native->color_trc = AVCOL_TRC_SMPTE2084;
+    native->chroma_location = AVCHROMA_LOC_LEFT;
+
+    std::size_t metadataSize = 0;
+    AVDOVIMetadata* metadata = av_dovi_metadata_alloc(&metadataSize);
+    if (!metadata || metadataSize == 0) {
+        av_free(metadata);
+        av_frame_free(&native);
+        return {};
+    }
+    AVDOVIRpuDataHeader* header = av_dovi_get_header(metadata);
+    AVDOVIDataMapping* mapping = av_dovi_get_mapping(metadata);
+    AVDOVIColorMetadata* color = av_dovi_get_color(metadata);
+    header->bl_bit_depth = 10;
+    header->el_bit_depth = 10;
+    header->vdr_bit_depth = 12;
+    header->coef_log2_denom = 13;
+    header->disable_residual_flag = 1;
+    mapping->nlq_method_idc = AV_DOVI_NLQ_NONE;
+    for (int component = 0; component < 3; ++component) {
+        AVDOVIReshapingCurve& curve = mapping->curves[component];
+        curve.num_pivots = 2;
+        curve.pivots[0] = 0;
+        curve.pivots[1] = 1023;
+        curve.mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
+        curve.poly_order[0] = 1;
+        curve.poly_coef[0][0] = 0;
+        curve.poly_coef[0][1] = 1 << header->coef_log2_denom;
+    }
+    for (int index = 0; index < 9; ++index) {
+        const AVRational value = index % 4 == 0
+            ? AVRational { 1, 1 }
+            : AVRational { 0, 1 };
+        color->ycc_to_rgb_matrix[index] = value;
+        color->rgb_to_lms_matrix[index] = value;
+    }
+    for (AVRational& offset : color->ycc_to_rgb_offset) {
+        offset = { 0, 1 };
+    }
+    color->signal_bit_depth = 12;
+    color->source_min_pq = 0;
+    color->source_max_pq = 3079;
+
+    AVFrameSideData* sideData = av_frame_new_side_data(
+        native,
+        AV_FRAME_DATA_DOVI_METADATA,
+        metadataSize);
+    if (!sideData) {
+        av_free(metadata);
+        av_frame_free(&native);
+        return {};
+    }
+    std::memcpy(sideData->data, metadata, metadataSize);
+    av_free(metadata);
+
+    VideoFrame result = detail::FrameFactory::video(native, 0, 0);
+    av_frame_free(&native);
+    return result;
+}
+
 } // namespace
 
 bool runOpenGLOffscreenRendererChecks(
@@ -565,6 +661,28 @@ bool runOpenGLOffscreenRendererChecks(
     }
 
     const std::vector<Pixel> explicitSrgbPixels = pixels;
+    const VideoFrame doviFrame = makeDoviSoftwareUploadFrame();
+    if (!doviFrame || !renderer.render(doviFrame)
+        || !readPixels(context.size(), pixels, error)) {
+        if (error.empty()) {
+            error =
+                "The OpenGL ES Dolby Vision software-upload check failed";
+        }
+        renderer.close();
+        return false;
+    }
+    const Pixel doviCenter = pixels[
+        static_cast<std::size_t>(Height / 2) * Width + Width / 2];
+    if (static_cast<int>(doviCenter.blue)
+                <= static_cast<int>(doviCenter.green) + 8
+        || static_cast<int>(doviCenter.green)
+                <= static_cast<int>(doviCenter.red) + 8) {
+        error =
+            "The OpenGL ES Dolby Vision software upload treated converted RGB as Y/Cb/Cr";
+        renderer.close();
+        return false;
+    }
+
     {
         SrgbFramebuffer srgbFramebuffer;
         if (!srgbFramebuffer.create(Width, Height, error)) {

@@ -15,7 +15,7 @@ if(PkgConfig_FOUND)
         "libplacebo>=7.351.0"
     )
 endif()
-find_package(FFmpeg REQUIRED COMPONENTS avutil)
+find_package(FFmpeg REQUIRED COMPONENTS avutil swscale)
 
 if(NOT QTAV_GLES3_INCLUDE_DIR
    OR NOT QTAV_GLES3_LIBRARY_PATH
@@ -51,6 +51,7 @@ target_link_libraries(qtav_render_opengl
         "${QTAV_OPENGL_EGL_LIBRARY_PATH}"
         PkgConfig::QTAV_LIBPLACEBO
         FFmpeg::avutil
+        FFmpeg::swscale
         QtAV::RenderLibplaceboCommon
 )
 

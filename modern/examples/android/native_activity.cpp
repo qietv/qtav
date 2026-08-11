@@ -913,7 +913,7 @@ struct TestState {
                     "QTAV_ANDROID_TEST: OFFSCREEN_PASS hdr=pq,hlg,dovi");
                 logInfo(
                     "QTAV_ANDROID_TEST: GLES_OFFSCREEN_PASS "
-                    "formats=yuv,nv12,p010,rgb "
+                    "formats=yuv,nv12,p010,dovi,rgb "
                     "geometry=viewport,rotation,recreation");
             }
             ++videoFrames;

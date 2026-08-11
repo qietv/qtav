@@ -11,6 +11,13 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/swapchain.h>
 
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
+}
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -80,6 +87,24 @@ bool validViewport(
     return viewport.x >= 0 && viewport.y >= 0
         && viewport.x <= surface.width - viewport.width
         && viewport.y <= surface.height - viewport.height;
+}
+
+AVPixelFormat softwareNormalizationFormat(
+    const AVPixFmtDescriptor& source) noexcept
+{
+    if ((source.flags & AV_PIX_FMT_FLAG_RGB) != 0) {
+        return AV_PIX_FMT_RGBA;
+    }
+    if (source.nb_components == 1) {
+        return AV_PIX_FMT_GRAY8;
+    }
+    if (source.log2_chroma_w == 0 && source.log2_chroma_h == 0) {
+        return AV_PIX_FMT_YUV444P;
+    }
+    if (source.log2_chroma_w == 1 && source.log2_chroma_h == 0) {
+        return AV_PIX_FMT_YUV422P;
+    }
+    return AV_PIX_FMT_YUV420P;
 }
 
 bool supportedConfig(const VideoRenderConfig& config) noexcept
@@ -883,6 +908,9 @@ public:
                 pl_tex_destroy(openGL_->gpu, &texture);
             }
         }
+        sws_freeContext(softwareNormalizeContext_);
+        softwareNormalizeContext_ = nullptr;
+        av_frame_free(&softwareNormalizeFrame_);
         if (swapchain_) {
             pl_swapchain_destroy(&swapchain_);
         }
@@ -1010,6 +1038,12 @@ public:
         }
         frame.num_planes = 1;
         initializePlane(frame.planes[0], texture, 3, 0);
+        if (external.rawYcbcr) {
+            // The normalized texture was rendered into an OpenGL FBO. Its
+            // row origin is therefore inverted relative to libplacebo's
+            // image-coordinate convention.
+            frame.planes[0].flipped = true;
+        }
         frame.crop = {
             0.0F,
             0.0F,
@@ -1035,6 +1069,137 @@ public:
             frame.repr.bits = { 8, 8, 0 };
         }
         return true;
+    }
+
+    const AVFrame* normalizeSoftwareFrame(
+        const AVFrame* source,
+        std::string& error)
+    {
+        if (!source || source->width <= 0 || source->height <= 0
+            || source->format < 0) {
+            error =
+                "The decoded software frame cannot be normalized for OpenGL upload";
+            return nullptr;
+        }
+        const AVPixFmtDescriptor* sourceDescription =
+            av_pix_fmt_desc_get(
+                static_cast<AVPixelFormat>(source->format));
+        if (!sourceDescription) {
+            error =
+                "The decoded software frame has no usable pixel-format description";
+            return nullptr;
+        }
+        const AVPixelFormat normalizedFormat =
+            softwareNormalizationFormat(*sourceDescription);
+        const bool normalizedRgb = normalizedFormat == AV_PIX_FMT_RGBA;
+        softwareNormalizeContext_ = sws_getCachedContext(
+            softwareNormalizeContext_,
+            source->width,
+            source->height,
+            static_cast<AVPixelFormat>(source->format),
+            source->width,
+            source->height,
+            normalizedFormat,
+            SWS_FAST_BILINEAR,
+            nullptr,
+            nullptr,
+            nullptr);
+        if (!softwareNormalizeContext_) {
+            error =
+                "libswscale could not create the OpenGL software-upload normalizer";
+            return nullptr;
+        }
+        if (!softwareNormalizeFrame_) {
+            softwareNormalizeFrame_ = av_frame_alloc();
+        }
+        if (!softwareNormalizeFrame_) {
+            error = "Could not allocate the OpenGL software-upload frame";
+            return nullptr;
+        }
+
+        av_frame_unref(softwareNormalizeFrame_);
+        softwareNormalizeFrame_->format = normalizedFormat;
+        softwareNormalizeFrame_->width = source->width;
+        softwareNormalizeFrame_->height = source->height;
+        if (av_frame_get_buffer(softwareNormalizeFrame_, 64) < 0
+            || av_frame_make_writable(softwareNormalizeFrame_) < 0) {
+            error =
+                "Could not allocate writable normalized storage for OpenGL upload";
+            av_frame_unref(softwareNormalizeFrame_);
+            return nullptr;
+        }
+
+        const int sourceRange =
+            source->color_range == AVCOL_RANGE_JPEG ? 1 : 0;
+        const int destinationRange = normalizedRgb ? 1 : sourceRange;
+        int colorSpace = SWS_CS_DEFAULT;
+        switch (source->colorspace) {
+        case AVCOL_SPC_BT709:
+            colorSpace = SWS_CS_ITU709;
+            break;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL:
+            colorSpace = SWS_CS_BT2020;
+            break;
+        case AVCOL_SPC_SMPTE170M:
+        case AVCOL_SPC_BT470BG:
+            colorSpace = SWS_CS_ITU601;
+            break;
+        default:
+            break;
+        }
+        const int* coefficients = sws_getCoefficients(colorSpace);
+        if (coefficients) {
+            if (sws_setColorspaceDetails(
+                softwareNormalizeContext_,
+                coefficients,
+                sourceRange,
+                coefficients,
+                destinationRange,
+                0,
+                1 << 16,
+                1 << 16) < 0) {
+                error =
+                    "libswscale could not configure OpenGL software-upload color conversion";
+                av_frame_unref(softwareNormalizeFrame_);
+                return nullptr;
+            }
+        }
+        const int rows = sws_scale(
+            softwareNormalizeContext_,
+            source->data,
+            source->linesize,
+            0,
+            source->height,
+            softwareNormalizeFrame_->data,
+            softwareNormalizeFrame_->linesize);
+        if (rows != source->height
+            || av_frame_copy_props(softwareNormalizeFrame_, source) < 0) {
+            error =
+                "libswscale could not normalize the software frame for OpenGL upload";
+            av_frame_unref(softwareNormalizeFrame_);
+            return nullptr;
+        }
+        if (normalizedRgb) {
+            softwareNormalizeFrame_->color_range = AVCOL_RANGE_JPEG;
+            softwareNormalizeFrame_->colorspace = AVCOL_SPC_RGB;
+            softwareNormalizeFrame_->chroma_location =
+                AVCHROMA_LOC_UNSPECIFIED;
+            av_frame_remove_side_data(
+                softwareNormalizeFrame_,
+                AV_FRAME_DATA_DOVI_METADATA);
+            av_frame_remove_side_data(
+                softwareNormalizeFrame_,
+                AV_FRAME_DATA_DOVI_RPU_BUFFER);
+        } else {
+            // Keep Y/Cb/Cr as Y/Cb/Cr. In particular, Dolby Vision metadata
+            // must still describe the normalized planes consumed by
+            // libplacebo instead of being applied to an RGB conversion.
+            softwareNormalizeFrame_->color_range = destinationRange
+                ? AVCOL_RANGE_JPEG
+                : AVCOL_RANGE_MPEG;
+        }
+        return softwareNormalizeFrame_;
     }
 
     OpenGLHardwareImportStatus prepareHardwareFrame(
@@ -1095,6 +1260,8 @@ public:
     pl_renderer renderer_ = nullptr;
     pl_swapchain swapchain_ = nullptr;
     std::array<pl_tex, 4> uploadTextures_ {};
+    SwsContext* softwareNormalizeContext_ = nullptr;
+    AVFrame* softwareNormalizeFrame_ = nullptr;
     ExternalImageNormalizer normalizer_;
     std::uint64_t targetGeneration_ = 0;
     std::uint32_t targetFramebuffer_ = 0;
@@ -1320,16 +1487,40 @@ VideoRenderAttemptResult OpenGLVideoRenderer::renderDetailed(
     } else {
         const AVFrame* native =
             detail::FrameFactory::nativeVideoFrame(frame);
-        if (!native
-            || !qtav_pl_map_avframe(
+        if (native
+            && qtav_pl_map_avframe(
                 impl_->openGL_->gpu,
                 &image,
                 impl_->uploadTextures_.data(),
                 native)) {
-            error = impl_->takeLogError(
-                "libplacebo could not map the decoded software frame for OpenGL");
-        } else {
             mappedSoftware = true;
+        } else if (native) {
+            const std::string directError = impl_->takeLogError(
+                "libplacebo could not directly map the decoded software frame for OpenGL");
+            image = {};
+            const AVFrame* normalized =
+                impl_->normalizeSoftwareFrame(native, error);
+            if (normalized
+                && qtav_pl_map_avframe(
+                    impl_->openGL_->gpu,
+                    &image,
+                    impl_->uploadTextures_.data(),
+                    normalized)) {
+                mappedSoftware = true;
+                error.clear();
+            } else {
+                if (error.empty()) {
+                    error = impl_->takeLogError(
+                        "libplacebo could not map the normalized software frame for OpenGL");
+                }
+                if (!directError.empty()) {
+                    error += "; direct upload failed first: "
+                        + directError;
+                }
+            }
+        } else {
+            error =
+                "The decoded software frame has no FFmpeg backing frame for OpenGL upload";
         }
     }
 

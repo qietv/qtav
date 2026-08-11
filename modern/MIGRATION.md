@@ -163,7 +163,11 @@ already own a graphics context or require multiple/custom render targets:
   FFmpeg-parsed Dolby Vision RPU reshaping, plus Android
   `QtAV::RenderOpenGLAndroid` EGL/window adaptation for native RGB10_A2 HDR or
   explicit RGBA8/sRGB fallback and OHOS `QtAV::RenderOpenGLOHOS` adaptation
-  for a capability-verified RGBA8/sRGB baseline;
+  for a capability-verified RGBA8/sRGB baseline. When the GPU cannot directly
+  map a decoded high-bit-depth software plane, the libswscale compatibility
+  fallback keeps Y/Cb/Cr sources planar so Dolby Vision metadata still
+  describes their components; RGB sources normalize to full-range RGBA.
+  Native hardware interop remains unchanged;
 - one GPU semantic pipeline: libplacebo is the sole authority across Windows
   D3D11 and the Android/OHOS Vulkan and OpenGL ES paths for color conversion,
   Dolby Vision, tone/gamut mapping, scaling, and output encoding. Platform

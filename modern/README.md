@@ -1344,7 +1344,10 @@ matches each image timestamp against the queued presentation timestamp after
 checking the device's observed microsecond and nanosecond forms. It samples
 raw Y/Cb/Cr through `GL_EXT_YUV_target` into an RGBA16F representation texture;
 libplacebo remains responsible for Dolby Vision reshaping, color conversion,
-tone/gamut mapping, scaling, and output encoding.
+tone/gamut mapping, scaling, and output encoding. Because that representation
+texture is rendered into an OpenGL framebuffer, its libplacebo input plane is
+marked vertically flipped; the EGL output framebuffer keeps normal OpenGL
+orientation semantics.
 
 The repository FFmpeg overlay enables the HEVC parser and built-in RPU decoder
 for `hevc_ohcodec`. It parses RPU NAL units before packet submission, keys the
@@ -1997,6 +2000,14 @@ structured range/matrix/transfer/primaries metadata into libplacebo, which
 owns color conversion, scaling, Dolby Vision reshaping, tone mapping, gamut
 mapping, and final output encoding. The renderer supplies Fit/Fill/Stretch,
 custom viewports, and right-angle rotations through libplacebo frame geometry.
+If the OpenGL ES GPU cannot directly upload a high-bit-depth software plane,
+the renderer uses libswscale to reduce it to a directly uploadable 8-bit
+representation. Y/Cb/Cr sources remain planar Y/Cb/Cr with their Dolby Vision
+metadata intact; RGB sources become full-range RGBA and discard any
+representation-specific Dolby Vision side data. This prevents converted RGB
+components from being interpreted a second time as Dolby Vision Y/Cb/Cr. This
+is a CPU software-decode compatibility fallback and may lose source precision;
+hardware-frame interop remains on its separate zero-CPU-map path.
 For `SdrSrgb`, it queries the bound framebuffer attachment's color encoding so
 fixed-function sRGB conversion occurs exactly once. BT.2020 `HDR10PQ` and
 `HDR10HLG` targets preserve HDR through libplacebo's corresponding output
