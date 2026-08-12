@@ -882,19 +882,24 @@ bool AndroidVulkanVideoRenderer::setWindow(ANativeWindow* window)
     if (!impl_) {
         return false;
     }
+    // Wake an AImageReader correlation wait before surface recreation waits
+    // for an overlapping render or GPU lifecycle work.
+    impl_->renderer_.invalidatePendingFrames();
     std::string error;
     bool succeeded = true;
     {
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
         if (window == impl_->window_) {
             if (!window) {
-                return false;
+                succeeded = false;
+            } else {
+                // SurfaceView can publish a same-identity Surface whose new
+                // base geometry is not yet reflected by
+                // ANativeWindow_getWidth/Height. A same-window publication is
+                // therefore an explicit refresh signal, not a value-based
+                // no-op.
+                succeeded = impl_->recreate(error);
             }
-            // SurfaceView can publish a same-identity Surface whose new base
-            // geometry is not yet reflected by ANativeWindow_getWidth/Height.
-            // A same-window publication is therefore an explicit refresh
-            // signal, not a value-based no-op.
-            succeeded = impl_->recreate(error);
         } else {
             if (impl_->context_.device.device) {
                 impl_->renderer_.close();
@@ -918,6 +923,10 @@ bool AndroidVulkanVideoRenderer::setWindow(ANativeWindow* window)
                 succeeded = false;
             }
         }
+        // Seal the replacement boundary after any render which entered before
+        // the adapter lock has finished. Its producer output cannot become a
+        // current-generation image after this call returns.
+        impl_->renderer_.invalidatePendingFrames();
     }
     if (!succeeded) {
         impl_->notify(

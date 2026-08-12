@@ -192,26 +192,34 @@ propagation, so the shipped example currently performs a correctness-critical
 manual flush before seek. Fix these boundaries in C++; applications must not
 track pending frames or flush renderer internals around Player controls.
 
-- [ ] Forward Player presentation-generation invalidation through
+- [x] Forward Player presentation-generation invalidation through
   `OpenGLVideoRenderer` and the Android OpenGL adapter to
   `OpenGLHardwareFrameInterop`, with a default no-op virtual for compatible
   third-party implementations and a MediaCodec implementation that invalidates
   pending producer associations.
-- [ ] Give both MediaCodec Vulkan and OpenGL AImageReader interops an internal
+- [x] Give both MediaCodec Vulkan and OpenGL AImageReader interops an internal
   producer epoch. Outputs released before invalidation must remain represented
   by bounded invalidated association records until their late AImages are
   acquired and discarded; an image may not enter the current correlation set
   using timestamp proximity alone when its producer epoch is unproven.
-- [ ] Make invalidation wake Vulkan's bounded exact-image wait immediately and
+- [x] Make invalidation wake Vulkan's bounded exact-image wait immediately and
   close the render/invalidation race without waiting for GPU completion.
 - [ ] Remove correctness dependence on explicit pre-seek interop `flush()`
   calls in the Android player and native regression harness. Keep public
   `flush()` only for standalone interop lifecycle control and make it obey the
   same epoch contract.
-- [ ] Add deterministic lifecycle coverage for forward/backward seek, repeated
+- [~] Add deterministic lifecycle coverage for forward/backward seek, repeated
   timestamps, late callback arrival after invalidation, media replacement, and
   a render overlapping seek. Cover Vulkan and OpenGL ES independently, then
   retain direct-Surface present/drop as a separate regression path.
+
+The shared producer-epoch tracker, automatic Vulkan/OpenGL invalidation
+forwarding, prompt Vulkan wait wake-up, and overlapping mobile-render
+invalidation test are implemented. The portable repeated-timestamp/late-image
+lifecycle test and Windows selector test pass, and the changed Android arm64
+Vulkan/OpenGL/MediaCodec targets cross-build. Removing the remaining explicit
+application/harness flush calls and the connected-device matrix stay open, so
+the task and its acceptance criteria are not marked complete.
 
 Acceptance criteria:
 

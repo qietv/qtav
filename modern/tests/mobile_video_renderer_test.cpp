@@ -4,10 +4,15 @@
 
 #include "frame_internal.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -131,6 +136,70 @@ public:
 private:
     std::shared_ptr<RendererBehavior> behavior_;
     EventCallback callback_;
+};
+
+class BlockingInvalidationRenderer final : public qtav::VideoRenderAPI {
+public:
+    qtav::VideoRenderCapabilities capabilities() const override
+    {
+        return {};
+    }
+    void setEventCallback(EventCallback) override {}
+    bool open(const qtav::VideoRenderConfig&) override { return true; }
+    bool configure(const qtav::VideoRenderConfig&) override { return true; }
+    qtav::VideoRenderAttemptResult renderDetailed(
+        const qtav::VideoFrame&) override
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        entered_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [this] { return released_; });
+        return { qtav::VideoRenderAttemptStatus::Presented, 0, {} };
+    }
+    bool render(const qtav::VideoFrame& frame) override
+    {
+        return renderDetailed(frame).frameConsumed();
+    }
+    void close() noexcept override {}
+    void invalidatePendingFrames() noexcept override
+    {
+        invalidations_.fetch_add(1, std::memory_order_release);
+        changed_.notify_all();
+    }
+
+    bool waitUntilEntered()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(
+            lock,
+            std::chrono::seconds(2),
+            [this] { return entered_; });
+    }
+
+    bool waitUntilInvalidated()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(
+            lock,
+            std::chrono::milliseconds(50),
+            [this] {
+                return invalidations_.load(std::memory_order_acquire) > 0;
+            });
+    }
+
+    void release()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        changed_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::atomic<int> invalidations_ { 0 };
+    bool entered_ = false;
+    bool released_ = false;
 };
 
 struct FactoryScript {
@@ -900,6 +969,33 @@ void testBothBackendsUnavailable()
         "Unavailable diagnostics omitted a backend reason");
 }
 
+void testInvalidationBypassesOverlappingRender()
+{
+    auto renderer = std::make_shared<BlockingInvalidationRenderer>();
+    qtav::MobileRendererSelectorConfig config;
+    config.vulkan = [renderer] {
+        return qtav::MobileRendererCandidate { renderer, {} };
+    };
+    qtav::MobileVideoRendererSelector selector(std::move(config));
+    expect(selector.open(renderConfig()), "Blocking renderer startup failed");
+
+    auto rendering = std::async(
+        std::launch::async,
+        [&selector] {
+            return selector.renderDetailed(qtav::VideoFrame {});
+        });
+    expect(renderer->waitUntilEntered(), "Blocking render did not start");
+    selector.invalidatePendingFrames();
+    expect(
+        renderer->waitUntilInvalidated(),
+        "Invalidation waited behind an overlapping mobile render");
+    renderer->release();
+    expect(
+        rendering.get().status
+            == qtav::VideoRenderAttemptStatus::Presented,
+        "Blocking render did not finish after invalidation");
+}
+
 } // namespace
 
 int main()
@@ -918,5 +1014,6 @@ int main()
     testSurfaceSuspendAndSameAPIResume();
     testRecoverableOpenGLESRecreation();
     testBothBackendsUnavailable();
+    testInvalidationBypassesOverlappingRender();
     return 0;
 }

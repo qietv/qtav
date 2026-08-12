@@ -2,6 +2,8 @@
 
 #include <qtav/mediacodec_opengl_interop.h>
 
+#include "mediacodec_image_epoch.h"
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
@@ -27,7 +29,6 @@ namespace {
 
 constexpr std::int64_t TimestampToleranceNanoseconds = 2'000'000;
 constexpr std::int64_t MaximumPresentationLagNanoseconds = 250'000'000;
-constexpr std::size_t MaximumRetiredFrameKeys = 64;
 
 void closeDescriptor(int& descriptor) noexcept
 {
@@ -60,6 +61,8 @@ struct PendingImage {
     AImage* image = nullptr;
     int acquireFence = -1;
     std::int64_t timestampNanoseconds = 0;
+    detail::MediaCodecImageFrameKey frameKey;
+    std::uint64_t producerEpoch = 0;
 };
 
 void discardImage(PendingImage& pending) noexcept
@@ -77,29 +80,17 @@ void discardImage(PendingImage& pending) noexcept
     pending.image = nullptr;
 }
 
-struct FrameKey {
-    std::uintptr_t buffer = 0;
-    std::uint32_t generation = 0;
-    std::int64_t timestampMilliseconds = 0;
-
-    bool operator==(const FrameKey& other) const noexcept
-    {
-        return buffer == other.buffer
-            && generation == other.generation
-            && timestampMilliseconds == other.timestampMilliseconds;
-    }
-};
-
-FrameKey frameKey(const VideoFrame& frame) noexcept
+detail::MediaCodecImageFrameKey frameKey(
+    const VideoFrame& frame) noexcept
 {
-    FrameKey result;
+    detail::MediaCodecImageFrameKey result;
     if (!frame || !frame.hasHardwareFrame()) {
         return result;
     }
     const NativeHandle output = frame.hardwareFrame().nativeHandle(
         HardwareHandleType::Frame);
     result.buffer = output.value;
-    result.generation = output.subresource;
+    result.surfaceGeneration = output.subresource;
     result.timestampMilliseconds = frame.timestamp();
     return result;
 }
@@ -146,8 +137,6 @@ struct SharedState {
             std::lock_guard<std::mutex> lock(mutex);
             shuttingDown = true;
             pending.swap(images);
-            queuedFrames.clear();
-            retiredFrames.clear();
             frameAvailable = {};
         }
         for (auto& image : pending) {
@@ -165,8 +154,10 @@ struct SharedState {
     MediaCodecSurface surface;
     mutable std::mutex mutex;
     std::deque<PendingImage> images;
-    std::vector<FrameKey> queuedFrames;
-    std::deque<FrameKey> retiredFrames;
+    detail::MediaCodecImageEpochTracker producerEpoch {
+        64,
+        TimestampToleranceNanoseconds,
+    };
     OpenGLHardwareFrameInterop::FrameAvailableCallback frameAvailable;
     std::string asyncError;
     std::string lastRuntimeError;
@@ -222,18 +213,30 @@ void onImageAvailable(void* context, AImageReader* reader) noexcept
             if (state->shuttingDown) {
                 discarded = pending;
             } else {
-                state->images.push_back(pending);
-                if (static_cast<int>(state->images.size())
-                    > state->config.maximumPendingFrames) {
-                    discarded = state->images.front();
-                    state->images.pop_front();
+                const auto association =
+                    state->producerEpoch.associateImage(
+                        pending.timestampNanoseconds);
+                if (!association.matched || !association.current) {
+                    discarded = pending;
                     state->statistics.staleFramesDropped.fetch_add(
                         1,
                         std::memory_order_relaxed);
+                } else {
+                    pending.frameKey = association.key;
+                    pending.producerEpoch = association.epoch;
+                    state->images.push_back(pending);
+                    if (static_cast<int>(state->images.size())
+                        > state->config.maximumPendingFrames) {
+                        discarded = state->images.front();
+                        state->images.pop_front();
+                        state->statistics.staleFramesDropped.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
+                    updateMaximum(
+                        state->statistics.maximumPendingFrames,
+                        state->images.size());
                 }
-                updateMaximum(
-                    state->statistics.maximumPendingFrames,
-                    state->images.size());
             }
         }
         // Do not retain evicted acquisitions until the callback has finished
@@ -392,8 +395,8 @@ public:
         const VideoFrame& frame,
         std::string& detail)
     {
-        const FrameKey key = frameKey(frame);
-        if (key.buffer == 0 || key.generation == 0) {
+        const detail::MediaCodecImageFrameKey key = frameKey(frame);
+        if (key.buffer == 0 || key.surfaceGeneration == 0) {
             detail = "The frame is not a MediaCodec surface output";
             return OpenGLHardwareImportStatus::Unsupported;
         }
@@ -405,8 +408,7 @@ public:
 
         std::deque<PendingImage> discarded;
         bool imageReady = false;
-        bool alreadyQueued = false;
-        bool alreadyRetired = false;
+        detail::MediaCodecProducerQueueResult queueResult;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             if (!state_->asyncError.empty()) {
@@ -416,10 +418,13 @@ public:
             }
             const std::int64_t expected =
                 frame.timestamp() * 1'000'000LL;
+            const std::uint64_t currentEpoch =
+                state_->producerEpoch.currentEpoch();
             for (auto iterator = state_->images.begin();
                  iterator != state_->images.end();) {
-                if (iterator->timestampNanoseconds
-                    < expected - MaximumPresentationLagNanoseconds) {
+                if (iterator->producerEpoch != currentEpoch
+                    || iterator->timestampNanoseconds
+                        < expected - MaximumPresentationLagNanoseconds) {
                     discarded.push_back(*iterator);
                     iterator = state_->images.erase(iterator);
                     state_->statistics.staleFramesDropped.fetch_add(
@@ -427,33 +432,13 @@ public:
                         std::memory_order_relaxed);
                     continue;
                 }
-                const std::int64_t distance = std::llabs(
-                    iterator->timestampNanoseconds - expected);
-                if (distance <= TimestampToleranceNanoseconds) {
+                if (iterator->frameKey == key) {
                     imageReady = true;
                 }
                 ++iterator;
             }
-            alreadyQueued = std::find(
-                state_->queuedFrames.begin(),
-                state_->queuedFrames.end(),
-                key) != state_->queuedFrames.end();
-            alreadyRetired = std::find(
-                state_->retiredFrames.begin(),
-                state_->retiredFrames.end(),
-                key) != state_->retiredFrames.end();
-            if (!imageReady && !alreadyQueued && !alreadyRetired) {
-                if (static_cast<int>(state_->queuedFrames.size())
-                    >= state_->config.maximumPendingFrames) {
-                    state_->retiredFrames.push_back(
-                        state_->queuedFrames.front());
-                    state_->queuedFrames.erase(
-                        state_->queuedFrames.begin());
-                    state_->statistics.staleFramesDropped.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
-                }
-                state_->queuedFrames.push_back(key);
+            if (!imageReady) {
+                queueResult = state_->producerEpoch.begin(key);
             }
         }
         for (auto& image : discarded) {
@@ -462,10 +447,14 @@ public:
         if (imageReady) {
             return OpenGLHardwareImportStatus::Ready;
         }
-        if (alreadyRetired) {
+        if (queueResult.status
+            == detail::MediaCodecProducerQueueStatus::Retired) {
             return OpenGLHardwareImportStatus::Stale;
         }
-        if (alreadyQueued) {
+        if (queueResult.status
+                == detail::MediaCodecProducerQueueStatus::Pending
+            || queueResult.status
+                == detail::MediaCodecProducerQueueStatus::CapacityReached) {
             return OpenGLHardwareImportStatus::Pending;
         }
 
@@ -474,12 +463,7 @@ public:
             output && output.isPending() && output.present();
         if (!released) {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            state_->queuedFrames.erase(
-                std::remove(
-                    state_->queuedFrames.begin(),
-                    state_->queuedFrames.end(),
-                    key),
-                state_->queuedFrames.end());
+            state_->producerEpoch.cancel(key, queueResult.epoch);
             detail =
                 "Could not release the MediaCodec output into the private AImageReader";
             return OpenGLHardwareImportStatus::Error;
@@ -503,18 +487,18 @@ public:
     {
         PendingImage matched;
         std::deque<PendingImage> discarded;
-        const FrameKey key = frameKey(frame);
+        const detail::MediaCodecImageFrameKey key = frameKey(frame);
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             const std::int64_t expected =
                 frame.timestamp() * 1'000'000LL;
-            auto closest = state_->images.end();
-            std::int64_t closestDistance =
-                MaximumPresentationLagNanoseconds + 1;
+            const std::uint64_t currentEpoch =
+                state_->producerEpoch.currentEpoch();
             for (auto iterator = state_->images.begin();
                  iterator != state_->images.end();) {
-                if (iterator->timestampNanoseconds
-                    < expected - MaximumPresentationLagNanoseconds) {
+                if (iterator->producerEpoch != currentEpoch
+                    || iterator->timestampNanoseconds
+                        < expected - MaximumPresentationLagNanoseconds) {
                     discarded.push_back(*iterator);
                     iterator = state_->images.erase(iterator);
                     state_->statistics.staleFramesDropped.fetch_add(
@@ -522,29 +506,18 @@ public:
                         std::memory_order_relaxed);
                     continue;
                 }
-                const std::int64_t distance = std::llabs(
-                    iterator->timestampNanoseconds - expected);
-                if (distance <= TimestampToleranceNanoseconds
-                    && distance < closestDistance) {
-                    closest = iterator;
-                    closestDistance = distance;
-                }
                 ++iterator;
             }
-            if (closest != state_->images.end()) {
-                matched = *closest;
-                state_->images.erase(closest);
-                state_->queuedFrames.erase(
-                    std::remove(
-                        state_->queuedFrames.begin(),
-                        state_->queuedFrames.end(),
-                        key),
-                    state_->queuedFrames.end());
-                state_->retiredFrames.push_back(key);
-                while (state_->retiredFrames.size()
-                       > MaximumRetiredFrameKeys) {
-                    state_->retiredFrames.pop_front();
-                }
+            const auto exact = std::find_if(
+                state_->images.begin(),
+                state_->images.end(),
+                [&key, currentEpoch](const PendingImage& image) {
+                    return image.producerEpoch == currentEpoch
+                        && image.frameKey == key;
+                });
+            if (exact != state_->images.end()) {
+                matched = *exact;
+                state_->images.erase(exact);
             }
         }
         for (auto& image : discarded) {
@@ -962,8 +935,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             pending.swap(state_->images);
-            state_->queuedFrames.clear();
-            state_->retiredFrames.clear();
+            state_->producerEpoch.invalidate();
             state_->asyncError.clear();
         }
         for (auto& image : pending) {
@@ -1090,6 +1062,11 @@ void MediaCodecOpenGLInterop::flush() noexcept
     if (impl_) {
         impl_->flush();
     }
+}
+
+void MediaCodecOpenGLInterop::invalidatePendingFrames() noexcept
+{
+    flush();
 }
 
 MediaCodecOpenGLInteropStatistics

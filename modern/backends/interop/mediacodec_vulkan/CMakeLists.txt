@@ -33,6 +33,8 @@ target_include_directories(qtav_interop_mediacodec_vulkan
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/backends/interop"
 )
 target_link_libraries(qtav_interop_mediacodec_vulkan
     PUBLIC

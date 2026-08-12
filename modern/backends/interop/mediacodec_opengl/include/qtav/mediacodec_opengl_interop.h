@@ -117,11 +117,11 @@ public:
     void releaseCurrentContextResources() noexcept override;
     void setFrameAvailableCallback(
         FrameAvailableCallback callback) override;
+    void invalidatePendingFrames() noexcept override;
 
-    // Reject pending timestamp associations and acquired images before seek,
-    // loop, decoder replacement, explicit stop, or renderer fallback. The
-    // AImageReader producer generation remains valid until this object is
-    // replaced.
+    // Advance the producer epoch and reject pending associations/images at a
+    // standalone interop lifecycle boundary. Player-connected renderers call
+    // the same operation automatically.
     void flush() noexcept;
     MediaCodecOpenGLInteropStatistics statistics() const noexcept;
 

@@ -41,6 +41,7 @@ public:
         const VideoFrame& frame) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
+    void invalidatePendingFrames() noexcept override;
 
     // The adapter acquires its own window reference. Replacing or removing the
     // window invalidates the old EGL surface generation. Republishing the same

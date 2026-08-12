@@ -763,6 +763,10 @@ bool OpenGLHardwareFrameInterop::initializeCurrentContext(
 
 OpenGLHardwareFrameInterop::~OpenGLHardwareFrameInterop() = default;
 
+void OpenGLHardwareFrameInterop::invalidatePendingFrames() noexcept
+{
+}
+
 class OpenGLVideoRenderer::Impl {
 public:
     Impl(
@@ -1589,6 +1593,21 @@ void OpenGLVideoRenderer::close() noexcept
     }
 }
 
+void OpenGLVideoRenderer::invalidatePendingFrames() noexcept
+{
+    if (!impl_) {
+        return;
+    }
+    std::shared_ptr<OpenGLHardwareFrameInterop> interop;
+    {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        interop = impl_->hardwareInterop_;
+    }
+    if (interop) {
+        interop->invalidatePendingFrames();
+    }
+}
+
 void OpenGLVideoRenderer::setCurrentTargetCallback(
     OpenGLCurrentTargetCallback callback)
 {
@@ -1646,6 +1665,7 @@ void OpenGLVideoRenderer::setHardwareFrameInterop(
             rendererOpen = impl_->open_;
         }
         if (previous) {
+            previous->invalidatePendingFrames();
             previous->setFrameAvailableCallback({});
             previous->releaseCurrentContextResources();
         }

@@ -841,12 +841,22 @@ void AndroidOpenGLVideoRenderer::close() noexcept
     }
 }
 
+void AndroidOpenGLVideoRenderer::invalidatePendingFrames() noexcept
+{
+    if (impl_) {
+        impl_->renderer_.invalidatePendingFrames();
+    }
+}
+
 bool AndroidOpenGLVideoRenderer::setWindow(
     ANativeWindow* window)
 {
     if (!impl_) {
         return false;
     }
+    // Publish the producer boundary before waiting for an overlapping render
+    // to release the adapter mutex. The interop hook itself is non-blocking.
+    impl_->renderer_.invalidatePendingFrames();
     std::string error;
     bool succeeded = false;
     {
@@ -874,6 +884,10 @@ bool AndroidOpenGLVideoRenderer::setWindow(
                 succeeded = impl_->openEngine(replacement, error);
             }
         }
+        // Seal the replacement boundary after any render which entered before
+        // the adapter lock has finished. Its producer output cannot become a
+        // current-generation image after this call returns.
+        impl_->renderer_.invalidatePendingFrames();
     }
     if (!succeeded) {
         impl_->notify(

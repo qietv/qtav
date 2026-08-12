@@ -2,6 +2,8 @@
 
 #include <qtav/mediacodec_vulkan_interop.h>
 
+#include "mediacodec_image_epoch.h"
+
 #include <android/hardware_buffer.h>
 #include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
@@ -27,7 +29,6 @@ namespace {
 constexpr std::int64_t TimestampToleranceNanoseconds = 2'000'000;
 constexpr std::int64_t MaximumPresentationLagNanoseconds =
     250'000'000;
-constexpr std::size_t MaximumRetiredFrameKeys = 64;
 
 const char* resultName(VkResult result) noexcept
 {
@@ -67,6 +68,8 @@ struct PendingImage {
     AImage* image = nullptr;
     int acquireFence = -1;
     std::int64_t timestampNanoseconds = 0;
+    detail::MediaCodecImageFrameKey frameKey;
+    std::uint64_t producerEpoch = 0;
 };
 
 void discardImage(PendingImage& pending) noexcept
@@ -83,19 +86,6 @@ void discardImage(PendingImage& pending) noexcept
     }
     pending.image = nullptr;
 }
-
-struct FrameKey {
-    std::uintptr_t buffer = 0;
-    std::uint32_t generation = 0;
-    std::int64_t timestampMilliseconds = 0;
-
-    bool operator==(const FrameKey& other) const noexcept
-    {
-        return buffer == other.buffer
-            && generation == other.generation
-            && timestampMilliseconds == other.timestampMilliseconds;
-    }
-};
 
 struct AtomicStatistics {
     std::atomic<std::uint64_t> codecOutputsQueued { 0 };
@@ -190,8 +180,6 @@ struct SharedState {
             std::lock_guard<std::mutex> lock(mutex);
             shuttingDown = true;
             pending.swap(images);
-            queuedFrames.clear();
-            retiredFrames.clear();
             bufferImports.clear();
             frameAvailable = {};
         }
@@ -219,8 +207,10 @@ struct SharedState {
     mutable std::mutex mutex;
     std::condition_variable imageChanged;
     std::deque<PendingImage> images;
-    std::vector<FrameKey> queuedFrames;
-    std::deque<FrameKey> retiredFrames;
+    detail::MediaCodecImageEpochTracker producerEpoch {
+        64,
+        TimestampToleranceNanoseconds,
+    };
     std::vector<
         std::pair<
             ConversionKey,
@@ -313,18 +303,30 @@ void onImageAvailable(void* context, AImageReader* reader) noexcept
             if (state->shuttingDown) {
                 discarded.push_back(pending);
             } else {
-                state->images.push_back(pending);
-                while (static_cast<int>(state->images.size())
-                       > state->config.maximumImages) {
-                    discarded.push_back(state->images.front());
-                    state->images.pop_front();
+                const auto association =
+                    state->producerEpoch.associateImage(
+                        pending.timestampNanoseconds);
+                if (!association.matched || !association.current) {
+                    discarded.push_back(pending);
                     state->statistics.staleImagesDropped.fetch_add(
                         1,
                         std::memory_order_relaxed);
+                } else {
+                    pending.frameKey = association.key;
+                    pending.producerEpoch = association.epoch;
+                    state->images.push_back(pending);
+                    while (static_cast<int>(state->images.size())
+                           > state->config.maximumImages) {
+                        discarded.push_back(state->images.front());
+                        state->images.pop_front();
+                        state->statistics.staleImagesDropped.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
+                    updateMaximum(
+                        state->statistics.maximumPendingImages,
+                        state->images.size());
                 }
-                updateMaximum(
-                    state->statistics.maximumPendingImages,
-                    state->images.size());
             }
         }
     }
@@ -1251,9 +1253,10 @@ private:
     std::atomic<bool> releaseAttempted_ { false };
 };
 
-FrameKey frameKey(const VideoFrame& frame) noexcept
+detail::MediaCodecImageFrameKey frameKey(
+    const VideoFrame& frame) noexcept
 {
-    FrameKey result;
+    detail::MediaCodecImageFrameKey result;
     if (!frame || !frame.hasHardwareFrame()) {
         return result;
     }
@@ -1261,7 +1264,7 @@ FrameKey frameKey(const VideoFrame& frame) noexcept
     const NativeHandle output =
         hardware.nativeHandle(HardwareHandleType::Frame);
     result.buffer = output.value;
-    result.generation = output.subresource;
+    result.surfaceGeneration = output.subresource;
     result.timestampMilliseconds = frame.timestamp();
     return result;
 }
@@ -1399,8 +1402,8 @@ public:
             detail = error_;
             return VulkanHardwareImportStatus::Error;
         }
-        const FrameKey key = frameKey(frame);
-        if (key.buffer == 0 || key.generation == 0) {
+        const detail::MediaCodecImageFrameKey key = frameKey(frame);
+        if (key.buffer == 0 || key.surfaceGeneration == 0) {
             detail =
                 "The frame is not a MediaCodec direct-surface output";
             return VulkanHardwareImportStatus::Unsupported;
@@ -1412,9 +1415,8 @@ public:
         }
 
         std::deque<PendingImage> discarded;
-        bool alreadyQueued = false;
-        bool alreadyRetired = false;
         bool imageReady = false;
+        detail::MediaCodecProducerQueueResult queueResult;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             if (!state_->asyncError.empty()) {
@@ -1424,11 +1426,14 @@ public:
             }
             const std::int64_t expected =
                 frame.timestamp() * 1'000'000LL;
+            const std::uint64_t currentEpoch =
+                state_->producerEpoch.currentEpoch();
             for (auto iterator = state_->images.begin();
                  iterator != state_->images.end();) {
-                if (iterator->timestampNanoseconds
-                    < expected
-                        - MaximumPresentationLagNanoseconds) {
+                if (iterator->producerEpoch != currentEpoch
+                    || iterator->timestampNanoseconds
+                        < expected
+                            - MaximumPresentationLagNanoseconds) {
                     discarded.push_back(*iterator);
                     iterator = state_->images.erase(iterator);
                     state_->statistics.staleImagesDropped.fetch_add(
@@ -1436,60 +1441,13 @@ public:
                         std::memory_order_relaxed);
                     continue;
                 }
-                const std::int64_t distance = std::llabs(
-                    iterator->timestampNanoseconds - expected);
-                if (iterator->timestampNanoseconds
-                        <= expected
-                            + TimestampToleranceNanoseconds
-                    && distance
-                        <= TimestampToleranceNanoseconds) {
+                if (iterator->frameKey == key) {
                     imageReady = true;
                 }
                 ++iterator;
             }
             if (!imageReady) {
-                alreadyQueued =
-                    std::find(
-                        state_->queuedFrames.begin(),
-                        state_->queuedFrames.end(),
-                        key)
-                    != state_->queuedFrames.end();
-                alreadyRetired =
-                    std::find(
-                        state_->retiredFrames.begin(),
-                        state_->retiredFrames.end(),
-                        key)
-                    != state_->retiredFrames.end();
-                if (!alreadyQueued && !alreadyRetired) {
-                    for (auto iterator = state_->queuedFrames.begin();
-                         iterator != state_->queuedFrames.end();) {
-                        if (iterator->timestampMilliseconds
-                                * 1'000'000LL
-                            < expected
-                                - MaximumPresentationLagNanoseconds) {
-                            state_->retiredFrames.push_back(*iterator);
-                            iterator = state_->queuedFrames.erase(iterator);
-                        } else {
-                            ++iterator;
-                        }
-                    }
-                    if (static_cast<int>(
-                            state_->queuedFrames.size())
-                        >= state_->config.maximumImages) {
-                        state_->retiredFrames.push_back(
-                            state_->queuedFrames.front());
-                        state_->queuedFrames.erase(
-                            state_->queuedFrames.begin());
-                        state_->statistics.staleImagesDropped.fetch_add(
-                            1,
-                            std::memory_order_relaxed);
-                    }
-                    state_->queuedFrames.push_back(key);
-                    while (state_->retiredFrames.size()
-                           > MaximumRetiredFrameKeys) {
-                        state_->retiredFrames.pop_front();
-                    }
-                }
+                queueResult = state_->producerEpoch.begin(key);
             }
         }
         for (auto& image : discarded) {
@@ -1498,7 +1456,14 @@ public:
         if (imageReady) {
             return VulkanHardwareImportStatus::Ready;
         }
-        if (alreadyQueued || alreadyRetired) {
+        if (queueResult.status
+            == detail::MediaCodecProducerQueueStatus::Retired) {
+            return VulkanHardwareImportStatus::Stale;
+        }
+        if (queueResult.status
+                == detail::MediaCodecProducerQueueStatus::Pending
+            || queueResult.status
+                == detail::MediaCodecProducerQueueStatus::CapacityReached) {
             return VulkanHardwareImportStatus::Pending;
         }
 
@@ -1508,12 +1473,7 @@ public:
             output && output.isPending() && output.present();
         if (!released) {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            state_->queuedFrames.erase(
-                std::remove(
-                    state_->queuedFrames.begin(),
-                    state_->queuedFrames.end(),
-                    key),
-                state_->queuedFrames.end());
+            state_->producerEpoch.cancel(key, queueResult.epoch);
             detail =
                 "Could not release the MediaCodec output into the private AImageReader";
             return VulkanHardwareImportStatus::Error;
@@ -1534,8 +1494,8 @@ public:
                 error_,
             };
         }
-        const FrameKey key = frameKey(frame);
-        if (key.buffer == 0 || key.generation == 0
+        const detail::MediaCodecImageFrameKey key = frameKey(frame);
+        if (key.buffer == 0 || key.surfaceGeneration == 0
             || !supports(frame.hardwareFrame())) {
             return {
                 VulkanHardwareImportStatus::Stale,
@@ -1550,14 +1510,14 @@ public:
             std::lock_guard<std::mutex> lock(state_->mutex);
             const std::int64_t expected =
                 frame.timestamp() * 1'000'000LL;
-            auto closest = state_->images.end();
-            std::int64_t closestDistance =
-                MaximumPresentationLagNanoseconds + 1;
+            const std::uint64_t currentEpoch =
+                state_->producerEpoch.currentEpoch();
             for (auto iterator = state_->images.begin();
                  iterator != state_->images.end();) {
-                if (iterator->timestampNanoseconds
-                    < expected
-                        - MaximumPresentationLagNanoseconds) {
+                if (iterator->producerEpoch != currentEpoch
+                    || iterator->timestampNanoseconds
+                        < expected
+                            - MaximumPresentationLagNanoseconds) {
                     discarded.push_back(*iterator);
                     iterator = state_->images.erase(iterator);
                     state_->statistics.staleImagesDropped.fetch_add(
@@ -1565,42 +1525,18 @@ public:
                         std::memory_order_relaxed);
                     continue;
                 }
-                const std::int64_t distance = std::llabs(
-                    iterator->timestampNanoseconds - expected);
-                if (iterator->timestampNanoseconds
-                        <= expected
-                            + TimestampToleranceNanoseconds
-                    && distance <= TimestampToleranceNanoseconds
-                    && distance < closestDistance) {
-                    closest = iterator;
-                    closestDistance = distance;
-                }
                 ++iterator;
             }
-            if (closest != state_->images.end()
-                && closestDistance
-                    <= MaximumPresentationLagNanoseconds) {
-                matched = *closest;
-                state_->images.erase(closest);
-                const auto correlated = std::find(
-                    state_->queuedFrames.begin(),
-                    state_->queuedFrames.end(),
-                    key);
-                if (correlated
-                        == state_->queuedFrames.end()
-                    || std::llabs(
-                           matched.timestampNanoseconds
-                           - correlated->timestampMilliseconds
-                               * 1'000'000LL)
-                        > TimestampToleranceNanoseconds) {
-                    discarded.push_back(matched);
-                    matched = {};
-                    state_->statistics.staleImagesDropped.fetch_add(
-                        1,
-                        std::memory_order_relaxed);
-                } else {
-                    state_->queuedFrames.erase(correlated);
-                }
+            const auto exact = std::find_if(
+                state_->images.begin(),
+                state_->images.end(),
+                [&key, currentEpoch](const PendingImage& image) {
+                    return image.producerEpoch == currentEpoch
+                        && image.frameKey == key;
+                });
+            if (exact != state_->images.end()) {
+                matched = *exact;
+                state_->images.erase(exact);
             }
         }
         for (auto& image : discarded) {
@@ -1643,21 +1579,31 @@ public:
         const VideoFrame& frame,
         std::chrono::milliseconds timeout)
     {
-        const auto expected = frame.timestamp() * 1'000'000LL;
+        const detail::MediaCodecImageFrameKey key = frameKey(frame);
         std::unique_lock<std::mutex> lock(state_->mutex);
+        const std::uint64_t expectedEpoch =
+            state_->producerEpoch.associationEpoch(key);
+        if (expectedEpoch == 0) {
+            return;
+        }
         state_->imageChanged.wait_for(
             lock,
             timeout,
-            [this, expected] {
+            [this, key, expectedEpoch] {
                 return state_->shuttingDown
                     || !state_->asyncError.empty()
+                    || state_->producerEpoch.currentEpoch()
+                        != expectedEpoch
+                    || !state_->producerEpoch.hasAssociation(
+                        key,
+                        expectedEpoch)
                     || std::any_of(
                         state_->images.begin(),
                         state_->images.end(),
-                        [expected](const PendingImage& image) {
-                            return std::llabs(
-                                image.timestampNanoseconds - expected)
-                                <= TimestampToleranceNanoseconds;
+                        [key, expectedEpoch](
+                            const PendingImage& image) {
+                            return image.producerEpoch == expectedEpoch
+                                && image.frameKey == key;
                         });
             });
     }
@@ -1688,10 +1634,10 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             pending.swap(state_->images);
-            state_->queuedFrames.clear();
-            state_->retiredFrames.clear();
+            state_->producerEpoch.invalidate();
             state_->asyncError.clear();
         }
+        state_->imageChanged.notify_all();
         for (auto& image : pending) {
             discardImage(image);
         }

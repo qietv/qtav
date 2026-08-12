@@ -119,6 +119,23 @@ target_link_libraries(qtav_core_backend_api_test PRIVATE QtAV::Core)
 target_compile_features(qtav_core_backend_api_test PRIVATE cxx_std_17)
 add_test(NAME qtav_core_backend_api COMMAND qtav_core_backend_api_test)
 
+add_executable(
+    qtav_mediacodec_image_epoch_test
+    mediacodec_image_epoch_test.cpp
+)
+target_include_directories(
+    qtav_mediacodec_image_epoch_test
+    PRIVATE "${PROJECT_SOURCE_DIR}/backends/interop"
+)
+target_compile_features(
+    qtav_mediacodec_image_epoch_test
+    PRIVATE cxx_std_17
+)
+add_test(
+    NAME qtav_mediacodec_image_epoch
+    COMMAND qtav_mediacodec_image_epoch_test
+)
+
 if(NOT QTAV_AUDIO_AAUDIO STREQUAL "OFF")
     add_executable(
         qtav_audio_aaudio_pcm_queue_test

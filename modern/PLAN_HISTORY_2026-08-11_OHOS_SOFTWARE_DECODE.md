@@ -71,13 +71,10 @@ presentation rate of 25.0 FPS. At 2:49 the paused snapshot recorded:
 | Hardware-decoded frames | 0 |
 
 The decoded cadence therefore held the 25 FPS source rate through the sustained
-sample. The 533-frame decoded/presented total difference is not included in the
-Player queue/late-drop counter. It is consistent with the demo's intentional
-single-pending-render flag coalescing multiple render requests while its render
-thread is busy, but this run did not add an origin-specific coalescing counter.
-It is retained as a separate presentation-scheduling observation. This run
-validates the software decoder throughput change but does not redefine a
-decoded frame as a presented frame.
+sample. The 533-frame decoded/presented total difference is not explained by
+the Player queue/late-drop counter and is retained as a separate presentation-
+scheduling/coalescing observation. This run validates the software decoder
+throughput change but does not redefine a decoded frame as a presented frame.
 
 The device began near 32.7 degrees C at the `system_h` sensor. After the
 sustained run it reported 37.2 degrees C, with a 35.0 degrees C battery sensor.

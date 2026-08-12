@@ -108,8 +108,9 @@ public:
         FrameAvailableCallback callback) override;
     void invalidatePendingFrames() noexcept override;
 
-    // Drop images and timestamp associations that have not entered a Vulkan
-    // submission. Call before seek, decoder replacement, or explicit stop.
+    // Advance the producer epoch and reject pending associations/images at a
+    // standalone interop lifecycle boundary. Player-connected renderers call
+    // the same operation automatically.
     void flush() noexcept;
     MediaCodecVulkanInteropStatistics statistics() const noexcept;
 

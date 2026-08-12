@@ -142,6 +142,10 @@ public:
     virtual void releaseCurrentContextResources() noexcept = 0;
     virtual void setFrameAvailableCallback(
         FrameAvailableCallback callback) = 0;
+    // Cancels producer/image associations which have not entered an OpenGL
+    // submission. The default is a non-blocking no-op for compatible custom
+    // implementations.
+    virtual void invalidatePendingFrames() noexcept;
 };
 
 class QTAV_RENDER_OPENGL_EXPORT OpenGLVideoRenderer final
@@ -166,6 +170,7 @@ public:
         const VideoFrame& frame) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
+    void invalidatePendingFrames() noexcept override;
 
     void setCurrentTargetCallback(
         OpenGLCurrentTargetCallback callback);
