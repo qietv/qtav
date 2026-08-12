@@ -1029,9 +1029,6 @@ struct TestState {
                 && frameNumber >= 60
                 && !mediaCodecOpenGLSeekRequested.exchange(
                     true)) {
-                if (mediaCodecOpenGLInterop) {
-                    mediaCodecOpenGLInterop->flush();
-                }
                 logInfo(
                     "QTAV_ANDROID_TEST: "
                     "MEDIACODEC_OPENGL_SEEK codec=h264 "

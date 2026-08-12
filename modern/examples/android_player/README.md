@@ -131,21 +131,19 @@ position, rebuilds the affected decoder/renderer resources, and resumes only
 if playback was active. Renderer preferences changed while direct-Surface
 presentation is active are retained without interrupting playback.
 
-All non-direct video rendering runs on one native render thread. The player
-hands MediaCodec frames to the application inside the bounded decode window,
-together with their monotonic presentation deadlines. Direct Surface output
-uses the core's independent video-decode and presentation workers: encoded
-packets are paced before decode and the application releases each small-window
-output when its ordinary presentation callback arrives. Both private
-AImageReader ZeroCopy paths reserve one of four application pipeline slots,
-including the frame currently in the graphics-thread attempt, before releasing
-another output. Vulkan waits up to 100 ms for image ownership. OpenGL releases
-non-blockingly, retains the exact frame/deadline, and lets the AImageReader
-callback wake the native render thread; the reader has two acquisition slots
-outside the four-image correlation window so callback coalescing cannot strand
-an available image at `MAX_IMAGES_ACQUIRED`. Audio decode/output remains on
-separate workers. A pending frame older than the 250 ms timestamp-correlation
-window is retired instead of being presented in a recovery burst.
+All non-direct video rendering runs on one native render thread. `Player`
+retains the exact backend-deferred frame and the application only schedules
+`renderVideoDetailed()` from `setRenderCallback()`; the demo has no
+application-owned MediaCodec retry-frame FIFO or correctness-critical interop
+flush around seek, stop, or media replacement. Direct Surface output uses the
+core's independent video-decode and presentation workers: encoded packets are
+paced before decode and the application releases each small-window output when
+its ordinary presentation callback arrives. Vulkan waits up to 100 ms for
+image ownership. OpenGL releases non-blockingly and lets the AImageReader
+callback wake the native render thread. Both interops retain bounded producer
+epoch associations so late invalidated AImages are acquired and returned but
+cannot enter the current presentation generation. Audio decode/output remains
+on separate workers.
 
 The Debug switch shows or hides the top-left status window without rebuilding
 the playback pipeline. Its first lines report the actual Vulkan swapchain or
@@ -202,6 +200,10 @@ color conversion; libplacebo then applies Dolby Vision reshaping, color
 conversion, tone mapping, and output encoding. A device that cannot provide
 this raw contract rejects the hardware frame rather than interpreting Profile
 5 samples through an implicit RGB conversion.
+The Android crop matrix also converts AImage's top-left origin to the
+bottom-left external-texture sampling origin. The renderer's generic
+FBO-to-libplacebo `flipped` flag remains unchanged, and Java/`SurfaceView` adds
+no separate transform.
 Android window submission occurs through the renderer's present callback
 before the AImage is returned. The exported EGL native fence therefore covers
 `eglSwapBuffers()` as well as sampling; presenting only after `render()`

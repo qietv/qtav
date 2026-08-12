@@ -756,13 +756,17 @@ public:
         current.frame.transform[0] =
             static_cast<float>(crop.right - crop.left)
             / static_cast<float>(description.width);
+        // AHardwareBuffer-backed EGLImages use OpenGL's bottom-left sampling
+        // origin, while AImage crop rectangles use top-left image coordinates.
+        // Fold that origin conversion into the crop matrix. The subsequent
+        // FBO normalization remains marked flipped for libplacebo.
         current.frame.transform[5] =
-            static_cast<float>(crop.bottom - crop.top)
+            -static_cast<float>(crop.bottom - crop.top)
             / static_cast<float>(description.height);
         current.frame.transform[10] = 1.0F;
         current.frame.transform[12] = static_cast<float>(crop.left)
             / static_cast<float>(description.width);
-        current.frame.transform[13] = static_cast<float>(crop.top)
+        current.frame.transform[13] = static_cast<float>(crop.bottom)
             / static_cast<float>(description.height);
         current.frame.transform[15] = 1.0F;
 

@@ -31,24 +31,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <unistd.h>
 #include <utility>
 
 namespace {
 
 constexpr const char* LogTag = "QtAVCorePlayer";
-// The Player callback is already paced against the playback clock. While an
-// asynchronous AImageReader import is pending, retain a bounded
-// set of exact outputs already released to the producer plus only the newest
-// not-yet-released candidate. A deep second FIFO can exhaust MediaCodec output
-// slots and then present obsolete frames in a burst after the path recovers.
-constexpr std::size_t MaximumQueuedRenderFrames = 4;
-// Keep this below the interop's 250 ms timestamp-correlation window for both
-// 24 and 25 fps media, and leave AImageReader capacity for images retained by
-// the Vulkan frames-in-flight ring.
-constexpr std::size_t MaximumPendingRenderFrames = 4;
-constexpr std::int64_t MaximumPendingRenderAgeMilliseconds = 250;
 constexpr std::size_t FrameRateSampleCount = 32;
 constexpr std::chrono::milliseconds PresentationFpsWindow { 1'500 };
 constexpr std::chrono::milliseconds PresentationFpsStaleAfter { 750 };
@@ -439,12 +427,6 @@ public:
         savedPosition_ = 0;
         resetPresentationContinuity();
         clearScheduledRenderFrames();
-        if (vulkanInterop_) {
-            vulkanInterop_->flush();
-        }
-        if (openGLInterop_) {
-            openGLInterop_->flush();
-        }
         if (player_) {
             player_->setState(qtav::State::Stopped);
         }
@@ -457,12 +439,6 @@ public:
         savedPosition_ = std::max<std::int64_t>(0, position);
         resetPresentationContinuity();
         clearScheduledRenderFrames();
-        if (vulkanInterop_) {
-            vulkanInterop_->flush();
-        }
-        if (openGLInterop_) {
-            openGLInterop_->flush();
-        }
         if (player_ && !player_->seek(savedPosition_)) {
             setStatus("Seek was rejected because the media is not seekable");
         }
@@ -886,7 +862,7 @@ private:
     }
 
     void recordPresentation(
-        const qtav::VideoFrame& frame,
+        std::int64_t timestamp,
         std::uint64_t generation)
     {
         const auto now = std::chrono::steady_clock::now();
@@ -898,7 +874,7 @@ private:
             && lastPresentationTime_
                 != std::chrono::steady_clock::time_point {}) {
             const std::int64_t sourceDelta =
-                frame.timestamp() - lastPresentedTimestamp_;
+                timestamp - lastPresentedTimestamp_;
             const auto actualDelta =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - lastPresentationTime_)
@@ -946,7 +922,7 @@ private:
         } else {
             presentationFpsMilliHertz_ = 0;
         }
-        lastPresentedTimestamp_ = frame.timestamp();
+        lastPresentedTimestamp_ = timestamp;
         lastPresentationTime_ = now;
     }
 
@@ -1041,8 +1017,6 @@ private:
                     if (directEnabled_.load()) {
                         recordDirectOutputColorSpace(frame);
                         presentDirectSurfaceFrame(frame, generation);
-                    } else {
-                        enqueueRenderFrame(frame, generation);
                     }
                 });
     }
@@ -1260,59 +1234,14 @@ private:
             }
             player->setVideoRenderAPI(renderer_);
             renderEnabled_.store(true);
-            if (hardwareZeroCopy
-                && (vulkanInterop_ || openGLInterop_)) {
-                const auto scheduledVulkanInterop = vulkanInterop_;
-                const auto scheduledOpenGLInterop = openGLInterop_;
-                player->setVideoFrameScheduler(
-                    [this,
-                     generation = playerGeneration_.load(),
-                     scheduledVulkanInterop,
-                     scheduledOpenGLInterop](
-                        const qtav::VideoFrame& frame,
-                        int,
-                        std::int64_t monotonicNanoseconds) {
-                        if (playerGeneration_.load() != generation
-                            || !renderEnabled_.load()
-                            || (!scheduledVulkanInterop
-                                && !scheduledOpenGLInterop)) {
-                            return false;
-                        }
-                        if (!reserveScheduledRenderFrame(generation)) {
-                            return false;
-                        }
-                        std::string detail;
-                        const bool queued = scheduledVulkanInterop
-                            ? scheduledVulkanInterop->queueFrame(
-                                  frame,
-                                  detail)
-                            : scheduledOpenGLInterop->queueFrame(
-                                  frame,
-                                  detail);
-                        if (!queued) {
-                            cancelScheduledRenderFrame();
-                            return false;
-                        }
-                        decodedVideoFrames_.fetch_add(1);
-                        observeDolbyVisionFrame(frame);
-                        observeVideoSize(frame.width(), frame.height());
-                        latestVideoTimestamp_.store(frame.timestamp());
-                        observeVideoCallback(
-                            frame.timestamp(),
-                            generation);
-                        commitScheduledRenderFrame(
-                            frame,
-                            generation,
-                            monotonicNanoseconds);
-                        return true;
-                    });
-            }
-            // Scheduled hardware frames already retain the exact frame in the
-            // bounded render queue. AImageReader completion wakes the render
-            // thread through the interop callback; no core redraw callback is
-            // needed for the same frame. Software/fallback frames continue to
-            // enter through onVideoFrame().
-            player->setRenderCallback({});
+            // Player owns the exact deferred frame. AImageReader completion
+            // asks this render thread to retry through the core callback, so
+            // the application never keeps a second retry-frame queue.
+            player->setRenderCallback(
+                [this,
+                 generation = playerGeneration_.load()](void*) {
+                    requestRender(generation);
+                });
         }
         player->setHardwareDecodeConfig(std::move(hardwareConfig));
         return true;
@@ -1351,7 +1280,7 @@ private:
         }
         player_ = nextPlayer;
         activateRenderer(
-            renderer_,
+            nextPlayer,
             vulkanInterop_,
             openGLInterop_,
             generation);
@@ -1430,7 +1359,7 @@ private:
             qtav::mediaCodecFrame(frame, directSurface_);
         const bool presented = output && output.present();
         if (presented) {
-            recordPresentation(frame, generation);
+            recordPresentation(frame.timestamp(), generation);
             const std::uint64_t presented =
                 directPresentedFrames_.fetch_add(1) + 1;
             if (presented == 1) {
@@ -1457,16 +1386,17 @@ private:
             player_->setRenderCallback({});
             player_->setVideoFrameScheduler({});
             player_->onVideoFrame({});
+            player_->setState(qtav::State::Stopped);
+            player_->waitFor(qtav::State::Stopped, 5'000);
         }
+        // Player stop has already propagated the presentation-generation
+        // invalidation. These standalone flushes only release any images that
+        // remain owned while the interop objects are torn down.
         if (vulkanInterop_) {
             vulkanInterop_->flush();
         }
         if (openGLInterop_) {
             openGLInterop_->flush();
-        }
-        if (player_) {
-            player_->setState(qtav::State::Stopped);
-            player_->waitFor(qtav::State::Stopped, 5'000);
         }
         {
             std::lock_guard<std::mutex> lock(renderMutex_);
@@ -1490,22 +1420,16 @@ private:
     }
 
     void activateRenderer(
-        const std::shared_ptr<qtav::VideoRenderAPI>& renderer,
+        const std::shared_ptr<qtav::Player>& player,
         const std::shared_ptr<qtav::MediaCodecVulkanInterop>& vulkanInterop,
         const std::shared_ptr<qtav::MediaCodecOpenGLInterop>& openGLInterop,
         std::uint64_t generation)
     {
         std::lock_guard<std::mutex> lock(renderScheduleMutex_);
-        scheduledRenderer_ = renderer;
+        scheduledPlayer_ = player;
         scheduledVulkanInterop_ = vulkanInterop;
         scheduledOpenGLInterop_ = openGLInterop;
         renderGeneration_ = generation;
-        renderFrames_.clear();
-        pendingRenderFrames_.clear();
-        scheduledRenderDeadlines_.clear();
-        scheduledRenderReservations_ = 0;
-        scheduledRenderFramesInFlight_ = 0;
-        renderFrameQueued_ = false;
         renderRedrawRequested_ = false;
     }
 
@@ -1513,12 +1437,6 @@ private:
     {
         {
             std::lock_guard<std::mutex> lock(renderScheduleMutex_);
-            renderFrames_.clear();
-            pendingRenderFrames_.clear();
-            scheduledRenderDeadlines_.clear();
-            scheduledRenderReservations_ = 0;
-            scheduledRenderFramesInFlight_ = 0;
-            renderFrameQueued_ = false;
             renderRedrawRequested_ = false;
         }
         renderScheduleChanged_.notify_all();
@@ -1527,108 +1445,11 @@ private:
     void deactivateRenderer()
     {
         std::lock_guard<std::mutex> lock(renderScheduleMutex_);
-        scheduledRenderer_.reset();
+        scheduledPlayer_.reset();
         scheduledVulkanInterop_.reset();
         scheduledOpenGLInterop_.reset();
         renderGeneration_ = 0;
-        renderFrames_.clear();
-        pendingRenderFrames_.clear();
-        scheduledRenderDeadlines_.clear();
-        scheduledRenderReservations_ = 0;
-        scheduledRenderFramesInFlight_ = 0;
-        renderFrameQueued_ = false;
         renderRedrawRequested_ = false;
-        renderScheduleChanged_.notify_all();
-    }
-
-    void enqueueRenderFrame(
-        const qtav::VideoFrame& frame,
-        std::uint64_t generation)
-    {
-        if (!frame || !renderEnabled_.load()
-            || unsupportedSoftwareFrame_.load()
-            || playerGeneration_.load() != generation) {
-            return;
-        }
-        {
-            std::unique_lock<std::mutex> lock(renderScheduleMutex_);
-            renderScheduleChanged_.wait(lock, [this, generation] {
-                return renderThreadStopping_
-                    || renderGeneration_ != generation
-                    || !scheduledRenderer_
-                    || renderFrames_.size()
-                            + pendingRenderFrames_.size()
-                            + scheduledRenderReservations_
-                            + scheduledRenderFramesInFlight_
-                        < MaximumQueuedRenderFrames;
-            });
-            if (renderThreadStopping_
-                || renderGeneration_ != generation
-                || !scheduledRenderer_) {
-                return;
-            }
-            // Keep the reference-counted MediaCodec output token associated
-            // with the exact frame that was released to AImageReader. The
-            // player's current frame may advance before the asynchronous
-            // image-arrival callback asks us to retry.
-            renderFrames_.push_back(frame);
-            renderFrameQueued_ = true;
-        }
-        renderScheduleChanged_.notify_one();
-    }
-
-    bool reserveScheduledRenderFrame(std::uint64_t generation)
-    {
-        std::unique_lock<std::mutex> lock(renderScheduleMutex_);
-        renderScheduleChanged_.wait(lock, [this, generation] {
-            return renderThreadStopping_
-                || renderGeneration_ != generation
-                || !scheduledRenderer_
-                || renderFrames_.size()
-                        + pendingRenderFrames_.size()
-                        + scheduledRenderReservations_
-                        + scheduledRenderFramesInFlight_
-                    < MaximumQueuedRenderFrames;
-        });
-        if (renderThreadStopping_
-            || renderGeneration_ != generation
-            || !scheduledRenderer_) {
-            return false;
-        }
-        ++scheduledRenderReservations_;
-        return true;
-    }
-
-    void cancelScheduledRenderFrame()
-    {
-        {
-            std::lock_guard<std::mutex> lock(renderScheduleMutex_);
-            if (scheduledRenderReservations_ > 0) {
-                --scheduledRenderReservations_;
-            }
-        }
-        renderScheduleChanged_.notify_all();
-    }
-
-    void commitScheduledRenderFrame(
-        const qtav::VideoFrame& frame,
-        std::uint64_t generation,
-        std::int64_t monotonicNanoseconds)
-    {
-        {
-            std::lock_guard<std::mutex> lock(renderScheduleMutex_);
-            if (scheduledRenderReservations_ > 0) {
-                --scheduledRenderReservations_;
-            }
-            if (!renderThreadStopping_
-                && renderGeneration_ == generation
-                && scheduledRenderer_) {
-                scheduledRenderDeadlines_[frame.timestamp()] =
-                    monotonicNanoseconds;
-                renderFrames_.push_back(frame);
-                renderFrameQueued_ = true;
-            }
-        }
         renderScheduleChanged_.notify_all();
     }
 
@@ -1643,7 +1464,7 @@ private:
             std::lock_guard<std::mutex> lock(renderScheduleMutex_);
             if (renderThreadStopping_
                 || renderGeneration_ != generation
-                || !scheduledRenderer_) {
+                || !scheduledPlayer_) {
                 return;
             }
             renderRedrawRequested_ = true;
@@ -1654,97 +1475,46 @@ private:
     void runRenderThread()
     {
         for (;;) {
-            std::shared_ptr<qtav::VideoRenderAPI> renderer;
+            std::shared_ptr<qtav::Player> player;
             std::shared_ptr<qtav::MediaCodecVulkanInterop> vulkanInterop;
             std::shared_ptr<qtav::MediaCodecOpenGLInterop> openGLInterop;
             std::uint64_t generation = 0;
-            bool retryPending = false;
-            bool startQueuedFrame = false;
             {
                 std::unique_lock<std::mutex> lock(renderScheduleMutex_);
                 renderScheduleChanged_.wait(lock, [this] {
                     return renderThreadStopping_
-                        || renderFrameQueued_
-                        || !renderFrames_.empty()
                         || renderRedrawRequested_;
                 });
                 if (renderThreadStopping_) {
                     return;
                 }
-                retryPending = renderRedrawRequested_;
-                startQueuedFrame = renderFrameQueued_
-                    || !renderFrames_.empty();
                 renderRedrawRequested_ = false;
-                renderFrameQueued_ = false;
-                renderer = scheduledRenderer_;
+                player = scheduledPlayer_;
                 vulkanInterop = scheduledVulkanInterop_;
                 openGLInterop = scheduledOpenGLInterop_;
                 generation = renderGeneration_;
             }
 
-            enum class AttemptResult {
-                Discarded,
-                Pending,
-                Presented,
-            };
-            const auto attemptFrame =
-                [this, &renderer, &vulkanInterop, &openGLInterop, generation](
-                    qtav::VideoFrame& frame) {
+            if (!player || !renderEnabled_.load()
+                || unsupportedSoftwareFrame_.load()
+                || playerGeneration_.load() != generation) {
+                continue;
+            }
+
+            const auto renderStart = std::chrono::steady_clock::now();
+            qtav::VideoRenderResult result;
+            {
+                std::lock_guard<std::mutex> renderLock(renderMutex_);
                 if (!renderEnabled_.load()
                     || unsupportedSoftwareFrame_.load()
-                    || playerGeneration_.load() != generation
-                    || !renderer || !frame) {
-                    return AttemptResult::Discarded;
+                    || playerGeneration_.load() != generation) {
+                    continue;
                 }
+                renderAttempts_.fetch_add(1);
+                result = player->renderVideoDetailed();
+            }
 
-                {
-                    std::unique_lock<std::mutex> lock(
-                        renderScheduleMutex_);
-                    const auto scheduled =
-                        scheduledRenderDeadlines_.find(
-                            frame.timestamp());
-                    if (scheduled
-                        != scheduledRenderDeadlines_.end()) {
-                        const auto deadline =
-                            std::chrono::steady_clock::time_point(
-                                std::chrono::duration_cast<
-                                    std::chrono::steady_clock::duration>(
-                                    std::chrono::nanoseconds(
-                                        scheduled->second)));
-                        renderScheduleChanged_.wait_until(
-                            lock,
-                            deadline,
-                            [this, generation] {
-                                return renderThreadStopping_
-                                    || renderGeneration_ != generation;
-                            });
-                        if (renderThreadStopping_
-                            || renderGeneration_ != generation) {
-                            return AttemptResult::Discarded;
-                        }
-                    }
-                }
-
-                bool rendered = false;
-                const auto renderStart =
-                    std::chrono::steady_clock::now();
-                {
-                    std::lock_guard<std::mutex> renderLock(
-                        renderMutex_);
-                    if (!renderEnabled_.load()
-                        || unsupportedSoftwareFrame_.load()
-                        || playerGeneration_.load() != generation) {
-                        return AttemptResult::Discarded;
-                    }
-                    renderAttempts_.fetch_add(1);
-                    rendered = renderer->render(frame);
-                }
-
-                if (!rendered) {
-                    return renderEnabled_.load()
-                        ? AttemptResult::Pending
-                        : AttemptResult::Discarded;
-                }
+            if (result.status == qtav::VideoRenderStatus::Rendered) {
                 const auto renderMicroseconds =
                     static_cast<std::uint64_t>(
                         std::max<std::int64_t>(
@@ -1763,64 +1533,10 @@ private:
                                    maximum,
                                    renderMicroseconds)) {
                 }
-
-                {
-                    std::lock_guard<std::mutex> lock(
-                        renderScheduleMutex_);
-                    scheduledRenderDeadlines_.erase(
-                        frame.timestamp());
-                }
-
-                recordPresentation(frame, generation);
-                if (vulkanInterop) {
-                    const auto statistics = vulkanInterop->statistics();
-                    hardwareBufferImports_.store(
-                        statistics.hardwareBufferImports);
-                    hardwareBufferImportCacheHits_.store(
-                        statistics.hardwareBufferImportCacheHits);
-                    maximumCachedHardwareBufferImports_.store(
-                        statistics.maximumCachedHardwareBufferImports);
-                    unconvertedYcbcrImports_.store(
-                        statistics.unconvertedYcbcrImports);
-                    interopCodecOutputsQueued_.store(
-                        statistics.codecOutputsQueued);
-                    interopImagesAcquired_.store(
-                        statistics.imagesAcquired);
-                    interopImagesImported_.store(
-                        statistics.imagesImported);
-                    interopStaleImagesDropped_.store(
-                        statistics.staleImagesDropped);
-                    interopMaximumPendingImages_.store(
-                        statistics.maximumPendingImages);
-                }
-                if (openGLInterop) {
-                    const auto statistics = openGLInterop->statistics();
-                    interopCodecOutputsQueued_.store(
-                        statistics.codecOutputsQueued);
-                    interopImagesAcquired_.store(
-                        statistics.imagesLatched);
-                    interopImagesImported_.store(
-                        statistics.textureAttachments);
-                    unconvertedYcbcrImports_.store(
-                        statistics.rawYcbcrImports);
-                    interopStaleImagesDropped_.store(
-                        statistics.staleFramesDropped);
-                    interopMaximumPendingImages_.store(
-                        statistics.maximumPendingFrames);
-                    openGLHdrSamplingStatus_.store(
-                        static_cast<int>(statistics.hdrSamplingStatus));
-                    openGLHardwareBufferFormat_.store(
-                        statistics.lastHardwareBufferFormat);
-                    if (statistics.hdrSamplingStatus
-                            == qtav::MediaCodecOpenGLHdrSamplingStatus::Supported
-                        && !openGLHdrSupportLogged_.exchange(true)) {
-                        logMessage(
-                            ANDROID_LOG_INFO,
-                            "OpenGL raw AHardwareBuffer/EGLImage YCbCr path active; format "
-                                + std::to_string(
-                                    statistics.lastHardwareBufferFormat));
-                    }
-                }
+                recordPresentation(
+                    static_cast<std::int64_t>(
+                        std::llround(result.timestamp * 1'000.0)),
+                    generation);
                 const std::uint64_t renderedCount =
                     renderedVideoFrames_.fetch_add(1) + 1;
                 if (renderedCount == 1) {
@@ -1828,129 +1544,87 @@ private:
                         ANDROID_LOG_INFO,
                         "First video frame rendered and presented");
                 }
-                return AttemptResult::Presented;
-            };
-
-            // A codec output has already been released once it enters the
-            // pending queue. If its AImage never correlates, do not let that
-            // stale token occupy every pipeline slot or get retried after the
-            // interop's 250 ms correlation window has retired it.
-            std::uint64_t stalePendingFrames = 0;
-            {
-                const std::int64_t latest =
-                    latestVideoTimestamp_.load();
-                std::lock_guard<std::mutex> lock(
-                    renderScheduleMutex_);
-                pendingRenderFrames_.erase(
-                    std::remove_if(
-                        pendingRenderFrames_.begin(),
-                        pendingRenderFrames_.end(),
-                        [latest, &stalePendingFrames](
-                            const qtav::VideoFrame& frame) {
-                            const bool stale = frame
-                                && latest > frame.timestamp()
-                                && latest - frame.timestamp()
-                                    > MaximumPendingRenderAgeMilliseconds;
-                            if (stale) {
-                                ++stalePendingFrames;
-                            }
-                            return stale;
-                        }),
-                    pendingRenderFrames_.end());
-            }
-            if (stalePendingFrames > 0) {
-                renderQueueDrops_.fetch_add(stalePendingFrames);
-                renderScheduleChanged_.notify_all();
             }
 
-            // AImageReader may coalesce notifications, so retry every exact
-            // released output that was pending when this redraw arrived once.
-            // Do not do this for a decoder callback alone: its image normally
-            // does not exist yet.
-            if (retryPending) {
-                std::size_t pendingAttempts = 0;
-                {
-                    std::lock_guard<std::mutex> lock(
-                        renderScheduleMutex_);
-                    pendingAttempts = pendingRenderFrames_.size();
-                }
-                while (pendingAttempts > 0) {
-                    --pendingAttempts;
-                    qtav::VideoFrame frame;
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            renderScheduleMutex_);
-                        if (renderGeneration_ != generation
-                            || scheduledRenderer_ != renderer
-                            || pendingRenderFrames_.empty()) {
-                            break;
-                        }
-                        frame = std::move(
-                            pendingRenderFrames_.front());
-                        pendingRenderFrames_.pop_front();
-                        ++scheduledRenderFramesInFlight_;
-                    }
-                    const AttemptResult result = attemptFrame(frame);
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            renderScheduleMutex_);
-                        if (scheduledRenderFramesInFlight_ > 0) {
-                            --scheduledRenderFramesInFlight_;
-                        }
-                        if (renderGeneration_ == generation
-                            && scheduledRenderer_ == renderer
-                            && result == AttemptResult::Pending) {
-                            pendingRenderFrames_.push_back(
-                                std::move(frame));
-                        } else if (frame) {
-                            scheduledRenderDeadlines_.erase(
-                                frame.timestamp());
-                        }
-                    }
-                    renderScheduleChanged_.notify_all();
+            if (vulkanInterop) {
+                const auto statistics = vulkanInterop->statistics();
+                hardwareBufferImports_.store(
+                    statistics.hardwareBufferImports);
+                hardwareBufferImportCacheHits_.store(
+                    statistics.hardwareBufferImportCacheHits);
+                maximumCachedHardwareBufferImports_.store(
+                    statistics.maximumCachedHardwareBufferImports);
+                unconvertedYcbcrImports_.store(
+                    statistics.unconvertedYcbcrImports);
+                interopCodecOutputsQueued_.store(
+                    statistics.codecOutputsQueued);
+                interopImagesAcquired_.store(statistics.imagesAcquired);
+                interopImagesImported_.store(statistics.imagesImported);
+                interopStaleImagesDropped_.store(
+                    statistics.staleImagesDropped);
+                interopMaximumPendingImages_.store(
+                    statistics.maximumPendingImages);
+            }
+            if (openGLInterop) {
+                const auto statistics = openGLInterop->statistics();
+                interopCodecOutputsQueued_.store(
+                    statistics.codecOutputsQueued);
+                interopImagesAcquired_.store(statistics.imagesLatched);
+                interopImagesImported_.store(
+                    statistics.textureAttachments);
+                unconvertedYcbcrImports_.store(
+                    statistics.rawYcbcrImports);
+                interopStaleImagesDropped_.store(
+                    statistics.staleFramesDropped);
+                interopMaximumPendingImages_.store(
+                    statistics.maximumPendingFrames);
+                openGLHdrSamplingStatus_.store(
+                    static_cast<int>(statistics.hdrSamplingStatus));
+                openGLHardwareBufferFormat_.store(
+                    statistics.lastHardwareBufferFormat);
+                if (statistics.hdrSamplingStatus
+                        == qtav::MediaCodecOpenGLHdrSamplingStatus::Supported
+                    && !openGLHdrSupportLogged_.exchange(true)) {
+                    logMessage(
+                        ANDROID_LOG_INFO,
+                        "OpenGL raw AHardwareBuffer/EGLImage YCbCr path active; format "
+                            + std::to_string(
+                                statistics.lastHardwareBufferFormat));
                 }
             }
 
-            if (startQueuedFrame) {
-                qtav::VideoFrame frame;
-                bool removedQueuedFrame = false;
-                {
-                    std::lock_guard<std::mutex> lock(
-                        renderScheduleMutex_);
-                    if (renderGeneration_ == generation
-                        && scheduledRenderer_ == renderer
-                        && !renderFrames_.empty()
-                        && pendingRenderFrames_.size()
-                            < MaximumPendingRenderFrames) {
-                        frame = std::move(renderFrames_.front());
-                        renderFrames_.pop_front();
-                        ++scheduledRenderFramesInFlight_;
-                        removedQueuedFrame = true;
-                    }
+            if (result.status == qtav::VideoRenderStatus::RendererBusy
+                || result.status
+                    == qtav::VideoRenderStatus::PlayerStateBusy) {
+                const auto retryDelay = std::chrono::milliseconds(
+                    std::clamp<std::uint32_t>(
+                        result.retryAfterMilliseconds,
+                        1,
+                        50));
+                std::unique_lock<std::mutex> lock(renderScheduleMutex_);
+                const bool interrupted = renderScheduleChanged_.wait_for(
+                    lock,
+                    retryDelay,
+                    [this, generation, &player] {
+                        return renderThreadStopping_
+                            || renderGeneration_ != generation
+                            || scheduledPlayer_ != player
+                            || renderRedrawRequested_;
+                    });
+                if (!interrupted && !renderThreadStopping_
+                    && renderGeneration_ == generation
+                    && scheduledPlayer_ == player) {
+                    renderRedrawRequested_ = true;
                 }
-                const AttemptResult result = frame
-                    ? attemptFrame(frame)
-                    : AttemptResult::Discarded;
-                if (removedQueuedFrame) {
-                    std::lock_guard<std::mutex> lock(
-                        renderScheduleMutex_);
-                    if (scheduledRenderFramesInFlight_ > 0) {
-                        --scheduledRenderFramesInFlight_;
-                    }
-                    if (renderGeneration_ == generation
-                        && scheduledRenderer_ == renderer
-                        && result == AttemptResult::Pending
-                        && pendingRenderFrames_.size()
-                            < MaximumPendingRenderFrames) {
-                        pendingRenderFrames_.push_back(
-                            std::move(frame));
-                    } else if (frame) {
-                        scheduledRenderDeadlines_.erase(
-                            frame.timestamp());
-                    }
-                }
-                if (removedQueuedFrame) {
-                    renderScheduleChanged_.notify_all();
+            } else if (
+                result.status == qtav::VideoRenderStatus::SurfaceLost
+                || result.status
+                    == qtav::VideoRenderStatus::RendererError) {
+                const std::string message = result.detail.empty()
+                    ? "The active video renderer cannot continue"
+                    : result.detail;
+                if (setPipelineErrorOnce(message)) {
+                    logMessage(ANDROID_LOG_ERROR, message);
                 }
             }
         }
@@ -1961,16 +1635,10 @@ private:
         {
             std::lock_guard<std::mutex> lock(renderScheduleMutex_);
             renderThreadStopping_ = true;
-            renderFrameQueued_ = false;
             renderRedrawRequested_ = false;
-            scheduledRenderer_.reset();
+            scheduledPlayer_.reset();
             scheduledVulkanInterop_.reset();
             scheduledOpenGLInterop_.reset();
-            renderFrames_.clear();
-            pendingRenderFrames_.clear();
-            scheduledRenderDeadlines_.clear();
-            scheduledRenderReservations_ = 0;
-            scheduledRenderFramesInFlight_ = 0;
         }
         renderScheduleChanged_.notify_all();
         if (renderThread_.joinable()) {
@@ -2079,19 +1747,12 @@ private:
     mutable std::mutex timingMutex_;
     std::condition_variable renderScheduleChanged_;
     std::thread renderThread_;
-    std::shared_ptr<qtav::VideoRenderAPI> scheduledRenderer_;
+    std::shared_ptr<qtav::Player> scheduledPlayer_;
     std::shared_ptr<qtav::MediaCodecVulkanInterop>
         scheduledVulkanInterop_;
     std::shared_ptr<qtav::MediaCodecOpenGLInterop>
         scheduledOpenGLInterop_;
-    std::deque<qtav::VideoFrame> renderFrames_;
-    std::deque<qtav::VideoFrame> pendingRenderFrames_;
-    std::unordered_map<std::int64_t, std::int64_t>
-        scheduledRenderDeadlines_;
-    std::size_t scheduledRenderReservations_ = 0;
-    std::size_t scheduledRenderFramesInFlight_ = 0;
     std::uint64_t renderGeneration_ = 0;
-    bool renderFrameQueued_ = false;
     bool renderRedrawRequested_ = false;
     bool renderThreadStopping_ = false;
     std::shared_ptr<qtav::Player> player_;

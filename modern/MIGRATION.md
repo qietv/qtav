@@ -587,6 +587,9 @@ AHardwareBuffers as EGLImages, and samples raw Y/Cb/Cr through
 conversion; libplacebo then applies Dolby Vision reshaping and the complete
 SDR/PQ/HLG pipeline. Imports without the raw-component contract are rejected
 for Dolby Vision rather than relying on implicit SurfaceTexture conversion.
+The Android import matrix converts AImage's top-left crop origin to OpenGL's
+bottom-left external-texture origin; the generic normalized FBO remains marked
+flipped for libplacebo, with no Java-side transform.
 Both Android presentation adapters also treat a republished identical
 `ANativeWindow` with changed buffer geometry as a resize and refresh their
 swapchain/EGL target without reopening the decoder.

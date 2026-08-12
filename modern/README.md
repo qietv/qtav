@@ -1767,14 +1767,21 @@ matrix, transfer, gamut, tone mapping, or output encoding; libplacebo performs
 all of those operations after applying any FFmpeg `AVDOVIMetadata`. A
 configured `width` and `height` only set the AImageReader's initial size;
 MediaCodec output supplies each acquired image's actual dimensions and crop.
+The Android import folds AImage's top-left crop into the external-texture
+matrix with a vertical origin conversion. The generic normalization FBO still
+marks its libplacebo plane as flipped; Java and the application `SurfaceView`
+do not provide another flip.
 This route is zero-CPU-copy, but the RGBA16F normalization texture means it is
 not strict no-intermediate source zero-copy.
 
-Call `flush()` before seek, loop, decoder/media replacement, explicit stop, or
-an interop-policy switch. Close the renderer while its context can still be
-made current so pending EGLImage and GL resources are released safely.
-Same-context Android window loss/recreation does not replace the decoder
-surface or map the native frame.
+When the interop is attached through `Player`, seek, loop, decoder/media
+replacement, stop, track reopen, and surface-generation replacement propagate
+presentation invalidation automatically. Applications must not call `flush()`
+around those Player controls or retain a second retry-frame queue. Public
+`flush()` remains available only for standalone interop lifecycle control.
+Close the renderer while its context can still be made current so pending
+EGLImage and GL resources are released safely. Same-context Android window
+loss/recreation does not replace the decoder surface or map the native frame.
 
 The raw hardware contract requires `GL_OES_EGL_image_external_essl3`,
 `GL_EXT_YUV_target`, AHardwareBuffer EGLImage import, and Android native-fence

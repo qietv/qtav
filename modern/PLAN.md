@@ -97,6 +97,14 @@ The following accepted decisions constrain all remaining work:
   reported its HDR composition algorithm. Explicit SDR still selected
   RGBA8/sRGB and reported tone mapping. Subjective audible pitch/track
   confirmation remains a user manual check.
+- The 2026-08-12 OHOS player full-screen follow-up keeps one XComponent alive
+  across normal/landscape layouts, preserves the observed position when a
+  hardware-surface configuration reopens playback, and compensates Vulkan and
+  OpenGL ES orientation/viewport semantics separately. Connected
+  `legend.mkv` checks passed upright 16:9 full-screen output without restart on
+  both renderers; PiP remained 16:9 at zero transform/rotation and advanced
+  continuously. See
+  [`PLAN_HISTORY_2026-08-12_OHOS_PLAYER_FULLSCREEN_PIP.md`](PLAN_HISTORY_2026-08-12_OHOS_PLAYER_FULLSCREEN_PIP.md).
 - The OHCodec/Vulkan deferred-frame freeze root cause is repaired in C++.
   Player now retains the exact backend-deferred frame per renderer key and
   automatically invalidates pending producer associations at every
@@ -180,17 +188,13 @@ The CI implementation and local validation record is in
 The first published run and temporary Windows-only scope are recorded in
 [`PLAN_HISTORY_2026-08-10_WINDOWS_ONLY_CI.md`](PLAN_HISTORY_2026-08-10_WINDOWS_ONLY_CI.md).
 
-## Next task — Android MediaCodec seek-generation isolation
+## Completed task — Android MediaCodec seek-generation isolation
 
-The OHOS deferred-render investigation exposed a related Android ownership
-gap. Android does not have the same one-buffer `OH_ConsumerSurface` deadlock,
-but MediaCodec/AImageReader producer callbacks can outlive a seek generation.
-The Vulkan path now receives Player invalidation but can retain a late old-epoch
-image or leave its bounded image wait asleep. The OpenGL ES path has an interop
-`flush()` but no automatic `VideoRenderAPI::invalidatePendingFrames()`
-propagation, so the shipped example currently performs a correctness-critical
-manual flush before seek. Fix these boundaries in C++; applications must not
-track pending frames or flush renderer internals around Player controls.
+MediaCodec/AImageReader producer callbacks are now isolated by a bounded
+producer epoch across seek, stop, media replacement, track reopen, and surface
+replacement. Player owns the exact deferred frame and propagates invalidation;
+applications neither retain retry frames nor flush renderer internals around
+Player controls.
 
 - [x] Forward Player presentation-generation invalidation through
   `OpenGLVideoRenderer` and the Android OpenGL adapter to
@@ -204,51 +208,51 @@ track pending frames or flush renderer internals around Player controls.
   using timestamp proximity alone when its producer epoch is unproven.
 - [x] Make invalidation wake Vulkan's bounded exact-image wait immediately and
   close the render/invalidation race without waiting for GPU completion.
-- [ ] Remove correctness dependence on explicit pre-seek interop `flush()`
+- [x] Remove correctness dependence on explicit pre-seek interop `flush()`
   calls in the Android player and native regression harness. Keep public
   `flush()` only for standalone interop lifecycle control and make it obey the
   same epoch contract.
-- [~] Add deterministic lifecycle coverage for forward/backward seek, repeated
+- [x] Add deterministic lifecycle coverage for forward/backward seek, repeated
   timestamps, late callback arrival after invalidation, media replacement, and
   a render overlapping seek. Cover Vulkan and OpenGL ES independently, then
   retain direct-Surface present/drop as a separate regression path.
 
-The shared producer-epoch tracker, automatic Vulkan/OpenGL invalidation
-forwarding, prompt Vulkan wait wake-up, and overlapping mobile-render
-invalidation test are implemented. The portable repeated-timestamp/late-image
-lifecycle test and Windows selector test pass, and the changed Android arm64
-Vulkan/OpenGL/MediaCodec targets cross-build. Removing the remaining explicit
-application/harness flush calls and the connected-device matrix stay open, so
-the task and its acceptance criteria are not marked complete.
+The Android player and native harness no longer perform pre-seek interop
+flushes. The player render thread calls `Player::renderVideoDetailed()` and has
+no application-owned retry-frame queue. Connected-device work also found and
+fixed the Android raw AHardwareBuffer input-origin conversion while preserving
+the generic FBO-to-libplacebo flip. Detailed implementation and validation
+evidence is in
+[`PLAN_HISTORY_2026-08-12_ANDROID_MEDIACODEC_SEEK_GENERATION.md`](PLAN_HISTORY_2026-08-12_ANDROID_MEDIACODEC_SEEK_GENERATION.md).
 
 Acceptance criteria:
 
-1. [ ] `Player::seek()`, stop, media replacement, track-switch reopen, and
+1. [x] `Player::seek()`, stop, media replacement, track-switch reopen, and
    surface-generation replacement invalidate Vulkan and OpenGL pending producer
    state without any application-side interop call.
-2. [ ] A deferred frame is retried by exact Player frame identity, while an
+2. [x] A deferred frame is retried by exact Player frame identity, while an
    AImageReader image is accepted only for a current-epoch producer association;
    a repeated timestamp after backward seek cannot match an old-epoch image.
-3. [ ] Late invalidated images are acquired and returned with their native
+3. [x] Late invalidated images are acquired and returned with their native
    fences, not left to consume AImageReader capacity, and cannot trigger a
    current-generation presentation.
-4. [ ] A seek or replacement wakes the Vulkan 100-ms correlation wait promptly;
+4. [x] A seek or replacement wakes the Vulkan 100-ms correlation wait promptly;
    an overlapping old render finishes as discarded and cannot republish stale
    pending state after invalidation.
-5. [ ] The repair adds no decoded-source CPU map, transfer, staging copy,
+5. [x] The repair adds no decoded-source CPU map, transfer, staging copy,
    upload, software fallback, per-frame GPU wait, unbounded queue, or
    application-owned retry-frame state. Existing submitted GPU work retains its
    fence/timeline lifetime.
-6. [ ] Windows shared/static Release CTest remains passing. Android arm64/API 28
+6. [x] Windows shared/static Release CTest remains passing. Android arm64/API 28
    shared/static core, Vulkan, OpenGL ES, MediaCodec interop, player package, and
    install-consumer cross-builds pass with `git diff --check` and no new Qt
    dependency.
-7. [ ] On the connected Android device, H.264 and HEVC/10-bit paths pass repeated
+7. [x] On the connected Android device, H.264 and HEVC/10-bit paths pass repeated
    forward/backward seek and media-replacement matrices through both Vulkan and
    OpenGL ES. Decoding, AImage callbacks, successful presents, audio, and media
    position must all continue; pending depth stays bounded and zero-CPU-copy
    counters remain zero.
-8. [ ] MediaCodec direct-Surface present/drop, pause/resume, stop, surface
+8. [x] MediaCodec direct-Surface present/drop, pause/resume, stop, surface
    recreation, and stale-surface rejection remain passing and are reported
    separately from application-rendered Vulkan/OpenGL ES evidence.
 
@@ -402,7 +406,7 @@ is intentionally short:
 | Milestones 0–3: Qt-free core, decomposition, backend contracts, portable video/audio references | Complete and verified |
 | Milestone 4: former Apple production path | Archived and unsupported |
 | Milestone 5: Windows D3D11/D3D11VA/WASAPI | Complete, including the Intel post-seek root-cause investigation and repair; AD-010 is closed |
-| Milestone 6: Android Vulkan/OpenGL ES/MediaCodec/AAudio | Baseline complete; MediaCodec/AImageReader seek-generation isolation is the active next hardening task |
+| Milestone 6: Android Vulkan/OpenGL ES/MediaCodec/AAudio | Complete, including MediaCodec/AImageReader seek-generation isolation and connected-device H.264/HEVC validation |
 | Milestone 7: OHOS production path | AD-009 opaque external-format policy complete and connected-device validated; the separate explicit-plane strict Vulkan gate and broader validation remain open above |
 | Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step, pitch-preserving time-stretch | Complete and verified on Windows plus Android/OHOS static/shared cross-builds |
 | General audio/video processing contracts and reference volume filter | Complete and verified on Windows plus Android/OHOS static/shared package consumption |
@@ -415,8 +419,9 @@ is intentionally short:
    Actions only after project direction re-enables them.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.
-3. Complete the Android MediaCodec seek-generation isolation task before
-   starting the guarded Android HDR external-OES work. Do not conflate the two.
+3. Android MediaCodec seek-generation isolation is complete. The guarded
+   Android HDR external-OES work remains deferred until every preceding gate is
+   complete; do not conflate the two.
 4. When a task completes, move detailed evidence to the history/decision/
    architecture document that owns it and keep only a concise status in this
    file.
