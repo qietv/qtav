@@ -3,6 +3,7 @@
 #include <qtav/mobile_video_renderer.h>
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -214,6 +215,8 @@ public:
         if (!renderer_) {
             return;
         }
+        pendingFrameInvalidation_.store(false, std::memory_order_release);
+        renderer_->invalidatePendingFrames();
         renderer_->setEventCallback({});
         renderer_->close();
         renderer_.reset();
@@ -743,6 +746,7 @@ public:
     VideoRenderAttemptResult renderDetailed(const VideoFrame& frame)
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
+        applyPendingFrameInvalidation();
         if (!sessionConfigured_ || suspended_) {
             lastAttempt_ = {
                 suspended_ ? VideoRenderAttemptStatus::SurfaceLost
@@ -793,6 +797,17 @@ public:
         lastError_.clear();
     }
 
+    void invalidatePendingFrames() noexcept
+    {
+        pendingFrameInvalidation_.store(true, std::memory_order_release);
+        std::unique_lock<std::recursive_mutex> lock(
+            mutex_,
+            std::try_to_lock);
+        if (lock.owns_lock()) {
+            applyPendingFrameInvalidation();
+        }
+    }
+
     void suspendSurface() noexcept
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -826,7 +841,20 @@ public:
             nullptr);
     }
 
+    void applyPendingFrameInvalidation() noexcept
+    {
+        if (!pendingFrameInvalidation_.exchange(
+                false,
+                std::memory_order_acq_rel)) {
+            return;
+        }
+        if (renderer_) {
+            renderer_->invalidatePendingFrames();
+        }
+    }
+
     mutable std::recursive_mutex mutex_;
+    std::atomic<bool> pendingFrameInvalidation_ { false };
     MobileRendererSelectorConfig selectorConfig_;
     EventCallback eventCallback_;
     SelectionCallback selectionCallback_;
@@ -920,6 +948,13 @@ void MobileVideoRendererSelector::close() noexcept
 {
     if (impl_) {
         impl_->close();
+    }
+}
+
+void MobileVideoRendererSelector::invalidatePendingFrames() noexcept
+{
+    if (impl_) {
+        impl_->invalidatePendingFrames();
     }
 }
 

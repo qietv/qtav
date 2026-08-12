@@ -436,20 +436,23 @@ producer window to `QtAV::HWOHCodec`. Surface-mode callback `OH_AVBuffer`
 objects do not expose usable native memory, so the adapter presents exactly one
 retained codec output into the private surface, acquires the corresponding
 `OHNativeWindowBuffer`, retains its `OH_NativeBuffer`, and imports it through
-`VK_OHOS_external_memory`. An acquire sync fd becomes a Vulkan semaphore. The
-consumer buffer stays retained until the renderer GPU timeline destroys the
-imported image and memory, then it is returned to the consumer surface.
+`VK_OHOS_external_memory`. An acquire sync fd becomes a Vulkan semaphore.
+Direct-plane input stays retained through renderer GPU completion. Opaque
+input is returned immediately after its normalization submission completes;
+immutable sampler/conversion state is retained independently of the decoder
+allocation.
 
 The target accepts driver-reported explicit multi-planar `VkFormat` values
 that libplacebo wraps directly. It claims strict source zero-copy only after
 that route succeeds. When the driver instead reports `VK_FORMAT_UNDEFINED`,
-the production-default Huawei workaround recognizes only a closed set of
-standard Vulkan packed/multi-planar YCbCr IDs across common 8/10/12/16-bit and
-4:2:0/4:2:2/4:4:4 families. It uses the explicit format with Vulkan YCbCr
-sampling and a raw GPU normalization texture, so it remains zero-CPU-copy but
-does not claim strict source zero-copy. Disabling
-`externalFormatWorkaroundEnabled` selects the standards-based opaque
-`VkExternalFormatOHOS` path instead.
+production uses the standards-based opaque `VkExternalFormatOHOS` path. The
+driver-suggested sampler handles ordinary SDR/HDR; an additional
+`RGB_IDENTITY` sampler preserves encoded values for Dolby Vision. The raw
+normalization draw stores sampled `.gbr` from Vulkan's `(Cr,Y,Cb)` convention
+as `(Y,Cb,Cr)`, while the suggested RGB route remains `.rgb`. This remains
+zero-CPU-copy but not strict source
+zero-copy. `externalFormatWorkaroundEnabled` defaults to `false`; enabling it
+requests the historical closed-allowlist numeric mapping for diagnostics only.
 
 The OHOS OpenGL ES fallback is a separate, lower-priority target. It must prove
 raw `GL_EXT_YUV_target` sampling and normalize crop-aware Y/Cb/Cr into RGBA16F
@@ -470,10 +473,13 @@ The Mate 60 Pro and Pura X Max both returned `VK_FORMAT_UNDEFINED` with
 external format `1000156003` for H.264/NV12 and `1000156013` for HEVC
 Main10/P010. Opaque sampling and the forced explicit-format probes each passed
 60/60 frames with zero decoded-source map/transfer/staging/upload calls.
-Huawei subsequently permitted the bounded workaround as a production default,
-while requiring broader-format handling, automatic OpenGL ES then software-
-decode fallback, a user kill switch, and a user OpenGL ES preference. Strict
-direct-plane/P010 precision remains a separate claim.
+Huawei's formal 2026-08-12 reply states that the numeric equality is an
+internal detail, that the tested driver has no explicit-format switch, and
+that identity sampling preserves raw P010 10-bit data plus the queried
+range/chroma properties. The signed player subsequently kept Profile 5 input
+on OHCodec/Vulkan at 24.1 FPS with 561 decoded/presented frames and zero drops.
+Strict direct-plane use remains a separate claim because the opaque route has
+a normalization image.
 
 On the same device, residual-disabled Profile 5 and Profile 8.4 each rendered
 45 HEVC frames through the raw OpenGL ES path with 45 RPU frames queued,

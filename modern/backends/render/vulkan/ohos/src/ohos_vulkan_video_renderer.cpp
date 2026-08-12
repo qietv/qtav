@@ -1142,6 +1142,13 @@ void OHOSVulkanVideoRenderer::close() noexcept
     }
 }
 
+void OHOSVulkanVideoRenderer::invalidatePendingFrames() noexcept
+{
+    if (impl_) {
+        impl_->renderer_.invalidatePendingFrames();
+    }
+}
+
 bool OHOSVulkanVideoRenderer::setWindow(OHNativeWindow* window)
 {
     if (!impl_) {

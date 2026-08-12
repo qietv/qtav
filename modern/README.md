@@ -61,7 +61,8 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   switching, `avformat.*` property forwarding, and an
   `avcodec.video.threads` software-video decoder override;
 - decoder-driven `setRenderCallback()` plus reason-aware render-thread
-  `renderVideoDetailed()` and the compatibility `renderVideo()` wrapper;
+  `renderVideoDetailed()`, per-renderer exact-frame retention across
+  backend-redraw deferral, and the compatibility `renderVideo()` wrapper;
 - compile-time `VideoRenderAPI`, `AudioSink`, and hardware-frame interop
   contracts;
 - optional libswscale CPU renderer for application-owned image buffers;
@@ -1428,10 +1429,8 @@ interopConfig.ohosExternalMemoryEnabled = true;
 interopConfig.foreignQueueFamilyEnabled = true;
 interopConfig.syncFdSemaphoreEnabled = true;
 interopConfig.samplerYcbcrConversionEnabled = true;
-// Production default. Bind this to an application/user setting while Huawei's
-// Vulkan driver behavior continues to evolve.
-interopConfig.externalFormatWorkaroundEnabled =
-    !settings.disableOhosExternalFormatWorkaround;
+// Leave externalFormatWorkaroundEnabled at false. Numeric reinterpretation is
+// retained only for explicit driver diagnostics.
 
 auto interop = std::make_shared<qtav::OHCodecVulkanInterop>(
     borrowedVulkanDevice,
@@ -1458,30 +1457,34 @@ do not expose native memory through their `OH_AVBuffer`; the interop therefore
 presents exactly one retained output into that surface, waits for its frame
 callback, acquires and retains the corresponding `OHNativeWindowBuffer`, and
 converts it to `OH_NativeBuffer`. An acquire sync fd is imported into a Vulkan
-semaphore. The consumer buffer remains retained until the renderer's GPU
-completion timeline retires the texture.
+semaphore. Direct-plane buffers remain retained through renderer GPU
+completion. For opaque input, normalization completes first and the consumer
+buffer is then returned immediately; immutable sampler/conversion state has an
+independent lifetime and cannot keep a one-buffer consumer queue exhausted.
+If seek, stop, or media replacement invalidates an output while it is awaiting
+that callback, the interop acquires and returns the invalidated consumer buffer
+as soon as it becomes available. A newer OHCodec output is never correlated
+against or blocked permanently behind that retired frame.
 
 Explicit sampled multi-planar `VkFormat` values are passed directly to
 `pl_vulkan_wrap` only when the OH native format has the same raw component and
 plane order. In particular, YCrCb/VU buffers are not silently accepted as
 YCbCr/UV direct-plane inputs. For `VK_FORMAT_UNDEFINED` plus an external-format
-ID, the
-default production workaround accepts only a closed standard Vulkan YCbCr
-allow-list covering common 8/10/12/16-bit packed and two-/three-plane
-4:2:0/4:2:2/4:4:4 formats. It reinterprets the recognized ID as an explicit
-format, verifies sampled-image support, creates the explicit YCbCr conversion,
-requires a matching OH native YUV layout, imports/binds the same NativeBuffer,
-and samples once into an RGBA16F GPU image before libplacebo. Unknown IDs,
-layout conflicts, and any feature/object/import/sampling failure are rejected
-and trigger renderer fallback; arbitrary IDs are never cast.
+ID, the production path keeps the ID opaque and uses `VkExternalFormatOHOS`.
+Ordinary input is sampled with the driver-suggested model, range, component
+mapping, chroma offsets, and filter. Opaque Dolby Vision input additionally
+requires an `RGB_IDENTITY` conversion with the same driver component mapping.
+Vulkan exposes raw `(Cr, Y, Cb)` in sampled `(R, G, B)` order, so the GPU
+normalizer stores `.gbr` as `(Y, Cb, Cr)` only for that identity route before
+libplacebo performs Dolby Vision and color processing. Suggested-conversion RGB
+samples remain `.rgb`.
 
-Setting `externalFormatWorkaroundEnabled=false` is the application/user kill
-switch. It restores the standards-based opaque path using
-`VkExternalFormatOHOS` and `VK_FORMAT_UNDEFINED`. Both paths avoid decoded-
-source mapping, software transfer, staging, and upload. Because both use the
-GPU normalization image, neither claims strict no-intermediate source zero
-copy. The separate forced-libplacebo probe remains available for strict-plane
-diagnostics.
+`externalFormatWorkaroundEnabled` defaults to `false`. Setting it to `true`
+requests the historical closed-allowlist numeric reinterpretation and is
+diagnostic compatibility only. The forced native/libplacebo modes remain
+available for the same purpose. Opaque production sampling avoids decoded-
+source mapping, software transfer, staging, and upload, but its GPU
+normalization image is not strict no-intermediate source zero copy.
 
 The connected Mate 60 Pro probe on 2026-08-06 exercised real H.264/NV12,
 HEVC/NV12, and HEVC Main10/P010 outputs. The queried Vulkan format remained
@@ -1502,13 +1505,22 @@ reinterpretation. They omit `VkExternalFormatOHOS` from image creation and set
 Application-owned Vulkan YCbCr sampling passed 30 H.264/NV12 plus 30 HEVC
 Main10/P010 frames. Direct `pl_vulkan_wrap` with libplacebo 7.351.0 also passed
 all 60 frames with `directPlanes=60`, `normalization=0`, and zero CPU map,
-transfer, staging, or upload. This proves the device and libplacebo paths can
-consume the forced explicit formats. Huawei subsequently approved a bounded
-production workaround, warned that formats beyond NV12/P010 may behave the
-same way, and required automatic OpenGL ES/software fallback plus user
-controls. The default production path is therefore broader but deliberately
-uses explicit YCbCr sampling and GPU normalization; strict direct-plane use
-remains a separate diagnostic/precision claim.
+transfer, staging, or upload. This proves only that the named driver and
+libplacebo can consume the forced explicit formats. Huawei's formal 2026-08-12
+reply identifies the numerical equality as an internal implementation detail,
+confirms that the tested driver has no explicit-format mode or switch, and
+directs applications to `VkExternalFormatOHOS`. It also confirms identity
+raw-component sampling, P010 10-bit preservation, and the queried range/chroma
+properties. Production therefore uses the opaque path; strict direct-plane use
+remains a separate device gate.
+
+The final signed 2026-08-12 Mate 60 Pro player run kept `legend.mkv` on
+OHCodec/Vulkan at 25.0 FPS and kept Dolby Vision `wednesday.mp4` on
+OHCodec/Vulkan at 24.1 FPS. Forced-SDR captures first verified correct color
+for both suggested-RGB and raw-identity sampling. The same-process snapshot
+ended with 1,988 opaque imports, normalization passes, releases, and frame
+callbacks, zero numeric-workaround imports,
+`lastVulkanFormat=VK_FORMAT_UNDEFINED`, and zero Player drops.
 
 The same connected harness now exercises the shared selector with real
 OHCodec frames. After eight successful opaque Vulkan imports it injects a
@@ -1668,9 +1680,11 @@ the image and decoder output through the submission fence. Vulkan image,
 memory, view, and YCbCr-conversion resources are cached by retained
 `AHardwareBuffer` identity and retired by the AImageReader buffer-removed
 callback; per-frame acquire/release semaphores remain synchronized with the
-individual image. Call `flush()` before seek, decoder/media replacement, or
-explicit stop to retire queued images and timestamp associations that have
-not entered a submission.
+individual image. When this interop is attached through `Player` and
+`VulkanVideoRenderer`, seek, decoder/media replacement, and explicit stop
+automatically invalidate queued images and timestamp associations that have not
+entered a submission. Direct standalone interop users can still call `flush()`
+at their own lifecycle boundary.
 
 `statistics()` exposes queue depth, import/fence counts, last native/Vulkan
 format, decoded-source map/transfer/staging/upload counters, and persistent
@@ -1774,7 +1788,8 @@ player
                     result.retryAfterMilliseconds);
             } else if (result.status
                        == qtav::VideoRenderStatus::RendererDeferred) {
-                // Retain the exact frame; the backend will request redraw.
+                // The backend will request redraw. Player retains the exact
+                // deferred frame for this renderer key.
             } else if (result.status
                        == qtav::VideoRenderStatus::SurfaceLost) {
                 recreate_native_surface(key);
@@ -1812,12 +1827,19 @@ hot render path does not take the Player control mutex. The backend-level
 optional retry delay, structured `VideoRenderRetryReason`, and diagnostic
 detail. The retry reason distinguishes state, serialization, reservation-aware
 or unreserved device-context contention, and in-flight capacity without using
-optional statistics as a control channel. Retain and retry the exact frame
-only for `RendererDeferred` (after the backend raises `RedrawRequested`) or
-`RendererBusy` (after bounded timer backoff); terminal discarded/no-frame
-results wait for a newly published frame. Player rechecks the generation after
-the backend call, so a seek, stop, or media replacement that overlaps rendering
-returns `FrameDiscarded` for that stale completion. The compatibility
+optional statistics as a control channel. Player retains the exact frame per
+renderer key for `RendererDeferred`; the application schedules the backend
+redraw and does not copy or track that frame. `RendererBusy` keeps the existing
+bounded timer/latest-frame policy so high-level outputs may supersede a busy
+frame. After a retained deferred frame is consumed, Player requests another redraw
+when a newer frame was already published. Terminal discarded/no-frame results
+wait for a newly published frame. Player rechecks the generation after the
+backend call, so a seek, stop, or media replacement that overlaps rendering
+returns `FrameDiscarded` for that stale completion. The same generation change
+calls the renderer's non-blocking `invalidatePendingFrames()` hook, canceling
+producer associations that have not entered a GPU submission without waiting
+for submitted work. Existing custom renderers inherit a no-op implementation,
+but consumers must rebuild because the public C++ vtable changed. The compatibility
 `renderVideo()` returns the rendered timestamp in seconds and collapses every
 other result to a negative value. Existing boolean-only `VideoRenderAPI`
 implementations remain source-compatible: their `false` result maps to a
@@ -1935,9 +1957,13 @@ The renderer can also accept an optional `VulkanHardwareFrameInterop`.
 render target is acquired, while `importFrame()` returns a retained sampled
 image/view, immutable YCbCr sampler, acquire/release semaphores, native image
 layouts, foreign queue-family identity, and normalized source crop. The
-renderer retains that `VulkanTextureFrame` until its submission fence
-completes. Platform interop remains a separate target; `QtAV::RenderVulkan`
-does not depend on MediaCodec or Android.
+renderer retains a directly sampled `VulkanTextureFrame` until its submission
+fence completes. A normalized external source may override
+`samplerLifetime()` with ownership independent of the decoded allocation; the
+renderer can then return that allocation as soon as the normalization copy
+finishes while retaining the immutable sampler/conversion token. Platform
+interop remains a separate target; `QtAV::RenderVulkan` does not depend on a
+platform decoder.
 
 On Android, `QtAV::RenderVulkanAndroid` implements that target protocol and
 the `VideoRenderAPI` facade together. The application creates a Vulkan

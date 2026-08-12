@@ -145,7 +145,9 @@ over concurrent natural-end teardown. See
 Decoded `AudioFrame` and `VideoFrame` objects are cheap reference-counted
 views. Copying a frame retains its backing FFmpeg frame or hardware token. A
 pending hardware import must retain the exact decoded frame it is correlating;
-it may not substitute the player's newer current frame.
+it may not substitute the player's newer current frame. Player owns that
+retention per renderer key: backend-redraw deferred attempts keep their immutable
+snapshot even when the presentation worker publishes a newer current frame.
 
 ## Buffering, live latency, and recoverable input
 
@@ -186,6 +188,15 @@ checked again after the backend call so an invalidated frame is not presented.
 The older `renderVideo()` timestamp/negative-value contract remains as a
 compatibility wrapper. Multiple renderer instances may be keyed by application
 opaque pointers.
+
+Deferred frame state is part of the immutable render binding rather than the
+Player control lock. A consumed retained frame triggers another redraw when a
+newer snapshot is already current. A presentation-generation boundary clears
+all retained retries and invokes each renderer's non-blocking pending-frame
+invalidation hook. That hook may cancel a producer/image association which has
+not entered submission; it may not wait for already submitted GPU work.
+Timer-backoff busy results remain eligible for a high-level output's existing
+latest-frame supersession policy and are not pinned by Player.
 
 The high-level Windows output reserves the shared immediate context before
 each output pass makes its first non-blocking acquisition. An uncontended pass
@@ -437,24 +448,32 @@ texture interop. `QtAV::InteropOHCodecVulkan` owns a private
 `OH_ConsumerSurface`, presents exactly one retained OHCodec output into that
 surface, acquires the corresponding `OHNativeWindowBuffer`, retains its
 `OH_NativeBuffer`, imports acquire synchronization and memory through
-`VK_OHOS_external_memory`, and releases the consumer buffer only after renderer
-GPU completion.
+`VK_OHOS_external_memory`. Direct-plane input is released after renderer GPU
+completion. Opaque input is released after the normalization submission has
+completed, before the normalized image is rendered; immutable sampler state
+uses a lifetime token independent of the decoder allocation.
+
+The single queued output is also a generation-owned association. If control
+invalidates it before import, the callback path acquires and immediately returns
+its consumer buffer, then clears the exact frame key before admitting another
+OHCodec output. Player repeats invalidation after an overlapping backend call,
+closing the race where an old render attempt queues its producer after seek was
+published. This path adds no per-frame GPU wait or decoded-source CPU copy.
 
 The Vulkan interop has three explicitly reported format routes:
 
 1. A queried explicit sampled multi-plane `VkFormat` may be wrapped directly by
    libplacebo. This is the preferred strict no-intermediate route.
-2. `VK_FORMAT_UNDEFINED` may use the standards-based
-   `VkExternalFormatOHOS`/`VkSamplerYcbcrConversion` route and a GPU-only raw-
-   representation normalization pass. This remains zero-CPU-copy but is not
-   strict source zero-copy.
-3. [AD-009](DECISIONS.md#ad-009-ohos-external-format-guessing-is-a-bounded-workaround)
-   permits a production-default, closed-allowlist Huawei workaround for known
-   video-YUV external IDs. It still gates native format family, usage, sampled-
-   image features, image creation, import/bind, views, synchronization, and
-   actual sampling at runtime, retains an application kill switch, and falls
-   back one-way to OpenGL ES or software decode on failure. It is not a portable
-   promise that an arbitrary external ID equals a `VkFormat`.
+2. `VK_FORMAT_UNDEFINED` uses the standards-based
+   `VkExternalFormatOHOS`/`VkSamplerYcbcrConversion` route. The suggested
+   conversion handles ordinary input; `RGB_IDENTITY` preserves raw values for
+   Dolby Vision. The normalization shader keeps suggested RGB as `.rgb` and
+   changes Vulkan's raw sampled `(Cr,Y,Cb)` to `(Y,Cb,Cr)` with `.gbr`. Both
+   use a GPU normalization pass, remain zero-CPU-copy, and are not strict
+   source zero-copy.
+3. [AD-009](DECISIONS.md#ad-009-ohos-external-formats-are-opaque-identity-sampling-is-the-production-path)
+   retains the closed-allowlist numeric reinterpretation only as a diagnostic
+   route. It defaults off and cannot be used as a portable or product contract.
 
 The OHOS OpenGL ES fallback target is raw import through
 `GL_EXT_YUV_target`, followed by a crop-aware RGBA16F GPU normalization of raw
@@ -468,23 +487,25 @@ then stores and correlates the selected value in nanoseconds.
 
 The connected Mate 60 Pro and Pura X Max expose H.264/NV12 and HEVC/P010 as
 `VK_FORMAT_UNDEFINED` with the same two observed opaque external IDs. Opaque
-import/sampling, the separately diagnosed explicit-format/direct-plane route,
-and the bounded production workaround have each passed their recorded 60-frame
-matrices with zero decoded-source CPU map, transfer, staging, or upload. These
-results validate the named devices and bounded policy, not a general explicit-
-plane contract. Strict direct wrapping remains open until a device reports a
-non-opaque sampled multi-plane format and passes import, sampling, precision,
-and GPU-release validation.
+import/sampling and the separately diagnosed explicit-format/direct-plane
+route passed their recorded 60-frame matrices with zero decoded-source CPU
+map, transfer, staging, or upload. Huawei's formal reply confirms that the
+numeric mapping is internal-only and that the tested driver has no explicit-
+format switch, so production keeps external IDs opaque. Strict direct wrapping
+remains open until a device reports a non-opaque sampled multi-plane format and
+passes import, sampling, precision, and GPU-release validation.
 
 The connected Profile 5 and Profile 8.4 OpenGL ES runs each rendered 45 HEVC
 frames with `45/45/45` Dolby Vision queued/timestamp-matched/released counts,
 zero implicit-RGB images, and zero decoded-source map, transfer, staging, or
 upload calls. Profile 8.4 exercises MMR reshaping; the repository libplacebo
 overlay corrects its generated GLES array-index types and third-order branch
-syntax so the strict Maleoon shader compiler accepts that path. This validates
-the raw OpenGL ES half of the Dolby Vision route. The strict Vulkan half stays
-open because the tested devices report the P010 consumer buffer only as
-`VK_FORMAT_UNDEFINED` plus an opaque external-format ID.
+syntax so the strict Maleoon shader compiler accepts that path. The 2026-08-12
+Mate 60 Pro run also validates the production opaque Vulkan half: forced-SDR
+captures verified ordinary-HDR and Profile 5 component ordering, then Profile 5
+stayed on OHCodec/Vulkan at 24.1 FPS with identity sampling, 730 presentations,
+and zero drops. The strict direct-plane Vulkan gate stays open because this
+route uses an RGBA16F normalization image.
 
 ## General processing architecture
 
@@ -597,10 +618,10 @@ stall, and the broader zero-transient follow-up is no longer required.
 OHOS has Vulkan and OpenGL ES software presentation, shared selector fallback,
 OHAudio output, OHCodec H.264/HEVC and capability-gated VVC/H.266 selection,
 single-decision direct-surface present/drop/timed output, raw OpenGL ES
-hardware-frame interop, and the AD-009 bounded Vulkan policy. These paths and
-their fallback/lifecycle matrices are connected-device validated. The remaining
-native-buffer item is the narrower explicit-plane direct-wrap/precision gate on
-suitable hardware, followed by strict Vulkan Dolby Vision validation.
+hardware-frame interop, and the AD-009 opaque Vulkan identity policy. These
+paths and their fallback/lifecycle matrices are connected-device validated.
+The remaining native-buffer item is the narrower explicit-plane direct-wrap
+and no-intermediate Dolby Vision gate on suitable hardware.
 
 Core feature work is complete through active audio/video/subtitle track
 switching, external audio/subtitle sources, optional libass rasterization,

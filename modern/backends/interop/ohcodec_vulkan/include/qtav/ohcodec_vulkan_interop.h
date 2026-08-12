@@ -43,14 +43,13 @@ OHCodecVulkanInteropConfig {
     // Diagnostic override. Disabled means use the production policy below.
     OHCodecVulkanExternalFormatProbeMode externalFormatProbeMode =
         OHCodecVulkanExternalFormatProbeMode::Disabled;
-    // HarmonyOS drivers may return VK_FORMAT_UNDEFINED while externalFormat
-    // is numerically identical to a standard Vulkan YCbCr format. The
-    // production workaround is enabled by default and reinterprets only a
-    // closed allow-list of standard packed/multiplane YCbCr formats. Object
-    // creation and sampling support remain runtime gates. Applications should
-    // expose this setting so users can disable the workaround while vendor
-    // drivers are still evolving.
-    bool externalFormatWorkaroundEnabled = true;
+    // Legacy diagnostic compatibility only. externalFormat is an opaque,
+    // implementation-defined identifier and must not normally be reinterpreted
+    // as VkFormat even when the numeric values happen to match. The production
+    // default uses VkExternalFormatOHOS. Enabling this option requests the
+    // historical, runtime-gated explicit-format reinterpretation for a closed
+    // allow-list; applications must not treat success as a portable contract.
+    bool externalFormatWorkaroundEnabled = false;
 };
 
 struct QTAV_INTEROP_OHCODEC_VULKAN_EXPORT
@@ -103,8 +102,10 @@ OHCodecVulkanNativeBufferObservation {
 // Presents one OHCodec output into a private OH_ConsumerSurface, acquires the
 // exact queued OHNativeWindowBuffer, and imports its OH_NativeBuffer through
 // VK_OHOS_external_memory. Explicit two- or three-plane Vulkan formats can be
-// wrapped by libplacebo directly. Opaque external formats expose a YCbCr
-// conversion/view/sampler pair for the renderer's GPU-only normalization pass.
+// wrapped by libplacebo directly. Opaque external formats expose both the
+// driver's suggested display conversion and an identity raw-Y/Cb/Cr
+// conversion/view/sampler pair. The renderer uses the identity pair for Dolby
+// Vision before libplacebo performs its reshape and color processing.
 // The acquired consumer buffer remains retained until VulkanVideoRenderer's
 // GPU completion timeline retires the returned texture frame.
 class QTAV_INTEROP_OHCODEC_VULKAN_EXPORT
@@ -135,6 +136,7 @@ public:
         const VideoFrame& frame) override;
     void setFrameAvailableCallback(
         FrameAvailableCallback callback) override;
+    void invalidatePendingFrames() noexcept override;
 
     OHCodecVulkanInteropStatistics statistics() const noexcept;
     OHCodecVulkanNativeBufferObservation

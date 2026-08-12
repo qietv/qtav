@@ -239,9 +239,12 @@ ZeroCopy selection, and HDR output policy.
 ## AD-003: Android OpenGL ZeroCopy asynchronous ownership and present ordering
 
 - Date: 2026-08-03
+- Amended: 2026-08-12 to make seek-generation invalidation and late AImage
+  rejection an interop responsibility shared with the Vulkan path
 - Status: Accepted
 - Scope: Android player OpenGL ES MediaCodec/AImageReader scheduling and EGL
-  release synchronization
+  release synchronization, plus Android AImageReader producer-generation
+  isolation
 
 ### Context
 
@@ -267,6 +270,17 @@ second with 943 callbacks, 541 presents, 397 application drops, and 398 core
 late drops. A later ordinary-HDR run stopped permanently at
 queued/acquired/imported 2564/2556/2546 and emitted an AAudio underrun.
 
+The later OHOS deferred-frame seek investigation exposed a separate but related
+Android boundary. Player can invalidate its presentation snapshot while an
+already-released MediaCodec output is still travelling to AImageReader. The
+callback has no Player generation, and ordinary seek keeps the same private
+producer surface generation. Clearing only the current timestamp maps therefore
+does not prove that an image arriving after flush belongs to the new playback
+generation. Vulkan already receives the generic Player invalidation hook but
+does not wake its bounded image wait; OpenGL has an interop `flush()` but no
+automatic renderer-to-interop invalidation path. Correctness must not depend on
+the Android application calling those interop methods before Player controls.
+
 ### Decision
 
 1. `MediaCodecOpenGLInterop::queueFrame()` only registers the exact frame key
@@ -287,6 +301,21 @@ queued/acquired/imported 2564/2556/2546 and emitted an AAudio underrun.
 5. An AImageReader completion only schedules work on the native render thread.
    Pending imports retain the exact reference-counted frame and deadline and
    return immediately when the image is not ready.
+6. Player presentation-generation invalidation is forwarded through both
+   Android renderer adapters and their platform-neutral renderer/interops.
+   `OpenGLHardwareFrameInterop` gains the same default no-op invalidation
+   contract as Vulkan so existing third-party implementations remain source
+   compatible after rebuilding.
+7. Vulkan and OpenGL MediaCodec interops assign a producer epoch to every
+   released output association. Invalidation advances the epoch and marks
+   outstanding old associations as bounded tombstones instead of forgetting
+   them. A late AImage is acquired and discarded against the old association;
+   timestamp proximity alone cannot promote it into the current epoch, even
+   when a backward seek repeats timestamps.
+8. Invalidation wakes any bounded producer/image wait and is re-applied when an
+   overlapping old render crosses the Player generation boundary. It never
+   waits for already-submitted GPU work; imported images keep their existing
+   native-fence or timeline-based lifetime.
 
 ### Consequences
 
@@ -301,6 +330,23 @@ queued/acquired/imported 2564/2556/2546 and emitted an AAudio underrun.
 - Queue counters can trail by the small bounded in-flight window; smoothness is
   still judged from source-rate presents, non-growing depth, core drops,
   starvation, and audio underruns together.
+- `Player::seek()`, stop, replacement, and surface-generation controls become
+  sufficient for normal application use. Public interop `flush()` remains for
+  standalone lifecycle ownership, not as a required companion to Player calls.
+- Invalidated association tombstones are bounded by the existing AImageReader
+  capacity/producer window and are retired by callbacks. The repair adds no
+  pixel copy, software fallback, GPU-wide wait, or application retry queue.
+- This amendment specializes AD-008's generic exact-deferred-frame and
+  pending-producer invalidation contract for Android AImageReader. It does not
+  change direct-Surface present/drop ownership.
+
+### Seek-generation amendment status
+
+The 2026-08-12 seek-generation amendment is accepted architecture but remains
+the first unchecked task in `PLAN.md`. The connected-device evidence below
+predates that amendment, used explicit pre-seek interop flush in the relevant
+harness path, and must not be cited as validation of automatic invalidation,
+late-callback epoch rejection, or repeated forward/backward seek recovery.
 
 ### Connected-device validation
 
@@ -723,9 +769,12 @@ remain unchanged.
 - Date: 2026-08-04
 - Amended: 2026-08-08 to carry transient busy reasons in render results and
   make statistics optional
+- Amended: 2026-08-12 to make exact retry-frame retention and pending-producer
+  invalidation a Player/backend responsibility
 - Status: Accepted
-- Scope: Core render snapshots, Windows D3D11 context scheduling, composition
-  output retry semantics, and cadence diagnostics
+- Scope: Core render snapshots and cross-platform deferred-producer
+  invalidation, plus Windows D3D11 context scheduling, composition output retry
+  semantics, and cadence diagnostics
 
 ### Context
 
@@ -779,11 +828,21 @@ reacquire the recursive immediate-context lock before a timer-only retry.
    separately.
    Retain `skippedRenders` as a compatibility mirror of terminal drops; a
    recovered retry is not a skipped frame.
+7. Retain the exact backend-redraw deferred frame inside Player for each keyed
+   `VideoRenderAPI`; a newer current snapshot may not replace an asynchronous
+   producer association. On a presentation-generation change, clear those
+   retries and invoke a non-blocking renderer invalidation hook for producer
+   work which has not entered GPU submission. Recheck and invalidate again
+   after an overlapping backend call closes the old-render/new-seek race.
 
 ### Consequences
 
 - Native/UI render integrations can distinguish retryable contention from the
   absence of a current frame without blocking on Player control work.
+- Native/UI integrations schedule backend redraw but do not retain a deferred
+  frame object themselves. A consumed retained frame automatically requests
+  the newer already-published snapshot. Timer-backoff busy output remains free
+  to use its existing latest-frame mailbox and supersession policy.
 - The high-level Windows output can recover a transient collision without a
   second decoder callback, but never accumulates an unbounded retry queue.
 - FFmpeg decode cannot overtake a contended output pass or its reserved retry.
@@ -836,152 +895,136 @@ high-load result as an environmental caution. The subsequent Intel root-cause
 repair and regression record complete that performance comparison and the
 Intel performance task.
 
-## AD-009: OHOS external-format guessing is a bounded workaround
+## AD-009: OHOS external formats are opaque; identity sampling is the production path
 
 - Date: 2026-08-06
-- Amended: 2026-08-08 after Huawei's production-policy reply
-- Status: Accepted
-- Scope: OHCodec `OH_NativeBuffer` import, Vulkan multi-planar formats, and
-  libplacebo source wrapping on OHOS
+- Amended: 2026-08-12 after Huawei's formal specification and driver reply
+- Status: Accepted and connected-device validated; complete for the opaque
+  external-format production policy. The separate strict explicit-plane/
+  no-intermediate Vulkan gate remains open.
+- Scope: OHCodec `OH_NativeBuffer` import, Vulkan YCbCr sampling, Dolby Vision
+  raw-component preservation, and libplacebo source wrapping on OHOS
 
 ### Context
 
-Surface-mode OHCodec output was presented into a private
+Surface-mode OHCodec output is presented into a private
 `OH_ConsumerSurface`, acquired as the exact retained
 `OHNativeWindowBuffer`/`OH_NativeBuffer`, and queried with
 `vkGetNativeBufferPropertiesOHOS()`. On the connected Mate 60 Pro/Maleoon 910,
-the query returned `VK_SUCCESS` but reported
-`VkNativeBufferFormatPropertiesOHOS::format = VK_FORMAT_UNDEFINED`.
-
-The observed buffers were:
+the query succeeds but reports:
 
 ```text
-H.264/NV12:
-  nativeFormat   = NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP (24)
-  format         = VK_FORMAT_UNDEFINED
-  externalFormat = 1000156003
-
-HEVC Main10/P010:
-  nativeFormat   = NATIVEBUFFER_PIXEL_FMT_YCBCR_P010 (35)
-  format         = VK_FORMAT_UNDEFINED
-  externalFormat = 1000156013
+H.264/NV12:         nativeFormat=24, format=VK_FORMAT_UNDEFINED,
+                   externalFormat=1000156003
+HEVC Main10/P010:   nativeFormat=35, format=VK_FORMAT_UNDEFINED,
+                   externalFormat=1000156013
 ```
 
-The external IDs are numerically equal to
-`VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` and
-`VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16`, respectively, but
-`externalFormat` is an implementation-defined identifier intended for
-`VkExternalFormatOHOS`; numerical equality alone is not a portable Vulkan
-format contract.
+Earlier diagnostics established that those two external IDs happen to be
+numerically equal to standard Vulkan NV12 and P010 formats on the tested
+driver. Forced explicit-format sampling and direct libplacebo wrapping both
+worked. AD-009 temporarily allowed that bounded guess by default while the
+vendor contract was unresolved.
 
-Three connected-device probes separated hardware consumption from interface
-representation:
+Huawei's formal 2026-08-12 reply resolves the contract differently:
 
-1. The standard opaque path used `VK_FORMAT_UNDEFINED +
-   VkExternalFormatOHOS`. Vulkan object creation, NativeBuffer memory import,
-   shader sampling, queue submission, and completion all succeeded.
-2. A diagnostic path omitted `VkExternalFormatOHOS`, guessed the explicit
-   NV12/P010 format from the two allowlisted external IDs, and used that format
-   in `VkImageCreateInfo`. Application-owned Vulkan sampling succeeded for 30
-   NV12 and 30 P010 frames.
-3. The same guessed explicit images were passed to libplacebo 7.351.0.
-   `pl_vulkan_wrap()` created the direct Y/UV planes and rendered all 60
-   frames with no RGBA source-normalization intermediate.
+1. `format` is a standard `VkFormat` only when the NativeBuffer has an
+   equivalent standard Vulkan format. `VK_FORMAT_UNDEFINED` is expected when
+   the implementation exposes the capability through `externalFormat`.
+2. Numerical equality between `externalFormat` and a standard `VkFormat` is a
+   driver implementation detail and is not a long-term contract.
+3. The tested Maleoon 910/HarmonyOS 6.1.0.135 driver does not return an
+   explicit standard multi-plane format, and there is no configuration switch
+   which makes it do so.
+4. An opaque `VkExternalFormatOHOS` image cannot expose standard independent
+   plane image views, but `VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY` can
+   sample the unconverted Y, Cb, and Cr components.
+5. P010 remains 10-bit through import and sampling. The queried
+   `suggestedYcbcrRange` and chroma offsets match the physical codec buffer and
+   may be used for subsequent color processing.
 
-All paths reported zero decoded-source CPU map, software transfer, staging,
-or upload. These results prove current-device capability and libplacebo's
-acceptance of the guessed explicit formats. They do not prove that Huawei
-supports the numerical mapping across devices, GPUs, system releases, buffer
-modifiers, compression modes, usages, dataspaces, or HDR configurations.
+References: [Huawei `VkNativeBufferFormatPropertiesOHOS`](https://developer.huawei.com/consumer/cn/doc/harmonyos-references/capi-vulkan-vknativebufferformatpropertiesohos)
+and [Vulkan `VkExternalFormatOHOS`](https://docs.vulkan.org/refpages/latest/refpages/source/VkExternalFormatOHOS.html).
 
 ### Decision
 
-1. A successful `vkGetNativeBufferPropertiesOHOS()` call with an explicit
-   supported `format` remains the standard direct-plane path. That queried
-   `VkFormat` may be passed to libplacebo subject to normal feature, import,
-   synchronization, and lifetime validation.
-2. A successful query with `format == VK_FORMAT_UNDEFINED` does not mean that
-   the NativeBuffer is unconsumable. The standards-based fallback imports it
-   with `VkExternalFormatOHOS` and samples it through
-   `VkSamplerYcbcrConversion`. When needed, a GPU-only representation-
-   normalization pass feeds libplacebo. This is zero-CPU-copy, but it is not
-   strict raw-plane/no-intermediate zero-copy.
-3. Huawei confirmed that the workaround may be enabled by default in
-   production, warned that formats beyond NV12/P010 may exhibit the same
-   `VK_FORMAT_UNDEFINED` report, and required application-visible controls and
-   fallback while its Vulkan driver continues to evolve.
-4. The production path therefore recognizes a closed allow-list of standard
-   Vulkan packed and multi-planar YCbCr external IDs across 8/10/12/16-bit,
-   4:2:0/4:2:2/4:4:4, and two-/three-plane families. It never casts an
-   arbitrary external ID. The OH native format must still be an accepted video
-   YUV family, and dimensions, texture usage, explicit-format sampled-image
-   support, sampler conversion, image creation, NativeBuffer memory
-   import/bind, image view, queue synchronization, and actual sampling remain
-   runtime gates.
-5. `OHCodecVulkanInteropConfig::externalFormatWorkaroundEnabled` defaults to
-   `true`. Setting it to `false` uses the standards-based opaque
-   `VkExternalFormatOHOS` path and gives applications the required user-facing
-   kill switch. The production workaround uses explicit-format Vulkan YCbCr
-   sampling followed by the existing GPU normalization pass; the direct
-   libplacebo plane mode remains separately diagnosable.
-6. A workaround mapping or Vulkan import/sampling failure is fatal to the
-   current Vulkan candidate. `MobileVideoRendererSelector` then prepares
-   OpenGL ES. Its synchronous application callback first rebinds future
-   OHCodec output to OpenGL ES interop; if that hardware interop subsequently
-   fails, the callback is invoked again so the application can disable
-   hardware decode and continue with software frames. No frame from a retired
-   native surface is retried or CPU-mapped.
-7. `MobileRendererSelectorConfig::preferredAPI` defaults to Vulkan and may be
-   set to `OpenGLES`, providing the required user-facing preference. This is a
-   startup preference, not a permanent ban: failure to open the preferred API
-   tries the other configured candidate.
-8. This workaround remains an OHOS/Huawei compatibility policy, not a portable
-   Vulkan guarantee. Strict raw-plane/no-intermediate use, especially the P010
-   raw 10-bit guarantee required before Dolby Vision reshaping, remains a
-   separate validation gate.
+1. An explicit driver-reported supported `format` remains the only production
+   direct-plane path. It may be passed to libplacebo only after the usual
+   format-feature, native-layout, synchronization, and lifetime checks.
+2. `format == VK_FORMAT_UNDEFINED` uses `VkExternalFormatOHOS`; the external ID
+   remains opaque. `OHCodecVulkanInteropConfig::externalFormatWorkaroundEnabled`
+   now defaults to `false`. Enabling it, or either forced-format probe mode, is
+   diagnostic compatibility only and must not become a product contract.
+3. Each opaque import exposes two immutable YCbCr sampler pairs when the driver
+   permits them:
+   - the driver-suggested model, range, component mapping, chroma offsets, and
+     filter for ordinary SDR/HDR display conversion;
+   - `RGB_IDENTITY` with that same implementation-defined component mapping.
+     Vulkan exposes the raw YCbCr convention as `(Cr, Y, Cb)` in sampled
+     `(R, G, B)`, so the raw normalization shader stores `.gbr` as
+     `(Y, Cb, Cr)` without range expansion. The suggested RGB route remains
+     `.rgb`.
+4. The Vulkan renderer uses the suggested pair for ordinary input. For a frame
+   carrying Dolby Vision metadata it requires the identity pair, copies the
+   raw encoded components into RGBA16F on the GPU, declares the original bit
+   depth/range/color metadata to libplacebo, and lets libplacebo remain the
+   sole owner of Dolby Vision reshaping and color conversion. Failure to create
+   or sample the identity pair fails closed and invokes the existing one-way
+   OpenGL ES/software fallback.
+5. YCbCr sampler/conversion lifetime is independent of the decoder allocation.
+   Once the normalization submission completes, the OHCodec consumer buffer is
+   returned immediately; it is not retained until a future redraw. This is
+   required for consumer queues whose available-buffer count can otherwise be
+   exhausted before another frame callback is generated.
+6. The opaque route is zero decoded-source CPU copy, map, transfer, staging,
+   and upload. Its RGBA16F normalization draw means it is not strict
+   no-intermediate source zero-copy and cannot complete the separate explicit-
+   plane gate.
+7. OpenGL ES remains the automatic hardware-frame fallback and software decode
+   remains the next application fallback. No frame from a retired native
+   surface is retried or CPU-mapped.
 
 ### Consequences
 
-- `VK_FORMAT_UNDEFINED` is no longer treated as evidence of hardware failure.
-- The opaque external-format path remains the correctness fallback and keeps
-  decoded pixels off the CPU, while its GPU intermediate and converted sample
-  semantics remain explicit.
-- The bounded compatibility path is production-default, but its allow-list,
-  object-creation gates, fallback chain, and application kill switch prevent
-  unknown or newly broken external IDs from silently being reinterpreted.
-- libplacebo support is no longer the open question: it accepts the evidenced
-  explicit NV12/P010 formats. Broader allow-listed formats remain individually
-  gated by the actual Vulkan driver operations on each device.
-- Production use of the workaround is no longer vendor-confirmation-gated;
-  strict Vulkan raw-plane/Dolby Vision claims remain separately gated.
+- `VK_FORMAT_UNDEFINED` is normal on the tested driver, not evidence of a
+  broken query or an invitation to cast `externalFormat`.
+- The old broad numeric allow-list remains only for explicit diagnostics. Its
+  successful historical probes are useful device evidence but no longer
+  justify production behavior.
+- Ordinary HDR and raw Dolby Vision sampling now share the standards-based
+  opaque import while retaining distinct sampler semantics.
+- Huawei's precision/range/chroma guarantee closes the opaque P010 raw-sample
+  question on the named driver. It does not create independent plane views or
+  satisfy the strict direct-plane/no-intermediate definition.
 
 ### Current validation evidence
 
-On the Mate 60 Pro, both the application-owned forced-format sampler and the
-direct libplacebo path rendered 30 H.264/NV12 plus 30 HEVC Main10/P010 frames.
-The libplacebo run reported `directPlanes=60`, `normalization=0`, and zero
-decoded-source CPU map, transfer, staging, or upload. The then-default
-disabled-workaround build also passed the complete connected OHOS regression,
-including opaque Vulkan sampling and Vulkan-to-OpenGL/software fallbacks.
+Historical Mate 60 Pro and Pura X Max probes remain recorded: opaque sampling
+passed, and separately forced numeric NV12/P010 diagnostics passed both native
+sampling and direct libplacebo wrapping with zero decoded-source CPU work.
+Those forced results are diagnostic only under the amended decision.
 
-The result was independently reproduced on 2026-08-08 with a HUAWEI Pura X
-Max (`HOP-AL00`) running HarmonyOS 6.1.0.135 SP17 / API 24. The standard query
-still returned `VK_FORMAT_UNDEFINED` plus external format `1000156003` for
-`NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP` and `1000156013` for
-`NATIVEBUFFER_PIXEL_FMT_YCBCR_P010`. Opaque import and sampling passed 60/60
-frames. The separately enabled forced-format/libplacebo diagnostic also
-passed 60/60 frames with `directPlanes=60`, `normalization=0`, and no decoded-
-source CPU map, transfer, staging, or upload. Huawei's later reply permits the
-bounded workaround as a production default while explicitly requiring
-broader-format handling, Vulkan-to-OpenGL/software fallback, a workaround kill
-switch, and an OpenGL ES startup preference. The amended decision implements
-those constraints without describing the mapping as a portable Vulkan
-contract. The resulting signed production-policy HAP subsequently passed the
-same Pura X Max: 60/60 frames used the default workaround and GPU normalization,
-an injected Vulkan failure switched from 8 Vulkan frames to 30 OpenGL ES native-
-interop frames, and an independent session continued with 30 software-rendered
-frames after disabling OHCodec. Every route reported zero decoded-source CPU
-map, transfer, staging, or upload.
+On 2026-08-12 a newly signed player HAP was installed on the Mate 60 Pro
+(`ALN-AL80`, Maleoon 910, HarmonyOS 6.1.0.135 SP8). Counter-only candidates
+were not accepted: forced-SDR Vulkan captures were compared with the existing
+OpenGL ES control and exposed first an incorrect Dolby Vision order, then an
+over-broad raw swizzle which damaged ordinary HDR. The accepted implementation
+keeps the driver mapping, applies `.gbr` only to `RGB_IDENTITY` samples, and
+keeps suggested-conversion samples `.rgb`; final forced-SDR captures of both
+files had normal color.
+
+In native HDR mode `legend.mkv` stayed on OHCodec/Vulkan with BT.2020/PQ 10-bit
+output at 25.0 FPS, 1,676 presentations at the snapshot, and zero Player drops.
+Its HDR renderer generation reported `opaque=633`, `normalization=633`, and
+`released=633/633`. `wednesday.mp4` stayed on OHCodec/Vulkan, was recognized as
+Dolby Vision, and produced BT.2020/PQ 10-bit output at 24.1 FPS with 730
+presentations and zero Player drops. The final same-process cumulative
+diagnostics were `opaque=1988`, `normalization=1988`, `released=1988/1988`,
+`frameAvailableCallbacks=1988`, `externalFormatWorkaroundImports=0`,
+`lastVulkanFormat=VK_FORMAT_UNDEFINED`, and
+`lastExternalFormat=1000156013`. This validates the production opaque identity
+path, its component ordering, and its consumer-buffer release loop on the
+named device; the strict explicit-plane gate remains open by definition.
 
 ## AD-010: Windows copies the visible decoder region by default
 
@@ -1903,9 +1946,9 @@ the requested color space.
 5. Libplacebo remains the only semantic color, Dolby Vision reshape,
    tone/gamut, and output-encoding authority. This decision changes native
    target/composition negotiation only.
-6. This output workaround is independent of the OHCodec source-buffer
-   workaround in AD-009. It does not turn `VK_FORMAT_UNDEFINED` decoder input
-   into a strict explicit-plane source path or complete the strict Dolby
+6. This output workaround is independent of the OHCodec opaque source-buffer
+   policy in AD-009. It does not turn `VK_FORMAT_UNDEFINED` decoder input into
+   a strict explicit-plane source path or complete the no-intermediate Dolby
    Vision Vulkan gate.
 
 ### Consequences

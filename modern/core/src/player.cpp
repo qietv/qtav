@@ -642,10 +642,16 @@ public:
         std::uint64_t generation = 0;
     };
 
+    struct RenderRetryState {
+        std::shared_ptr<const VideoFrameSnapshot> retainedFrame;
+    };
+
     struct RenderBindingsSnapshot {
         RenderCallback callback;
         VideoRenderer legacyRenderer;
         std::unordered_map<void*, std::shared_ptr<VideoRenderAPI>> renderAPIs;
+        std::unordered_map<void*, std::shared_ptr<RenderRetryState>>
+            retryStates;
     };
 
     Impl()
@@ -670,6 +676,8 @@ public:
             presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
             clearCurrentVideoFrameSnapshot();
         }
+        clearRenderRetryStates();
+        invalidatePendingRendererFrames();
         // Pair shutdown with each condition variable's wait mutex so a waiter
         // cannot observe the old predicate and go to sleep after notification.
         {
@@ -1801,23 +1809,83 @@ public:
         std::shared_ptr<VideoRenderAPI> renderer,
         void* opaque)
     {
-        std::lock_guard<std::mutex> lock(renderBindingsMutex_);
-        auto updated = copyRenderBindings();
-        if (renderer) {
-            updated->renderAPIs[opaque] = std::move(renderer);
-        } else {
-            updated->renderAPIs.erase(opaque);
+        std::shared_ptr<VideoRenderAPI> previous;
+        bool previousStillBound = false;
+        {
+            std::lock_guard<std::mutex> lock(renderBindingsMutex_);
+            auto updated = copyRenderBindings();
+            const auto found = updated->renderAPIs.find(opaque);
+            if (found != updated->renderAPIs.end()) {
+                previous = found->second;
+            }
+            if (previous == renderer) {
+                return;
+            }
+            if (renderer) {
+                updated->renderAPIs[opaque] = renderer;
+                updated->retryStates[opaque] =
+                    std::make_shared<RenderRetryState>();
+            } else {
+                updated->renderAPIs.erase(opaque);
+                updated->retryStates.erase(opaque);
+            }
+            previousStillBound = previous && std::any_of(
+                updated->renderAPIs.begin(),
+                updated->renderAPIs.end(),
+                [&](const auto& entry) {
+                    return entry.second == previous;
+                });
+            publishRenderBindings(std::move(updated));
         }
-        publishRenderBindings(std::move(updated));
+        if (previous && !previousStillBound) {
+            previous->invalidatePendingFrames();
+        }
     }
 
     VideoRenderResult renderVideoDetailed(void* opaque)
     {
-        const auto frame = std::atomic_load_explicit(
-            &currentVideoFrameSnapshot_,
+        const auto bindings = std::atomic_load_explicit(
+            &renderBindings_,
             std::memory_order_acquire);
+        std::shared_ptr<VideoRenderAPI> renderAPI;
+        std::shared_ptr<RenderRetryState> retryState;
+        VideoRenderer legacyRenderer;
+        if (bindings) {
+            const auto found = bindings->renderAPIs.find(opaque);
+            if (found != bindings->renderAPIs.end()) {
+                renderAPI = found->second;
+                const auto state = bindings->retryStates.find(opaque);
+                if (state != bindings->retryStates.end()) {
+                    retryState = state->second;
+                }
+            }
+            legacyRenderer = bindings->legacyRenderer;
+        }
+        if (renderAPI && !retryState) {
+            retryState = std::make_shared<RenderRetryState>();
+        }
+
         const auto currentGeneration =
             presentationGeneration_.load(std::memory_order_acquire);
+        auto retainedFrame = retryState
+            ? std::atomic_load_explicit(
+                  &retryState->retainedFrame,
+                  std::memory_order_acquire)
+            : std::shared_ptr<const VideoFrameSnapshot> {};
+        if (retainedFrame
+            && retainedFrame->generation != currentGeneration) {
+            std::atomic_store_explicit(
+                &retryState->retainedFrame,
+                std::shared_ptr<const VideoFrameSnapshot> {},
+                std::memory_order_release);
+            retainedFrame.reset();
+        }
+        const auto currentFrame = std::atomic_load_explicit(
+            &currentVideoFrameSnapshot_,
+            std::memory_order_acquire);
+        const auto frame = retainedFrame
+            ? retainedFrame
+            : currentFrame;
         if (!frame || frame->generation != currentGeneration) {
             return {
                 VideoRenderStatus::NoFrame,
@@ -1827,19 +1895,6 @@ public:
                 0,
                 {},
             };
-        }
-
-        const auto bindings = std::atomic_load_explicit(
-            &renderBindings_,
-            std::memory_order_acquire);
-        std::shared_ptr<VideoRenderAPI> renderAPI;
-        VideoRenderer legacyRenderer;
-        if (bindings) {
-            const auto found = bindings->renderAPIs.find(opaque);
-            if (found != bindings->renderAPIs.end()) {
-                renderAPI = found->second;
-            }
-            legacyRenderer = bindings->legacyRenderer;
         }
 
         VideoRenderAttemptResult attempt {
@@ -1856,6 +1911,19 @@ public:
         const auto completedGeneration =
             presentationGeneration_.load(std::memory_order_acquire);
         if (frame->generation != completedGeneration) {
+            if (retryState) {
+                std::atomic_store_explicit(
+                    &retryState->retainedFrame,
+                    std::shared_ptr<const VideoFrameSnapshot> {},
+                    std::memory_order_release);
+            }
+            if (renderAPI) {
+                // The backend may have queued an asynchronous producer after
+                // the control thread published the generation boundary. A
+                // second invalidation here closes that race without waiting
+                // for the render call or submitted GPU work.
+                renderAPI->invalidatePendingFrames();
+            }
             return {
                 VideoRenderStatus::FrameDiscarded,
                 static_cast<double>(frame->frame.timestamp()) / 1000.0,
@@ -1864,6 +1932,21 @@ public:
                 0,
                 "The presentation generation changed during the render attempt",
             };
+        }
+
+        if (retryState) {
+            if (attempt.status
+                == VideoRenderAttemptStatus::DeferredUntilRedraw) {
+                std::atomic_store_explicit(
+                    &retryState->retainedFrame,
+                    frame,
+                    std::memory_order_release);
+            } else {
+                std::atomic_store_explicit(
+                    &retryState->retainedFrame,
+                    std::shared_ptr<const VideoFrameSnapshot> {},
+                    std::memory_order_release);
+            }
         }
 
         VideoRenderStatus status = VideoRenderStatus::RendererError;
@@ -1887,7 +1970,7 @@ public:
             status = VideoRenderStatus::RendererError;
             break;
         }
-        return {
+        VideoRenderResult result {
             status,
             static_cast<double>(frame->frame.timestamp()) / 1000.0,
             frame->sequence,
@@ -1896,6 +1979,27 @@ public:
             std::move(attempt.detail),
             attempt.retryReason,
         };
+
+        const auto latestFrame = std::atomic_load_explicit(
+            &currentVideoFrameSnapshot_,
+            std::memory_order_acquire);
+        const bool requestLatestFrame = renderAPI
+            && attempt.frameConsumed() && latestFrame
+            && latestFrame->generation == completedGeneration
+            && latestFrame->sequence != frame->sequence;
+        if (requestLatestFrame) {
+            const auto latestBindings = std::atomic_load_explicit(
+                &renderBindings_,
+                std::memory_order_acquire);
+            if (latestBindings && latestBindings->callback) {
+                const auto found = latestBindings->renderAPIs.find(opaque);
+                if (found != latestBindings->renderAPIs.end()
+                    && found->second == renderAPI) {
+                    latestBindings->callback(opaque);
+                }
+            }
+        }
+        return result;
     }
 
     double renderVideo(void* opaque)
@@ -1996,6 +2100,39 @@ public:
     }
 
 private:
+    void clearRenderRetryStates() noexcept
+    {
+        const auto bindings = std::atomic_load_explicit(
+            &renderBindings_,
+            std::memory_order_acquire);
+        if (!bindings) {
+            return;
+        }
+        for (const auto& entry : bindings->retryStates) {
+            if (entry.second) {
+                std::atomic_store_explicit(
+                    &entry.second->retainedFrame,
+                    std::shared_ptr<const VideoFrameSnapshot> {},
+                    std::memory_order_release);
+            }
+        }
+    }
+
+    void invalidatePendingRendererFrames() noexcept
+    {
+        const auto bindings = std::atomic_load_explicit(
+            &renderBindings_,
+            std::memory_order_acquire);
+        if (!bindings) {
+            return;
+        }
+        for (const auto& entry : bindings->renderAPIs) {
+            if (entry.second) {
+                entry.second->invalidatePendingFrames();
+            }
+        }
+    }
+
     std::shared_ptr<RenderBindingsSnapshot> copyRenderBindings() const
     {
         const auto current = std::atomic_load_explicit(
@@ -7112,10 +7249,12 @@ private:
             presentationGeneration_.fetch_add(1, std::memory_order_acq_rel);
             clearCurrentVideoFrameSnapshot();
         }
+        clearRenderRetryStates();
     }
 
     void notifyPlaybackQueueInvalidation()
     {
+        invalidatePendingRendererFrames();
         resetPacketBuffering();
         invalidateAudioClock();
         audioQueueChanged_.notify_all();

@@ -158,8 +158,14 @@ bool probeNativeBuffer(
         };
         conversionInfo.pNext = forced ? nullptr : &externalFormat;
         conversionInfo.format = observation.imageFormat;
-        conversionInfo.ycbcrModel = formatProperties.suggestedYcbcrModel;
-        conversionInfo.ycbcrRange = formatProperties.suggestedYcbcrRange;
+        const bool preserveRawYcbcr = !forced
+            && options.preserveRawYcbcr;
+        conversionInfo.ycbcrModel = preserveRawYcbcr
+            ? VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY
+            : formatProperties.suggestedYcbcrModel;
+        conversionInfo.ycbcrRange = preserveRawYcbcr
+            ? VK_SAMPLER_YCBCR_RANGE_ITU_FULL
+            : formatProperties.suggestedYcbcrRange;
         conversionInfo.components =
             formatProperties.samplerYcbcrConversionComponents;
         conversionInfo.xChromaOffset =

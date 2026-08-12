@@ -133,6 +133,7 @@ public:
         const VideoFrame& frame) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
+    void invalidatePendingFrames() noexcept override;
 
     void setSelectionCallback(SelectionCallback callback);
     // Invoked synchronously after Vulkan is retired for a current hardware

@@ -147,7 +147,10 @@ already own a graphics context or require multiple/custom render targets:
 - optional OHOS OHCodec/Vulkan texture interop through
   `QtAV::InteropOHCodecVulkan`, using a private `OH_ConsumerSurface`, retained
   `OHNativeWindowBuffer`/`OH_NativeBuffer` import, explicit-plane direct wrap,
-  or opaque external-format YCbCr sampling into a GPU normalization image;
+  or opaque external-format suggested/identity YCbCr sampling into a GPU
+  normalization image. Custom `VulkanTextureFrame` implementations may return
+  an independent `samplerLifetime()` token so normalization does not retain
+  the producer allocation;
 - optional Android MediaCodec/Vulkan texture interop through
   `QtAV::InteropMediaCodecVulkan`, using a private GPU-sampled `AImageReader`,
   retained `AHardwareBuffer` external-format import, and acquire/release
@@ -619,14 +622,25 @@ released. The consumer-surface bridge avoids the software-copying FFmpeg
 OHCodec buffer-output branch and leaves the generic core API free of OHOS
 types.
 
-Huawei now permits the bounded `VK_FORMAT_UNDEFINED` compatibility workaround
-as a production default and notes that it is not limited to NV12/P010.
-`OHCodecVulkanInteropConfig::externalFormatWorkaroundEnabled` therefore
-defaults to `true`; set it to `false` from an application/user setting to use
-only the opaque `VkExternalFormatOHOS` route. The workaround recognizes a
-closed set of standard packed and multi-planar Vulkan YCbCr IDs and still
-requires every sampled-format, object-creation, NativeBuffer import, and
-sampling operation to succeed. It is not an arbitrary external-ID cast.
+Huawei's formal reply defines `VK_FORMAT_UNDEFINED` as expected when the
+driver exposes the buffer through `externalFormat`, identifies numeric
+external-ID equality as an internal detail, and confirms that the tested
+Maleoon driver has no explicit-format switch. Production therefore uses
+opaque `VkExternalFormatOHOS`, and
+`OHCodecVulkanInteropConfig::externalFormatWorkaroundEnabled` now defaults to
+`false`. Setting it to `true` is diagnostic compatibility only.
+
+Opaque input exposes a driver-suggested sampler for ordinary SDR/HDR and an
+`RGB_IDENTITY` sampler for Dolby Vision. Both preserve the driver's component
+mapping; the normalization shader converts Vulkan's sampled `(Cr,Y,Cb)`
+convention to libplacebo's `(Y,Cb,Cr)` order with `.gbr` only on the raw path.
+Huawei confirms P010 10-bit preservation and that the queried range/chroma
+properties describe the physical codec buffer. The
+normalization pipeline retains sampler/conversion state independently and
+returns the decoded consumer allocation as soon as the GPU copy completes.
+The new virtual has a default empty implementation, so existing custom frame
+source code need not override it, but consumers must rebuild because the C++
+vtable changed.
 
 OHOS Vulkan diagnostics can now call the additive
 `OHCodecVulkanInterop::nativeBufferObservation()` method without changing the
@@ -654,9 +668,9 @@ formats allowed both an application-owned Vulkan YCbCr shader and direct
 libplacebo 7.351.0 plane wrapping to render 30 frames per codec. The direct
 libplacebo run reported 60 direct-plane imports, no RGBA16F normalization, and
 no decoded-source CPU map, transfer, staging, or upload. This demonstrates
-working device and renderer capability. Huawei's later guidance promotes the
-bounded, fallback-protected workaround to the default production policy,
-while strict direct-plane/P010 precision claims remain separately gated.
+working device and renderer capability, but Huawei's formal reply classifies
+the mapping as an internal detail. These modes remain diagnostic; they do not
+change the opaque production policy.
 
 The OHOS HAP also connects `MobileVideoRendererSelector` to native OHCodec
 fallback. A Vulkan hardware-frame failure now prepares the OpenGL ES candidate
@@ -674,9 +688,14 @@ HEVC frames with `45/45/45` RPU queued/matched/released counts, raw YCbCr input,
 zero implicit-RGB images, and zero decoded-source map, transfer, staging, or
 upload calls. The repository libplacebo overlay corrects Profile 8 MMR GLSL
 integer indexing and third-order syntax for the device's strict GLES compiler.
-  The opaque Vulkan path can sample P010, but the Dolby Vision half remains
-  incomplete because the driver-provided YCbCr conversion does not prove the
-  raw-component/10-bit contract required before RPU reshaping.
+The 2026-08-12 signed Mate 60 Pro run closes the production opaque Vulkan
+Dolby Vision route: `wednesday.mp4` remained on OHCodec/Vulkan at 24.1 FPS,
+with raw identity sampling, 730 presentations at the final snapshot, and zero
+drops. Forced-SDR captures verified the final raw and suggested component
+orders. The same-process media-switch snapshot ended with 1,988 opaque imports,
+normalizations, releases, and callbacks, zero numeric-workaround imports, and
+`lastVulkanFormat=VK_FORMAT_UNDEFINED`. This is still not the separate strict
+direct-plane/no-intermediate claim.
 The Vulkan renderer now imports the application device through libplacebo.
 `BorrowedVulkanDevice` therefore also requires its `VkInstance` and explicit
 confirmation that Vulkan 1.2 `timelineSemaphore` and `hostQueryReset` were
@@ -836,13 +855,21 @@ implementation.
   discarded, surface-lost, or fatal. `VideoRenderResult` maps those outcomes
   to Player-facing statuses and includes frame sequence, presentation
   generation, optional retry delay, structured retry reason, and detail. A
-  generation change during the
-  backend call returns a terminal `FrameDiscarded` completion;
+  generation change during the backend call returns a terminal
+  `FrameDiscarded` completion. Player retains one exact backend-deferred frame per
+  renderer key, so a newer current frame cannot replace the frame associated
+  with an asynchronous producer callback;
 - compatibility `renderVideo()` returns a negative value for every non-rendered
   result and therefore cannot distinguish a missing frame from retryable
-  contention. New native render loops retain the exact frame for
+  contention. New native render loops schedule the backend-requested redraw for
   `RendererDeferred`, retry `RendererBusy` after bounded backoff, recreate the
   platform surface for `SurfaceLost`, and do not retry `FrameDiscarded`;
+- seek, stop, media replacement, and other presentation-generation changes
+  call `VideoRenderAPI::invalidatePendingFrames()` automatically. The default
+  implementation is a non-blocking no-op; asynchronous native-buffer backends
+  cancel only producer associations which have not entered GPU submission.
+  Existing custom renderer source does not need an override, but consumers
+  must rebuild for the appended public virtual;
 - `OpenGLPresentCallback` runs on that same graphics-owner thread after
   framebuffer submission and before hardware-source release; it is intended
   for the adapter's bounded window-present call, not general application work;

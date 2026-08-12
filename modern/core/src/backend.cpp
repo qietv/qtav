@@ -30,6 +30,11 @@ VideoRenderAttemptResult VideoRenderAPI::renderDetailed(
         "Legacy boolean renderer deferred the frame",
     };
 }
+
+void VideoRenderAPI::invalidatePendingFrames() noexcept
+{
+}
+
 AudioSink::~AudioSink() = default;
 
 bool AudioSink::drain()

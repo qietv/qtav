@@ -47,6 +47,14 @@ export interface PlayerSnapshot {
   softwareFrames: number;
   renderedFrames: number;
   droppedFrames: number;
+  opaqueExternalImports: number;
+  externalFormatWorkaroundImports: number;
+  externalNormalizationPasses: number;
+  nativeBuffersAcquired: number;
+  frameAvailableCallbacks: number;
+  outputsReleasedAfterGpu: number;
+  lastVulkanSourceFormat: number;
+  lastExternalFormat: number;
   audioTracks: PlayerTrack[];
   subtitleTracks: PlayerTrack[];
 }

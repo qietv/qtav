@@ -414,6 +414,11 @@ public:
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     }
 
+    bool sourceLifetimeDecoupled() const noexcept
+    {
+        return sourceLifetimeDecoupled_;
+    }
+
     bool convert(
         const std::shared_ptr<VulkanTextureFrame>& source,
         int width,
@@ -421,6 +426,7 @@ public:
         bool preserveYcbcr,
         std::string& error)
     {
+        sourceLifetimeDecoupled_ = false;
         const VkImageView sourceView = preserveYcbcr
             ? source ? source->unconvertedImageView() : VK_NULL_HANDLE
             : source ? source->imageView() : VK_NULL_HANDLE;
@@ -435,6 +441,8 @@ public:
                 : "The external-format image is incomplete";
             return false;
         }
+        sourceLifetimeDecoupled_ = static_cast<bool>(
+            source->samplerLifetime(sourceSampler));
         if (!ensure(source, sourceSampler, width, height, error)) {
             return false;
         }
@@ -570,19 +578,23 @@ public:
             &descriptorSet_,
             0,
             nullptr);
-        const std::array<float, 4> sourceRect {
+        const std::array<float, 8> sourceParameters {
             crop.left,
             crop.top,
             crop.right,
             crop.bottom,
+            preserveYcbcr ? 1.0F : 0.0F,
+            0.0F,
+            0.0F,
+            0.0F,
         };
         vkCmdPushConstants(
             commandBuffer_,
             pipelineLayout_,
             VK_SHADER_STAGE_FRAGMENT_BIT,
             0,
-            sizeof(sourceRect),
-            sourceRect.data());
+            sizeof(sourceParameters),
+            sourceParameters.data());
         const VkViewport viewport {
             0.0F,
             0.0F,
@@ -735,7 +747,10 @@ private:
         width_ = width;
         height_ = height;
         sampler_ = sourceSampler;
-        samplerOwner_ = source;
+        samplerOwner_ = source->samplerLifetime(sourceSampler);
+        if (!samplerOwner_) {
+            samplerOwner_ = source;
+        }
 
         VkImageCreateInfo imageInfo {
             VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -871,7 +886,7 @@ private:
         }
         VkPushConstantRange pushRange {};
         pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        pushRange.size = sizeof(float) * 4;
+        pushRange.size = sizeof(float) * 8;
         VkPipelineLayoutCreateInfo layoutInfo {
             VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         };
@@ -1159,7 +1174,8 @@ private:
     int height_ = 0;
     bool initialized_ = false;
     VkSampler sampler_ = VK_NULL_HANDLE;
-    std::shared_ptr<VulkanTextureFrame> samplerOwner_;
+    std::shared_ptr<void> samplerOwner_;
+    bool sourceLifetimeDecoupled_ = false;
     VkImage image_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkImageView imageView_ = VK_NULL_HANDLE;
@@ -1292,6 +1308,12 @@ VkSampler VulkanTextureFrame::unconvertedSampler() const noexcept
     return VK_NULL_HANDLE;
 }
 
+std::shared_ptr<void> VulkanTextureFrame::samplerLifetime(
+    VkSampler) const noexcept
+{
+    return {};
+}
+
 VkFormat VulkanTextureFrame::format() const noexcept
 {
     return VK_FORMAT_UNDEFINED;
@@ -1343,6 +1365,10 @@ bool VulkanTextureFrame::waitForProducer(std::string& detail) noexcept
 }
 
 VulkanHardwareFrameInterop::~VulkanHardwareFrameInterop() = default;
+
+void VulkanHardwareFrameInterop::invalidatePendingFrames() noexcept
+{
+}
 
 class VulkanVideoRenderer::Impl {
 public:
@@ -2118,6 +2144,19 @@ VideoRenderAttemptResult VulkanVideoRenderer::renderDetailed(
                     dovi,
                     externalNormalized,
                     error);
+#if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
+                // The normalization submission has already completed before
+                // wrapHardwareSource() returns. When the platform supplies a
+                // sampler/conversion lifetime token independent of the
+                // decoded allocation, release the producer buffer now. A
+                // one-buffer consumer surface must not wait for a future
+                // redraw to retire the allocation which produces that redraw.
+                if (externalNormalized
+                    && impl_->externalNormalizer_
+                           .sourceLifetimeDecoupled()) {
+                    imported.reset();
+                }
+#endif
             }
         }
     } else {
@@ -2162,7 +2201,7 @@ VideoRenderAttemptResult VulkanVideoRenderer::renderDetailed(
         targetTexture,
         error);
     std::uint64_t hardwareCompletion = 0;
-    if (hardwareTexture && imported) {
+    if (hardwareTexture && (imported || externalNormalized)) {
         hardwareCompletion = impl_->finishHardwareSource(
             hardwareTexture,
             imported,
@@ -2213,6 +2252,21 @@ void VulkanVideoRenderer::close() noexcept
 {
     if (impl_) {
         impl_->close();
+    }
+}
+
+void VulkanVideoRenderer::invalidatePendingFrames() noexcept
+{
+    if (!impl_) {
+        return;
+    }
+    std::shared_ptr<VulkanHardwareFrameInterop> interop;
+    {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        interop = impl_->hardwareInterop_;
+    }
+    if (interop) {
+        interop->invalidatePendingFrames();
     }
 }
 

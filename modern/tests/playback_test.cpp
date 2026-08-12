@@ -16,6 +16,7 @@
 #include <memory>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -79,6 +80,10 @@ public:
         return true;
     }
     void close() noexcept override {}
+    void invalidatePendingFrames() noexcept override
+    {
+        ++invalidations_;
+    }
 
     bool waitUntilEntered()
     {
@@ -98,12 +103,68 @@ public:
         changed_.notify_all();
     }
 
+    int invalidations() const noexcept
+    {
+        return invalidations_.load();
+    }
+
 private:
     std::mutex mutex_;
     std::condition_variable changed_;
     bool entered_ = false;
     bool released_ = false;
+    std::atomic<int> invalidations_ { 0 };
     EventCallback callback_;
+};
+
+class DeferredFrameRenderer final : public qtav::VideoRenderAPI {
+public:
+    qtav::VideoRenderCapabilities capabilities() const override { return {}; }
+    void setEventCallback(EventCallback) override {}
+    bool open(const qtav::VideoRenderConfig&) override { return true; }
+    bool configure(const qtav::VideoRenderConfig&) override { return true; }
+    qtav::VideoRenderAttemptResult renderDetailed(
+        const qtav::VideoFrame& frame) override
+    {
+        assert(frame);
+        std::lock_guard<std::mutex> lock(mutex_);
+        attempts_.push_back(frame.timestamp());
+        if (attempts_.size() == 1U) {
+            firstTimestamp_ = frame.timestamp();
+        }
+        if (frame.timestamp() == firstTimestamp_ && !released_) {
+            return {
+                qtav::VideoRenderAttemptStatus::DeferredUntilRedraw,
+                0,
+                "waiting for the exact first frame",
+            };
+        }
+        return { qtav::VideoRenderAttemptStatus::Presented, 0, {} };
+    }
+    bool render(const qtav::VideoFrame& frame) override
+    {
+        return renderDetailed(frame).frameConsumed();
+    }
+    void close() noexcept override {}
+
+    void releaseFirstFrame()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+    }
+
+    std::int64_t attemptTimestamp(std::size_t index) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        assert(index < attempts_.size());
+        return attempts_[index];
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<std::int64_t> attempts_;
+    std::int64_t firstTimestamp_ = -1;
+    bool released_ = false;
 };
 
 class DetailedRenderer final : public qtav::VideoRenderAPI {
@@ -171,6 +232,10 @@ int main(int argc, char** argv)
     std::atomic<int> surfaceLostRenderAttempts { 0 };
     std::atomic<int> fatalRenderAttempts { 0 };
     std::atomic<int> structuredRetryAttempts { 0 };
+    std::atomic<int> exactDeferredStage { 0 };
+    qtav::VideoRenderResult exactDeferredFirst;
+    qtav::VideoRenderResult exactDeferredRetry;
+    qtav::VideoRenderResult exactDeferredNext;
     int firstRenderKey = 1;
     int secondRenderKey = 2;
     int rejectingRenderKey = 3;
@@ -179,6 +244,7 @@ int main(int argc, char** argv)
     int surfaceLostRenderKey = 6;
     int fatalRenderKey = 7;
     int structuredRetryKey = 8;
+    int exactDeferredKey = 9;
     auto firstRenderer = std::make_shared<CountingRenderer>(renderedFrames);
     auto secondRenderer = std::make_shared<CountingRenderer>(renderedFrames);
     auto rejectingRenderer = std::make_shared<CountingRenderer>(
@@ -202,6 +268,8 @@ int main(int argc, char** argv)
         3,
         qtav::VideoRenderRetryReason::
             DeviceContextBusyReservationAware);
+    auto exactDeferredRenderer =
+        std::make_shared<DeferredFrameRenderer>();
     const auto emptyRender = player.renderVideoDetailed();
     assert(emptyRender.status == qtav::VideoRenderStatus::NoFrame);
     assert(emptyRender.frameSequence == 0);
@@ -243,11 +311,44 @@ int main(int argc, char** argv)
         .setVideoRenderAPI(surfaceLostRenderer, &surfaceLostRenderKey)
         .setVideoRenderAPI(fatalRenderer, &fatalRenderKey)
         .setVideoRenderAPI(structuredRetryRenderer, &structuredRetryKey)
+        .setVideoRenderAPI(exactDeferredRenderer, &exactDeferredKey)
         .setRenderCallback([&](void* opaque) {
             const auto rejectedBefore = rejectedRenderAttempts.load();
             if (!opaque) {
                 assert(player.renderVideo() >= 0.0);
                 return;
+            }
+
+            if (opaque == &exactDeferredKey) {
+                const int stage = exactDeferredStage.load();
+                if (stage == 0) {
+                    exactDeferredStage.store(1);
+                    exactDeferredFirst =
+                        player.renderVideoDetailed(opaque);
+                    assert(
+                        exactDeferredFirst.status
+                        == qtav::VideoRenderStatus::RendererDeferred);
+                    return;
+                }
+                if (stage == 1) {
+                    exactDeferredRenderer->releaseFirstFrame();
+                    exactDeferredStage.store(2);
+                    exactDeferredRetry =
+                        player.renderVideoDetailed(opaque);
+                    assert(
+                        exactDeferredRetry.status
+                        == qtav::VideoRenderStatus::Rendered);
+                    return;
+                }
+                if (stage == 2) {
+                    exactDeferredStage.store(3);
+                    exactDeferredNext =
+                        player.renderVideoDetailed(opaque);
+                    assert(
+                        exactDeferredNext.status
+                        == qtav::VideoRenderStatus::Rendered);
+                    return;
+                }
             }
 
             const auto result = player.renderVideoDetailed(opaque);
@@ -315,6 +416,20 @@ int main(int argc, char** argv)
     assert(discardedRenderAttempts.load() == videoFrames.load());
     assert(surfaceLostRenderAttempts.load() == videoFrames.load());
     assert(fatalRenderAttempts.load() == videoFrames.load());
+    assert(exactDeferredStage.load() >= 3);
+    assert(
+        exactDeferredFirst.frameSequence
+        == exactDeferredRetry.frameSequence);
+    assert(exactDeferredFirst.timestamp == exactDeferredRetry.timestamp);
+    assert(
+        exactDeferredNext.frameSequence
+        > exactDeferredRetry.frameSequence);
+    assert(
+        exactDeferredRenderer->attemptTimestamp(0)
+        == exactDeferredRenderer->attemptTimestamp(1));
+    assert(
+        exactDeferredRenderer->attemptTimestamp(2)
+        != exactDeferredRenderer->attemptTimestamp(1));
     assert(player.state() == qtav::State::Stopped);
 
     qtav::Player invalidationPlayer;
@@ -354,7 +469,11 @@ int main(int argc, char** argv)
     invalidationPlayer.setMedia(argv[1]);
     invalidationPlayer.setState(qtav::State::Playing);
     assert(blockingRenderer->waitUntilEntered());
+    const int invalidationsBeforeSeek = blockingRenderer->invalidations();
     assert(invalidationPlayer.seek(0));
+    assert(
+        blockingRenderer->invalidations()
+        == invalidationsBeforeSeek + 1);
     invalidationPlayer.setVideoRenderAPI({});
     blockingRenderer->release();
     {

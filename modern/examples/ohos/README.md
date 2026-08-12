@@ -72,8 +72,11 @@ SDR remained RGBA8/sRGB with deterministic tone mapping. The Vulkan interop reta
 `VK_OHOS_external_memory`, and can be called strict no-intermediate source
 zero-copy only when the driver exposes an explicit `VkFormat` and plane mapping
 that libplacebo wraps directly. An opaque format is imported with
-`VkExternalFormatOHOS` and normalized by one GPU YCbCr sampling pass before
-libplacebo. The OpenGL ES fallback likewise
+`VkExternalFormatOHOS`; ordinary input uses the suggested YCbCr conversion,
+while Dolby Vision uses `RGB_IDENTITY`, preserves the driver component mapping,
+and reorders sampled `.gbr` from Vulkan's `(Cr,Y,Cb)` convention into
+`(Y,Cb,Cr)` during one GPU normalization pass. The OpenGL ES
+fallback likewise
 requires raw `GL_EXT_YUV_target` sampling followed by crop-aware RGBA16F GPU
 normalization before libplacebo; it is zero-CPU-copy but not strict source
 zero-copy. Implicit `OH_NativeImage` external-OES YUV-to-RGB conversion
@@ -103,7 +106,18 @@ and the direct libplacebo 7.351.0 run each rendered 30 H.264/NV12 and 30 HEVC
 Main10/P010 frames. The libplacebo marker reported `directPlanes=60` and
 `normalization=0`, proving that libplacebo accepts both explicit formats. The
 option defaults to `DISABLED`; the numeric mapping is not enabled for
-production until Huawei confirms it as a stable supported contract.
+production. Huawei's formal 2026-08-12 reply identifies that equality as a
+driver implementation detail, confirms that the tested driver has no explicit-
+format switch, and directs applications to the opaque external-format route.
+It also confirms identity raw-component sampling and full P010 10-bit data
+with the queried range/chroma properties.
+
+The final signed player HAP kept `legend.mkv` on OHCodec/Vulkan at 25.0 FPS and
+kept Dolby Vision `wednesday.mp4` on OHCodec/Vulkan at 24.1 FPS. Forced-SDR
+captures first verified correct color for both suggested-RGB and raw-identity
+sampling. The final same-process snapshot reported 1,988 opaque imports,
+normalization passes, consumer-buffer releases, and callbacks, zero numeric-
+workaround imports, and zero Player drops.
 The same run also emitted `QTAV_OHOS_OHCODEC_FALLBACK_RESULT PASS` after the
 OHCodec surface generation changed from 5 to 6 and 30 raw-YCbCr OpenGL ES
 frames were presented. Its independent software route emitted

@@ -116,6 +116,10 @@ failure.
 8. For HDR input, record `hdrInput`, `hdrOutput`, output color space/format,
    and `toneMappedToSdr`. `Require HDR` must fail rather than quietly creating
    an SDR surface; explicit SDR mode must report the tone-map.
+9. With OHCodec/Vulkan, seek forward and then backward repeatedly in both
+   `legend.mkv` and `wednesday.mp4`. Successful-presentation FPS and native
+   buffer acquire/import/release counters must resume after every seek while
+   audio continues; a stale image with advancing audio is a failure.
 
 ## Connected-device record
 
@@ -174,6 +178,19 @@ Dolby Vision and the target remained RGB10_A2 BT.2020/PQ. This is a native HDR
 carrier for libplacebo's residual-disabled Dolby Vision/base-layer processing;
 it is not Dolby Vision dynamic-metadata passthrough, enhancement-layer
 reconstruction, licensing, or certification.
+
+The 2026-08-12 Huawei-contract update removed that automatic fallback for the
+working case. The production default now keeps `externalFormat` opaque and
+uses a second `RGB_IDENTITY` Vulkan sampler for raw Dolby Vision components;
+numeric explicit-format guessing defaults off. The driver component mapping is
+kept unchanged; the normalization shader applies Vulkan's raw `(Cr,Y,Cb)` to
+`(Y,Cb,Cr)` `.gbr` reorder only for the identity sampler, while ordinary HDR's
+suggested RGB conversion remains `.rgb`. Forced-SDR captures of both files
+matched the established OpenGL ES color control. On the same Mate 60 Pro,
+`legend.mkv` held OHCodec/Vulkan at 25.0 FPS and `wednesday.mp4` held 24.1 FPS,
+both with zero Player drops. The final same-process overlay reported 1,988
+opaque imports, normalization passes, consumer-buffer releases, and frame
+callbacks, `workaround=0`, and source `VkFormat 0`.
 
 The Vulkan path uses a bounded OHOS WSI compatibility rule. The platform
 swapchain layer supports A2B10G10R10 plus BT.2020/PQ at creation time on the

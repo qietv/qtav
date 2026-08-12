@@ -1842,6 +1842,11 @@ void MediaCodecVulkanInterop::flush() noexcept
     }
 }
 
+void MediaCodecVulkanInterop::invalidatePendingFrames() noexcept
+{
+    flush();
+}
+
 MediaCodecVulkanInteropStatistics
 MediaCodecVulkanInterop::statistics() const noexcept
 {

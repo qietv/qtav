@@ -168,6 +168,11 @@ public:
     // the 2.x API is still being integrated.
     virtual VideoRenderAttemptResult renderDetailed(
         const VideoFrame& frame);
+    // Invalidates asynchronous producer associations which have not entered
+    // a render submission yet. Player calls this automatically when its
+    // presentation generation changes. Implementations must be thread-safe,
+    // non-blocking, and must not wait for submitted GPU work.
+    virtual void invalidatePendingFrames() noexcept;
 };
 
 } // namespace qtav

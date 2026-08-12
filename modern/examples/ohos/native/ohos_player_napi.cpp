@@ -253,6 +253,14 @@ struct PlayerSnapshot {
     std::uint64_t softwareFrames = 0;
     std::uint64_t renderedFrames = 0;
     std::uint64_t droppedFrames = 0;
+    std::uint64_t opaqueExternalImports = 0;
+    std::uint64_t externalFormatWorkaroundImports = 0;
+    std::uint64_t externalNormalizationPasses = 0;
+    std::uint64_t nativeBuffersAcquired = 0;
+    std::uint64_t frameAvailableCallbacks = 0;
+    std::uint64_t outputsReleasedAfterGpu = 0;
+    std::int32_t lastVulkanSourceFormat = 0;
+    std::uint64_t lastExternalFormat = 0;
     bool hdrInput = false;
     bool dolbyVisionInput = false;
     bool hdrOutput = false;
@@ -706,6 +714,26 @@ public:
         const PlaybackStatistics statistics = player_.playbackStatistics();
         result.droppedFrames = statistics.videoQueueOverflowDrops
             + statistics.lateVideoDrops;
+        if (vulkanInterop_) {
+            const OHCodecVulkanInteropStatistics interopStatistics =
+                vulkanInterop_->statistics();
+            result.opaqueExternalImports =
+                interopStatistics.opaqueExternalImports;
+            result.externalFormatWorkaroundImports =
+                interopStatistics.externalFormatWorkaroundImports;
+            result.externalNormalizationPasses =
+                interopStatistics.normalizationPasses;
+            result.nativeBuffersAcquired =
+                interopStatistics.nativeBuffersAcquired;
+            result.frameAvailableCallbacks =
+                interopStatistics.frameAvailableCallbacks;
+            result.outputsReleasedAfterGpu =
+                interopStatistics.outputsReleasedAfterGpu;
+            result.lastVulkanSourceFormat = static_cast<std::int32_t>(
+                interopStatistics.lastVulkanFormat);
+            result.lastExternalFormat =
+                interopStatistics.lastExternalFormat;
+        }
         {
             std::lock_guard<std::mutex> lock(statusMutex_);
             result.source = source_;
@@ -1818,6 +1846,46 @@ napi_value snapshot(napi_env env, napi_callback_info)
         result,
         "droppedFrames",
         static_cast<double>(snapshot.droppedFrames));
+    setNamedNumber(
+        env,
+        result,
+        "opaqueExternalImports",
+        static_cast<double>(snapshot.opaqueExternalImports));
+    setNamedNumber(
+        env,
+        result,
+        "externalFormatWorkaroundImports",
+        static_cast<double>(snapshot.externalFormatWorkaroundImports));
+    setNamedNumber(
+        env,
+        result,
+        "externalNormalizationPasses",
+        static_cast<double>(snapshot.externalNormalizationPasses));
+    setNamedNumber(
+        env,
+        result,
+        "nativeBuffersAcquired",
+        static_cast<double>(snapshot.nativeBuffersAcquired));
+    setNamedNumber(
+        env,
+        result,
+        "frameAvailableCallbacks",
+        static_cast<double>(snapshot.frameAvailableCallbacks));
+    setNamedNumber(
+        env,
+        result,
+        "outputsReleasedAfterGpu",
+        static_cast<double>(snapshot.outputsReleasedAfterGpu));
+    setNamedNumber(
+        env,
+        result,
+        "lastVulkanSourceFormat",
+        snapshot.lastVulkanSourceFormat);
+    setNamedNumber(
+        env,
+        result,
+        "lastExternalFormat",
+        static_cast<double>(snapshot.lastExternalFormat));
     napi_set_named_property(
         env,
         result,

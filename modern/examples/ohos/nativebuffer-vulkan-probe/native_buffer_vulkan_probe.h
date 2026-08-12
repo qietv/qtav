@@ -29,6 +29,12 @@ struct Options {
     // application shader can sample the image.
     // false: import only the VkImage, for direct pl_vulkan_wrap().
     bool createSamplerObjects = true;
+
+    // Opaque external formats default to RGB_IDENTITY while preserving the
+    // implementation-defined component mapping returned by the driver. This
+    // exposes the encoded samples without guessing another component swizzle.
+    // Forced-explicit diagnostic mode ignores this option.
+    bool preserveRawYcbcr = true;
 };
 
 struct Report {

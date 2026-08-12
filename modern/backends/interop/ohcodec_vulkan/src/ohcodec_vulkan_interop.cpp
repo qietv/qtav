@@ -208,6 +208,91 @@ bool nativeFormatHasDirectPlaneOrder(
     }
 }
 
+bool supportedChromaOffset(
+    VkFormatFeatureFlags features,
+    VkChromaLocation location) noexcept
+{
+    if (location == VK_CHROMA_LOCATION_MIDPOINT) {
+        return (features & VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT)
+            != 0U;
+    }
+    return (features & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT)
+        != 0U;
+}
+
+bool createYcbcrResources(
+    VkDevice device,
+    const VkSamplerYcbcrConversionCreateInfo& conversionInfo,
+    const char* label,
+    VkSamplerYcbcrConversion& conversion,
+    VkSampler& sampler,
+    std::string& error)
+{
+    VkResult result = vkCreateSamplerYcbcrConversion(
+        device,
+        &conversionInfo,
+        nullptr,
+        &conversion);
+    if (result != VK_SUCCESS) {
+        error = resultError(label, result);
+        return false;
+    }
+
+    VkSamplerYcbcrConversionInfo samplerConversion {
+        VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+    };
+    samplerConversion.conversion = conversion;
+    VkSamplerCreateInfo samplerInfo {
+        VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+    };
+    samplerInfo.pNext = &samplerConversion;
+    samplerInfo.magFilter = conversionInfo.chromaFilter;
+    samplerInfo.minFilter = conversionInfo.chromaFilter;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = 1.0F;
+    result = vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
+    if (result != VK_SUCCESS) {
+        error = resultError("vkCreateSampler(YCbCr OH_NativeBuffer)", result);
+        vkDestroySamplerYcbcrConversion(device, conversion, nullptr);
+        conversion = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+struct YcbcrSamplerResources {
+    ~YcbcrSamplerResources()
+    {
+        if (unconvertedSampler) {
+            vkDestroySampler(device, unconvertedSampler, nullptr);
+        }
+        if (sampler) {
+            vkDestroySampler(device, sampler, nullptr);
+        }
+        if (unconvertedConversion) {
+            vkDestroySamplerYcbcrConversion(
+                device,
+                unconvertedConversion,
+                nullptr);
+        }
+        if (conversion) {
+            vkDestroySamplerYcbcrConversion(
+                device,
+                conversion,
+                nullptr);
+        }
+    }
+
+    VkDevice device = VK_NULL_HANDLE;
+    VkSamplerYcbcrConversion conversion = VK_NULL_HANDLE;
+    VkSamplerYcbcrConversion unconvertedConversion = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkSampler unconvertedSampler = VK_NULL_HANDLE;
+};
+
 bool probeOpaqueExternalFormatObjects(
     const BorrowedVulkanDevice& device,
     OH_NativeBuffer* nativeBuffer,
@@ -550,12 +635,14 @@ struct SharedState {
     PFN_vkGetNativeBufferPropertiesOHOS getNativeBufferProperties = nullptr;
     PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
     bool samplerYcbcrConversionEnabled = false;
-    bool externalFormatWorkaroundEnabled = true;
+    bool externalFormatWorkaroundEnabled = false;
     OHCodecVulkanExternalFormatProbeMode externalFormatProbeMode =
         OHCodecVulkanExternalFormatProbeMode::Disabled;
     std::mutex mutex;
     FrameKey queuedFrame;
     bool frameAvailable = false;
+    bool queuedFrameInvalidated = false;
+    std::string pendingError;
     VulkanHardwareFrameInterop::FrameAvailableCallback callback;
     AtomicStatistics statistics;
 };
@@ -568,6 +655,40 @@ void closeDescriptor(int& descriptor) noexcept
     }
 }
 
+bool drainInvalidatedFrameLocked(SharedState& state) noexcept
+{
+    if (!state.queuedFrameInvalidated || !state.frameAvailable) {
+        return false;
+    }
+
+    OHNativeWindowBuffer* windowBuffer = nullptr;
+    int acquireFence = -1;
+    const int32_t acquireResult =
+        OH_NativeImage_AcquireNativeWindowBuffer(
+            state.consumerSurface,
+            &windowBuffer,
+            &acquireFence);
+    if (acquireResult != 0 || !windowBuffer) {
+        closeDescriptor(acquireFence);
+        return false;
+    }
+
+    const int32_t releaseResult =
+        OH_NativeImage_ReleaseNativeWindowBuffer(
+            state.consumerSurface,
+            windowBuffer,
+            acquireFence);
+    if (releaseResult != 0) {
+        closeDescriptor(acquireFence);
+        state.pendingError =
+            "Could not release an invalidated OHCodec consumer buffer";
+    }
+    state.queuedFrame = {};
+    state.frameAvailable = false;
+    state.queuedFrameInvalidated = false;
+    return true;
+}
+
 void onFrameAvailable(void* context)
 {
     auto* state = static_cast<SharedState*>(context);
@@ -578,6 +699,7 @@ void onFrameAvailable(void* context)
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->frameAvailable = true;
+        drainInvalidatedFrameLocked(*state);
         callback = state->callback;
     }
     state->statistics.frameAvailableCallbacks.fetch_add(
@@ -638,20 +760,16 @@ public:
                 vkQueueWaitIdle(state_->device.queue);
             }
         }
+        if (unconvertedImageView_) {
+            vkDestroyImageView(
+                state_->device.device,
+                unconvertedImageView_,
+                nullptr);
+            unconvertedImageView_ = VK_NULL_HANDLE;
+        }
         if (imageView_) {
             vkDestroyImageView(state_->device.device, imageView_, nullptr);
             imageView_ = VK_NULL_HANDLE;
-        }
-        if (sampler_) {
-            vkDestroySampler(state_->device.device, sampler_, nullptr);
-            sampler_ = VK_NULL_HANDLE;
-        }
-        if (conversion_) {
-            vkDestroySamplerYcbcrConversion(
-                state_->device.device,
-                conversion_,
-                nullptr);
-            conversion_ = VK_NULL_HANDLE;
         }
         if (image_) {
             vkDestroyImage(state_->device.device, image_, nullptr);
@@ -713,7 +831,27 @@ public:
 
     VkSampler sampler() const noexcept override
     {
-        return sampler_;
+        return ycbcr_ ? ycbcr_->sampler : VK_NULL_HANDLE;
+    }
+
+    VkImageView unconvertedImageView() const noexcept override
+    {
+        return unconvertedImageView_;
+    }
+
+    VkSampler unconvertedSampler() const noexcept override
+    {
+        return ycbcr_ ? ycbcr_->unconvertedSampler : VK_NULL_HANDLE;
+    }
+
+    std::shared_ptr<void> samplerLifetime(
+        VkSampler sampler) const noexcept override
+    {
+        if (!ycbcr_ || (sampler != ycbcr_->sampler
+                && sampler != ycbcr_->unconvertedSampler)) {
+            return {};
+        }
+        return ycbcr_;
     }
 
     VkFormat format() const noexcept override
@@ -1033,6 +1171,19 @@ private:
                     std::memory_order_relaxed);
                 return false;
             }
+            if (!supportedChromaOffset(
+                    formatProperties.formatFeatures,
+                    formatProperties.suggestedXChromaOffset)
+                || !supportedChromaOffset(
+                    formatProperties.formatFeatures,
+                    formatProperties.suggestedYChromaOffset)) {
+                status = VulkanHardwareImportStatus::Unsupported;
+                error = "The OH_NativeBuffer suggested chroma sample locations are unsupported";
+                state_->statistics.opaqueFormatsRejected.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                return false;
+            }
             if (useOpaqueExternalFormat
                 && state_->statistics.opaqueExternalObjectProbes.load(
                     std::memory_order_relaxed)
@@ -1088,44 +1239,51 @@ private:
                     != 0U
                 ? VK_FILTER_LINEAR
                 : VK_FILTER_NEAREST;
-            VkResult result = vkCreateSamplerYcbcrConversion(
-                state_->device.device,
-                &conversionInfo,
-                nullptr,
-                &conversion_);
-            if (result != VK_SUCCESS) {
-                status = VulkanHardwareImportStatus::Error;
-                error = resultError(
+            ycbcr_ = std::make_shared<YcbcrSamplerResources>();
+            ycbcr_->device = state_->device.device;
+            if (!createYcbcrResources(
+                    state_->device.device,
+                    conversionInfo,
                     "vkCreateSamplerYcbcrConversion(OH_NativeBuffer)",
-                    result);
+                    ycbcr_->conversion,
+                    ycbcr_->sampler,
+                    error)) {
+                status = VulkanHardwareImportStatus::Error;
                 return false;
             }
-            VkSamplerYcbcrConversionInfo samplerConversion {
-                VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
-            };
-            samplerConversion.conversion = conversion_;
-            VkSamplerCreateInfo samplerInfo {
-                VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-            };
-            samplerInfo.pNext = &samplerConversion;
-            samplerInfo.magFilter = conversionInfo.chromaFilter;
-            samplerInfo.minFilter = conversionInfo.chromaFilter;
-            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerInfo.maxLod = 1.0F;
-            result = vkCreateSampler(
-                state_->device.device,
-                &samplerInfo,
-                nullptr,
-                &sampler_);
-            if (result != VK_SUCCESS) {
-                status = VulkanHardwareImportStatus::Error;
-                error = resultError(
-                    "vkCreateSampler(YCbCr OH_NativeBuffer)",
-                    result);
-                return false;
+
+            if (useOpaqueExternalFormat) {
+                VkSamplerYcbcrConversionCreateInfo identityInfo =
+                    conversionInfo;
+                identityInfo.ycbcrModel =
+                    VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
+                // RGB_IDENTITY disables range expansion. libplacebo receives
+                // the original VideoFrame range metadata and remains the sole
+                // owner of range and color-model conversion.
+                identityInfo.ycbcrRange =
+                    VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
+                // externalFormat is implementation-defined, so its component
+                // mapping is implementation-defined as well. Huawei confirms
+                // that the returned mapping describes the codec buffer's raw
+                // components; changing only the model to RGB_IDENTITY exposes
+                // those Y/Cb/Cr samples without guessing a second swizzle.
+                identityInfo.components =
+                    formatProperties.samplerYcbcrConversionComponents;
+                std::string identityError;
+                if (!createYcbcrResources(
+                        state_->device.device,
+                        identityInfo,
+                        "vkCreateSamplerYcbcrConversion(raw identity OH_NativeBuffer)",
+                        ycbcr_->unconvertedConversion,
+                        ycbcr_->unconvertedSampler,
+                        identityError)) {
+                    // Ordinary HDR/SDR content can still use the driver's
+                    // suggested conversion. Dolby Vision later fails closed
+                    // and the mobile selector rebinds future output to the
+                    // raw OpenGL ES interop.
+                    ycbcr_->unconvertedConversion = VK_NULL_HANDLE;
+                    ycbcr_->unconvertedSampler = VK_NULL_HANDLE;
+                }
             }
         } else if (!directPlaneFormat(importFormat)
             || !nativeFormatHasDirectPlaneOrder(
@@ -1260,7 +1418,7 @@ private:
             VkSamplerYcbcrConversionInfo viewConversion {
                 VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
             };
-            viewConversion.conversion = conversion_;
+            viewConversion.conversion = ycbcr_->conversion;
             VkImageViewCreateInfo viewInfo {
                 VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             };
@@ -1289,6 +1447,32 @@ private:
                     "vkCreateImageView(opaque OH_NativeBuffer)",
                     result);
                 return false;
+            }
+            if (ycbcr_->unconvertedConversion) {
+                VkSamplerYcbcrConversionInfo identityViewConversion {
+                    VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+                };
+                identityViewConversion.conversion =
+                    ycbcr_->unconvertedConversion;
+                viewInfo.pNext = &identityViewConversion;
+                result = vkCreateImageView(
+                    state_->device.device,
+                    &viewInfo,
+                    nullptr,
+                    &unconvertedImageView_);
+                if (result != VK_SUCCESS) {
+                    unconvertedImageView_ = VK_NULL_HANDLE;
+                    vkDestroySampler(
+                        state_->device.device,
+                        ycbcr_->unconvertedSampler,
+                        nullptr);
+                    ycbcr_->unconvertedSampler = VK_NULL_HANDLE;
+                    vkDestroySamplerYcbcrConversion(
+                        state_->device.device,
+                        ycbcr_->unconvertedConversion,
+                        nullptr);
+                    ycbcr_->unconvertedConversion = VK_NULL_HANDLE;
+                }
             }
         }
 
@@ -1355,8 +1539,8 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkImageView imageView_ = VK_NULL_HANDLE;
-    VkSamplerYcbcrConversion conversion_ = VK_NULL_HANDLE;
-    VkSampler sampler_ = VK_NULL_HANDLE;
+    VkImageView unconvertedImageView_ = VK_NULL_HANDLE;
+    std::shared_ptr<YcbcrSamplerResources> ycbcr_;
     VkSemaphore acquireSemaphore_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VulkanNormalizedSourceRect sourceRect_;
@@ -1501,6 +1685,24 @@ public:
         const FrameKey key = frameKey(frame);
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
+            if (!state_->pendingError.empty()) {
+                detail = std::move(state_->pendingError);
+                state_->pendingError.clear();
+                return VulkanHardwareImportStatus::Error;
+            }
+            if (state_->queuedFrameInvalidated) {
+                drainInvalidatedFrameLocked(*state_);
+                if (!state_->pendingError.empty()) {
+                    detail = std::move(state_->pendingError);
+                    state_->pendingError.clear();
+                    return VulkanHardwareImportStatus::Error;
+                }
+                if (state_->queuedFrame) {
+                    detail =
+                        "An invalidated OHCodec output is awaiting consumer release";
+                    return VulkanHardwareImportStatus::Pending;
+                }
+            }
             if (state_->queuedFrame) {
                 if (!(state_->queuedFrame == key)) {
                     detail = "Another OHCodec output is awaiting its exact consumer buffer";
@@ -1513,6 +1715,7 @@ public:
             }
             state_->queuedFrame = key;
             state_->frameAvailable = false;
+            state_->queuedFrameInvalidated = false;
         }
 
         OHCodecFrame output = ohCodecFrame(frame, state_->surface);
@@ -1520,6 +1723,7 @@ public:
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->queuedFrame = {};
             state_->frameAvailable = false;
+            state_->queuedFrameInvalidated = false;
             detail = "Could not queue the OHCodec output into the private OH_ConsumerSurface";
             return VulkanHardwareImportStatus::Error;
         }
@@ -1564,6 +1768,7 @@ public:
             }
             state_->queuedFrame = {};
             state_->frameAvailable = false;
+            state_->queuedFrameInvalidated = false;
         }
         if (OH_NativeWindow_NativeObjectReference(windowBuffer) != 0) {
             const int32_t releaseResult =
@@ -1638,6 +1843,23 @@ public:
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         state_->callback = std::move(callback);
+    }
+
+    void invalidatePendingFrames() noexcept
+    {
+        VulkanHardwareFrameInterop::FrameAvailableCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (!state_->queuedFrame) {
+                return;
+            }
+            state_->queuedFrameInvalidated = true;
+            drainInvalidatedFrameLocked(*state_);
+            callback = state_->callback;
+        }
+        if (callback) {
+            callback();
+        }
     }
 
     std::string lastError() const
@@ -1737,6 +1959,13 @@ void OHCodecVulkanInterop::setFrameAvailableCallback(
 {
     if (isValid()) {
         impl_->setFrameAvailableCallback(std::move(callback));
+    }
+}
+
+void OHCodecVulkanInterop::invalidatePendingFrames() noexcept
+{
+    if (isValid()) {
+        impl_->invalidatePendingFrames();
     }
 }
 

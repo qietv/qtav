@@ -104,10 +104,16 @@ public:
     virtual VkImageView imageView() const noexcept = 0;
     virtual VkSampler sampler() const noexcept = 0;
     // Optional view/sampler pair which exposes undecoded Y, Cb, and Cr in
-    // RGB component order. Android external formats use this for Dolby
-    // Vision RPU reshaping before libplacebo performs any color conversion.
+    // RGB component order. Android and OHOS external formats use this for
+    // Dolby Vision RPU reshaping before libplacebo performs color conversion.
     virtual VkImageView unconvertedImageView() const noexcept;
     virtual VkSampler unconvertedSampler() const noexcept;
+    // Optional ownership token for a sampler/conversion whose lifetime is
+    // independent of the decoded image allocation. Returning a token lets
+    // the external-image normalization pipeline retain immutable-sampler
+    // state without retaining the producer buffer itself.
+    virtual std::shared_ptr<void> samplerLifetime(
+        VkSampler sampler) const noexcept;
     virtual VkFormat format() const noexcept;
     virtual VkImageUsageFlags usage() const noexcept;
     virtual VkSemaphore acquireSemaphore() const noexcept = 0;
@@ -164,6 +170,10 @@ public:
         const VideoFrame& frame) = 0;
     virtual void setFrameAvailableCallback(
         FrameAvailableCallback callback) = 0;
+    // Cancels producer/image associations which have not entered a Vulkan
+    // submission. This is a non-blocking presentation-generation boundary;
+    // submitted GPU work keeps its normal retained lifetime.
+    virtual void invalidatePendingFrames() noexcept;
 };
 
 class QTAV_RENDER_VULKAN_EXPORT VulkanVideoRenderer final
@@ -190,6 +200,7 @@ public:
         const VideoFrame& frame) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
+    void invalidatePendingFrames() noexcept override;
 
     BorrowedVulkanDevice device() const noexcept;
     void setCurrentTargetCallback(VulkanCurrentTargetCallback callback);

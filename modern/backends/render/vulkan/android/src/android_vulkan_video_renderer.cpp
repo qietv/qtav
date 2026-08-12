@@ -870,6 +870,13 @@ void AndroidVulkanVideoRenderer::close() noexcept
     }
 }
 
+void AndroidVulkanVideoRenderer::invalidatePendingFrames() noexcept
+{
+    if (impl_) {
+        impl_->renderer_.invalidatePendingFrames();
+    }
+}
+
 bool AndroidVulkanVideoRenderer::setWindow(ANativeWindow* window)
 {
     if (!impl_) {

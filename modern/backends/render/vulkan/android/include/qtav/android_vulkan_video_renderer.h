@@ -53,6 +53,7 @@ public:
         const VideoFrame& frame) override;
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
+    void invalidatePendingFrames() noexcept override;
 
     // The adapter acquires its own ANativeWindow reference. Republishing the
     // same window after its buffer geometry changes refreshes the swapchain;

@@ -106,6 +106,7 @@ public:
         const VideoFrame& frame) override;
     void setFrameAvailableCallback(
         FrameAvailableCallback callback) override;
+    void invalidatePendingFrames() noexcept override;
 
     // Drop images and timestamp associations that have not entered a Vulkan
     // submission. Call before seek, decoder replacement, or explicit stop.

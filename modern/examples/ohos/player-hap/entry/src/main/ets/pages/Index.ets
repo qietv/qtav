@@ -77,6 +77,14 @@ function emptySnapshot(): PlayerSnapshot {
     softwareFrames: 0,
     renderedFrames: 0,
     droppedFrames: 0,
+    opaqueExternalImports: 0,
+    externalFormatWorkaroundImports: 0,
+    externalNormalizationPasses: 0,
+    nativeBuffersAcquired: 0,
+    frameAvailableCallbacks: 0,
+    outputsReleasedAfterGpu: 0,
+    lastVulkanSourceFormat: 0,
+    lastExternalFormat: 0,
     audioTracks: [],
     subtitleTracks: []
   };
@@ -579,7 +587,11 @@ struct Index {
       `输入 ${inputHdr} · 输出 ${outputHdr}${conversion} · XComponent HDR ${this.xComponentHdrBrightness.toFixed(1)}\n` +
       `${info.mediaStatus} · ${info.playbackRate.toFixed(2)}× · FPS ${info.fps.toFixed(1)}\n` +
       `硬解帧 ${info.hardwareFrames} · 软解帧 ${info.softwareFrames} · 呈现 ${info.renderedFrames}\n` +
-      `丢帧 ${info.droppedFrames} · 音轨 ${info.activeAudioTrack} · 字幕 ${info.activeSubtitleTrack}`;
+      `丢帧 ${info.droppedFrames} · 音轨 ${info.activeAudioTrack} · 字幕 ${info.activeSubtitleTrack}\n` +
+      `opaque ${info.opaqueExternalImports} · normalize ${info.externalNormalizationPasses} · ` +
+      `release ${info.outputsReleasedAfterGpu}/${info.nativeBuffersAcquired} · ` +
+      `callback ${info.frameAvailableCallbacks} · workaround ${info.externalFormatWorkaroundImports} · ` +
+      `srcFmt ${info.lastVulkanSourceFormat} · external ${info.lastExternalFormat}`;
   }
 
   aboutToDisappear(): void {
