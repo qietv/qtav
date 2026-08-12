@@ -97,7 +97,11 @@ public:
 
     void notifyRender(const VideoRenderEvent& event)
     {
-        EventCallback callback = eventCallback_;
+        EventCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(eventMutex_);
+            callback = eventCallback_;
+        }
         if (callback) {
             callback(event);
         }
@@ -175,13 +179,19 @@ public:
         std::uint64_t generation,
         const VideoRenderEvent& event)
     {
+        if (event.type == VideoRenderEventType::RedrawRequested) {
+            if (generation != activeCallbackGeneration_.load(
+                                  std::memory_order_acquire)
+                || api != activeCallbackAPI_.load(
+                              std::memory_order_acquire)) {
+                return;
+            }
+            notifyRender(event);
+            return;
+        }
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (generation != candidateGeneration_
             || api != selectedAPI_ || !renderer_) {
-            return;
-        }
-        if (event.type == VideoRenderEventType::RedrawRequested) {
-            notifyRender(event);
             return;
         }
         pendingEvent_ = event;
@@ -215,7 +225,14 @@ public:
         if (!renderer_) {
             return;
         }
-        pendingFrameInvalidation_.store(false, std::memory_order_release);
+        std::atomic_store_explicit(
+            &invalidationRenderer_,
+            std::shared_ptr<VideoRenderAPI> {},
+            std::memory_order_release);
+        activeCallbackGeneration_.store(0, std::memory_order_release);
+        activeCallbackAPI_.store(
+            MobileRenderAPI::None,
+            std::memory_order_release);
         renderer_->invalidatePendingFrames();
         renderer_->setEventCallback({});
         renderer_->close();
@@ -243,6 +260,14 @@ public:
         const std::uint64_t generation = ++candidateGeneration_;
         selectedAPI_ = api;
         renderer_ = candidate.renderer;
+        activeCallbackAPI_.store(api, std::memory_order_release);
+        activeCallbackGeneration_.store(
+            generation,
+            std::memory_order_release);
+        std::atomic_store_explicit(
+            &invalidationRenderer_,
+            renderer_,
+            std::memory_order_release);
         clearPendingEvent();
         renderer_->setEventCallback(
             [this, api, generation](const VideoRenderEvent& event) {
@@ -746,7 +771,6 @@ public:
     VideoRenderAttemptResult renderDetailed(const VideoFrame& frame)
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
-        applyPendingFrameInvalidation();
         if (!sessionConfigured_ || suspended_) {
             lastAttempt_ = {
                 suspended_ ? VideoRenderAttemptStatus::SurfaceLost
@@ -799,12 +823,21 @@ public:
 
     void invalidatePendingFrames() noexcept
     {
-        pendingFrameInvalidation_.store(true, std::memory_order_release);
-        std::unique_lock<std::recursive_mutex> lock(
-            mutex_,
-            std::try_to_lock);
-        if (lock.owns_lock()) {
-            applyPendingFrameInvalidation();
+        const auto renderer = std::atomic_load_explicit(
+            &invalidationRenderer_,
+            std::memory_order_acquire);
+        if (renderer) {
+            renderer->invalidatePendingFrames();
+        }
+    }
+
+    void completePendingFrameInvalidation() noexcept
+    {
+        const auto renderer = std::atomic_load_explicit(
+            &invalidationRenderer_,
+            std::memory_order_acquire);
+        if (renderer) {
+            renderer->completePendingFrameInvalidation();
         }
     }
 
@@ -841,20 +874,9 @@ public:
             nullptr);
     }
 
-    void applyPendingFrameInvalidation() noexcept
-    {
-        if (!pendingFrameInvalidation_.exchange(
-                false,
-                std::memory_order_acq_rel)) {
-            return;
-        }
-        if (renderer_) {
-            renderer_->invalidatePendingFrames();
-        }
-    }
-
     mutable std::recursive_mutex mutex_;
-    std::atomic<bool> pendingFrameInvalidation_ { false };
+    std::mutex eventMutex_;
+    std::shared_ptr<VideoRenderAPI> invalidationRenderer_;
     MobileRendererSelectorConfig selectorConfig_;
     EventCallback eventCallback_;
     SelectionCallback selectionCallback_;
@@ -865,6 +887,10 @@ public:
     MobileRenderAPI selectedAPI_ = MobileRenderAPI::None;
     std::uint64_t sessionGeneration_ = 0;
     std::uint64_t candidateGeneration_ = 0;
+    std::atomic<std::uint64_t> activeCallbackGeneration_ { 0 };
+    std::atomic<MobileRenderAPI> activeCallbackAPI_ {
+        MobileRenderAPI::None,
+    };
     bool sessionConfigured_ = false;
     bool suspended_ = false;
     bool hasPendingEvent_ = false;
@@ -908,7 +934,7 @@ void MobileVideoRendererSelector::setEventCallback(
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    std::lock_guard<std::mutex> lock(impl_->eventMutex_);
     impl_->eventCallback_ = std::move(callback);
 }
 
@@ -955,6 +981,13 @@ void MobileVideoRendererSelector::invalidatePendingFrames() noexcept
 {
     if (impl_) {
         impl_->invalidatePendingFrames();
+    }
+}
+
+void MobileVideoRendererSelector::completePendingFrameInvalidation() noexcept
+{
+    if (impl_) {
+        impl_->completePendingFrameInvalidation();
     }
 }
 

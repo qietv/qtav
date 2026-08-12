@@ -1370,6 +1370,10 @@ void VulkanHardwareFrameInterop::invalidatePendingFrames() noexcept
 {
 }
 
+void VulkanHardwareFrameInterop::completePendingFrameInvalidation() noexcept
+{
+}
+
 class VulkanVideoRenderer::Impl {
 public:
     struct RetainedHardwareFrame {
@@ -2267,6 +2271,21 @@ void VulkanVideoRenderer::invalidatePendingFrames() noexcept
     }
     if (interop) {
         interop->invalidatePendingFrames();
+    }
+}
+
+void VulkanVideoRenderer::completePendingFrameInvalidation() noexcept
+{
+    if (!impl_) {
+        return;
+    }
+    std::shared_ptr<VulkanHardwareFrameInterop> interop;
+    {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        interop = impl_->hardwareInterop_;
+    }
+    if (interop) {
+        interop->completePendingFrameInvalidation();
     }
 }
 

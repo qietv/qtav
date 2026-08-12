@@ -195,6 +195,20 @@ newer snapshot is already current. A presentation-generation boundary clears
 all retained retries and invokes each renderer's non-blocking pending-frame
 invalidation hook. That hook may cancel a producer/image association which has
 not entered submission; it may not wait for already submitted GPU work.
+The playback worker does not join native render calls before a hardware-decoder
+flush: a codec present/release IPC may itself need that flush to make progress.
+The decoder flush becomes the cancellation authority for native producers
+which never published a consumer callback. Player publishes that completed
+generation and invokes the renderer's second-phase completion hook. A retired
+render call which overlaps the first pass repeats invalidation and completion
+when it returns. This two-phase discontinuity protocol has no caller, UI, or
+render-thread wait, no per-frame cost, and no wait for submitted GPU work.
+Native producer callbacks are a separate synchronization domain from renderer
+state. A redraw callback may run synchronously before the platform producer
+call returns, so forwarding it must not acquire a renderer/selector state lock
+which the graphics thread holds across that producer call. The active renderer
+identity is published independently, and one producer decision emits at most
+one redraw even when its consumer callback arrives before the decision returns.
 Timer-backoff busy results remain eligible for a high-level output's existing
 latest-frame supersession policy and are not pinned by Player.
 
@@ -458,7 +472,19 @@ invalidates it before import, the callback path acquires and immediately returns
 its consumer buffer, then clears the exact frame key before admitting another
 OHCodec output. Player repeats invalidation after an overlapping backend call,
 closing the race where an old render attempt queues its producer after seek was
-published. This path adds no per-frame GPU wait or decoded-source CPU copy.
+published. Player flushes the decoder without joining that native render call,
+then invokes a second completion phase. If OHCodec cancelled the invalidated
+producer without a callback, that phase clears the exact association. An
+overlapping retired call repeats both phases after it returns; any later orphan
+callback is drained instead of being matched to a newer frame. This path adds
+no render-thread or per-frame GPU wait and no decoded-source CPU copy.
+OHOS Surface notification can run before the native output-present call
+returns. The adapter and mobile selector therefore forward redraw through an
+event-only lock and atomically published active renderer identity, never their
+render-state locks. Interop records an early callback while the producer call
+is in flight and hands off exactly one redraw after it returns. This avoids both
+a callback/producer lock cycle and a second present of the same exactly-once
+OHCodec token.
 
 The Vulkan interop has three explicitly reported format routes:
 

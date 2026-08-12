@@ -308,11 +308,11 @@ struct Index {
   }
 
   private seekTo(positionMs: number): void {
-    if (!this.snapshot.seekable) {
+    const nativeContext: QtAVPlayerNativeContext | undefined =
+      this.nativeContext;
+    if (!nativeContext || !nativeContext.seek(Math.round(positionMs))) {
       this.showToast('当前媒体不可定位');
-      return;
     }
-    this.nativeContext?.seek(Math.round(positionMs));
   }
 
   private seekRelative(deltaMs: number): void {

@@ -642,6 +642,9 @@ struct SharedState {
     FrameKey queuedFrame;
     bool frameAvailable = false;
     bool queuedFrameInvalidated = false;
+    bool producerCallInFlight = false;
+    bool decoderCancellationCompleted = false;
+    bool orphanDrainPending = false;
     std::string pendingError;
     VulkanHardwareFrameInterop::FrameAvailableCallback callback;
     AtomicStatistics statistics;
@@ -686,6 +689,39 @@ bool drainInvalidatedFrameLocked(SharedState& state) noexcept
     state.queuedFrame = {};
     state.frameAvailable = false;
     state.queuedFrameInvalidated = false;
+    state.decoderCancellationCompleted = false;
+    return true;
+}
+
+bool drainOrphanedFrameLocked(SharedState& state) noexcept
+{
+    if (!state.orphanDrainPending) {
+        return false;
+    }
+
+    OHNativeWindowBuffer* windowBuffer = nullptr;
+    int acquireFence = -1;
+    const int32_t acquireResult =
+        OH_NativeImage_AcquireNativeWindowBuffer(
+            state.consumerSurface,
+            &windowBuffer,
+            &acquireFence);
+    if (acquireResult != 0 || !windowBuffer) {
+        closeDescriptor(acquireFence);
+        return false;
+    }
+
+    const int32_t releaseResult =
+        OH_NativeImage_ReleaseNativeWindowBuffer(
+            state.consumerSurface,
+            windowBuffer,
+            acquireFence);
+    if (releaseResult != 0) {
+        closeDescriptor(acquireFence);
+        state.pendingError =
+            "Could not release an orphaned OHCodec consumer buffer";
+    }
+    state.orphanDrainPending = false;
     return true;
 }
 
@@ -698,9 +734,29 @@ void onFrameAvailable(void* context)
     VulkanHardwareFrameInterop::FrameAvailableCallback callback;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        state->frameAvailable = true;
-        drainInvalidatedFrameLocked(*state);
-        callback = state->callback;
+        if (state->queuedFrame) {
+            state->frameAvailable = true;
+            drainInvalidatedFrameLocked(*state);
+        } else {
+            // A decoder flush can cancel the frame association before an
+            // already-dispatched Surface callback runs. No valid producer is
+            // ever presented without first publishing queuedFrame, so a
+            // callback observed with no association is an orphan. Acquisition
+            // belongs to the Vulkan render thread: the callback can precede
+            // the buffer becoming acquirable, and a one-shot acquire here can
+            // otherwise leave the private one-buffer Surface permanently
+            // full with no later callback to drain it.
+            state->orphanDrainPending = true;
+            state->frameAvailable = false;
+        }
+        // A callback which races the synchronous producer call is recorded in
+        // frameAvailable but not dispatched yet. Dispatching here and again
+        // when the producer returns can schedule two redraws for the same
+        // exactly-once OHCodec output token; the second present is a successful
+        // no-op and can never produce another Surface callback.
+        if (!state->producerCallInFlight) {
+            callback = state->callback;
+        }
     }
     state->statistics.frameAvailableCallbacks.fetch_add(
         1,
@@ -1690,6 +1746,19 @@ public:
                 state_->pendingError.clear();
                 return VulkanHardwareImportStatus::Error;
             }
+            if (state_->orphanDrainPending) {
+                drainOrphanedFrameLocked(*state_);
+                if (!state_->pendingError.empty()) {
+                    detail = std::move(state_->pendingError);
+                    state_->pendingError.clear();
+                    return VulkanHardwareImportStatus::Error;
+                }
+                if (state_->orphanDrainPending) {
+                    detail =
+                        "An orphaned OHCodec consumer buffer is not yet acquirable";
+                    return VulkanHardwareImportStatus::Pending;
+                }
+            }
             if (state_->queuedFrameInvalidated) {
                 drainInvalidatedFrameLocked(*state_);
                 if (!state_->pendingError.empty()) {
@@ -1702,6 +1771,11 @@ public:
                         "An invalidated OHCodec output is awaiting consumer release";
                     return VulkanHardwareImportStatus::Pending;
                 }
+            }
+            if (state_->producerCallInFlight) {
+                detail =
+                    "An OHCodec output decision is still completing for the retired generation";
+                return VulkanHardwareImportStatus::Pending;
             }
             if (state_->queuedFrame) {
                 if (!(state_->queuedFrame == key)) {
@@ -1716,14 +1790,51 @@ public:
             state_->queuedFrame = key;
             state_->frameAvailable = false;
             state_->queuedFrameInvalidated = false;
+            state_->producerCallInFlight = true;
+            state_->decoderCancellationCompleted = false;
         }
 
         OHCodecFrame output = ohCodecFrame(frame, state_->surface);
-        if (!output || !output.isPending() || !output.present()) {
+        const bool queued = output && output.isPending() && output.present();
+        VulkanHardwareFrameInterop::FrameAvailableCallback callback;
+        {
             std::lock_guard<std::mutex> lock(state_->mutex);
-            state_->queuedFrame = {};
-            state_->frameAvailable = false;
-            state_->queuedFrameInvalidated = false;
+            state_->producerCallInFlight = false;
+            bool notifyAfterProducer = queued && state_->frameAvailable;
+            if (!queued) {
+                state_->queuedFrame = {};
+                state_->frameAvailable = false;
+                state_->queuedFrameInvalidated = false;
+                state_->decoderCancellationCompleted = false;
+            } else if (state_->queuedFrameInvalidated
+                       && state_->decoderCancellationCompleted) {
+                notifyAfterProducer = true;
+                // The decoder flush may have completed while the native
+                // producer IPC was still returning. It is now safe to probe
+                // once for a delivered buffer; otherwise that flush cancelled
+                // the output and the late callback will be drained as orphan.
+                const bool callbackWasPublished = state_->frameAvailable;
+                drainInvalidatedFrameLocked(*state_);
+                if (state_->queuedFrame) {
+                    state_->orphanDrainPending = callbackWasPublished;
+                    state_->queuedFrame = {};
+                    state_->frameAvailable = false;
+                    state_->queuedFrameInvalidated = false;
+                    state_->decoderCancellationCompleted = false;
+                }
+            }
+            if (notifyAfterProducer) {
+                callback = state_->callback;
+            }
+        }
+        // A callback can arrive before OH_VideoDecoder_RenderOutputBuffer()
+        // returns. The redraw it scheduled observes producerCallInFlight and
+        // defers; wake it again after the call leaves so the exact frame or
+        // the newer generation can make progress.
+        if (callback) {
+            callback();
+        }
+        if (!queued) {
             detail = "Could not queue the OHCodec output into the private OH_ConsumerSurface";
             return VulkanHardwareImportStatus::Error;
         }
@@ -1862,6 +1973,36 @@ public:
         }
     }
 
+    void completePendingFrameInvalidation() noexcept
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->queuedFrameInvalidated) {
+            return;
+        }
+        state_->decoderCancellationCompleted = true;
+        if (state_->producerCallInFlight) {
+            // Do not admit a newer producer while the retired native call is
+            // still returning. The call's completion path will perform the
+            // acquire-or-cancel decision without waiting on this thread.
+            return;
+        }
+
+        // Decoder flush is the cancellation authority. First consume a
+        // buffer which reached the Surface before the flush; if none exists,
+        // the synchronous codec flush cancelled it. Either outcome retires
+        // the old exact-frame association without waiting for a callback that
+        // may never be published.
+        const bool callbackWasPublished = state_->frameAvailable;
+        drainInvalidatedFrameLocked(*state_);
+        if (state_->queuedFrame) {
+            state_->orphanDrainPending = callbackWasPublished;
+            state_->queuedFrame = {};
+            state_->frameAvailable = false;
+            state_->queuedFrameInvalidated = false;
+            state_->decoderCancellationCompleted = false;
+        }
+    }
+
     std::string lastError() const
     {
         std::lock_guard<std::mutex> lock(errorMutex_);
@@ -1966,6 +2107,13 @@ void OHCodecVulkanInterop::invalidatePendingFrames() noexcept
 {
     if (isValid()) {
         impl_->invalidatePendingFrames();
+    }
+}
+
+void OHCodecVulkanInterop::completePendingFrameInvalidation() noexcept
+{
+    if (isValid()) {
+        impl_->completePendingFrameInvalidation();
     }
 }
 

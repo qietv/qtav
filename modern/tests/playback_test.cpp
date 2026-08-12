@@ -84,6 +84,11 @@ public:
     {
         ++invalidations_;
     }
+    void completePendingFrameInvalidation() noexcept override
+    {
+        ++invalidationCompletions_;
+        changed_.notify_all();
+    }
 
     bool waitUntilEntered()
     {
@@ -108,12 +113,22 @@ public:
         return invalidations_.load();
     }
 
+    bool waitUntilInvalidationCompleted()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return invalidationCompletions_.load() > 0; });
+    }
+
 private:
     std::mutex mutex_;
     std::condition_variable changed_;
     bool entered_ = false;
     bool released_ = false;
     std::atomic<int> invalidations_ { 0 };
+    std::atomic<int> invalidationCompletions_ { 0 };
     EventCallback callback_;
 };
 
@@ -217,6 +232,46 @@ private:
 int main(int argc, char** argv)
 {
     assert(argc == 2);
+
+    qtav::Player openingSeekPlayer;
+    std::mutex openingSeekMutex;
+    std::condition_variable openingSeekChanged;
+    std::atomic<bool> openingSeekIssued { false };
+    std::atomic<bool> openingSeekAccepted { false };
+    std::int64_t openingSeekResult = -2;
+    openingSeekPlayer.onMediaStatus(
+        [&](qtav::MediaStatus, qtav::MediaStatus status) -> bool {
+            if (status != qtav::MediaStatus::Loading
+                || openingSeekIssued.load()) {
+                return true;
+            }
+            openingSeekIssued.store(true);
+            openingSeekAccepted.store(openingSeekPlayer.seek(
+                500,
+                qtav::SeekFlag::KeyFrame,
+                [&](std::int64_t position) {
+                    {
+                        std::lock_guard<std::mutex> lock(openingSeekMutex);
+                        openingSeekResult = position;
+                    }
+                    openingSeekChanged.notify_all();
+                }));
+            return true;
+        });
+    openingSeekPlayer.setMedia(argv[1]);
+    openingSeekPlayer.setState(qtav::State::Playing);
+    {
+        std::unique_lock<std::mutex> lock(openingSeekMutex);
+        assert(openingSeekChanged.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            [&] { return openingSeekResult != -2; }));
+    }
+    assert(openingSeekIssued.load());
+    assert(openingSeekAccepted.load());
+    assert(openingSeekResult >= 0);
+    openingSeekPlayer.setState(qtav::State::Stopped);
+    assert(openingSeekPlayer.waitFor(qtav::State::Stopped, 5'000));
 
     qtav::Player player;
     std::mutex mutex;
@@ -474,7 +529,10 @@ int main(int argc, char** argv)
     assert(
         blockingRenderer->invalidations()
         == invalidationsBeforeSeek + 1);
-    invalidationPlayer.setVideoRenderAPI({});
+    // Decoder-flush completion must not wait for a native render call. A
+    // platform codec release/present operation can itself need that flush to
+    // make progress.
+    assert(blockingRenderer->waitUntilInvalidationCompleted());
     blockingRenderer->release();
     {
         std::unique_lock<std::mutex> requestLock(renderRequestMutex);
@@ -489,6 +547,7 @@ int main(int argc, char** argv)
         == qtav::VideoRenderStatus::FrameDiscarded);
     assert(invalidatedRender.frameSequence > 0);
     assert(!invalidatedRender.detail.empty());
+    invalidationPlayer.setVideoRenderAPI({});
     invalidationPlayer.setState(qtav::State::Stopped);
     assert(invalidationPlayer.waitFor(qtav::State::Stopped, 5'000));
 

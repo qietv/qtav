@@ -137,6 +137,7 @@ public:
     void setFrameAvailableCallback(
         FrameAvailableCallback callback) override;
     void invalidatePendingFrames() noexcept override;
+    void completePendingFrameInvalidation() noexcept override;
 
     OHCodecVulkanInteropStatistics statistics() const noexcept;
     OHCodecVulkanNativeBufferObservation

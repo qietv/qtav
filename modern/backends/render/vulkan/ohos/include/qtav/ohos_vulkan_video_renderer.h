@@ -59,6 +59,7 @@ public:
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
     void invalidatePendingFrames() noexcept override;
+    void completePendingFrameInvalidation() noexcept override;
 
     // The adapter acquires its own OHNativeWindow reference. Republishing the
     // same window after an XComponent size change refreshes the swapchain;

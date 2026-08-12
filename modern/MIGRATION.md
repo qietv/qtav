@@ -868,8 +868,14 @@ implementation.
   call `VideoRenderAPI::invalidatePendingFrames()` automatically. The default
   implementation is a non-blocking no-op; asynchronous native-buffer backends
   cancel only producer associations which have not entered GPU submission.
-  Existing custom renderer source does not need an override, but consumers
-  must rebuild for the appended public virtual;
+  A hardware-decoder seek then flushes the decoder without joining native
+  render calls, publishes that cancellation generation, and calls
+  `completePendingFrameInvalidation()`. Backends use that second phase to
+  retire a producer callback synchronously cancelled by the flush. A retired
+  render call which overlaps the first pass repeats both hooks when it returns.
+  Both appended virtuals default to no-op, so custom renderer source remains
+  compatible after consumers rebuild; no application-side interop flush,
+  render-thread wait, or per-frame wait is required;
 - `OpenGLPresentCallback` runs on that same graphics-owner thread after
   framebuffer submission and before hardware-source release; it is intended
   for the adapter's bounded window-present call, not general application work;
@@ -885,7 +891,10 @@ implementation.
   wrapper). Its default implementation calls the legacy boolean `render()`;
   backend event callbacks may request another player state;
 - audio-sink and video-render backend event callbacks run on the thread chosen
-  by the backend and may request another player state;
+  by the backend and may request another player state. A native producer may
+  invoke its redraw callback before the producer call returns; renderer
+  adapters therefore forward redraw through synchronization independent of
+  render-state locks and coalesce that producer decision to one redraw;
 - compressed audio packets cross a bounded queue to their decode worker, then
   decoded audio crosses a second bounded queue to the dedicated audio-output worker;
   ordinary conversion, time stretching, sink writes, and primary device-clock

@@ -771,6 +771,10 @@ remain unchanged.
   make statistics optional
 - Amended: 2026-08-12 to make exact retry-frame retention and pending-producer
   invalidation a Player/backend responsibility
+- Amended: 2026-08-12 to make decoder-flush cancellation a two-phase
+  discontinuity contract
+- Amended: 2026-08-12 to isolate synchronous native callbacks from renderer
+  state locks and coalesce one redraw per producer decision
 - Status: Accepted
 - Scope: Core render snapshots and cross-platform deferred-producer
   invalidation, plus Windows D3D11 context scheduling, composition output retry
@@ -793,6 +797,25 @@ non-blocking native-render contract. Atomically publishing Player render state
 removed that collision, then reason-level diagnostics exposed the remaining
 owner: FFmpeg's reservation-aware D3D11VA work could release and immediately
 reacquire the recursive immediate-context lock before a timer-only retry.
+
+The later OHOS seek stress matrix exposed a second lifecycle boundary. A
+non-blocking generation invalidation can mark an asynchronous producer stale,
+but some codec outputs never publish their native consumer callback because
+`avcodec_flush_buffers()` synchronously cancels them. Waiting for that callback
+before flushing is circular and produced a one-second seek timeout. Clearing
+the association before all old CPU render calls return is also unsafe because
+one of those calls can republish the retired producer after the clear.
+Joining those calls before flush is equally circular on OHCodec: a native
+`ReleaseOutputBuffer`/producer operation can itself wait for decoder flush and
+caused the foreground process to exceed the six-second thread-block watchdog.
+The consumer callback may also arrive before that producer operation returns.
+The OHOS adapter and mobile selector previously forwarded the callback through
+their recursive renderer-state locks while the render thread held those locks
+around the producer call. The callback then waited for the render thread, while
+the render thread's next native producer operation waited for callback return.
+Forwarding both the callback edge and the producer-return edge could also
+schedule two redraws for one exactly-once OHCodec token; the second present was
+a successful no-op and could not generate another consumer callback.
 
 ### Decision
 
@@ -834,6 +857,20 @@ reacquire the recursive immediate-context lock before a timer-only retry.
    retries and invoke a non-blocking renderer invalidation hook for producer
    work which has not entered GPU submission. Recheck and invalidate again
    after an overlapping backend call closes the old-render/new-seek race.
+8. A hardware-decoder seek uses a two-phase discontinuity protocol. First,
+   publish generation invalidation, then flush the decoder without joining
+   native render calls and publish the completed cancellation generation.
+   `completePendingFrameInvalidation()` may retire an invalidated association
+   whose callback the decoder flush cancelled; it may not wait for submitted
+   GPU work. An old render call which returns after that generation repeats
+   invalidation and completion, closing the late-republish race without a
+   render-thread barrier. Both public hooks default to no-op.
+9. Backend redraw callbacks use synchronization independent of renderer state
+   held across a native producer/present call. The mobile selector validates a
+   redraw against atomically published active API/generation identity without
+   entering its render-state mutex. When a native consumer callback arrives
+   before its producer call returns, interop records that edge and publishes
+   exactly one redraw after producer completion.
 
 ### Consequences
 
@@ -852,6 +889,13 @@ reacquire the recursive immediate-context lock before a timer-only retry.
 - The new public result and Windows statistics are additive API. Existing code
   using `renderVideo()` and `skippedRenders` continues to compile, with the
   clarified terminal-drop meaning for the latter.
+- Applications do not wait for, flush, or track backend producer state around
+  Player controls. Decoder cancellation and the repeated completion pass add
+  no steady-state frame cost and preserve the lifetime of GPU work already
+  submitted.
+- Callback delivery cannot form a renderer-state/native-producer lock cycle,
+  and one exactly-once decoder output cannot leave a duplicate redraw waiting
+  for a callback which will never exist.
 - D3D11 statistics use `Off`, `Counters`, or `Timing`. The high-level output no
   longer reads, clears, and re-aggregates renderer atomics after every frame;
   retry behavior remains identical when statistics are off.

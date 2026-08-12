@@ -174,6 +174,7 @@ public:
     // submission. This is a non-blocking presentation-generation boundary;
     // submitted GPU work keeps its normal retained lifetime.
     virtual void invalidatePendingFrames() noexcept;
+    virtual void completePendingFrameInvalidation() noexcept;
 };
 
 class QTAV_RENDER_VULKAN_EXPORT VulkanVideoRenderer final
@@ -201,6 +202,7 @@ public:
     bool render(const VideoFrame& frame) override;
     void close() noexcept override;
     void invalidatePendingFrames() noexcept override;
+    void completePendingFrameInvalidation() noexcept override;
 
     BorrowedVulkanDevice device() const noexcept;
     void setCurrentTargetCallback(VulkanCurrentTargetCallback callback);

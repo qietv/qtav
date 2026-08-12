@@ -782,6 +782,16 @@ player.stepForward();
 player.stepBackward();
 ```
 
+`seek()` also accepts the latest request while the selected media is still
+opening, once playback or prepare intent has been established. The request is
+resolved after stream discovery, when its position can be clamped against the
+real duration and seekability. Queuing that request does not interrupt the
+input open which must resolve it. The callback receives `-1` if opening or the
+subsequent seek fails. Applications therefore do not need to poll
+`MediaStatus::Loaded` before forwarding an early user seek; the synchronous
+return value means that the asynchronous request was accepted, not that the
+demux seek has already completed.
+
 `SeekFlag::Accurate` can be passed to `seek()` or `prepare()` and takes
 precedence over `KeyFrame` and `AnyFrame`. For an active video track, Player
 seeks to a preceding keyframe, decodes without
@@ -1838,13 +1848,26 @@ backend call, so a seek, stop, or media replacement that overlaps rendering
 returns `FrameDiscarded` for that stale completion. The same generation change
 calls the renderer's non-blocking `invalidatePendingFrames()` hook, canceling
 producer associations that have not entered a GPU submission without waiting
-for submitted work. Existing custom renderers inherit a no-op implementation,
-but consumers must rebuild because the public C++ vtable changed. The compatibility
+for submitted work. For a hardware-decoder seek, the playback worker flushes
+the decoder without joining native render calls, publishes that cancellation
+generation, and calls `completePendingFrameInvalidation()`. That second phase
+lets an interop retire a producer association whose native callback was
+synchronously cancelled by the decoder flush. An overlapping retired render
+repeats both phases when it returns, so it cannot republish stale producer
+state after the first completion pass. There is no per-frame, UI-thread,
+render-thread, or GPU-wide wait, and no application-side flush. Existing custom renderers inherit
+no-op implementations, but consumers must rebuild because the public C++ vtable changed. The compatibility
 `renderVideo()` returns the rendered timestamp in seconds and collapses every
 other result to a negative value. Existing boolean-only `VideoRenderAPI`
 implementations remain source-compatible: their `false` result maps to a
 one-millisecond `RetryAfterBackoff` attempt until they override
 `renderDetailed()`.
+Backend redraw callbacks may run synchronously before a native producer or
+present call returns. Renderer adapters must forward that edge without taking
+renderer-state locks held across the native call, and must schedule at most one
+redraw for that producer decision. The built-in mobile selector validates the
+event against atomically published active renderer identity and keeps callback
+synchronization separate from render-state synchronization.
 A/V startup and playing seeks use a bounded video preroll before releasing
 device audio, avoiding an audio-first clock sprint while the first video
 frames are still being decoded.

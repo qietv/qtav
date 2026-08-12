@@ -332,7 +332,7 @@ public:
     {
         EventCallback callback;
         {
-            std::lock_guard<std::recursive_mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(eventMutex_);
             callback = eventCallback_;
         }
         if (callback) {
@@ -862,6 +862,7 @@ public:
     }
 
     mutable std::recursive_mutex mutex_;
+    std::mutex eventMutex_;
     BorrowedOHOSVulkanContext context_;
     VulkanOutputPreference outputPreference_ =
         VulkanOutputPreference::PreferHdr;
@@ -915,7 +916,7 @@ void OHOSVulkanVideoRenderer::setEventCallback(EventCallback callback)
     if (!impl_) {
         return;
     }
-    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+    std::lock_guard<std::mutex> lock(impl_->eventMutex_);
     impl_->eventCallback_ = std::move(callback);
 }
 
@@ -1146,6 +1147,13 @@ void OHOSVulkanVideoRenderer::invalidatePendingFrames() noexcept
 {
     if (impl_) {
         impl_->renderer_.invalidatePendingFrames();
+    }
+}
+
+void OHOSVulkanVideoRenderer::completePendingFrameInvalidation() noexcept
+{
+    if (impl_) {
+        impl_->renderer_.completePendingFrameInvalidation();
     }
 }
 

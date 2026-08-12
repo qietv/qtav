@@ -35,6 +35,10 @@ void VideoRenderAPI::invalidatePendingFrames() noexcept
 {
 }
 
+void VideoRenderAPI::completePendingFrameInvalidation() noexcept
+{
+}
+
 AudioSink::~AudioSink() = default;
 
 bool AudioSink::drain()

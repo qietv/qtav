@@ -1193,16 +1193,22 @@ public:
         const auto current = hasFlag(flags, SeekFlag::FromNow)
             ? position()
             : static_cast<std::int64_t>(0);
+        bool queuedWhileOpening = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!hasOpenMedia_ || currentState_ == State::Stopped) {
+            const bool opened = hasOpenMedia_
+                && loadedSerial_ == mediaSerial_;
+            queuedWhileOpening = !opened && !url_.empty()
+                && requestedState_ != State::Stopped;
+            if ((!opened && !queuedWhileOpening)
+                || (opened && currentState_ == State::Stopped)) {
                 return false;
             }
             if (hasFlag(flags, SeekFlag::FromNow)) {
                 target += current;
             }
             target = std::max<std::int64_t>(0, target);
-            if (mediaInfo_.duration > 0) {
+            if (opened && mediaInfo_.duration > 0) {
                 target = std::min(target, mediaInfo_.duration);
             }
             accurateSeek_.reset();
@@ -1217,14 +1223,21 @@ public:
                     : SeekRequest::Kind::Normal,
                 std::move(callback),
             };
-            // Publish the discontinuity before the playback worker can take
-            // the request. Otherwise a callback thread can unlock here, let
-            // the worker enter seekMedia(), and only then invalidate its new
-            // interrupt epoch or presentation generation.
-            interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
-            invalidatePlaybackGeneration();
+            if (!queuedWhileOpening) {
+                // Publish the discontinuity before the playback worker can
+                // take the request. Otherwise a callback thread can unlock
+                // here, let the worker enter seekMedia(), and only then
+                // invalidate its new interrupt epoch or presentation
+                // generation. An opening input is different: changing the
+                // interrupt epoch would cancel the very open which must
+                // resolve the queued seek.
+                interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+                invalidatePlaybackGeneration();
+            }
         }
-        notifyPlaybackQueueInvalidation();
+        if (!queuedWhileOpening) {
+            notifyPlaybackQueueInvalidation();
+        }
         controlChanged_.notify_all();
         return true;
     }
@@ -1920,9 +1933,17 @@ public:
             if (renderAPI) {
                 // The backend may have queued an asynchronous producer after
                 // the control thread published the generation boundary. A
-                // second invalidation here closes that race without waiting
-                // for the render call or submitted GPU work.
+                // second invalidation here closes that race. If the decoder
+                // flush for this generation has already completed, repeat the
+                // completion phase too; this covers a backend call which
+                // queued its retired producer after the worker's first
+                // completion pass.
                 renderAPI->invalidatePendingFrames();
+                if (completedRendererInvalidationGeneration_.load(
+                        std::memory_order_acquire)
+                    >= completedGeneration) {
+                    renderAPI->completePendingFrameInvalidation();
+                }
             }
             return {
                 VideoRenderStatus::FrameDiscarded,
@@ -2131,6 +2152,34 @@ private:
                 entry.second->invalidatePendingFrames();
             }
         }
+    }
+
+    void completePendingRendererFrameInvalidation() noexcept
+    {
+        const auto bindings = std::atomic_load_explicit(
+            &renderBindings_,
+            std::memory_order_acquire);
+        if (!bindings) {
+            return;
+        }
+        for (const auto& entry : bindings->renderAPIs) {
+            if (entry.second) {
+                entry.second->completePendingFrameInvalidation();
+            }
+        }
+    }
+
+    void completePendingRendererFrameInvalidationAfterDecoderCancellation()
+        noexcept
+    {
+        // Publish the decoder-side cancellation authority before calling the
+        // backend. An old render call which returns concurrently will observe
+        // this generation and repeat both phases if it queued a producer
+        // after this pass.
+        completedRendererInvalidationGeneration_.store(
+            presentationGeneration_.load(std::memory_order_acquire),
+            std::memory_order_release);
+        completePendingRendererFrameInvalidation();
     }
 
     std::shared_ptr<RenderBindingsSnapshot> copyRenderBindings() const
@@ -2893,6 +2942,7 @@ private:
         closeAudioSink(true);
         closeVideoFrameProcessor();
         media_.reset();
+        completePendingRendererFrameInvalidationAfterDecoderCancellation();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             hasOpenMedia_ = false;
@@ -3580,6 +3630,7 @@ private:
             media_.audio = std::move(replacement);
         } else if (request.type == MediaType::Video) {
             media_.video = std::move(replacement);
+            completePendingRendererFrameInvalidationAfterDecoderCancellation();
         } else {
             media_.subtitle = std::move(replacement);
         }
@@ -3613,6 +3664,7 @@ private:
             media_.externalSubtitle.resetDemux();
             if (media_.video.valid()) {
                 avcodec_flush_buffers(media_.video.context);
+                completePendingRendererFrameInvalidationAfterDecoderCancellation();
             }
             if (media_.audio.valid()) {
                 avcodec_flush_buffers(media_.audio.context);
@@ -3675,6 +3727,14 @@ private:
 
     void handleSeek(SeekRequest request)
     {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // A seek accepted while the asynchronous input was opening could
+            // not be clamped against media duration at call time.
+            request.position = clampPositionLocked(request.position);
+            request.selectionTarget = clampPositionLocked(
+                request.selectionTarget);
+        }
         const int error = seekMedia(request.position, request.flags);
         if (error < 0) {
             publishEvent({
@@ -4073,6 +4133,12 @@ private:
         }
         if (media_.video.valid()) {
             avcodec_flush_buffers(media_.video.context);
+            // A synchronous hardware-decoder flush may cancel a producer
+            // output without ever publishing its Surface callback. Complete
+            // the renderer's second invalidation phase only after that
+            // cancellation authority has run, so no seek can deadlock waiting
+            // for a callback which the flush intentionally removed.
+            completePendingRendererFrameInvalidationAfterDecoderCancellation();
         }
         if (media_.audio.valid()) {
             avcodec_flush_buffers(media_.audio.context);
@@ -4352,6 +4418,7 @@ private:
 
         if (media_.video.valid()) {
             avcodec_flush_buffers(media_.video.context);
+            completePendingRendererFrameInvalidationAfterDecoderCancellation();
         }
         if (media_.audio.valid()) {
             avcodec_flush_buffers(media_.audio.context);
@@ -8867,6 +8934,7 @@ private:
                 naturalEnd && mediaInfo_.duration > 0 ? mediaInfo_.duration : 0;
             resetClockLocked(currentPosition_);
         }
+        completePendingRendererFrameInvalidationAfterDecoderCancellation();
         closeAudioSink(false);
         closeVideoFrameProcessor();
         publishState(State::Stopped);
@@ -8901,6 +8969,15 @@ private:
         if (prepare && prepare->callback) {
             bool boost = false;
             prepare->callback(-1, &boost);
+        }
+        std::optional<SeekRequest> seek;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            seek = std::move(seekRequest_);
+            seekRequest_.reset();
+        }
+        if (seek && seek->callback) {
+            seek->callback(-1);
         }
     }
 
@@ -9188,6 +9265,7 @@ private:
         std::make_shared<const RenderBindingsSnapshot>();
     std::shared_ptr<const VideoFrameSnapshot> currentVideoFrameSnapshot_;
     std::atomic<std::uint64_t> nextVideoFrameSequence_ { 1 };
+    std::atomic<std::uint64_t> completedRendererInvalidationGeneration_ { 0 };
 };
 
 Player::Player()

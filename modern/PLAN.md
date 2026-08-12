@@ -100,13 +100,20 @@ The following accepted decisions constrain all remaining work:
 - The OHCodec/Vulkan deferred-frame freeze root cause is repaired in C++.
   Player now retains the exact backend-deferred frame per renderer key and
   automatically invalidates pending producer associations at every
-  presentation-generation boundary. The OHCodec consumer path drains an
-  invalidated one-buffer output before admitting a new frame, without a CPU
-  copy, renderer fallback, or GPU-wide wait. Deterministic Windows playback
-  tests, OHOS arm64/API 23 shared/static cross-builds, the player native link,
-  and signed HAP packaging pass. Replaying the forward/backward seek matrix on
-  `legend.mkv` and `wednesday.mp4` remains a connected-device gate requiring
-  explicit installation approval; see
+  presentation-generation boundary, then completes decoder-cancelled
+  associations after synchronous flush without joining native render calls.
+  The OHCodec consumer path drains invalidated/orphaned buffers before
+  admitting a new frame. Native redraw callbacks no longer enter renderer
+  state locks held across producer calls, and an early callback is coalesced to
+  exactly one redraw per OHCodec output. The repair adds no CPU copy, renderer
+  fallback, caller-side flush, per-frame wait, or GPU-wide wait. Deterministic
+  playback coverage, OHOS arm64/API 23 shared/static cross-builds, the player
+  native link, and signed HAP packaging pass. The overwrite-installed HAP then
+  passed cold-start, forward-seek, and backward-seek cells on both `legend.mkv`
+  and `wednesday.mp4` at 24--25 FPS with balanced native release/callback
+  counts; eight additional Wednesday forward/backward pairs continued decoding
+  and presenting without a seek timeout, thread-block watchdog, or crash. The
+  cold cells did not show `当前媒体不可定位`; see
   [`PLAN_HISTORY_2026-08-12_OHOS_DEFERRED_RENDER_SEEK.md`](PLAN_HISTORY_2026-08-12_OHOS_DEFERRED_RENDER_SEEK.md).
 - The OHOS software-decode follow-up now keeps FFmpeg LTO/NEON and the shared
   small-build policy while overriding the effective arm64 optimization from
@@ -314,6 +321,9 @@ all those frames still used an RGBA16F normalization image.
   still reported tone mapping. The 2026-08-12 follow-up then replaced the
   former Profile 5 Vulkan-to-OpenGL fallback with opaque identity Vulkan
   sampling and passed repeated `wednesday -> legend -> wednesday` switching.
+  The separate deferred-render regression now also passes cold-start plus
+  forward/backward seek on both local files and an eight-pair Wednesday seek
+  stress run without presentation freeze.
   Physical audio identity and the remaining broad manual cells stay open.
 
 The four-thread software-decode build, signed-device counters, temperatures,

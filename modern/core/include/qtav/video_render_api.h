@@ -173,6 +173,12 @@ public:
     // presentation generation changes. Implementations must be thread-safe,
     // non-blocking, and must not wait for submitted GPU work.
     virtual void invalidatePendingFrames() noexcept;
+    // Completes a prior invalidation after Player has synchronously cancelled
+    // decoder outputs. Render attempts may still overlap this phase; backends
+    // use it to discard producer associations which the decoder cancellation
+    // removed without publishing a consumer callback. The default has no
+    // pending producer state. This hook must be thread-safe and non-blocking.
+    virtual void completePendingFrameInvalidation() noexcept;
 };
 
 } // namespace qtav
