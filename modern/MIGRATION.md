@@ -170,7 +170,11 @@ already own a graphics context or require multiple/custom render targets:
   `VK_EXT_swapchain_colorspace` on the borrowed instance report that fact in
   the trailing `BorrowedOHOSVulkanContext::swapchainColorSpaceEnabled` field;
   its trailing placement preserves the meaning of older aggregate
-  initializers;
+  initializers. A same-window XComponent resize recreates only Vulkan
+  swapchain/render-target resources and preserves the renderer candidate plus
+  hardware-decoder interop generation. The adapter owns WSI
+  `currentTransform` handling; applications must not translate window
+  orientation into media rotation or an inverse viewport;
 - optional platform-neutral `QtAV::RenderOpenGL` OpenGL ES 3.x rendering with
   libplacebo color conversion, scaling, tone mapping, output encoding, and
   FFmpeg-parsed Dolby Vision RPU reshaping, plus Android
@@ -761,10 +765,17 @@ implementation.
   callbacks normally run on the playback worker; selected audio/video packets
   cross bounded queues to independent decode workers so one codec or output
   path cannot starve the other stream;
+- post-load subtitle selection is presentation-only: it swaps the subtitle
+  decoder on the playback worker, clears queued old-track cues, and replays a
+  bounded recent compressed-subtitle cache without invalidating audio/video
+  queues, closing the audio sink, publishing global buffering, or seeking the
+  primary A/V input. External subtitle inputs may seek their independent demux
+  cursor without disturbing primary playback;
 - compressed-packet buffering is now explicit through `PacketBufferPolicy`,
   `packetBufferStatus()`, and `onPacketBufferStatus()`. Initial playback, seek,
-  track switching, and confirmed queue underflow fill both selected A/V queues
-  to a time target before decoder release. The status exposes the minimum
+  audio/video track switching, and confirmed queue underflow fill both selected
+  A/V queues to a time target before decoder release. Subtitle-only selection
+  uses the independent path above. The status exposes the minimum
   usable A/V duration, combined bytes, memory/disk byte split, temporary-cache
   path, progress, reason, capacity-limited completion, and presentation
   generation; an underflow transition may run on the starving decode worker;
@@ -916,8 +927,8 @@ implementation.
 - `Player::position()` reads a generation-checked cached device-clock snapshot
   and never calls a sink or waits behind a sink write;
 - changing `HardwareDecodeConfig` while media is open interrupts and
-  asynchronously reopens the decoder; hardware frame callbacks run on the
-  presentation worker;
+  asynchronously reopens the decoder at the observed playback position;
+  hardware frame callbacks run on the presentation worker;
 - replacing its supplied `HardwareDecodeDevice` token also reopens the
   decoder; a token/type mismatch follows the selected software-fallback
   policy before decoder open;

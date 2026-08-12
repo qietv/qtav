@@ -813,7 +813,7 @@ public:
             static_cast<int>(extent_.width),
             static_cast<int>(extent_.height),
         };
-        config_.viewport = {};
+        config_.viewport = applicationViewport_;
         config_.rotation = applicationRotation_;
     }
 
@@ -889,6 +889,8 @@ public:
     bool acquired_ = false;
     bool open_ = false;
     bool engineOpen_ = false;
+    VideoSize applicationSurfaceSize_;
+    VideoViewport applicationViewport_;
     VideoRotation applicationRotation_ = VideoRotation::Rotate0;
 };
 
@@ -938,6 +940,8 @@ bool OHOSVulkanVideoRenderer::open(
             opened = false;
         } else {
             impl_->config_ = config;
+            impl_->applicationSurfaceSize_ = config.surfaceSize;
+            impl_->applicationViewport_ = config.viewport;
             impl_->applicationRotation_ = config.rotation;
             impl_->updateConfigForSurface();
             opened = impl_->renderer_.open(impl_->config_);
@@ -960,14 +964,42 @@ bool OHOSVulkanVideoRenderer::configure(
     if (!impl_) {
         return false;
     }
-    std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
-    if (!impl_->open_ || !impl_->swapchain_) {
-        return false;
+    std::string error;
+    bool configured = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
+        if (!impl_->open_ || !impl_->swapchain_) {
+            error = "The OHOS Vulkan renderer is closed or has no swapchain";
+        } else {
+            const bool surfaceSizeChanged =
+                impl_->applicationSurfaceSize_.width
+                    != config.surfaceSize.width
+                || impl_->applicationSurfaceSize_.height
+                    != config.surfaceSize.height;
+            impl_->config_ = config;
+            impl_->applicationSurfaceSize_ = config.surfaceSize;
+            impl_->applicationViewport_ = config.viewport;
+            impl_->applicationRotation_ = config.rotation;
+            if (surfaceSizeChanged) {
+                // A same-window XComponent resize retires only swapchain and
+                // engine target resources. The adapter and any OHCodec
+                // interop attached to it keep their identity and surface
+                // generation.
+                configured = impl_->recreate(error);
+            } else {
+                impl_->updateConfigForSurface();
+                configured = impl_->renderer_.configure(impl_->config_);
+                if (!configured) {
+                    error =
+                        "The Vulkan engine rejected the OHOS surface configuration";
+                }
+            }
+        }
     }
-    impl_->config_ = config;
-    impl_->applicationRotation_ = config.rotation;
-    impl_->updateConfigForSurface();
-    return impl_->renderer_.configure(impl_->config_);
+    if (!configured) {
+        impl_->notify(VideoRenderEventType::Error, std::move(error));
+    }
+    return configured;
 }
 
 VideoRenderAttemptResult OHOSVulkanVideoRenderer::renderDetailed(

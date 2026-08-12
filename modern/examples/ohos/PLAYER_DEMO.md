@@ -32,7 +32,10 @@ validation harness in this directory. Its ArkUI template is under
   BT.2020/HLG target and per-frame HDR metadata;
 - OHAudio device output through libswresample and the optional FFmpeg `atempo`
   time stretcher;
-- normal and landscape full-screen layouts;
+- normal and landscape full-screen layouts using one persistent XComponent;
+  switching layout is a presentation-only resize, while the OHOS Vulkan
+  adapter owns WSI orientation and both backends preserve ordinary `Fit`
+  geometry without rebinding the decoder;
 - system picture-in-picture using the same ArkUI `XComponentController`, with
   play/pause and ten-second seek actions in the PiP control panel plus optional
   automatic PiP when returning home and an explicit stop/restore control in
@@ -101,11 +104,15 @@ failure.
    certificate validation for the deployment environment.
 3. With a multi-track fixture, switch every audio track and verify the selected
    track ID plus audible output. Switch each text/ASS subtitle track, disable
-   subtitles, and verify old cues clear across switch and seek.
+   subtitles, and verify old cues clear across switch and seek. A subtitle-only
+   switch must not publish `Buffering`, reopen/flush audio, or make video PTS
+   move backward.
 4. Exercise every rate preset and verify audio remains pitch-preserved and A/V
    synchronized.
 5. Enter and exit landscape full screen, then start/restore PiP. Exercise PiP
-   play/pause and both ten-second seek controls.
+   play/pause and both ten-second seek controls. Verify the progress value does
+   not restart, video remains upright, and a 16:9 source is not stretched in
+   either landscape full screen or PiP.
 6. Close and reopen the media-information panel. Record successful-presentation
    FPS, decoded/presented counters, queue/late drops, renderer selection, and
    any OHAudio or network event.
@@ -207,6 +214,17 @@ behind the `SURFACE` XComponent and provides letterbox color for `Fit`; it did
 not cover the hardware-decoded layer. A system screenshot is useful for
 checking geometry and overlays but is composited/captured as SDR, so its pixel
 brightness is not accepted as HDR evidence.
+
+The initial 2026-08-12 full-screen regression used device-local `legend.mkv`
+on the connected ALN-AL80 and proved that one persistent XComponent removed
+the media restart. A follow-up root-cause audit superseded its demo-level
+Vulkan/GLES rotation compensation: a same-window resize now keeps the selector
+candidate and OHCodec interop surface generation, Vulkan owns its WSI surface
+transform, and the demo always requests ordinary `Fit` geometry. The original
+PiP observation remains useful: its 1182x665 surface displayed as 672x378 with
+no size distortion. The final signed-device acceptance then repeated five
+full-screen/restore cycles without restart, backward movement, stop, or aspect
+ratio drift.
 
 The same run also exercised HTTPS H.264/AAC playback through Vulkan,
 successful-presentation FPS, 1.5x rate, ten-second skip, landscape full screen,

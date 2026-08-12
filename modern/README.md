@@ -115,8 +115,10 @@ QtAVCore target. Linux is not part of the active target matrix or roadmap.
   publishes its output color space, and owns surface/swapchain synchronization;
 - optional OHOS Vulkan surface adapter that retains an ArkUI/XComponent
   `OHNativeWindow`, owns `VK_OHOS_surface` swapchain synchronization, and
-  verifies the selected native-window SDR/HDR color space before delegating
-  rendering to the same platform-neutral Vulkan engine;
+  verifies the selected native-window SDR/HDR color space, handles the WSI
+  surface transform inside the adapter, and recreates only swapchain/render
+  targets for a same-window resize before delegating to the same
+  platform-neutral Vulkan engine;
 - optional platform-neutral OpenGL ES 3.x renderer using libplacebo for
   software and hardware-frame color conversion, Dolby Vision RPU reshaping,
   tone mapping, gamut mapping, and output encoding, plus separate Android and
@@ -273,7 +275,9 @@ Current backend integration boundary:
 - `QtAV::RenderVulkanOHOS` owns the OHOS surface, swapchain, image views, and
   acquire/present resources for a retained XComponent `OHNativeWindow`. The
   ArkUI application owns the XComponent and borrowed Vulkan instance, device,
-  queue, and their lifetime;
+  queue, and their lifetime. A same-window resize retains the adapter and
+  decoder interop generation; WSI orientation is not an application-level
+  media rotation;
 - `QtAV::RenderOpenGL` uploads the same software YUV420/422/444, NV12/NV21,
   P010, RGB/BGR/RGBA/BGRA/ARGB, and Gray8 families into OpenGL ES textures,
   maps their structured metadata through the shared FFmpeg/libplacebo bridge,
@@ -2739,8 +2743,10 @@ whose first sample is invalid falls back after the first delivered buffer.
 
 `HardwareDecodeConfig` is copied by `Player` and applied the next time the
 video decoder opens. Changing it while media is loaded interrupts the current
-open/read operation and asynchronously reopens the media. The generic core
-maps `HardwareDeviceType` to FFmpeg's internal hardware-device selection,
+open/read operation and asynchronously reopens the media at the observed
+playback position instead of restarting at the playback-range origin. The
+generic core maps `HardwareDeviceType` to FFmpeg's internal hardware-device
+selection,
 checks the codec's advertised hardware pixel format, and keeps the platform
 types private. A backend can additionally request a registered FFmpeg decoder
 by wrapper identity and attach an application surface generation; both values

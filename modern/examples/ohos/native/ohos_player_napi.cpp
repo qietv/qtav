@@ -425,6 +425,13 @@ public:
             return;
         }
 
+        {
+            std::ostringstream message;
+            message << "XComponent surface created " << width << "x"
+                    << height << " window=" << window;
+            logMessage(LOG_INFO, message.str());
+        }
+
         std::lock_guard<std::mutex> lock(pipelineMutex_);
         closeRendererLocked();
         window_ = window;
@@ -465,30 +472,66 @@ public:
             return;
         }
 
+        {
+            std::ostringstream message;
+            message << "XComponent surface changed " << width << "x"
+                    << height << " window=" << window;
+            logMessage(LOG_INFO, message.str());
+        }
+
         std::lock_guard<std::mutex> lock(pipelineMutex_);
         if (!selector_ || window != window_) {
             return;
         }
-        renderConfig_.surfaceSize = {
+        const OHCodecSurface previousDecoderSurface =
+            selectedOHCodecSurfaceLocked();
+        VideoRenderConfig replacement = renderConfig_;
+        replacement.surfaceSize = {
             static_cast<int>(width),
             static_cast<int>(height),
         };
-        renderConfig_.aspectRatio = VideoAspectRatioMode::Fit;
-        selector_->suspendSurface();
-        if (!selector_->configure(renderConfig_)
-            || !selector_->recreateSurface()) {
-            setError("Could not recreate the resized video surface");
+        replacement.viewport = {};
+        replacement.aspectRatio = VideoAspectRatioMode::Fit;
+        replacement.rotation = VideoRotation::Rotate0;
+        if (!selector_->configure(replacement)) {
+            setError("Could not resize the video presentation surface");
             return;
         }
-        if (!configureDecoderLocked()) {
-            setError("Could not rebind the decoder to the resized surface");
-            return;
+        renderConfig_ = replacement;
+        {
+            std::ostringstream message;
+            message << "Video presentation resized to " << width << "x"
+                    << height;
+            if (vulkanRenderer_) {
+                const VideoSize size = vulkanRenderer_->surfaceSize();
+                message << "; Vulkan swapchain " << size.width << "x"
+                        << size.height;
+            } else if (openGLRenderer_) {
+                const VideoSize size = openGLRenderer_->surfaceSize();
+                message << "; EGL surface " << size.width << "x"
+                        << size.height;
+            }
+            logMessage(LOG_INFO, message.str());
+        }
+
+        const OHCodecSurface currentDecoderSurface =
+            selectedOHCodecSurfaceLocked();
+        if (previousDecoderSurface.nativeWindow()
+                != currentDecoderSurface.nativeWindow()
+            || previousDecoderSurface.generation()
+                != currentDecoderSurface.generation()) {
+            if (!configureDecoderLocked()) {
+                setError(
+                    "Could not rebind the decoder after renderer recovery");
+                return;
+            }
         }
         requestRender();
     }
 
     void releaseSurface()
     {
+        logMessage(LOG_INFO, "XComponent surface destroyed");
         const bool shouldPause =
             wantsPlaying_.load(std::memory_order_acquire);
         if (shouldPause) {
@@ -794,6 +837,9 @@ private:
             renderPreference_ == RenderPreference::OpenGLES
             ? MobileRenderAPI::OpenGLES
             : MobileRenderAPI::Vulkan;
+        renderConfig_.viewport = {};
+        renderConfig_.aspectRatio = VideoAspectRatioMode::Fit;
+        renderConfig_.rotation = VideoRotation::Rotate0;
         if (renderPreference_ != RenderPreference::OpenGLES) {
             config.vulkan = [this] {
             openGLRenderer_.reset();

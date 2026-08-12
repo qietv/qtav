@@ -69,6 +69,9 @@ constexpr std::size_t kMinimumVideoPrerollFrames = 6;
 constexpr std::size_t kMaximumQueuedSoftwareVideoFrames = 8;
 constexpr std::size_t kMaximumQueuedHardwareVideoFrames = 24;
 constexpr std::size_t kMaximumQueuedSubtitleFrames = 64;
+constexpr std::size_t kMaximumCachedSubtitlePackets = 512;
+constexpr std::uint64_t kMaximumCachedSubtitleBytes = 4U * 1024U * 1024U;
+constexpr std::int64_t kSubtitleReplayWindowMilliseconds = 60'000;
 constexpr std::size_t kMaximumQueuedAudioPackets = 128;
 constexpr std::size_t kMaximumQueuedVideoPackets = 128;
 constexpr std::size_t kMaximumQueuedDiskPacketMetadata = 16'384;
@@ -982,6 +985,15 @@ public:
         std::int64_t position = 0;
     };
 
+    struct CachedSubtitlePacket {
+        std::shared_ptr<AVPacket> packet;
+        InputSource source = InputSource::Primary;
+        int streamIndex = -1;
+        std::int64_t timestamp = 0;
+        std::int64_t duration = 0;
+        std::uint64_t bytes = 0;
+    };
+
     struct AudioSinkCallbackBridge {
         std::mutex mutex;
         Impl* owner = nullptr;
@@ -1116,7 +1128,7 @@ public:
             return false;
         }
 
-        const auto reopenPosition = position();
+        const auto reopenPosition = std::max<std::int64_t>(0, position());
         bool reopen = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1428,14 +1440,20 @@ public:
                 track,
                 requestedPosition,
             });
-            accurateSeek_.reset();
-            seekCompletion_.reset();
+            if (type != MediaType::Subtitle) {
+                accurateSeek_.reset();
+                seekCompletion_.reset();
+            }
         }
 
-        // Match seek(): public control calls invalidate without waiting. The
-        // playback worker drains in-flight decoder work before replacement.
-        invalidatePlaybackQueues();
-        interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        if (type != MediaType::Subtitle) {
+            // Audio/video replacement keeps the existing generation-boundary
+            // contract. Subtitle selection is presentation-only: it must not
+            // invalidate A/V queues, reset the playback clock, or interrupt a
+            // decoder read merely to change overlay text.
+            invalidatePlaybackQueues();
+            interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
         controlChanged_.notify_all();
         return true;
     }
@@ -1771,6 +1789,7 @@ public:
 
     void setHardwareDecodeConfig(HardwareDecodeConfig config)
     {
+        const auto reopenPosition = position();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (hardwareDecodeConfig_.deviceType == config.deviceType
@@ -1790,6 +1809,18 @@ public:
             hardwareDecodeConfig_ = config;
             ++mediaSerial_;
             loadedSerial_ = 0;
+            if (!url_.empty() && requestedState_ != State::Stopped) {
+                seekRequest_.reset();
+                trackSwitchRequests_.clear();
+                accurateSeek_.reset();
+                seekCompletion_.reset();
+                prepareRequest_ = PrepareRequest {
+                    ++requestSerial_,
+                    reopenPosition,
+                    SeekFlag::KeyFrame,
+                    {},
+                };
+            }
         }
         resetPlaybackQueues();
         interruptEpoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -2939,6 +2970,7 @@ private:
     {
         resetPlaybackQueues();
         resetReadRecoveryTracking();
+        clearSubtitlePacketCache();
         closeAudioSink(true);
         closeVideoFrameProcessor();
         media_.reset();
@@ -3599,9 +3631,12 @@ private:
                         + " track " + std::to_string(request.track),
                     AVERROR_DECODER_NOT_FOUND,
                 });
-                // The public call already invalidated queued output. Re-seek
-                // the unchanged decoders so playback resumes coherently.
-                if (mediaInfo().seekable) {
+                // Audio/video public calls already invalidated queued output;
+                // re-seek their unchanged decoders so playback resumes
+                // coherently. Subtitle selection never invalidates A/V, so a
+                // failed replacement can leave the current path untouched.
+                if (request.type != MediaType::Subtitle
+                    && mediaInfo().seekable) {
                     seekMedia(
                         request.position,
                         SeekFlag::KeyFrame,
@@ -3612,6 +3647,68 @@ private:
         }
 
         if (wasCanceled(request.mediaSerial)) {
+            return;
+        }
+
+        if (request.type == MediaType::Subtitle) {
+            TrackSource selected;
+            if (request.track >= 0) {
+                const auto* source = trackSource(
+                    request.track, MediaType::Subtitle);
+                if (!source) {
+                    return;
+                }
+                selected = *source;
+            }
+
+            media_.subtitle = std::move(replacement);
+            bool externalSubtitleAligned = false;
+            if (request.track >= 0
+                && selected.source == InputSource::ExternalSubtitle) {
+                AVFormatContext* format = formatForSource(selected.source);
+                if (formatIsSeekable(format)) {
+                    const auto timestamp =
+                        startTimeForSource(selected.source)
+                        + request.position
+                            * static_cast<std::int64_t>(1000);
+                    if (avformat_seek_file(
+                            format,
+                            -1,
+                            std::numeric_limits<std::int64_t>::min(),
+                            timestamp,
+                            std::numeric_limits<std::int64_t>::max(),
+                            AVSEEK_FLAG_BACKWARD)
+                        >= 0) {
+                        demuxForSource(selected.source).reset();
+                        externalSubtitleAligned = true;
+                    }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!hasOpenMedia_
+                    || request.mediaSerial != mediaSerial_
+                    || loadedSerial_ != mediaSerial_) {
+                    return;
+                }
+                mediaInfo_.activeSubtitleTrack = request.track;
+            }
+            clearQueuedSubtitlePresentations();
+            if (request.track >= 0 && !externalSubtitleAligned) {
+                replayCachedSubtitlePackets(
+                    selected,
+                    request.position,
+                    presentationGeneration_.load(
+                        std::memory_order_acquire));
+            }
+            publishEvent({
+                "track.changed",
+                request.track >= 0
+                    ? "subtitle track changed to "
+                        + std::to_string(request.track)
+                    : "subtitle tracks disabled",
+                0,
+            });
             return;
         }
 
@@ -4043,6 +4140,7 @@ private:
         const auto previousPosition = position();
         resetPlaybackQueues();
         resetReadRecoveryTracking();
+        clearSubtitlePacketCache();
         flushAudioSink();
         bool waitForData = false;
         {
@@ -4209,6 +4307,121 @@ private:
             || (media_.subtitle.valid()
                 && media_.subtitle.source == InputSource::Primary);
         return !hasPrimaryDecoder;
+    }
+
+    bool isSubtitleStream(InputSource source, int streamIndex) const noexcept
+    {
+        return std::any_of(
+            media_.tracks.begin(),
+            media_.tracks.end(),
+            [source, streamIndex](const TrackSource& track) {
+                return track.type == MediaType::Subtitle
+                    && track.source == source
+                    && track.streamIndex == streamIndex;
+            });
+    }
+
+    void cacheSubtitlePacket(
+        InputSource source,
+        AVFormatContext* format,
+        const AVPacket* packet)
+    {
+        if (!format || !packet || packet->stream_index < 0
+            || static_cast<unsigned>(packet->stream_index)
+                >= format->nb_streams
+            || !isSubtitleStream(source, packet->stream_index)) {
+            return;
+        }
+        AVPacket* copy = av_packet_clone(packet);
+        if (!copy) {
+            return;
+        }
+        std::shared_ptr<AVPacket> retained(
+            copy,
+            [](AVPacket* owned) { av_packet_free(&owned); });
+        const AVStream* stream = format->streams[packet->stream_index];
+        const std::int64_t packetTimestamp = packet->pts != AV_NOPTS_VALUE
+            ? packet->pts
+            : packet->dts;
+        const std::int64_t timestamp = packetTimestamp == AV_NOPTS_VALUE
+            ? 0
+            : std::max<std::int64_t>(
+                  0,
+                  (av_rescale_q(
+                       packetTimestamp,
+                       stream->time_base,
+                       AV_TIME_BASE_Q)
+                      - startTimeForSource(source))
+                      / 1000);
+        const std::int64_t duration = packet->duration > 0
+            ? std::max<std::int64_t>(
+                  0,
+                  toMilliseconds(packet->duration, stream->time_base))
+            : 0;
+        const std::uint64_t bytes = static_cast<std::uint64_t>(
+            std::max(packet->size, 0));
+        if (bytes > kMaximumCachedSubtitleBytes) {
+            return;
+        }
+        while (!subtitlePacketCache_.empty()
+               && (subtitlePacketCache_.size()
+                       >= kMaximumCachedSubtitlePackets
+                   || cachedSubtitlePacketBytes_ + bytes
+                       > kMaximumCachedSubtitleBytes)) {
+            cachedSubtitlePacketBytes_ -=
+                subtitlePacketCache_.front().bytes;
+            subtitlePacketCache_.pop_front();
+        }
+        subtitlePacketCache_.push_back({
+            std::move(retained),
+            source,
+            packet->stream_index,
+            timestamp,
+            duration,
+            bytes,
+        });
+        cachedSubtitlePacketBytes_ += bytes;
+    }
+
+    void clearSubtitlePacketCache() noexcept
+    {
+        subtitlePacketCache_.clear();
+        cachedSubtitlePacketBytes_ = 0;
+    }
+
+    void clearQueuedSubtitlePresentations()
+    {
+        std::lock_guard<std::mutex> lock(presentationMutex_);
+        for (auto item = presentationQueue_.begin();
+             item != presentationQueue_.end();) {
+            if (item->type == PresentationItem::Type::Subtitle) {
+                item = presentationQueue_.erase(item);
+                --queuedSubtitleFrames_;
+            } else {
+                ++item;
+            }
+        }
+        presentationChanged_.notify_all();
+    }
+
+    void replayCachedSubtitlePackets(
+        const TrackSource& selected,
+        std::int64_t position,
+        std::uint64_t generation)
+    {
+        const std::int64_t earliest = std::max<std::int64_t>(
+            0, position - kSubtitleReplayWindowMilliseconds);
+        for (const CachedSubtitlePacket& cached : subtitlePacketCache_) {
+            if (cached.source != selected.source
+                || cached.streamIndex != selected.streamIndex
+                || cached.timestamp + cached.duration < earliest) {
+                continue;
+            }
+            if (!decodeSubtitlePacket(
+                    cached.packet.get(), generation, position)) {
+                break;
+            }
+        }
     }
 
     int validateRecoveredInput(
@@ -4696,6 +4909,7 @@ private:
                 }
                 return InputReadResult::Error;
             }
+            cacheSubtitlePacket(source, format, packet);
             if (!selectedStream(source, packet->stream_index)) {
                 av_packet_unref(packet);
                 continue;
@@ -4874,7 +5088,8 @@ private:
 
     bool decodeSubtitlePacket(
         const AVPacket* packet,
-        std::uint64_t generation)
+        std::uint64_t generation,
+        std::int64_t minimumEndTimestamp = -1)
     {
         if (!media_.subtitle.valid()) {
             return true;
@@ -4977,7 +5192,14 @@ private:
                         rangeStart = rangeStart_;
                         rangeEnd = rangeEnd_;
                     }
-                    if (!shouldDropNonVideoForAccurateSeek(
+                    const bool replayStillRelevant =
+                        minimumEndTimestamp < 0
+                        || (durationMs > 0
+                                ? timestampMs + durationMs
+                                    > minimumEndTimestamp
+                                : timestampMs >= minimumEndTimestamp);
+                    if (replayStillRelevant
+                        && !shouldDropNonVideoForAccurateSeek(
                             timestampMs,
                             generation)
                         && timestampMs >= rangeStart
@@ -7094,7 +7316,9 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (item.generation
                     != presentationGeneration_.load(
-                        std::memory_order_acquire)) {
+                        std::memory_order_acquire)
+                    || item.track
+                        != mediaInfo_.activeSubtitleTrack) {
                     return;
                 }
                 callback = subtitleFrameCallback_;
@@ -9168,6 +9392,8 @@ private:
     std::uint64_t videoDecodeFailureGeneration_ = 0;
     PacketBufferState packetBufferState_;
     std::optional<PacketBufferStatus> lastPublishedPacketBufferStatus_;
+    std::deque<CachedSubtitlePacket> subtitlePacketCache_;
+    std::uint64_t cachedSubtitlePacketBytes_ = 0;
     CachedAudioClock cachedAudioClock_;
     MediaContext media_;
     ReadRecoveryBudget primaryReadRecoveryBudget_;

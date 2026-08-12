@@ -907,6 +907,33 @@ void testSurfaceSuspendAndSameAPIResume()
     expect(openGLES->calls == 0, "Replacement surface probed OpenGL ES");
 }
 
+void testSameWindowResizeKeepsRendererCandidate()
+{
+    auto vulkan = std::make_shared<FactoryScript>();
+    auto openGLES = std::make_shared<FactoryScript>();
+    auto active = behavior();
+    vulkan->behaviors.push_back(active);
+
+    qtav::MobileVideoRendererSelector selector(
+        selectorConfig(vulkan, openGLES));
+    expect(selector.open(renderConfig()), "Vulkan startup failed");
+    const auto sessionGeneration = selector.sessionGeneration();
+
+    auto resized = renderConfig();
+    resized.surfaceSize = { 1280, 720 };
+    expect(selector.configure(resized), "Same-window resize failed");
+    expect(vulkan->calls == 1, "Same-window resize recreated Vulkan");
+    expect(active->openCount == 1, "Same-window resize reopened renderer");
+    expect(active->configureCount == 1, "Resize did not configure renderer");
+    expect(active->closeCount == 0, "Same-window resize closed renderer");
+    expect(
+        selector.sessionGeneration() == sessionGeneration,
+        "Same-window resize replaced the renderer session");
+    expect(
+        selector.selectedAPI() == qtav::MobileRenderAPI::Vulkan,
+        "Same-window resize changed graphics API");
+}
+
 void testRecoverableOpenGLESRecreation()
 {
     auto vulkan = std::make_shared<FactoryScript>();
@@ -1012,6 +1039,7 @@ int main()
     testHardwareFrameFallbackRequiresExplicitPolicy();
     testRepeatedRecoveryFailureFallsBack();
     testSurfaceSuspendAndSameAPIResume();
+    testSameWindowResizeKeepsRendererCandidate();
     testRecoverableOpenGLESRecreation();
     testBothBackendsUnavailable();
     testInvalidationBypassesOverlappingRender();

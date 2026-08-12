@@ -115,9 +115,61 @@ struct Index {
   private pipPlaying: boolean | undefined = undefined;
   private pipWidth: number = 0;
   private pipHeight: number = 0;
+  private pipSurfaceActive: boolean = false;
+  private pipReturnSurfaceWidth: number = 0;
+  private pipReturnSurfaceHeight: number = 0;
   private snapshotTimer: number = -1;
   private progressTimer: number = -1;
   private snapshotKey: string = '';
+  private surfaceTransitioning: boolean = false;
+  private desiredSurfaceWidth: number = 0;
+  private desiredSurfaceHeight: number = 0;
+  private appliedSurfaceWidth: number = 0;
+  private appliedSurfaceHeight: number = 0;
+  private normalSurfaceWidth: number = 0;
+  private normalSurfaceHeight: number = 0;
+
+  private updateSurfaceArea(area: Area): void {
+    if (typeof area.width !== 'number' || typeof area.height !== 'number') {
+      return;
+    }
+    const uiContext = this.getUIContext();
+    const width: number = Math.max(
+      1, Math.round(uiContext.vp2px(area.width)));
+    const height: number = Math.max(
+      1, Math.round(uiContext.vp2px(area.height)));
+    if (this.pipSurfaceActive) {
+      return;
+    }
+    this.desiredSurfaceWidth = width;
+    this.desiredSurfaceHeight = height;
+    if (!this.surfaceTransitioning) {
+      if (!this.fullScreen) {
+        this.normalSurfaceWidth = this.desiredSurfaceWidth;
+        this.normalSurfaceHeight = this.desiredSurfaceHeight;
+      }
+      this.applySurfaceRect();
+    }
+  }
+
+  private applySurfaceRect(force: boolean = false): void {
+    if (this.desiredSurfaceWidth <= 0 || this.desiredSurfaceHeight <= 0 ||
+      (!force && this.appliedSurfaceWidth === this.desiredSurfaceWidth &&
+        this.appliedSurfaceHeight === this.desiredSurfaceHeight)) {
+      return;
+    }
+    try {
+      this.xComponentController.setXComponentSurfaceRect({
+        offsetX: 0,
+        offsetY: 0,
+        surfaceWidth: this.desiredSurfaceWidth,
+        surfaceHeight: this.desiredSurfaceHeight
+      });
+      this.appliedSurfaceWidth = this.desiredSurfaceWidth;
+      this.appliedSurfaceHeight = this.desiredSurfaceHeight;
+    } catch {
+    }
+  }
 
   private attachNativeContext(context: object): void {
     this.nativeContext = context as QtAVPlayerNativeContext;
@@ -396,24 +448,96 @@ struct Index {
   }
 
   private async toggleFullScreen(): Promise<void> {
+    if (this.surfaceTransitioning) {
+      return;
+    }
     const hostContext = this.getUIContext().getHostContext();
     if (!hostContext) {
       this.showToast('无法取得主窗口');
       return;
     }
     const next = !this.fullScreen;
+    if (next) {
+      this.normalSurfaceWidth = this.desiredSurfaceWidth;
+      this.normalSurfaceHeight = this.desiredSurfaceHeight;
+    }
+    this.surfaceTransitioning = true;
     try {
       const mainWindow = await window.getLastWindow(hostContext);
+      // The OHOS rotation lock requires the Buffer dimensions to stay fixed.
+      // Keep the current Surface rect until the target layout is complete.
+      this.applySurfaceRect(true);
+      this.xComponentController.setXComponentSurfaceRotation({
+        lock: true
+      });
+      await mainWindow.setPreferredOrientation(
+        next ? window.Orientation.AUTO_ROTATION_LANDSCAPE :
+          window.Orientation.PORTRAIT);
+      await this.waitForWindowOrientation(mainWindow, next);
+      this.fullScreen = next;
       await mainWindow.setWindowLayoutFullScreen(next);
       await mainWindow.setWindowSystemBarEnable(
         next ? [] : ['status', 'navigation']);
-      await mainWindow.setPreferredOrientation(
-        next ? window.Orientation.AUTO_ROTATION_LANDSCAPE :
-          window.Orientation.AUTO_ROTATION);
-      this.fullScreen = next;
+      await this.waitForTargetSurfaceArea(mainWindow, next);
+      this.xComponentController.setXComponentSurfaceRotation({
+        lock: false
+      });
+      this.applySurfaceRect(true);
     } catch {
       this.showToast('无法切换全屏模式');
+    } finally {
+      try {
+        this.xComponentController.setXComponentSurfaceRotation({
+          lock: false
+        });
+      } catch {
+      }
+      this.applySurfaceRect();
+      this.surfaceTransitioning = false;
     }
+  }
+
+  private waitForWindowOrientation(
+    mainWindow: window.Window,
+    landscape: boolean): Promise<void> {
+    return new Promise<void>((resolve: () => void) => {
+      const deadline: number = Date.now() + 1200;
+      let timer: number = -1;
+      timer = setInterval(() => {
+        const rect: window.Rect =
+          mainWindow.getWindowProperties().windowRect;
+        const reached: boolean = landscape ?
+          rect.width > rect.height : rect.height > rect.width;
+        if (reached || Date.now() >= deadline) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 16);
+    });
+  }
+
+  private waitForTargetSurfaceArea(
+    mainWindow: window.Window,
+    fullScreen: boolean): Promise<void> {
+    return new Promise<void>((resolve: () => void) => {
+      const deadline: number = Date.now() + 1200;
+      let timer: number = -1;
+      timer = setInterval(() => {
+        const windowRect: window.Rect =
+          mainWindow.getWindowProperties().windowRect;
+        const targetWidth: number = fullScreen ? windowRect.width :
+          this.normalSurfaceWidth;
+        const targetHeight: number = fullScreen ? windowRect.height :
+          this.normalSurfaceHeight;
+        const reached: boolean = targetWidth > 0 && targetHeight > 0 &&
+          Math.abs(this.desiredSurfaceWidth - targetWidth) <= 1 &&
+          Math.abs(this.desiredSurfaceHeight - targetHeight) <= 1;
+        if (reached || Date.now() >= deadline) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 16);
+    });
   }
 
   private async startPiP(): Promise<void> {
@@ -427,6 +551,7 @@ struct Index {
       return;
     }
     try {
+      this.preparePiPSurfaceRect();
       if (!this.pipController) {
         const controller = await PiPWindow.create({
           context: hostContext,
@@ -441,8 +566,15 @@ struct Index {
         controller.on(
           'stateChange',
           (state: PiPWindow.PiPState, reason: string) => {
+            if (state === PiPWindow.PiPState.ABOUT_TO_START) {
+              this.preparePiPSurfaceRect();
+            }
             this.pipActive = state === PiPWindow.PiPState.STARTED ||
               state === PiPWindow.PiPState.ABOUT_TO_START;
+            if (state === PiPWindow.PiPState.STOPPED ||
+              state === PiPWindow.PiPState.ERROR) {
+              this.restorePiPSurfaceRect();
+            }
             if (state === PiPWindow.PiPState.ERROR) {
               this.notice = `画中画错误：${reason}`;
             }
@@ -470,7 +602,37 @@ struct Index {
       }
       await this.pipController.startPiP();
     } catch {
+      this.restorePiPSurfaceRect();
       this.showToast('启动画中画失败');
+    }
+  }
+
+  private preparePiPSurfaceRect(): void {
+    if (this.pipSurfaceActive || this.snapshot.width <= 0 ||
+      this.snapshot.height <= 0) {
+      return;
+    }
+    this.pipReturnSurfaceWidth = this.desiredSurfaceWidth;
+    this.pipReturnSurfaceHeight = this.desiredSurfaceHeight;
+    const width: number = Math.max(
+      1, Math.min(this.pipReturnSurfaceWidth, 1280));
+    this.pipSurfaceActive = true;
+    this.desiredSurfaceWidth = width;
+    this.desiredSurfaceHeight = Math.max(1, Math.round(
+      width * this.snapshot.height / this.snapshot.width));
+    this.applySurfaceRect(true);
+  }
+
+  private restorePiPSurfaceRect(): void {
+    if (!this.pipSurfaceActive) {
+      return;
+    }
+    this.pipSurfaceActive = false;
+    if (this.pipReturnSurfaceWidth > 0 &&
+      this.pipReturnSurfaceHeight > 0) {
+      this.desiredSurfaceWidth = this.pipReturnSurfaceWidth;
+      this.desiredSurfaceHeight = this.pipReturnSurfaceHeight;
+      this.applySurfaceRect(true);
     }
   }
 
@@ -620,7 +782,17 @@ struct Index {
         .backgroundColor(Color.Black)
         .hdrBrightness(this.xComponentHdrBrightness)
         .onLoad((context: object) => {
+          this.xComponentController.setXComponentSurfaceRotation({
+            lock: false
+          });
+          const rect: SurfaceRect =
+            this.xComponentController.getXComponentSurfaceRect();
+          this.appliedSurfaceWidth = rect.surfaceWidth;
+          this.appliedSurfaceHeight = rect.surfaceHeight;
           this.attachNativeContext(context);
+        })
+        .onAreaChange((_oldArea: Area, newArea: Area) => {
+          this.updateSurfaceArea(newArea);
         })
 
       if (this.debugVisible) {
@@ -922,9 +1094,9 @@ struct Index {
 
   build() {
     Column() {
-      if (this.fullScreen) {
-        Stack({ alignContent: Alignment.Bottom }) {
-          this.videoPane()
+      Stack({ alignContent: Alignment.Bottom }) {
+        this.videoPane()
+        if (this.fullScreen) {
           Column() {
             this.progressControls()
             this.primaryControls(true)
@@ -933,14 +1105,10 @@ struct Index {
           .padding({ left: 14, right: 14, top: 8, bottom: 10 })
           .backgroundColor('#b0000000')
         }
-        .width('100%')
-        .height('100%')
-      } else {
-        Stack() {
-          this.videoPane()
-        }
-        .width('100%')
-        .height('44%')
+      }
+      .width('100%')
+      .height(this.fullScreen ? '100%' : '44%')
+      if (!this.fullScreen) {
         Scroll() {
           this.normalControls()
         }

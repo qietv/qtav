@@ -519,24 +519,35 @@ public:
             }
         }
 
-        EGLint width = 0;
-        EGLint height = 0;
-        if (eglQuerySurface(
-                display_, surface_, EGL_WIDTH, &width) != EGL_TRUE
-            || eglQuerySurface(
-                   display_, surface_, EGL_HEIGHT, &height) != EGL_TRUE
-            || width <= 0 || height <= 0) {
-            error = eglError("eglQuerySurface", lastEglError_);
+        if (!refreshSurfaceSize(error)) {
             eglDestroySurface(display_, surface_);
             surface_ = EGL_NO_SURFACE;
             return false;
         }
-        surfaceSize_ = { width, height };
         outputColorSpace_ = candidate.colorSpace;
         colorComponentBits_ = candidate.componentBits;
         activeCandidate_ = candidate;
         nativeVisual_ = nativeVisual;
-        ++generation_;
+        return true;
+    }
+
+    bool refreshSurfaceSize(std::string& error)
+    {
+        EGLint width = 0;
+        EGLint height = 0;
+        if (display_ == EGL_NO_DISPLAY || surface_ == EGL_NO_SURFACE
+            || eglQuerySurface(
+                   display_, surface_, EGL_WIDTH, &width) != EGL_TRUE
+            || eglQuerySurface(
+                   display_, surface_, EGL_HEIGHT, &height) != EGL_TRUE
+            || width <= 0 || height <= 0) {
+            error = eglError("eglQuerySurface", lastEglError_);
+            return false;
+        }
+        if (surfaceSize_.width != width || surfaceSize_.height != height) {
+            surfaceSize_ = { width, height };
+            ++generation_;
+        }
         return true;
     }
 
@@ -845,6 +856,7 @@ bool OHOSOpenGLVideoRenderer::configure(
         std::lock_guard<std::recursive_mutex> lock(impl_->mutex_);
         configured = impl_->open_
             && impl_->surface_ != EGL_NO_SURFACE
+            && impl_->refreshSurfaceSize(error)
             && impl_->openEngine(config, error);
     }
     if (!configured && error.empty()) {

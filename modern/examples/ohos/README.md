@@ -128,6 +128,13 @@ software transfer, staging, and upload calls.
 The generated 440 Hz and 660 Hz tones allow a manual audibility check, while
 automation validates delivery and hardware timing.
 
+A later full-screen/PiP regression keeps one player-demo XComponent alive
+across ArkUI layout and orientation changes. Same-window resize is now
+presentation-only: the selector candidate and OHCodec interop generation stay
+alive, Vulkan handles WSI orientation inside its adapter, and Vulkan/OpenGL ES
+both retain ordinary `Fit` geometry. See
+[`PLAN_HISTORY_2026-08-12_OHOS_PLAYER_FULLSCREEN_PIP.md`](../../PLAN_HISTORY_2026-08-12_OHOS_PLAYER_FULLSCREEN_PIP.md).
+
 An optional VVC-only mode is selected by packaging `-VVCMediaSource`. It
 preflights the exact 600-frame 1280x720/60 `vvc1` fixture, queries the OHOS
 hardware capability, presents the complete stream through `vvc_ohcodec`, then

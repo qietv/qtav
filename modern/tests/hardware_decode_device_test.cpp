@@ -2,6 +2,7 @@
 
 #include <qtav/player.h>
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -231,6 +232,59 @@ void testMismatchedSuppliedDeviceErrors(const char* media)
     assert(frames == 0);
 }
 
+void testConfigurationReopenPreservesPosition(const char* media)
+{
+    qtav::Player player;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::atomic<bool> configurationChanged { false };
+    std::atomic<std::int64_t> positionBefore { 0 };
+    std::int64_t reopenedPosition = 0;
+    bool reopened = false;
+
+    player
+        .onMediaStatus([&](qtav::MediaStatus, qtav::MediaStatus status) {
+            if (status != qtav::MediaStatus::Loaded
+                || !configurationChanged.load()) {
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                reopenedPosition = player.position();
+                reopened = true;
+            }
+            player.setState(qtav::State::Stopped);
+            changed.notify_all();
+            return false;
+        })
+        .onVideoFrame([&](const qtav::VideoFrame&, int) {
+            const std::int64_t position = player.position();
+            if (position < 150
+                || configurationChanged.exchange(true)) {
+                return;
+            }
+            positionBefore.store(position);
+            player.setHardwareDecodeConfig({
+                qtav::HardwareDeviceType::D3D11,
+                true,
+                makeDevice(qtav::HardwareDeviceType::MediaCodec, 0xdef0),
+            });
+        });
+
+    player.setMedia(media);
+    player.setState(qtav::State::Playing);
+
+    std::unique_lock<std::mutex> lock(mutex);
+    assert(changed.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [&] { return reopened; }));
+    assert(configurationChanged.load());
+    assert(positionBefore.load() >= 150);
+    assert(reopenedPosition > 0);
+    assert(reopenedPosition + 100 >= positionBefore.load());
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -240,6 +294,7 @@ int main(int argc, char** argv)
     if (argc == 2) {
         testMismatchedSuppliedDeviceFallsBack(argv[1]);
         testMismatchedSuppliedDeviceErrors(argv[1]);
+        testConfigurationReopenPreservesPosition(argv[1]);
     }
     return 0;
 }

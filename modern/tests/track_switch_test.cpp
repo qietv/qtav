@@ -75,8 +75,8 @@ int main(int argc, char** argv)
     std::condition_variable changed;
     bool prepared = false;
     bool failed = false;
-    bool switchBuffering = false;
-    bool switchLoaded = false;
+    std::atomic<bool> switchBuffering { false };
+    std::atomic<bool> switchLoaded { false };
     int trackChanges = 0;
     std::atomic<bool> playingSwitchRequested { false };
     std::atomic<int> expectedAudioTrack { -1 };
@@ -89,6 +89,9 @@ int main(int argc, char** argv)
     std::atomic<int> unexpectedVideoFrames { 0 };
     std::atomic<int> unexpectedSubtitleFrames { 0 };
     std::atomic<bool> countFrames { false };
+    std::atomic<bool> checkVideoMonotonic { false };
+    std::atomic<bool> videoTimestampRegressed { false };
+    std::atomic<std::int64_t> lastVideoTimestamp { -1 };
     std::string lastSubtitleText;
 
     player
@@ -114,11 +117,11 @@ int main(int argc, char** argv)
                         failed = true;
                     } else if (playingSwitchRequested.load()
                                && status == qtav::MediaStatus::Buffering) {
-                        switchBuffering = true;
+                        switchBuffering.store(true);
                     } else if (playingSwitchRequested.load()
                                && status == qtav::MediaStatus::Loaded
-                               && switchBuffering) {
-                        switchLoaded = true;
+                               && switchBuffering.load()) {
+                        switchLoaded.store(true);
                     }
                 }
                 changed.notify_all();
@@ -138,6 +141,13 @@ int main(int argc, char** argv)
         })
         .onVideoFrame([&](const qtav::VideoFrame& frame, int track) {
             assert(frame);
+            if (checkVideoMonotonic.load()) {
+                const auto previous = lastVideoTimestamp.exchange(
+                    frame.timestamp());
+                if (previous >= 0 && frame.timestamp() < previous) {
+                    videoTimestampRegressed.store(true);
+                }
+            }
             if (!countFrames.load()) {
                 return;
             }
@@ -301,6 +311,45 @@ int main(int argc, char** argv)
     assert(sinkSnapshot.openCount >= 1);
     assert(sinkSnapshot.decodedFormat.sampleRate == alternateAudio.sampleRate);
 
+    playingSwitchRequested.store(true);
+    switchBuffering.store(false);
+    switchLoaded.store(false);
+    const auto sinkBeforeSubtitleSwitch = audioSink->snapshot();
+    const int changesBeforeSubtitleSwitch = trackChanges;
+    lastVideoTimestamp.store(-1);
+    videoTimestampRegressed.store(false);
+    checkVideoMonotonic.store(true);
+    expectedSubtitleTrack.store(initialInfo.activeSubtitleTrack);
+    expectedSubtitleFrames.store(0);
+    unexpectedSubtitleFrames.store(0);
+    assert(player.setActiveTrack(
+        qtav::MediaType::Subtitle,
+        initialInfo.activeSubtitleTrack));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(lock, 10s, [&] {
+            return (trackChanges >= changesBeforeSubtitleSwitch + 1
+                    && expectedSubtitleFrames.load() >= 1)
+                || failed;
+        }));
+    }
+    checkVideoMonotonic.store(false);
+    assert(!failed);
+    assert(!switchBuffering.load());
+    assert(!switchLoaded.load());
+    assert(!videoTimestampRegressed.load());
+    assert(unexpectedSubtitleFrames.load() == 0);
+    const auto sinkAfterSubtitleSwitch = audioSink->snapshot();
+    assert(
+        sinkAfterSubtitleSwitch.openCount
+        == sinkBeforeSubtitleSwitch.openCount);
+    assert(
+        sinkAfterSubtitleSwitch.closeCount
+        == sinkBeforeSubtitleSwitch.closeCount);
+    assert(
+        sinkAfterSubtitleSwitch.flushCount
+        == sinkBeforeSubtitleSwitch.flushCount);
+
     const auto positionBeforePlayingSwitch = player.position();
     countFrames.store(false);
     playingSwitchRequested.store(true);
@@ -312,7 +361,7 @@ int main(int argc, char** argv)
     unexpectedSubtitleFrames.store(0);
     expectedAudioTrack.store(initialInfo.activeAudioTrack);
     expectedVideoTrack.store(initialInfo.activeVideoTrack);
-    expectedSubtitleTrack.store(initialInfo.activeSubtitleTrack);
+    expectedSubtitleTrack.store(alternateSubtitle.index);
     assert(player.setActiveTrack(
         qtav::MediaType::Audio,
         initialInfo.activeAudioTrack));
@@ -323,10 +372,10 @@ int main(int argc, char** argv)
     }
     assert(player.setActiveTrack(
         qtav::MediaType::Subtitle,
-        initialInfo.activeSubtitleTrack));
+        alternateSubtitle.index));
     countFrames.store(true);
 
-    const int totalSwitches = pausedSwitches * 2;
+    const int totalSwitches = pausedSwitches * 2 + 1;
     {
         std::unique_lock<std::mutex> lock(mutex);
         const bool received = changed.wait_for(lock, 10s, [&] {
@@ -334,7 +383,7 @@ int main(int argc, char** argv)
                     && expectedAudioFrames.load() >= 1
                     && expectedVideoFrames.load() >= 1
                     && expectedSubtitleFrames.load() >= 1
-                    && switchLoaded)
+                    && switchLoaded.load())
                 || failed;
         });
         if (!received) {
@@ -346,8 +395,8 @@ int main(int argc, char** argv)
                 << " activeAudio=" << current.activeAudioTrack
                 << " activeVideo=" << current.activeVideoTrack
                 << " trackChanges=" << trackChanges
-                << " buffering=" << switchBuffering
-                << " loaded=" << switchLoaded
+                << " buffering=" << switchBuffering.load()
+                << " loaded=" << switchLoaded.load()
                 << " expectedAudioFrames=" << expectedAudioFrames.load()
                 << " expectedVideoFrames=" << expectedVideoFrames.load()
                 << " expectedSubtitleFrames="
@@ -361,14 +410,14 @@ int main(int argc, char** argv)
         assert(received);
     }
     assert(!failed);
-    assert(switchBuffering);
-    assert(switchLoaded);
+    assert(switchBuffering.load());
+    assert(switchLoaded.load());
     assert(unexpectedAudioFrames.load() == 0);
     assert(unexpectedVideoFrames.load() == 0);
     assert(unexpectedSubtitleFrames.load() == 0);
     if (!suppliedAudioSubtitleFixture) {
         std::lock_guard<std::mutex> lock(mutex);
-        assert(lastSubtitleText.find("Primary") != std::string::npos);
+        assert(lastSubtitleText.find("Alternate") != std::string::npos);
     }
     sinkSnapshot = audioSink->snapshot();
     assert(sinkSnapshot.openCount >= 2);
@@ -386,7 +435,7 @@ int main(int argc, char** argv)
     assert(switchedInfo.activeVideoTrack == initialInfo.activeVideoTrack);
     assert(
         switchedInfo.activeSubtitleTrack
-        == initialInfo.activeSubtitleTrack);
+        == alternateSubtitle.index);
     assert(player.position() + 250 >= positionBeforePlayingSwitch);
 
     assert(player.setActiveTrack(qtav::MediaType::Audio, -1));
