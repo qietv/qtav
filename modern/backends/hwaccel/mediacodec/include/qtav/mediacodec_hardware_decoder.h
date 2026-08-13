@@ -61,6 +61,15 @@ mediaCodecHardwareDecodeConfig(
 
 class MediaCodecFrame;
 
+// Result of the one permitted decision for a MediaCodec surface output.
+// AlreadyReleased means the shared FFmpeg output was previously decided or
+// retired by a decoder flush; no new Surface buffer will be produced.
+enum class MediaCodecFrameDecisionResult {
+    Applied,
+    AlreadyReleased,
+    Failed,
+};
+
 // Validates that frame is a pending MediaCodec direct-surface output for the
 // exact supplied window generation. Stale or foreign surface outputs return
 // an empty value.
@@ -93,11 +102,15 @@ public:
 
     // Releases immediately to the codec's configured Surface.
     bool present() noexcept;
+    MediaCodecFrameDecisionResult presentResult() noexcept;
     // Releases for presentation at a CLOCK_MONOTONIC timestamp in
     // nanoseconds. FFmpeg/Android require this value to be near "now".
     bool presentAt(std::int64_t monotonicNanoseconds) noexcept;
+    MediaCodecFrameDecisionResult presentAtResult(
+        std::int64_t monotonicNanoseconds) noexcept;
     // Releases without presenting.
     bool drop() noexcept;
+    MediaCodecFrameDecisionResult dropResult() noexcept;
 
 private:
     MediaCodecFrame(

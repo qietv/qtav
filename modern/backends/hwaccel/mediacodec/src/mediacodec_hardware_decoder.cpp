@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <new>
 #include <utility>
 
@@ -12,6 +13,7 @@
 extern "C" {
 #include <libavcodec/mediacodec.h>
 #include <libavutil/buffer.h>
+#include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_mediacodec.h>
 }
@@ -213,33 +215,69 @@ const HardwareFrame& MediaCodecFrame::sourceFrame() const noexcept
 
 bool MediaCodecFrame::present() noexcept
 {
+    return presentResult() == MediaCodecFrameDecisionResult::Applied;
+}
+
+MediaCodecFrameDecisionResult MediaCodecFrame::presentResult() noexcept
+{
     if (!isPending()) {
-        return false;
+        return MediaCodecFrameDecisionResult::Failed;
     }
     decided_ = true;
-    return av_mediacodec_release_buffer(nativeBuffer(buffer_), 1) >= 0;
+    const int result =
+        av_mediacodec_release_buffer(nativeBuffer(buffer_), 1);
+    if (result == AVERROR(EALREADY)) {
+        return MediaCodecFrameDecisionResult::AlreadyReleased;
+    }
+    return result >= 0
+        ? MediaCodecFrameDecisionResult::Applied
+        : MediaCodecFrameDecisionResult::Failed;
 }
 
 bool MediaCodecFrame::presentAt(
     std::int64_t monotonicNanoseconds) noexcept
 {
+    return presentAtResult(monotonicNanoseconds)
+        == MediaCodecFrameDecisionResult::Applied;
+}
+
+MediaCodecFrameDecisionResult MediaCodecFrame::presentAtResult(
+    std::int64_t monotonicNanoseconds) noexcept
+{
     if (!isPending() || monotonicNanoseconds <= 0) {
-        return false;
+        return MediaCodecFrameDecisionResult::Failed;
     }
     decided_ = true;
-    return av_mediacodec_render_buffer_at_time(
-               nativeBuffer(buffer_),
-               monotonicNanoseconds)
-        >= 0;
+    const int result = av_mediacodec_render_buffer_at_time(
+        nativeBuffer(buffer_),
+        monotonicNanoseconds);
+    if (result == AVERROR(EALREADY)) {
+        return MediaCodecFrameDecisionResult::AlreadyReleased;
+    }
+    return result >= 0
+        ? MediaCodecFrameDecisionResult::Applied
+        : MediaCodecFrameDecisionResult::Failed;
 }
 
 bool MediaCodecFrame::drop() noexcept
 {
+    return dropResult() == MediaCodecFrameDecisionResult::Applied;
+}
+
+MediaCodecFrameDecisionResult MediaCodecFrame::dropResult() noexcept
+{
     if (!isPending()) {
-        return false;
+        return MediaCodecFrameDecisionResult::Failed;
     }
     decided_ = true;
-    return av_mediacodec_release_buffer(nativeBuffer(buffer_), 0) >= 0;
+    const int result =
+        av_mediacodec_release_buffer(nativeBuffer(buffer_), 0);
+    if (result == AVERROR(EALREADY)) {
+        return MediaCodecFrameDecisionResult::AlreadyReleased;
+    }
+    return result >= 0
+        ? MediaCodecFrameDecisionResult::Applied
+        : MediaCodecFrameDecisionResult::Failed;
 }
 
 MediaCodecFrame mediaCodecFrame(

@@ -81,6 +81,17 @@ if(TRIPLET MATCHES "ohos")
     endforeach()
 endif()
 
+if(TRIPLET MATCHES "android")
+    file(READ "${PREFIX}/include/libavcodec/mediacodec.h"
+         FFMPEG_MEDIACODEC_HEADER)
+    if(NOT FFMPEG_MEDIACODEC_HEADER MATCHES
+       "AVERROR\\(EALREADY\\).*retired by a decoder flush")
+        message(FATAL_ERROR
+            "Android FFmpeg is missing explicit MediaCodec repeat-release status"
+        )
+    endif()
+endif()
+
 file(READ "${PREFIX}/include/libplacebo/config.h" LIBPLACEBO_CONFIG)
 if(NOT LIBPLACEBO_CONFIG MATCHES "#define PL_HAVE_VULKAN 1")
     message(FATAL_ERROR "libplacebo was built without Vulkan support")

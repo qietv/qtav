@@ -124,10 +124,12 @@ per codec, one returned release fence per import, no release-fence fallback,
 a pending-image high-water mark within five, valid native/Vulkan format
 diagnostics, and zero decoded-source CPU-map, software-transfer, staging-copy,
 and renderer-upload counters. External-format imports must also expose an
-unconverted Y/Cb/Cr sampler for the Dolby Vision RPU path. Codec-aligned native
-buffers may be larger than the visible frame; a GPU-only external-format
-normalization pass applies the `AImage` crop, after which libplacebo performs
-color, tone mapping, DOVI, and final output processing.
+unconverted identity sampler for the Dolby Vision RPU path. It retains the
+driver component mapping, so Vulkan samples `(Cr,Y,Cb)` as `(R,G,B)` and the
+shared normalization shader performs the only `.gbr` reorder to `(Y,Cb,Cr)`.
+Codec-aligned native buffers may be larger than the visible frame; the same
+GPU-only pass applies the `AImage` crop, after which libplacebo performs color,
+tone mapping, DOVI, and final output processing.
 An additional profile 8.4 HEVC phase requires at least 60 MediaCodec output
 frames carrying FFmpeg-parsed RPU metadata, successful libplacebo rendering,
 matching AHardwareBuffer release fences, use of the raw-YCbCr import, and the

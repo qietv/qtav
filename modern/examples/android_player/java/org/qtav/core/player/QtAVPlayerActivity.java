@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Color;
@@ -14,6 +15,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.Display;
@@ -23,7 +25,10 @@ import android.view.SurfaceView;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.window.OnBackInvokedDispatcher;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -46,7 +51,20 @@ public final class QtAVPlayerActivity extends Activity
         implements SurfaceHolder.Callback {
     private static final int OPEN_DOCUMENT_REQUEST = 1001;
     private static final int SEEK_SCALE = 10_000;
+    private static final int MEDIA_TYPE_AUDIO = 0;
+    private static final int MEDIA_TYPE_SUBTITLE = 2;
     private static final long FULLSCREEN_CONTROLS_TIMEOUT_MILLIS = 5_000;
+    private static final long TRACK_REFRESH_INTERVAL_MILLIS = 500;
+
+    private static final class TrackOption {
+        final int index;
+        final String label;
+
+        TrackOption(int index, String label) {
+            this.index = index;
+            this.label = label;
+        }
+    }
 
     static {
         System.loadLibrary("qtav_android_player");
@@ -63,8 +81,11 @@ public final class QtAVPlayerActivity extends Activity
     private TextView currentTimeView;
     private TextView durationView;
     private TextView statusView;
+    private TextView subtitleView;
     private Button playPauseButton;
     private Button fullscreenButton;
+    private Button audioTrackButton;
+    private Button subtitleTrackButton;
     private Switch vulkanSwitch;
     private Switch hdrSwitch;
     private Switch zeroCopySwitch;
@@ -80,6 +101,15 @@ public final class QtAVPlayerActivity extends Activity
     private int publishedDisplayRotation = -1;
     private boolean fullscreenMode;
     private boolean consumeFullscreenRevealGesture;
+    private boolean requestedLandscapeForFullscreen;
+    private int orientationRequestBeforeFullscreen =
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+    private long lastTrackRefreshMillis;
+    private String trackSnapshotSignature = "";
+    private TrackOption[] audioTracks = new TrackOption[0];
+    private TrackOption[] subtitleTracks = new TrackOption[0];
+    private int activeAudioTrack = -1;
+    private int activeSubtitleTrack = -1;
 
     private final Runnable pollPlayback = new Runnable() {
         @Override
@@ -123,6 +153,21 @@ public final class QtAVPlayerActivity extends Activity
             }
             playPauseButton.setText(
                     nativeIsPlaying(nativeHandle) ? "Pause" : "Play");
+            String subtitle = nativeGetSubtitleText(nativeHandle);
+            if (subtitle == null) {
+                subtitle = "";
+            }
+            if (!subtitle.contentEquals(subtitleView.getText())) {
+                subtitleView.setText(subtitle);
+                subtitleView.setVisibility(
+                        subtitle.isEmpty() ? View.GONE : View.VISIBLE);
+            }
+            long now = SystemClock.uptimeMillis();
+            if (now - lastTrackRefreshMillis
+                    >= TRACK_REFRESH_INTERVAL_MILLIS) {
+                lastTrackRefreshMillis = now;
+                refreshTrackControls();
+            }
             int requestedFrameRate =
                     nativeGetRequestedFrameRate(nativeHandle);
             if (requestedFrameRate
@@ -163,6 +208,7 @@ public final class QtAVPlayerActivity extends Activity
     private final Runnable hideFullscreenControls = () -> {
         if (fullscreenMode && !userSeeking && controlsPanel != null) {
             controlsPanel.setVisibility(View.GONE);
+            updateSubtitleLayout();
         }
     };
 
@@ -171,8 +217,14 @@ public final class QtAVPlayerActivity extends Activity
         super.onCreate(savedInstanceState);
         nativeHandle = nativeCreate(createSystemCaBundle());
         buildUserInterface();
-        if (getResources().getConfiguration().orientation
-                == Configuration.ORIENTATION_LANDSCAPE) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    this::handleBackNavigation);
+        }
+        if (shouldSyncFullscreenToOrientation()
+                && getResources().getConfiguration().orientation
+                    == Configuration.ORIENTATION_LANDSCAPE) {
             setFullscreenMode(true);
         }
         surfaceView.getHolder().addCallback(this);
@@ -182,6 +234,10 @@ public final class QtAVPlayerActivity extends Activity
     @Override
     public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
+        if (!shouldSyncFullscreenToOrientation()) {
+            playerArea.post(this::applyVideoSurfaceLayout);
+            return;
+        }
         if (configuration.orientation
                 == Configuration.ORIENTATION_LANDSCAPE) {
             setFullscreenMode(true);
@@ -220,6 +276,23 @@ public final class QtAVPlayerActivity extends Activity
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus && fullscreenMode) {
             applyFullscreenSystemUi();
+        }
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (fullscreenMode) {
+            exitFullscreenFromUser();
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    private void handleBackNavigation() {
+        if (fullscreenMode) {
+            exitFullscreenFromUser();
+        } else {
+            finishAfterTransition();
         }
     }
 
@@ -373,10 +446,31 @@ public final class QtAVPlayerActivity extends Activity
         statusLayout.setMargins(padding, padding, padding, 0);
         playerArea.addView(statusView, statusLayout);
 
+        subtitleView = new TextView(this);
+        subtitleView.setTextColor(Color.WHITE);
+        subtitleView.setTextSize(20.0f);
+        subtitleView.setGravity(Gravity.CENTER);
+        subtitleView.setPadding(dp(12), dp(4), dp(12), dp(4));
+        subtitleView.setShadowLayer(dp(2), 0.0f, dp(1), Color.BLACK);
+        subtitleView.setVisibility(View.GONE);
+        subtitleView.setClickable(false);
+        subtitleView.setFocusable(false);
+        playerArea.addView(
+                subtitleView,
+                new FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                        Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+        updateSubtitleLayout();
+
         controlsPanel = new LinearLayout(this);
         controlsPanel.setOrientation(LinearLayout.VERTICAL);
         controlsPanel.setPadding(padding, padding, padding, padding);
         controlsPanel.setBackgroundColor(Color.rgb(32, 32, 32));
+        controlsPanel.addOnLayoutChangeListener(
+                (view, left, top, right, bottom,
+                        oldLeft, oldTop, oldRight, oldBottom) ->
+                        updateSubtitleLayout());
         rootLayout.addView(
                 controlsPanel,
                 new LinearLayout.LayoutParams(
@@ -459,8 +553,33 @@ public final class QtAVPlayerActivity extends Activity
                 nativeStop(nativeHandle);
             }
         });
-        fullscreenButton.setOnClickListener(
-                view -> setFullscreenMode(!fullscreenMode));
+        fullscreenButton.setOnClickListener(view -> {
+            if (fullscreenMode) {
+                exitFullscreenFromUser();
+            } else {
+                enterFullscreenFromUser();
+            }
+        });
+
+        LinearLayout trackControls = new LinearLayout(this);
+        trackControls.setOrientation(LinearLayout.HORIZONTAL);
+        audioTrackButton = actionButton("Audio: unavailable");
+        subtitleTrackButton = actionButton("Subtitles: off");
+        audioTrackButton.setEnabled(false);
+        subtitleTrackButton.setEnabled(false);
+        audioTrackButton.setSingleLine(true);
+        subtitleTrackButton.setSingleLine(true);
+        audioTrackButton.setEllipsize(
+                android.text.TextUtils.TruncateAt.END);
+        subtitleTrackButton.setEllipsize(
+                android.text.TextUtils.TruncateAt.END);
+        addWeighted(trackControls, audioTrackButton);
+        addWeighted(trackControls, subtitleTrackButton);
+        controlsPanel.addView(trackControls);
+        audioTrackButton.setOnClickListener(
+                view -> showTrackDialog(MEDIA_TYPE_AUDIO));
+        subtitleTrackButton.setOnClickListener(
+                view -> showTrackDialog(MEDIA_TYPE_SUBTITLE));
 
         LinearLayout renderOptions = new LinearLayout(this);
         renderOptions.setOrientation(LinearLayout.HORIZONTAL);
@@ -502,6 +621,36 @@ public final class QtAVPlayerActivity extends Activity
         setContentView(rootLayout);
     }
 
+    private boolean shouldSyncFullscreenToOrientation() {
+        return getResources().getConfiguration().smallestScreenWidthDp < 600;
+    }
+
+    private void enterFullscreenFromUser() {
+        if (fullscreenMode) {
+            return;
+        }
+        orientationRequestBeforeFullscreen = getRequestedOrientation();
+        setFullscreenMode(true);
+        if (shouldSyncFullscreenToOrientation()
+                && getResources().getConfiguration().orientation
+                    != Configuration.ORIENTATION_LANDSCAPE) {
+            requestedLandscapeForFullscreen = true;
+            setRequestedOrientation(
+                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        }
+    }
+
+    private void exitFullscreenFromUser() {
+        if (!fullscreenMode) {
+            return;
+        }
+        setFullscreenMode(false);
+        if (requestedLandscapeForFullscreen) {
+            requestedLandscapeForFullscreen = false;
+            setRequestedOrientation(orientationRequestBeforeFullscreen);
+        }
+    }
+
     private void setFullscreenMode(boolean fullscreen) {
         if (fullscreenMode == fullscreen
                 || rootLayout == null
@@ -538,6 +687,7 @@ public final class QtAVPlayerActivity extends Activity
         }
         applyFullscreenSystemUi();
         rootLayout.requestApplyInsets();
+        updateSubtitleLayout();
         playerArea.post(this::applyVideoSurfaceLayout);
     }
 
@@ -546,6 +696,7 @@ public final class QtAVPlayerActivity extends Activity
             return;
         }
         controlsPanel.setVisibility(View.VISIBLE);
+        updateSubtitleLayout();
         scheduleFullscreenControlsHide();
     }
 
@@ -559,7 +710,32 @@ public final class QtAVPlayerActivity extends Activity
     }
 
     private void applyFullscreenSystemUi() {
-        if (fullscreenMode) {
+        WindowManager.LayoutParams attributes = getWindow().getAttributes();
+        if (Build.VERSION.SDK_INT >= 28) {
+            attributes.layoutInDisplayCutoutMode = fullscreenMode
+                    ? WindowManager.LayoutParams
+                        .LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    : WindowManager.LayoutParams
+                        .LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+            getWindow().setAttributes(attributes);
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            getWindow().setDecorFitsSystemWindows(!fullscreenMode);
+            WindowInsetsController controller =
+                    getWindow().getInsetsController();
+            if (controller != null) {
+                if (fullscreenMode) {
+                    controller.setSystemBarsBehavior(
+                            WindowInsetsController
+                                .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                    controller.hide(WindowInsets.Type.systemBars());
+                } else {
+                    controller.show(WindowInsets.Type.systemBars());
+                    controller.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_DEFAULT);
+                }
+            }
+        } else if (fullscreenMode) {
             getWindow().addFlags(
                     WindowManager.LayoutParams.FLAG_FULLSCREEN);
             getWindow().getDecorView().setSystemUiVisibility(
@@ -574,6 +750,174 @@ public final class QtAVPlayerActivity extends Activity
                     WindowManager.LayoutParams.FLAG_FULLSCREEN);
             getWindow().getDecorView().setSystemUiVisibility(
                     View.SYSTEM_UI_FLAG_VISIBLE);
+        }
+    }
+
+    private void updateSubtitleLayout() {
+        if (subtitleView == null || playerArea == null) {
+            return;
+        }
+        int bottomMargin = dp(20);
+        if (fullscreenMode && controlsPanel != null
+                && controlsPanel.getVisibility() == View.VISIBLE) {
+            bottomMargin += controlsPanel.getHeight();
+        }
+        FrameLayout.LayoutParams layout =
+                (FrameLayout.LayoutParams) subtitleView.getLayoutParams();
+        layout.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        layout.setMargins(dp(24), 0, dp(24), bottomMargin);
+        subtitleView.setLayoutParams(layout);
+    }
+
+    private void refreshTrackControls() {
+        if (nativeHandle == 0 || audioTrackButton == null
+                || subtitleTrackButton == null) {
+            return;
+        }
+        String[] packedAudio =
+                nativeGetTrackOptions(nativeHandle, MEDIA_TYPE_AUDIO);
+        String[] packedSubtitles =
+                nativeGetTrackOptions(nativeHandle, MEDIA_TYPE_SUBTITLE);
+        int nextActiveAudio =
+                nativeGetActiveTrack(nativeHandle, MEDIA_TYPE_AUDIO);
+        int nextActiveSubtitle =
+                nativeGetActiveTrack(nativeHandle, MEDIA_TYPE_SUBTITLE);
+        String signature = Arrays.toString(packedAudio)
+                + "|" + Arrays.toString(packedSubtitles)
+                + "|" + nextActiveAudio
+                + "|" + nextActiveSubtitle;
+        if (signature.equals(trackSnapshotSignature)) {
+            return;
+        }
+        trackSnapshotSignature = signature;
+        audioTracks = unpackTrackOptions(packedAudio);
+        subtitleTracks = unpackTrackOptions(packedSubtitles);
+        activeAudioTrack = nextActiveAudio;
+        activeSubtitleTrack = nextActiveSubtitle;
+        updateTrackButtonLabels();
+    }
+
+    private TrackOption[] unpackTrackOptions(String[] packed) {
+        if (packed == null || packed.length < 2) {
+            return new TrackOption[0];
+        }
+        TrackOption[] result = new TrackOption[packed.length / 2];
+        int count = 0;
+        for (int index = 0; index + 1 < packed.length; index += 2) {
+            try {
+                result[count++] = new TrackOption(
+                        Integer.parseInt(packed[index]),
+                        packed[index + 1]);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return count == result.length
+                ? result
+                : Arrays.copyOf(result, count);
+    }
+
+    private void updateTrackButtonLabels() {
+        TrackOption selectedAudio =
+                findTrack(audioTracks, activeAudioTrack);
+        TrackOption selectedSubtitle =
+                findTrack(subtitleTracks, activeSubtitleTrack);
+        audioTrackButton.setEnabled(audioTracks.length > 0);
+        subtitleTrackButton.setEnabled(subtitleTracks.length > 0);
+        audioTrackButton.setText(selectedAudio != null
+                ? "Audio: " + selectedAudio.label
+                : audioTracks.length > 0
+                    ? "Audio: select"
+                    : "Audio: unavailable");
+        subtitleTrackButton.setText(selectedSubtitle != null
+                ? "Subtitles: " + selectedSubtitle.label
+                : "Subtitles: off");
+    }
+
+    private TrackOption findTrack(TrackOption[] tracks, int selector) {
+        for (TrackOption track : tracks) {
+            if (track.index == selector) {
+                return track;
+            }
+        }
+        return null;
+    }
+
+    private void showTrackDialog(int mediaType) {
+        refreshTrackControls();
+        final boolean subtitles = mediaType == MEDIA_TYPE_SUBTITLE;
+        final TrackOption[] tracks = subtitles
+                ? subtitleTracks
+                : audioTracks;
+        if (tracks.length == 0) {
+            Toast.makeText(
+                    this,
+                    subtitles
+                        ? "This media has no selectable subtitle track"
+                        : "This media has no selectable audio track",
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        int extra = subtitles ? 1 : 0;
+        String[] labels = new String[tracks.length + extra];
+        int checked = -1;
+        if (subtitles) {
+            labels[0] = "Off";
+            if (activeSubtitleTrack < 0) {
+                checked = 0;
+            }
+        }
+        int active = subtitles ? activeSubtitleTrack : activeAudioTrack;
+        for (int index = 0; index < tracks.length; ++index) {
+            labels[index + extra] = tracks[index].label;
+            if (tracks[index].index == active) {
+                checked = index + extra;
+            }
+        }
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(subtitles ? "Subtitle track" : "Audio track")
+                .setSingleChoiceItems(labels, checked, null)
+                .setNegativeButton("Cancel", null)
+                .create();
+        dialog.setOnShowListener(ignored -> dialog.getListView()
+                .setOnItemClickListener((parent, view, position, id) -> {
+                    int selector = subtitles && position == 0
+                            ? -1
+                            : tracks[position - extra].index;
+                    if (nativeSelectTrack(
+                            nativeHandle,
+                            mediaType,
+                            selector)) {
+                        trackSnapshotSignature = "";
+                        if (subtitles) {
+                            subtitleView.setText("");
+                            subtitleView.setVisibility(View.GONE);
+                        }
+                        dialog.dismiss();
+                    } else {
+                        Toast.makeText(
+                                this,
+                                "QtAVCore rejected the track selection",
+                                Toast.LENGTH_LONG).show();
+                    }
+                }));
+        dialog.show();
+    }
+
+    private void resetTrackControls() {
+        trackSnapshotSignature = "";
+        lastTrackRefreshMillis = 0;
+        audioTracks = new TrackOption[0];
+        subtitleTracks = new TrackOption[0];
+        activeAudioTrack = -1;
+        activeSubtitleTrack = -1;
+        if (subtitleView != null) {
+            subtitleView.setText("");
+            subtitleView.setVisibility(View.GONE);
+        }
+        if (audioTrackButton != null && subtitleTrackButton != null) {
+            updateTrackButtonLabels();
         }
     }
 
@@ -754,6 +1098,7 @@ public final class QtAVPlayerActivity extends Activity
             descriptor.close();
             descriptor = null;
             knownDuration = 0;
+            resetTrackControls();
             resetVideoSurfaceLayout();
             nativeOpenMedia(
                     nativeHandle,
@@ -810,6 +1155,7 @@ public final class QtAVPlayerActivity extends Activity
             return;
         }
         knownDuration = 0;
+        resetTrackControls();
         resetVideoSurfaceLayout();
         nativeOpenMedia(
                 nativeHandle,
@@ -1003,6 +1349,13 @@ public final class QtAVPlayerActivity extends Activity
     private native long nativeGetDuration(long handle);
     private native long nativeGetVideoSize(long handle);
     private native boolean nativeIsPlaying(long handle);
+    private native String[] nativeGetTrackOptions(long handle, int mediaType);
+    private native int nativeGetActiveTrack(long handle, int mediaType);
+    private native boolean nativeSelectTrack(
+            long handle,
+            int mediaType,
+            int selector);
+    private native String nativeGetSubtitleText(long handle);
     private native int nativeGetRequestedFrameRate(long handle);
     private native String nativeGetStatus(long handle);
     private native String nativeGetOutputColorSpace(long handle);

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <utility>
 
 #include "hardware_decode_device_internal.h"
@@ -11,6 +12,7 @@
 extern "C" {
 #include <libavcodec/ohcodec_surface.h>
 #include <libavutil/buffer.h>
+#include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_oh.h>
 }
@@ -252,33 +254,69 @@ const HardwareFrame& OHCodecFrame::sourceFrame() const noexcept
 
 bool OHCodecFrame::present() noexcept
 {
+    return presentResult() == OHCodecFrameDecisionResult::Applied;
+}
+
+OHCodecFrameDecisionResult OHCodecFrame::presentResult() noexcept
+{
     if (!isPending()) {
-        return false;
+        return OHCodecFrameDecisionResult::Failed;
     }
     decided_ = true;
-    return av_ohcodec_release_buffer(nativeBuffer(buffer_), 1) >= 0;
+    const int result =
+        av_ohcodec_release_buffer(nativeBuffer(buffer_), 1);
+    if (result == AVERROR(EALREADY)) {
+        return OHCodecFrameDecisionResult::AlreadyDecided;
+    }
+    return result >= 0
+        ? OHCodecFrameDecisionResult::Applied
+        : OHCodecFrameDecisionResult::Failed;
 }
 
 bool OHCodecFrame::presentAt(
     std::int64_t monotonicNanoseconds) noexcept
 {
+    return presentAtResult(monotonicNanoseconds)
+        == OHCodecFrameDecisionResult::Applied;
+}
+
+OHCodecFrameDecisionResult OHCodecFrame::presentAtResult(
+    std::int64_t monotonicNanoseconds) noexcept
+{
     if (!isPending() || monotonicNanoseconds <= 0) {
-        return false;
+        return OHCodecFrameDecisionResult::Failed;
     }
     decided_ = true;
-    return av_ohcodec_render_buffer_at_time(
-               nativeBuffer(buffer_),
-               monotonicNanoseconds)
-        >= 0;
+    const int result = av_ohcodec_render_buffer_at_time(
+        nativeBuffer(buffer_),
+        monotonicNanoseconds);
+    if (result == AVERROR(EALREADY)) {
+        return OHCodecFrameDecisionResult::AlreadyDecided;
+    }
+    return result >= 0
+        ? OHCodecFrameDecisionResult::Applied
+        : OHCodecFrameDecisionResult::Failed;
 }
 
 bool OHCodecFrame::drop() noexcept
 {
+    return dropResult() == OHCodecFrameDecisionResult::Applied;
+}
+
+OHCodecFrameDecisionResult OHCodecFrame::dropResult() noexcept
+{
     if (!isPending()) {
-        return false;
+        return OHCodecFrameDecisionResult::Failed;
     }
     decided_ = true;
-    return av_ohcodec_release_buffer(nativeBuffer(buffer_), 0) >= 0;
+    const int result =
+        av_ohcodec_release_buffer(nativeBuffer(buffer_), 0);
+    if (result == AVERROR(EALREADY)) {
+        return OHCodecFrameDecisionResult::AlreadyDecided;
+    }
+    return result >= 0
+        ? OHCodecFrameDecisionResult::Applied
+        : OHCodecFrameDecisionResult::Failed;
 }
 
 void OHCodecFrame::abandon() noexcept

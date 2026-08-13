@@ -60,6 +60,15 @@ ohCodecHardwareDecodeConfig(
 
 class OHCodecFrame;
 
+// Result of the one permitted decision for an OHCodec surface output.
+// AlreadyDecided means another view of the same underlying VideoFrame made
+// the decision first; no new surface buffer will be produced.
+enum class OHCodecFrameDecisionResult {
+    Applied,
+    AlreadyDecided,
+    Failed,
+};
+
 // Validates that frame is a pending OHCodec direct-surface output for the
 // exact supplied window generation. Stale or foreign surface outputs return
 // an empty value.
@@ -91,11 +100,15 @@ public:
 
     // Releases immediately to the codec's configured surface.
     bool present() noexcept;
+    OHCodecFrameDecisionResult presentResult() noexcept;
     // Releases for presentation at a CLOCK_MONOTONIC timestamp in
     // nanoseconds. The timestamp must be close to the current time.
     bool presentAt(std::int64_t monotonicNanoseconds) noexcept;
+    OHCodecFrameDecisionResult presentAtResult(
+        std::int64_t monotonicNanoseconds) noexcept;
     // Releases without presenting.
     bool drop() noexcept;
+    OHCodecFrameDecisionResult dropResult() noexcept;
 
 private:
     OHCodecFrame(

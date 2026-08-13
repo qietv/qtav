@@ -20,6 +20,8 @@ android_api=${QTAV_ANDROID_API:-28}
 compile_sdk=${QTAV_ANDROID_COMPILE_SDK:-36}
 build_tools_version=${QTAV_ANDROID_BUILD_TOOLS:-37.0.0}
 cmake_version=${QTAV_ANDROID_CMAKE_VERSION:-4.1.2}
+version_code=${QTAV_ANDROID_PLAYER_VERSION_CODE:-6}
+version_name=${QTAV_ANDROID_PLAYER_VERSION_NAME:-1.1-fullscreen-tracks}
 ffmpeg_triplet=arm64-android-28-static
 
 ndk_directory="${android_sdk}/ndk/${ndk_version}"
@@ -173,8 +175,8 @@ rm -f "${unsigned_apk}" "${aligned_apk}" "${signed_apk}"
     --manifest "${script_directory}/AndroidManifest.xml" \
     --min-sdk-version "${android_api}" \
     --target-sdk-version "${compile_sdk}" \
-    --version-code 1 \
-    --version-name 1.0 \
+    --version-code "${version_code}" \
+    --version-name "${version_name}" \
     -o "${unsigned_apk}"
 (
     cd "${package_directory}"

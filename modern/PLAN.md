@@ -1,6 +1,6 @@
 # QtAVCore implementation plan
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
 
 This is the active, executable plan for the Qt-free rewrite. It contains only
 current status, task ordering, incomplete gates, and the acceptance criteria
@@ -66,8 +66,17 @@ The following accepted decisions constrain all remaining work:
   stall, and the broader zero-transient follow-up is no longer required.
   Detailed evidence remains in the frozen plan history.
 - Android Vulkan/OpenGL ES/MediaCodec/AAudio, application-rendered raw-component
-  paths, direct-Surface mode, and one-way renderer fallback are complete and
-  retained as the mobile regression baseline.
+  paths, direct-Surface mode, and one-way renderer fallback are implemented.
+  The opaque Vulkan identity sampler now retains the driver component mapping
+  so the shared `.gbr` normalizer performs the only `(Cr,Y,Cb)` to `(Y,Cb,Cr)`
+  rotation. Static contract coverage, Android/OHOS cross-builds, and a real
+  Profile 5 `wednesday.mp4` Android device run pass. Android MediaCodec output
+  release now reports duplicate/flush-retired tokens explicitly instead of
+  installing an impossible pending AImage association after surface/fullscreen
+  invalidation; NDK 29 shared/static package consumers and `legend.mkv`
+  Vulkan/OpenGL ES fullscreen device runs pass. Detailed evidence is retained
+  in
+  [`PLAN_HISTORY_2026-08-13_ANDROID_MEDIACODEC_REPEAT_RELEASE.md`](PLAN_HISTORY_2026-08-13_ANDROID_MEDIACODEC_REPEAT_RELEASE.md).
 - OHOS Vulkan/OpenGL ES software presentation, mobile selection/fallback,
   OHAudio, OHCodec H.264/HEVC, capability-gated VVC/H.266, direct-surface
   lifecycle, raw OpenGL ES interop, and standards-based opaque external-format
@@ -105,6 +114,15 @@ The following accepted decisions constrain all remaining work:
   both renderers; PiP remained 16:9 at zero transform/rotation and advanced
   continuously. See
   [`PLAN_HISTORY_2026-08-12_OHOS_PLAYER_FULLSCREEN_PIP.md`](PLAN_HISTORY_2026-08-12_OHOS_PLAYER_FULLSCREEN_PIP.md).
+- The 2026-08-13 0.5x OHOS full-screen freeze is repaired at the OHCodec
+  one-shot output boundary. A render-target redraw of an already-consumed
+  `VideoFrame` now returns `AlreadyDecided`; Vulkan/OpenGL ES interop treats it
+  as stale and does not wait for an impossible second surface callback. The
+  rebuilt FFmpeg package, OHOS shared player build, signed HAP, original
+  `legend.mkv -> 0.5x -> full screen` path, and three final repeated
+  exit/re-enter cycles pass at 12.4 FPS with zero Player drops and balanced
+  release/callback counters. See
+  [`PLAN_HISTORY_2026-08-13_OHOS_HALF_RATE_FULLSCREEN.md`](PLAN_HISTORY_2026-08-13_OHOS_HALF_RATE_FULLSCREEN.md).
 - The OHCodec/Vulkan deferred-frame freeze root cause is repaired in C++.
   Player now retains the exact backend-deferred frame per renderer key and
   automatically invalidates pending producer associations at every
@@ -261,6 +279,245 @@ gate remains complete. Android and OHOS Actions execution is still temporarily
 disabled by explicit project direction; the local Android repair and connected
 device gate above do not silently re-enable those jobs.
 
+## Completed implementation — Android Vulkan Dolby Vision component order
+
+Android MediaCodec/Vulkan no longer pre-rotates the driver-provided component
+mapping for its `RGB_IDENTITY` sampler. Android and OHOS now share one explicit
+contract: the identity sampler exposes Vulkan's raw `(Cr,Y,Cb)` convention and
+the existing shared normalizer performs `.gbr` exactly once before libplacebo.
+The shared shader and OHOS runtime behavior are unchanged; no public structure,
+vtable, or installed target changed.
+
+A deterministic contract test failed against the old Android mapping and passes
+after the repair. Windows shared/static builds, the new test, and Android plus
+OHOS shared/static interop cross-builds pass. The unrelated existing
+`qtav_subtitle_libass_render` font-generation assertion fails in both Windows
+configurations; every other CTest passes. Detailed implementation and validation
+evidence is in
+[`PLAN_HISTORY_2026-08-13_ANDROID_DOVI_COMPONENT_ORDER.md`](PLAN_HISTORY_2026-08-13_ANDROID_DOVI_COMPONENT_ORDER.md).
+
+On the connected Xiaomi 2410DPN6CC running Android 16/API 36 and Adreno 830,
+the pre-repair APK reproduced strong purple/yellow Profile 5 output from
+`wednesday.mp4`. The repaired APK rendered the same close-up with natural
+color through `MediaCodec -> AImageReader -> Vulkan ZeroCopy -> libplacebo`.
+At the paused acceptance checkpoint it reported 582 RPU-bearing callbacks,
+578 matched opaque-external-format imports and presentations, 578 returned
+release fences, zero release-fence fallbacks, zero queue/late drops, pending
+depth one, and `0/0/0/0` CPU map/transfer/staging/upload counters. This closes
+the Android Profile 5 post-fix color gate without changing the already-good
+OHOS shader or identity behavior.
+
+## Completed implementation — Android player full screen and basic track UI
+
+The user-facing Android player now implements phone-oriented immersive video
+behavior without imposing a fixed-orientation assumption on adaptive devices.
+On compact displays, an explicit full-screen action requests sensor-landscape
+and restores the prior activity orientation request on exit; physical
+landscape/portrait rotation still enters/exits full screen. At `sw600dp` and
+above, full screen hides system bars without locking orientation. API 30+ uses
+`WindowInsetsController` with transient bars revealed by an edge swipe, API
+28-29 retain immersive-sticky compatibility, Back exits full screen first,
+and subtitles move above the auto-hiding control panel. API 33+ registers the
+predictive-back dispatcher rather than relying on the deprecated callback.
+
+The same demo now enumerates audio and subtitle `TrackInfo` values after load,
+selects them asynchronously by stable selector, exposes subtitle off, and
+presents each active `SubtitleFrame::text()` cue over its media-time interval.
+Switch, disable, seek, stop, media replacement, and native pipeline rebuild
+clear the cached cue immediately. Track title/language/codec/channel metadata
+is visible in the selector. This is intentionally the lightweight plain-text
+fallback: it does not complete the shared styled/bitmap/color-managed subtitle
+composition work below.
+
+Java compiles cleanly against the API 37 SDK with `--release 8`; a fresh
+Windows-hosted NDK 29/API 28 arm64 configure and complete 38-step Android
+shared-library build pass against the repository-local
+`arm64-android-28-static` package. The supplied HTTPS fixture was verified at
+10,960,066 bytes (SHA-256
+`8c8d15158d37b3d45e6ce8abb895d599eef0df185c4b38874d9da7aa3930204d`), and
+the existing core track-switch regression passes with one video, five audio,
+and five subtitle tracks. An API 37/minSdk 28 arm64 APK assembled from that
+build passes `zipalign`, v3 signing verification, manifest/package inspection,
+matches the certificate of the currently installed debug package without
+disclosing local signing material. The final version-code 6 APK uses the
+script's release strip rule, matches an independently stripped current native
+build, and has SHA-256
+`e73edea4d472a13cffa0d955c24ab17244bc0ea721af9d7a12678468bfd9d89a`.
+
+After explicit user approval, the development replacements installed on the
+connected Xiaomi 2410DPN6CC running Android 16/API 36 without a device-side
+authorization failure. With the supplied 1:44 fixture, the UI enumerated five
+audio choices (`zho`, `yue`, `eng`, `spa`, `kor`) and five subtitle choices
+(`zho`, `eng`, `jpn`, `kor`, `spa`); all audio choices switched without a
+media error. Chinese and English `mov_text` cues were independently visible in
+the subtitle `TextView`, including an English cue after selecting subtitle 2,
+and the selector exposed subtitle off. The same hardware session reported
+`MediaCodec -> AImageReader -> Vulkan ZeroCopy -> libplacebo`, matching
+queued/acquired/imported and release-fence counts, zero queue/late drops, and
+`0/0/0/0` decoded-source CPU map/transfer/staging/upload counters.
+
+The final APK was cold-started after installation and its compact-phone
+full-screen action was accepted separately: it
+changed the UI hierarchy from portrait rotation 0 to landscape rotation 1,
+covered the complete 2400x1080 window without status/navigation-bar nodes,
+showed `Exit full`, hid its controls after five seconds, and retained the
+independent Debug layer. Back then kept the same activity top-resumed, restored
+rotation 0, and restored `Full screen`. `legend.mkv` was excluded from subtitle
+acceptance because its video pixels already contain burned-in subtitles; a
+concurrent historical audit package repeatedly opening that file was treated
+as invalid evidence.
+
+## Planned implementation — production subtitle presentation and format coverage
+
+The existing baseline decodes FFmpeg text/ASS subtitles into `SubtitleFrame`,
+preserves ASS events/header data, and offers an optional caller-driven libass
+rasterizer. That is not yet complete player subtitle support: the OHOS and
+Android demos use plain platform text, the Windows demo does not present
+subtitles, bitmap rectangles are not exposed, and broadcast/live cue semantics
+are not covered. Complete the work without turning a subtitle change, output
+resize, full-screen transition, or PiP transition into an A/V seek, decoder
+rebind, or media reopen.
+
+### Phase 1 — core payload, attachment, and lifetime contracts
+
+- [ ] Extend the Qt/FFmpeg-free subtitle payload with a discriminated text/ASS
+  and bitmap representation while preserving the existing `text()`,
+  `assEvents()`, and `assHeader()` API. Bitmap cues need owning, bounded
+  rectangles with canvas position, dimensions, stride, premultiplied RGBA8,
+  forced state, timestamp/duration, track identity, presentation generation,
+  and explicit clear/end semantics; no `AVSubtitle` or `AVSubtitleRect` may
+  escape the core.
+- [ ] Add a bounded media-attachment contract for Matroska and other embedded
+  subtitle fonts, carrying an owned payload plus filename, MIME type, and
+  attachment identity without exposing FFmpeg dictionaries or filesystem
+  assumptions. Define per-file, aggregate-byte, and count limits before
+  accepting untrusted fonts.
+- [ ] Keep subtitle selection presentation-only. Switching, disabling, or
+  replacing a subtitle track must clear only old subtitle cues, preserve the
+  audio sink and A/V queues, publish no global `Buffering`, and never seek the
+  primary input. External subtitle inputs may seek only their own demux cursor.
+- [ ] Define one bounded subtitle timeline/cache policy for overlapping cues,
+  zero or unknown duration, replacement/clear packets, backward seek, loops,
+  frame stepping, playback-rate changes, and live streams. The presentation
+  generation remains the stale-cue boundary.
+
+### Phase 2 — text and styled-text families through libass
+
+- [ ] Make libass the production rasterizer for ASS/SSA and for plain-text
+  formats decoded by FFmpeg, including SubRip/SRT, WebVTT, MovText/TX3G, TTML,
+  SAMI, MicroDVD, SubViewer, MPL2, and LRC where the repository FFmpeg build
+  exposes a usable `TEXT` or `ASS` decoder result. Preserve native ASS/SSA
+  headers, styles, positioning, drawings, karaoke, transforms, and animation;
+  synthesize a documented default ASS style only for plain text.
+- [ ] Do not claim WebVTT/TTML CSS, regions, ruby, vertical text, or other
+  semantics that FFmpeg did not preserve. Add explicit capability/diagnostic
+  reporting for decoded-but-degraded features rather than silently presenting
+  them as format-complete.
+- [ ] Load bounded embedded fonts and configured application/system fallback
+  fonts into libass consistently on Windows, Android, and OHOS. Cover CJK,
+  Arabic shaping/BiDi, emoji/fallback, missing fonts, malformed attachments,
+  and deterministic fallback-family selection.
+- [ ] Use libass content/position change detection and bounded glyph/bitmap
+  caches, but continue time-driven rendering for `\t`, `\move`, fades,
+  karaoke, and other animated events. Paused playback must render the exact
+  paused media time and clear cues at their defined end.
+
+### Phase 3 — bitmap subtitle families
+
+- [ ] Convert FFmpeg `SUBTITLE_BITMAP` output into the public owning bitmap
+  representation for Blu-ray PGS/SUP, DVD/VobSub/SPU, DVB subtitles, and XSUB
+  when their decoders are present. Preserve palette/alpha, crop/canvas
+  geometry, display order, forced flags, and clear-display packets.
+- [ ] Composite bitmap cues directly; do not route them through libass or OCR
+  them into text. Reject invalid strides, rectangles outside bounded canvas
+  limits, oversized allocations, palette overflows, and aggregate cue memory
+  above the configured budget.
+- [ ] Validate coded-video versus subtitle-canvas scaling, anamorphic video,
+  cropped sources, rotation metadata, interlaced DVD material, multiple
+  simultaneous rectangles, palette transparency, and forced-only selection.
+
+### Phase 4 — broadcast, caption, and live subtitle families
+
+- [ ] Cover CEA-608/708, DVB Teletext, and ARIB STD-B24 through the FFmpeg
+  decoder modes available in the repository build. Route formatted text/ASS
+  output through libass and bitmap output through the bitmap compositor; keep
+  decoder availability and selected output mode observable.
+- [ ] Model roll-up/pop-on/paint-on replacement, service/page selection,
+  repeated updates, unknown duration, explicit erase, discontinuity, and
+  end-of-stream clearing without accumulating unbounded events. Late updates
+  from a retired track or generation must never reappear.
+- [ ] Add accessibility-preserving plain text alongside styled/bitmap output
+  where the decoder provides it. Rendering and accessible text are separate
+  consumers; enabling accessibility must not flatten the visual subtitle path.
+
+### Phase 5 — color-managed platform composition and player integration
+
+- [ ] Add a reusable subtitle-overlay composition boundary shared by D3D11,
+  Vulkan, and OpenGL ES. Upload only changed libass/bitmap regions, preserve
+  vector order, and blend at the final color-managed presentation stage with
+  subtitle colors mapped from a configurable SDR/UI reference white into SDR,
+  scRGB, PQ, or HLG output before final transfer encoding.
+- [ ] Keep decoded video frames and hardware surfaces untouched. Subtitle
+  composition must preserve D3D11VA, MediaCodec, and OHCodec zero-CPU-map paths
+  and add no decoded-source download, staging copy, software fallback,
+  per-frame GPU-wide wait, or unbounded texture allocation.
+- [ ] A resize, DPI change, full-screen transition, rotation, or PiP transition
+  may update only subtitle frame/storage geometry and presentation resources.
+  It must not replace the media decoder surface, reconfigure hardware decode,
+  seek, restart playback, or briefly stretch content through an intermediate
+  width/height swap.
+- [ ] For Android/OHOS direct-Surface presentation, use a synchronized
+  transparent application overlay because the platform owns the decoded video
+  layer. Validate Z order, clipping, HDR composition, surface recreation, and
+  PiP support separately; report unsupported PiP overlay behavior explicitly
+  rather than claiming the subtitle was burned into the video.
+- [ ] Replace the OHOS player's ArkUI `Text` path and Android player's View
+  `TextView` path with the shared styled subtitle overlay while retaining plain
+  text as an explicit fallback. Add subtitle presentation and track selection
+  to the WinUI player; keep the completed Android selectors on the same core
+  track/generation contract and align all three platforms' user controls.
+
+### Phase 6 — deterministic, native, and security validation
+
+- [ ] Add deterministic text/ASS goldens for style, positioning, overlap,
+  animation, karaoke, font attachments/fallback, Unicode shaping, switching,
+  disable/re-enable, seek, loop, pause, rate, and frame stepping. Add bitmap
+  goldens for PGS, VobSub, DVB, and XSUB geometry, palette, alpha, forced cues,
+  clear packets, malformed data, and memory limits.
+- [ ] Add renderer goldens for SDR and HDR subtitle luminance/color plus
+  resize, DPI, rotation, full-screen, restore, and PiP geometry. Prove the
+  active video rectangle remains unchanged when subtitles appear or disappear.
+- [ ] On Windows D3D11, Android Vulkan/OpenGL ES/direct Surface, and OHOS
+  Vulkan/OpenGL ES/direct Surface, exercise at least one plain-text, ASS,
+  bitmap, and available broadcast-caption fixture. Measure cue latency,
+  animation cadence, upload/cache bounds, A/V position monotonicity, and clean
+  shutdown; device absence is reported as an open gate, not a pass.
+- [ ] Fuzz or adversarially test subtitle packet parsing boundaries, ASS event
+  size/count, font attachment count/bytes, bitmap dimensions/stride/palette,
+  live event growth, and repeated track/generation replacement. Keep libass and
+  FFmpeg current enough to include applicable security fixes before release.
+
+Acceptance criteria:
+
+1. [ ] ASS/SSA retains author styling and animation; supported plain-text
+   families render through a documented default style; degraded format
+   semantics are observable.
+2. [ ] PGS/SUP, DVD/VobSub, DVB, and XSUB use the bitmap path with correct
+   geometry, palette/alpha, forced flags, and clear behavior; they never pass
+   through libass.
+3. [ ] Available CEA-608/708, Teletext, and ARIB modes handle live replacement
+   and clearing with bounded memory and no stale-generation cue.
+4. [ ] Subtitle switch/disable/seek/full-screen/restore/PiP never reopens or
+   moves the primary A/V timeline; video PTS remains monotonic and the audio
+   sink open/close/flush counters do not change for subtitle-only operations.
+5. [ ] Windows, Android, and OHOS application-rendered paths pass SDR/HDR
+   composition and geometry tests without sacrificing hardware zero-copy.
+   Direct-Surface overlay capabilities and limitations are proven separately.
+6. [ ] Public headers remain Qt/FFmpeg/libass/platform-type free, all new queues
+   and caches are bounded, supported-target shared/static builds and package
+   consumers pass, and detailed evidence moves to a dated plan-history record
+   before this task is marked complete.
+
 ## Active incomplete and external gates
 
 ### OHOS strict Vulkan native-buffer and Dolby Vision gate
@@ -369,7 +626,7 @@ interfaces evolve. The remaining release work is:
 - [ ] Split a backend into another repository only when it has an independent
   license, team, release cycle, or closed-source delivery requirement.
 
-## Deferred final task — guarded Android HDR external-OES fallback
+## Deferred final task — guarded Android HDR external-OES fallback and source-adaptive mobile output
 
 Do not begin this task until every preceding implementation, acceptance, and
 release gate in this plan is complete.
@@ -395,6 +652,39 @@ release gate in this plan is complete.
   success, each failure class, single fallback, stale-generation rejection,
   seek, background/foreground recreation, and clean shutdown.
 
+After the guarded external-OES work above is complete, add a source-adaptive
+SDR/HDR output policy for the Android and OHOS user players:
+
+- [ ] Replace the current source-independent HDR switch default with three
+  explicit policies: `Auto` (default), `Force SDR`, and an advanced/debug
+  `Force HDR`. Keep the backend output preference explicit; do not infer or
+  silently change the meaning of an existing public renderer option.
+- [ ] In `Auto`, select an SDR output for SDR source color metadata. Select a
+  native HDR output for PQ, HLG, HDR10, or Dolby Vision only when the active
+  display and renderer can support it; otherwise select SDR and retain the
+  existing libplacebo tone-mapping path.
+- [ ] Resolve the desired output class from the selected track metadata and
+  confirm it against the first valid decoded frame. Re-evaluate it for media
+  replacement and video-track switching. Recreate the render target or decoder
+  surface only when the resolved output class changes, with bounded transition
+  state that preserves play/pause intent, position, A/V synchronization,
+  presentation generation, and native-buffer lifetime.
+- [ ] Keep direct-Surface playback separate from application-rendered Vulkan
+  and OpenGL ES policy. Do not retag an Android platform-owned SDR buffer as
+  HDR, and do not claim libplacebo tone mapping when Android composition owns
+  decode presentation.
+- [ ] Preserve the already-passing OHOS SDR, native-HDR, HDR10, and Profile 5
+  behavior. Any shared policy/helper change must pass Android and OHOS
+  static/shared cross-builds and must not change OHOS raw-component order,
+  opaque external-format identity sampling, HDR color-space negotiation, or
+  Vulkan/OpenGL ES fallback behavior.
+- [ ] Add deterministic policy tests for SDR, PQ, HLG, HDR10, Dolby Vision,
+  missing/late metadata, unsupported-HDR fallback, media replacement, track
+  switching, and manual overrides. On connected Android and OHOS HDR devices,
+  prove that an SDR source uses an SDR compositor/output target in `Auto`, while
+  HDR10 and Profile 5 retain correct color and native HDR presentation; repeat
+  the existing forced-SDR and forced-HDR regression cells.
+
 ## Completed milestone summary
 
 Detailed checklists and validation evidence are retained in
@@ -406,9 +696,9 @@ is intentionally short:
 | Milestones 0–3: Qt-free core, decomposition, backend contracts, portable video/audio references | Complete and verified |
 | Milestone 4: former Apple production path | Archived and unsupported |
 | Milestone 5: Windows D3D11/D3D11VA/WASAPI | Complete, including the Intel post-seek root-cause investigation and repair; AD-010 is closed |
-| Milestone 6: Android Vulkan/OpenGL ES/MediaCodec/AAudio | Complete, including MediaCodec/AImageReader seek-generation isolation and connected-device H.264/HEVC validation |
+| Milestone 6: Android Vulkan/OpenGL ES/MediaCodec/AAudio | Complete, including MediaCodec/AImageReader seek-generation and repeat-release isolation, plus the Profile 5 opaque-Vulkan component-order repair/device gate |
 | Milestone 7: OHOS production path | AD-009 opaque external-format policy complete and connected-device validated; the separate explicit-plane strict Vulkan gate and broader validation remain open above |
-| Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step, pitch-preserving time-stretch | Complete and verified on Windows plus Android/OHOS static/shared cross-builds |
+| Milestone 9: track switching, subtitles/libass, external sources, packet buffering/cache, live policy, recovery, accurate seek/step, pitch-preserving time-stretch | Core switching, external sources, plain-text callbacks, and optional libass rasterization are complete; production text/ASS composition, bitmap subtitles, broadcast captions, and player integration remain planned above |
 | General audio/video processing contracts and reference volume filter | Complete and verified on Windows plus Android/OHOS static/shared package consumption |
 | Core C++ API and CMake package version contract | Complete at 2.0.0 with deterministic discovery and supported-target package consumers |
 | Milestone 10: software Dolby decode and HDR/Dolby Vision metadata paths | Partial; passthrough, Atmos, strict OHOS Vulkan, licensing, and certification remain open |
@@ -419,10 +709,14 @@ is intentionally short:
    Actions only after project direction re-enables them.
 2. A device-gated OHOS item remains open but does not justify claiming a pass
    on unsuitable hardware or replacing it with a different platform task.
-3. Android MediaCodec seek-generation isolation is complete. The guarded
-   Android HDR external-OES work remains deferred until every preceding gate is
-   complete; do not conflate the two.
-4. When a task completes, move detailed evidence to the history/decision/
+3. Production subtitle coverage is incomplete despite the existing core
+   callback and libass rasterizer. When selected, implement the planned phases
+   in order and do not claim format/platform completion from core-only tests.
+4. Android MediaCodec seek-generation isolation is complete. The guarded
+   Android HDR external-OES work and subsequent source-adaptive mobile output
+   policy remain deferred until every preceding gate is complete; do not
+   conflate these items with the completed generation or Profile 5 repairs.
+5. When a task completes, move detailed evidence to the history/decision/
    architecture document that owns it and keep only a concise status in this
    file.
 

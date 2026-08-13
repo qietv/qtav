@@ -108,7 +108,9 @@ failure.
    switch must not publish `Buffering`, reopen/flush audio, or make video PTS
    move backward.
 4. Exercise every rate preset and verify audio remains pitch-preserved and A/V
-   synchronized.
+   synchronized. With `legend.mkv` at 0.5x, enter and exit full screen at least
+   three times; decoded/presented and native release/callback counters must
+   continue advancing after every transition.
 5. Enter and exit landscape full screen, then start/restore PiP. Exercise PiP
    play/pause and both ten-second seek controls. Verify the progress value does
    not restart, video remains upright, and a 16:9 source is not stretched in
@@ -147,6 +149,15 @@ or introduce drops. Separate 20-second observations reported zero AceMenu
 relayouts and zero `ProcessJank` events. The page therefore keeps the 250 ms
 progress update local to the slider/text state instead of rebuilding debug and
 Select trees on every tick.
+
+The 2026-08-13 signed-player follow-up reproduced the former 0.5x full-screen
+freeze as one queued OHCodec output with no possible matching native-image
+callback. After the shared one-shot output decision was made observable as
+`AlreadyDecided`, the final no-instrumentation HAP passed the original
+`legend.mkv -> 0.5x -> full screen` path and three further exit/re-enter
+cycles. Each snapshot held 12.4 FPS and zero Player drops; the last snapshot
+reached 1,980 hardware frames, 1,961 presentations, and balanced
+`release=callback=1,963`.
 
 A software-decode follow-up rebuilt the repository OHOS arm64 FFmpeg package
 with LTO, NEON, runtime CPU detection, and effective `-O3` instead of the

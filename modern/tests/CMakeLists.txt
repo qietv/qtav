@@ -136,6 +136,30 @@ add_test(
     COMMAND qtav_mediacodec_image_epoch_test
 )
 
+add_executable(
+    qtav_vulkan_raw_ycbcr_contract_test
+    vulkan_raw_ycbcr_contract_test.cpp
+)
+target_include_directories(
+    qtav_vulkan_raw_ycbcr_contract_test
+    PRIVATE "${PROJECT_SOURCE_DIR}/backends/interop"
+)
+target_compile_definitions(
+    qtav_vulkan_raw_ycbcr_contract_test
+    PRIVATE
+        "QTAV_MEDIACODEC_VULKAN_SOURCE=\"${PROJECT_SOURCE_DIR}/backends/interop/mediacodec_vulkan/src/mediacodec_vulkan_interop.cpp\""
+        "QTAV_OHCODEC_VULKAN_SOURCE=\"${PROJECT_SOURCE_DIR}/backends/interop/ohcodec_vulkan/src/ohcodec_vulkan_interop.cpp\""
+        "QTAV_VULKAN_EXTERNAL_NORMALIZER_SHADER=\"${PROJECT_SOURCE_DIR}/backends/render/vulkan/shaders/external_normalize.frag\""
+)
+target_compile_features(
+    qtav_vulkan_raw_ycbcr_contract_test
+    PRIVATE cxx_std_17
+)
+add_test(
+    NAME qtav_vulkan_raw_ycbcr_contract
+    COMMAND qtav_vulkan_raw_ycbcr_contract_test
+)
+
 if(NOT QTAV_AUDIO_AAUDIO STREQUAL "OFF")
     add_executable(
         qtav_audio_aaudio_pcm_queue_test

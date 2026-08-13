@@ -404,6 +404,11 @@ zero-CPU-copy, but is not strict source zero-copy. The normalization shader may
 only crop or preserve/repack raw components; semantic color conversion, Dolby
 Vision, tone/gamut mapping, scaling, and output encoding remain libplacebo's
 exclusive responsibility.
+For the opaque Dolby Vision route, MediaCodec retains the driver's component
+mapping when it switches the sampler to `RGB_IDENTITY`. Vulkan samples raw
+`(Cr,Y,Cb)` as `(R,G,B)` and the shared shader performs one `.gbr` reorder to
+`(Y,Cb,Cr)`. This is the same contract as OHOS; neither platform interop may
+preapply that reorder.
 
 `QtAV::RenderVulkan` exposes the decoder-independent retained sampled-image
 contract used by this target; it keeps the imported image, hardware buffer,

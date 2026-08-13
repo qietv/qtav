@@ -1,0 +1,49 @@
+diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
+index 4d95dbd0c9..7bc20cb0f9 100644
+--- a/libavcodec/mediacodec.c
++++ b/libavcodec/mediacodec.c
+@@ -100,7 +100,7 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
+         return ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, render);
+     }
+ 
+-    return 0;
++    return AVERROR(EALREADY);
+ }
+ 
+ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time)
+@@ -117,7 +117,7 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
+         return ff_AMediaCodec_releaseOutputBufferAtTime(ctx->codec, buffer->index, time);
+     }
+ 
+-    return 0;
++    return AVERROR(EALREADY);
+ }
+ 
+ #else
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+index 2eb851fc40..87cf9f9d73 100644
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -81,8 +81,10 @@ typedef struct MediaCodecBuffer AVMediaCodecBuffer;
+  *
+  * @param buffer the buffer to render
+  * @param render 1 to release and render the buffer to the surface or 0 to
+  * discard the buffer
+- * @return 0 on success, < 0 otherwise
++ * @return 0 when the native output was released, AVERROR(EALREADY) when the
++ * output was already released or retired by a decoder flush, or another
++ * negative AVERROR value on failure
+  */
+ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render);
+ 
+@@ -96,7 +98,9 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render);
+  *
+  * @param buffer the buffer to render
+  * @param time timestamp in nanoseconds of when to render the buffer
+- * @return 0 on success, < 0 otherwise
++ * @return 0 when the native output was released, AVERROR(EALREADY) when the
++ * output was already released or retired by a decoder flush, or another
++ * negative AVERROR value on failure
+  *
+  * [0]: https://developer.android.com/reference/android/media/MediaCodec#releaseOutputBuffer(int,%20long)
+  */

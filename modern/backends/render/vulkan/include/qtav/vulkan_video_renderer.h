@@ -103,9 +103,12 @@ public:
     virtual VkImage image() const noexcept = 0;
     virtual VkImageView imageView() const noexcept = 0;
     virtual VkSampler sampler() const noexcept = 0;
-    // Optional view/sampler pair which exposes undecoded Y, Cb, and Cr in
-    // RGB component order. Android and OHOS external formats use this for
-    // Dolby Vision RPU reshaping before libplacebo performs color conversion.
+    // Optional view/sampler pair which exposes unconverted YCbCr through
+    // Vulkan's RGB_IDENTITY convention: R/G/B contain Cr/Y/Cb after the
+    // driver-provided component mapping. The shared external normalizer
+    // converts this once into Y/Cb/Cr for Dolby Vision RPU reshaping before
+    // libplacebo performs color conversion. Implementations must not preapply
+    // that final component rotation.
     virtual VkImageView unconvertedImageView() const noexcept;
     virtual VkSampler unconvertedSampler() const noexcept;
     // Optional ownership token for a sampler/conversion whose lifetime is
@@ -206,6 +209,10 @@ public:
 
     BorrowedVulkanDevice device() const noexcept;
     void setCurrentTargetCallback(VulkanCurrentTargetCallback callback);
+    // Rotates the image into a presentation target whose platform transform
+    // applies the inverse rotation. Unlike VideoRenderConfig::rotation, this
+    // does not change the displayed source aspect ratio.
+    void setPresentationRotation(VideoRotation rotation);
     VulkanHardwareImportStatus prepareHardwareFrame(
         const VideoFrame& frame,
         std::string* detail = nullptr);

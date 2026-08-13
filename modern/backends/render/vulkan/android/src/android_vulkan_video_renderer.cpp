@@ -55,6 +55,32 @@ VkCompositeAlphaFlagBitsKHR compositeAlpha(
     return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 }
 
+VkSurfaceTransformFlagBitsKHR presentationTransform(
+    const VkSurfaceCapabilitiesKHR& capabilities) noexcept
+{
+    if ((capabilities.supportedTransforms
+         & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        != 0U) {
+        return VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    }
+    return capabilities.currentTransform;
+}
+
+VideoRotation presentationRotation(
+    VkSurfaceTransformFlagBitsKHR transform) noexcept
+{
+    switch (transform) {
+    case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+        return VideoRotation::Rotate90;
+    case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+        return VideoRotation::Rotate180;
+    case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+        return VideoRotation::Rotate270;
+    default:
+        return VideoRotation::Rotate0;
+    }
+}
+
 VkXYColorEXT xyColor(const Chromaticity& value) noexcept
 {
     return {
@@ -160,6 +186,7 @@ public:
             swapchain_ = VK_NULL_HANDLE;
         }
         extent_ = {};
+        preTransform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         format_ = VK_FORMAT_UNDEFINED;
         colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     }
@@ -289,6 +316,27 @@ public:
                 "VK_EXT_hdr_metadata was reported enabled but vkSetHdrMetadataEXT is unavailable";
             return false;
         }
+        // SurfaceView keeps the same ANativeWindow identity across some
+        // configuration changes. In particular, an EGL generation can leave
+        // a producer-side buffer override in the previous orientation even
+        // after ANativeWindow_getWidth/Height expose the View's new size.
+        // Adopt those current View dimensions explicitly before Vulkan WSI
+        // queries its surface extent; resetting to the base geometry alone is
+        // asynchronous on affected Android implementations.
+        const int windowWidth = window_
+            ? ANativeWindow_getWidth(window_)
+            : 0;
+        const int windowHeight = window_
+            ? ANativeWindow_getHeight(window_)
+            : 0;
+        if (windowWidth <= 0 || windowHeight <= 0
+            || ANativeWindow_setBuffersGeometry(
+                   window_, windowWidth, windowHeight, 0)
+                != 0) {
+            error =
+                "ANativeWindow_setBuffersGeometry could not adopt the latest Android surface size";
+            return false;
+        }
         if (!createSurface(error) || !createSemaphores(error)) {
             return false;
         }
@@ -371,7 +419,8 @@ public:
         swapchainInfo.imageArrayLayers = 1;
         swapchainInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         swapchainInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        swapchainInfo.preTransform = capabilities.currentTransform;
+        preTransform_ = presentationTransform(capabilities);
+        swapchainInfo.preTransform = preTransform_;
         swapchainInfo.compositeAlpha =
             compositeAlpha(capabilities.supportedCompositeAlpha);
         swapchainInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
@@ -546,6 +595,8 @@ public:
             static_cast<int>(extent_.height),
         };
         config_.viewport = {};
+        renderer_.setPresentationRotation(
+            presentationRotation(preTransform_));
         config_.rotation = applicationRotation_;
     }
 
@@ -564,11 +615,17 @@ public:
         acquired_ = false;
         activeTarget_ = {};
         advanceSync();
-        if (result == VK_ERROR_OUT_OF_DATE_KHR
-            || result == VK_SUBOPTIMAL_KHR) {
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
             return recreate(error);
         }
-        if (result != VK_SUCCESS) {
+        // VK_SUBOPTIMAL_KHR is a successful presentation. Android may keep
+        // returning it when an explicitly supported identity pre-transform
+        // differs from the display's current rotation transform. Recreating
+        // the same swapchain cannot change that relationship and would turn
+        // every presented frame into a full device-idle/rebuild cycle.
+        // SurfaceView changes arrive independently through setWindow(), which
+        // recreates the swapchain with the new native-window geometry.
+        if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
             error = resultError("vkQueuePresentKHR", result);
             return false;
         }
@@ -608,6 +665,8 @@ public:
     VkExtent2D extent_ {};
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkColorSpaceKHR colorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    VkSurfaceTransformFlagBitsKHR preTransform_ =
+        VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     PFN_vkSetHdrMetadataEXT setHdrMetadata_ = nullptr;
     std::array<
         FrameSync,

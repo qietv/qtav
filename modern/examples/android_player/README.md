@@ -9,18 +9,47 @@ The UI contains:
 - a `SurfaceView` video area;
 - current time, seek slider, and total duration;
 - local-file, remote-URL, play/pause, stop, and full-screen controls;
+- post-load audio-track and subtitle-track selectors, including an explicit
+  subtitle-off choice;
+- a presentation-timed plain-text subtitle overlay above the video controls;
 - live Vulkan, HDR, ZeroCopy, hardware-decode, and Debug switches, with
   rendering controls on the first row and ZeroCopy/hardware decode on a
   separate second row so every switch remains touchable;
 - a Debug-controlled top-left status window showing the active native path,
   current presentation FPS, or the exact failure.
 
-The full-screen button or a rotation into landscape moves the complete control
-panel onto the bottom of the video. It remains visible for five seconds after
-the last touch and then disappears without hiding the independent Debug
-window. Tap the video once to reveal the controls again; that reveal gesture
-does not activate a newly exposed button. Rotating back to portrait exits
-full-screen mode.
+On a compact phone, the full-screen button requests sensor-aware landscape and
+enters immersive playback; leaving button-initiated full screen restores the
+activity's previous orientation request. A physical rotation into landscape
+also enters full screen, and rotating back to portrait exits it. On a tablet,
+unfolded large-screen device, or desktop window (`smallestScreenWidthDp >=
+600`), the button does not lock orientation: the layout remains adaptive and
+only the window enters immersive mode. This follows Android's large-screen
+orientation policy, where orientation requests can be ignored, while retaining
+the familiar landscape behavior of phone video players. See Android's
+[orientation and resizability guidance](https://developer.android.com/develop/adaptive-apps/guides/app-orientation-aspect-ratio-resizability)
+and [immersive system-bar guidance](https://developer.android.com/develop/ui/views/layout/immersive).
+
+On Android 11/API 30 and newer, full screen uses `WindowInsetsController` and
+lets an edge swipe reveal transient system bars over the video. Android 9 and
+10 use the compatible immersive-sticky system-UI flags. Display cutouts are
+used only in immersive mode. The complete control panel is overlaid at the
+bottom of the video, remains visible for five seconds after the last touch,
+and then disappears without hiding the independent Debug window or subtitle.
+Tap the video once to reveal the controls again; that reveal gesture does not
+activate a newly exposed button. Back exits full screen before leaving the
+activity; API 33 and newer register the predictive-back dispatcher while the
+older targets retain the activity callback.
+
+The selectors use `TrackInfo::index` and the asynchronous
+`Player::setActiveTrack()` contract. Audio choices show title, language,
+codec, and channel count when present. Subtitle switching and disabling clear
+the old cue immediately, and decoded cues are shown only over their
+presentation interval. This demo currently uses `SubtitleFrame::text()`:
+plain text and the normalized text of ASS/SSA cues are visible, but ASS styling,
+positioning, animation, embedded fonts, and bitmap subtitle rectangles are not
+rendered by this lightweight Android view overlay. Those remain part of the
+production subtitle-composition work tracked in `modern/PLAN.md`.
 
 ## Build
 
@@ -69,9 +98,16 @@ QTAV_ANDROID_API
 QTAV_ANDROID_COMPILE_SDK
 QTAV_ANDROID_BUILD_TOOLS
 QTAV_ANDROID_CMAKE_VERSION
+QTAV_ANDROID_PLAYER_VERSION_CODE
+QTAV_ANDROID_PLAYER_VERSION_NAME
 QTAV_BUILD_JOBS
 QTAV_HOST_PKG_CONFIG
 ```
+
+The default demo package version is `6` / `1.1-fullscreen-tracks`. Override
+both version variables together for a later reproducible device build; Android
+rejects an ordinary replacement when its version code is below the installed
+package.
 
 Before running the script, build the local dependency package with
 `ffmpeg/scripts/build-android.sh` on macOS or
@@ -172,6 +208,9 @@ target. Playback has no per-frame application logcat output; normal logging is
 limited to setup, the first Dolby Vision RPU frame, first presentation, and
 errors. The diagnostics count Dolby Vision RPU frames and raw YCbCr imports so
 the Profile 5 libplacebo path can be distinguished from codec passthrough.
+For Vulkan interop they also report acquire/release/fallback fence counts, the
+AHardwareBuffer/Vulkan/external formats, and the zero-CPU
+map/transfer/staging/upload counters used by the connected-device gate.
 
 `HDR` selects `PreferHdr`; disabling it selects deterministic SDR output on an
 application renderer. The status line reports whether the actual Vulkan/EGL
@@ -260,10 +299,31 @@ direct-Surface mode the demo fits and centers the `SurfaceView` from the
 already-open track or decoded-frame dimensions so MediaCodec does not stretch
 the picture to the control area's aspect ratio.
 
+A `surfaceChanged()`/fullscreen refresh can re-offer the retained latest frame
+after renderer invalidation. FFmpeg now reports an already-consumed or
+flush-retired MediaCodec output explicitly, and both AImageReader interops
+cancel that provisional association as stale. They do not wait for a callback
+that the suppressed native release cannot emit, and this lifecycle rule is
+independent of coded or window dimensions.
+
 The long-form 4K performance samples used for connected-device checks are
 `Download/legend.mkv` and `Download/suzume.mkv`. The matching direct-streaming
 URL for `legend.mkv` is
 `https://2dland.cn/test/legend_of_the_magnate.mkv`.
+That sample already has a subtitle layer burned into the video pixels. Its
+visible text must not be used as evidence that a selectable subtitle track was
+decoded, switched, disabled, or timed correctly.
+
+The multi-track selection fixture is:
+
+```text
+https://2dland.cn/test/multi_audio_and_subtitle_tracks.mp4
+```
+
+The current file contains one video stream, five selectable audio streams, and
+five selectable subtitle streams. The repository core track-switch regression
+uses the same downloaded bytes to exercise paused and playing audio/subtitle
+switches, subtitle disable/re-enable, and seek continuity.
 
 Native diagnostics:
 
@@ -286,8 +346,17 @@ background/foreground Surface recreation:
 6. hardware decode + ZeroCopy off (direct Surface);
 7. Debug off hides the top-left status window without interrupting playback;
 8. Debug on restores the status window and reports a stable `present fps`;
-9. the full-screen button and landscape rotation both overlay the controls,
-   auto-hide them after five seconds, and leave Debug visible.
+9. on a phone, the full-screen button rotates portrait playback into landscape,
+   enters immersive mode, allows transient system bars by edge swipe, and
+   restores the prior orientation request on exit;
+10. on a large-screen emulator/device or resizable window, full screen does
+    not lock orientation and the controls remain reachable in either layout;
+11. landscape rotation overlays the controls, auto-hides them after five
+    seconds, and leaves Debug and the active subtitle visible;
+12. open the multi-track fixture above, select all five audio tracks, select
+    all five subtitle tracks, turn subtitles off and back on, seek during a
+    cue, and repeat a subtitle switch in full screen. The old cue must clear
+    immediately and A/V playback must continue without a media reopen.
 
 Also open one file through the Storage Access Framework and one remote file
 through both HTTP and HTTPS where test hosting permits. Treat unsupported

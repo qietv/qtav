@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000000..ec0ced37cc
 --- /dev/null
 +++ b/libavcodec/ohcodec_surface.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,56 @@
 +/*
 + * OpenHarmony OHCodec surface-output public API
 + *
@@ -52,7 +52,8 @@ index 0000000000..ec0ced37cc
 + *
 + * @param buffer the surface output from AVFrame.data[3]
 + * @param render nonzero to render to the configured surface, zero to drop
-+ * @return 0 on success, a negative AVERROR value on failure
++ * @return 0 on success, AVERROR(EALREADY) when another view already made
++ *         the one permitted decision, or another negative AVERROR on failure
 + */
 +int av_ohcodec_release_buffer(AVOHCodecBuffer *buffer, int render);
 +
@@ -110,7 +111,7 @@ index 7f24d9a943..fb66163e52 100644
 +        return AVERROR(EINVAL);
 +
 +    if (atomic_exchange(&buffer->released, 1))
-+        return 0;
++        return AVERROR(EALREADY);
 +
 +    OH_AVCodec *dec = *buffer->dec_ref;
 +    OH_AVErrCode err = render
@@ -125,7 +126,7 @@ index 7f24d9a943..fb66163e52 100644
 +        return AVERROR(EINVAL);
 +
 +    if (atomic_exchange(&buffer->released, 1))
-+        return 0;
++        return AVERROR(EALREADY);
 +
 +    OH_AVCodec *dec = *buffer->dec_ref;
 +    return ff_oh_err_to_ff_err(

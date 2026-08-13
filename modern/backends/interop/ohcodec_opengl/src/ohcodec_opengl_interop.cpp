@@ -443,9 +443,15 @@ public:
         }
 
         OHCodecFrame output = ohCodecFrame(frame, targetSurface);
-        const bool presented = output && output.isPending()
-            && output.present();
+        const OHCodecFrameDecisionResult decision =
+            output && output.isPending()
+            ? output.presentResult()
+            : OHCodecFrameDecisionResult::Failed;
+        const bool presented =
+            decision == OHCodecFrameDecisionResult::Applied;
         if (!presented) {
+            const bool alreadyDecided =
+                decision == OHCodecFrameDecisionResult::AlreadyDecided;
             std::lock_guard<std::mutex> lock(mutex_);
             queuedFrames_.erase(
                 std::remove_if(
@@ -455,8 +461,12 @@ public:
                         return pending.key == key;
                     }),
                 queuedFrames_.end());
-            detail =
-                "Could not present the OHCodec output into OH_NativeImage";
+            if (alreadyDecided) {
+                detail =
+                    "The OHCodec output was already consumed before this redraw";
+                return OpenGLHardwareImportStatus::Stale;
+            }
+            detail = "Could not present the OHCodec output into OH_NativeImage";
             lastRuntimeError_ = detail;
             return OpenGLHardwareImportStatus::Error;
         }

@@ -337,9 +337,10 @@ MediaCodec + parsed RPU
        │
        ▼
 private AImageReader / AHardwareBuffer
-       ├── Vulkan external image ──► raw Y/Cb/Cr ──┐
+       ├── Vulkan identity (Cr/Y/Cb) ──► .gbr ─────┐
        └── EGLImage + GL_EXT_YUV_target ──────────┤
                                                   ▼
+                                      raw Y/Cb/Cr + parsed RPU
                                       libplacebo DOVI reshape
                                       + color/tone/gamut pipeline
                                                   │
@@ -351,7 +352,10 @@ private AImageReader / AHardwareBuffer
 
 An Android import that cannot prove the raw-component contract is rejected for
 Dolby Vision. Implicit `SurfaceTexture`/external-OES conversion is not treated
-as a valid Profile 5 source.
+as a valid Profile 5 source. Android and OHOS opaque Vulkan identity samplers
+both retain the driver-provided component mapping. The shared normalizer alone
+changes Vulkan's sampled `(Cr,Y,Cb)` to libplacebo's `(Y,Cb,Cr)`; a platform
+interop must not preapply the same rotation.
 
 The Windows path applies the same ordering through D3D11 only:
 
@@ -450,6 +454,16 @@ Both paths preserve crop, timestamp/generation, exact-frame ownership, and
 producer/consumer fence order. Native-buffer queues remain bounded. Cache
 entries may reuse GPU imports by AHardwareBuffer identity, but a codec output
 and its AImage remain retained until the GPU has finished consuming them.
+
+The FFmpeg MediaCodec decision is a three-way ownership boundary: `Applied`
+means the current call released a native output, `AlreadyReleased` means a
+retained peer already decided it or decoder flush retired it, and `Failed`
+means the native operation failed. An AImageReader interop begins its producer
+epoch association before the decision but keeps it only for `Applied`.
+`AlreadyReleased` cancels that provisional association and is stale; no
+Surface buffer or frame-available callback can follow. Presentation/surface
+invalidation may therefore re-offer a retained latest frame without creating
+an impossible pending image wait.
 
 Direct-Surface mode is a third, separate path. It has no application-readable
 texture and therefore cannot be described as Vulkan, OpenGL ES, libplacebo, or

@@ -232,6 +232,11 @@ are rejected when the application validates the output against its current
 token. Retained MediaCodec frames keep their FFmpeg decoder context alive so
 queue invalidation, seek, stop, media replacement, and surface recreation
 cannot free the codec before its output buffers are released.
+Use `presentResult()`, `presentAtResult()`, or `dropResult()` when an
+application or interop must distinguish an applied native release from an
+already-consumed/flush-retired output. The bool forms return true only when a
+native release was actually applied; `AlreadyReleased` cannot produce a
+Surface or AImageReader callback and should be treated as stale.
 For direct presentation, `setVideoFrameScheduler()` now supplies the target
 steady-clock deadline on the video-decode worker; accepting the frame bypasses
 the later `onVideoFrame()` and renderer callbacks so a small MediaCodec output
@@ -244,6 +249,11 @@ surface to `mediaCodecHardwareDecodeConfig()`, and bind the same interop to
 asynchronously acquired private `AImage` timestamps, imports retained
 `AHardwareBuffer` memory with driver-provided YCbCr/external-format sampling,
 and returns a Vulkan release sync fd through asynchronous image deletion.
+For the opaque Dolby Vision route, the identity sampler retains the driver's
+component mapping. Vulkan exposes `(Cr,Y,Cb)` as `(R,G,B)`, and the shared
+normalization shader performs the only `.gbr` conversion to `(Y,Cb,Cr)`.
+Android no longer pre-rotates the mapping before that shared pass; OHOS keeps
+the same already-validated contract.
 Its configured width and height are optional default reader dimensions;
 MediaCodec supplies the actual decoded buffer size, so applications do not
 need to pre-probe media dimensions before creating the interop. The OpenGL ES
@@ -354,9 +364,12 @@ identify `HardwareDeviceType::OHCodec` and carry the source surface identity
 and generation without exposing OHOS or FFmpeg types through core headers.
 `ohCodecFrame()` validates that identity and returns a move-only
 `OHCodecFrame`; exactly one of `present()`, `presentAt()`, or `drop()` may be
-used, and an undecided token drops on destruction. A final retained frame
-release without an explicit decision also unconditionally drops/frees the
-FFmpeg output instead of implicitly rendering it. Player applies the shared
+used, and an undecided token drops on destruction. Their `*Result()` forms
+report `Applied`, `AlreadyDecided`, or `Failed`; a render-target redraw of an
+already-consumed frame is stale and must not be registered as a new pending
+surface callback. A final retained frame release without an explicit decision
+also unconditionally drops/frees the FFmpeg output instead of implicitly
+rendering it. Player applies the shared
 surface-output packet-feed and output-retention bounds before invoking the
 decode-worker scheduler. The complete connected HAP now passes H.264 and HEVC
 direct output with 48/40 presentations and 5 drops per codec, pause/resume, a

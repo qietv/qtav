@@ -79,10 +79,23 @@ vcpkg's current platform model.
 The OHOS FFmpeg overlay installs `libavcodec/ohcodec_surface.h`. Its opaque
 token permits exactly one immediate render, monotonic timed render, or drop of
 an OHCodec surface output without exposing FFmpeg's private decoder structure.
+Repeating a decision through another retained view returns
+`AVERROR(EALREADY)`; callers can therefore reject an old-frame redraw without
+waiting for a surface callback that the already-consumed output cannot emit.
 Releasing the last frame reference without an explicit decision unconditionally
 drops the output; it never implicitly renders an abandoned output.
 It does not expose `OH_AVBuffer`/`OH_NativeBuffer` texture interop. The API and
 retirement criteria are recorded in [FD-004](DECISIONS.md).
+
+The Android FFmpeg overlay also makes MediaCodec output release observable.
+`av_mediacodec_release_buffer()` and
+`av_mediacodec_render_buffer_at_time()` return `0` only when that call actually
+releases the native output. A repeated retained-frame decision, or the first
+decision after decoder flush already retired the output, returns
+`AVERROR(EALREADY)`. This prevents a surface redraw from waiting for an
+`AImageReader` callback that MediaCodec cannot emit. The Android package
+verifier requires this header contract; rationale is recorded in
+[FD-009](DECISIONS.md).
 
 The OHOS overlay also registers `vvc_ohcodec`, maps `AV_CODEC_ID_VVC` to the
 platform VVC MIME, and selects `vvc_mp4toannexb` for MP4 `vvc1` input. The

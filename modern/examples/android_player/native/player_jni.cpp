@@ -33,6 +33,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -202,6 +203,29 @@ const char* statusName(qtav::MediaStatus status) noexcept
     return "Unknown";
 }
 
+std::string trackLabel(const qtav::TrackInfo& track, std::size_t ordinal)
+{
+    std::string result = track.title;
+    if (result.empty()) {
+        result = track.type == qtav::MediaType::Audio
+            ? "Audio " + std::to_string(ordinal + 1)
+            : "Subtitle " + std::to_string(ordinal + 1);
+    }
+    if (!track.language.empty() && track.language != "und") {
+        result += " · " + track.language;
+    }
+    if (!track.codec.empty()) {
+        result += " · " + track.codec;
+    }
+    if (track.type == qtav::MediaType::Audio && track.channels > 0) {
+        result += " · " + std::to_string(track.channels) + "ch";
+    }
+    if (track.external) {
+        result += " · external";
+    }
+    return result;
+}
+
 std::string fromJavaString(JNIEnv* environment, jstring value)
 {
     if (!environment || !value) {
@@ -214,6 +238,50 @@ std::string fromJavaString(JNIEnv* environment, jstring value)
     }
     std::string result(characters);
     environment->ReleaseStringUTFChars(value, characters);
+    return result;
+}
+
+jobjectArray toJavaTrackOptions(
+    JNIEnv* environment,
+    const std::vector<std::pair<int, std::string>>& tracks)
+{
+    jclass stringClass = environment->FindClass("java/lang/String");
+    if (!stringClass) {
+        return nullptr;
+    }
+    jobjectArray result = environment->NewObjectArray(
+        static_cast<jsize>(tracks.size() * 2),
+        stringClass,
+        nullptr);
+    environment->DeleteLocalRef(stringClass);
+    if (!result) {
+        return nullptr;
+    }
+    for (std::size_t index = 0; index < tracks.size(); ++index) {
+        const std::string selector = std::to_string(tracks[index].first);
+        jstring javaSelector = environment->NewStringUTF(selector.c_str());
+        jstring javaLabel =
+            environment->NewStringUTF(tracks[index].second.c_str());
+        if (!javaSelector || !javaLabel) {
+            if (javaSelector) {
+                environment->DeleteLocalRef(javaSelector);
+            }
+            if (javaLabel) {
+                environment->DeleteLocalRef(javaLabel);
+            }
+            return result;
+        }
+        environment->SetObjectArrayElement(
+            result,
+            static_cast<jsize>(index * 2),
+            javaSelector);
+        environment->SetObjectArrayElement(
+            result,
+            static_cast<jsize>(index * 2 + 1),
+            javaLabel);
+        environment->DeleteLocalRef(javaSelector);
+        environment->DeleteLocalRef(javaLabel);
+    }
     return result;
 }
 
@@ -273,12 +341,13 @@ public:
         stopRenderThread();
     }
 
-    void setSurface(ANativeWindow* window, int displayRotation)
+    void setSurface(ANativeWindow* window, int surfaceRotation)
     {
         std::lock_guard<std::mutex> lock(commandMutex_);
-        if (window) {
-            displayRotation_ = std::clamp(displayRotation, 0, 3);
-        }
+        // The Java value is a refresh signal. Vulkan surface capabilities own
+        // the presentation transform; it must not be treated as media
+        // rotation.
+        (void)surfaceRotation;
         if (window == window_) {
             // surfaceCreated() and the initial surfaceChanged() normally
             // deliver the same ANativeWindow. The JNI call acquired another
@@ -294,8 +363,7 @@ public:
                 qtav::VideoRenderConfig config;
                 config.surfaceSize = vulkanRenderer_->surfaceSize();
                 config.aspectRatio = qtav::VideoAspectRatioMode::Fit;
-                config.rotation = static_cast<qtav::VideoRotation>(
-                    displayRotation_);
+                config.rotation = qtav::VideoRotation::Rotate0;
                 if (refreshed
                     && !vulkanRenderer_->configure(config)) {
                     const std::string message =
@@ -425,6 +493,7 @@ public:
         std::lock_guard<std::mutex> lock(commandMutex_);
         userWantsPlaying_.store(false);
         savedPosition_ = 0;
+        clearSubtitle();
         resetPresentationContinuity();
         clearScheduledRenderFrames();
         if (player_) {
@@ -437,6 +506,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(commandMutex_);
         savedPosition_ = std::max<std::int64_t>(0, position);
+        clearSubtitle();
         resetPresentationContinuity();
         clearScheduledRenderFrames();
         if (player_ && !player_->seek(savedPosition_)) {
@@ -468,6 +538,81 @@ public:
     {
         std::lock_guard<std::mutex> lock(commandMutex_);
         return player_ && player_->state() == qtav::State::Playing;
+    }
+
+    std::vector<std::pair<int, std::string>> trackOptions(
+        qtav::MediaType type) const
+    {
+        std::vector<std::pair<int, std::string>> result;
+        if (type != qtav::MediaType::Audio
+            && type != qtav::MediaType::Subtitle) {
+            return result;
+        }
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (!player_) {
+            return result;
+        }
+        const qtav::MediaInfo mediaInfo = player_->mediaInfo();
+        for (const qtav::TrackInfo& track : mediaInfo.tracks) {
+            if (track.type == type) {
+                result.emplace_back(
+                    track.index,
+                    trackLabel(track, result.size()));
+            }
+        }
+        return result;
+    }
+
+    int activeTrack(qtav::MediaType type) const
+    {
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (!player_) {
+            return -1;
+        }
+        const qtav::MediaInfo mediaInfo = player_->mediaInfo();
+        if (type == qtav::MediaType::Audio) {
+            return mediaInfo.activeAudioTrack;
+        }
+        if (type == qtav::MediaType::Subtitle) {
+            return mediaInfo.activeSubtitleTrack;
+        }
+        return -1;
+    }
+
+    bool selectTrack(qtav::MediaType type, int selector)
+    {
+        if (type != qtav::MediaType::Audio
+            && type != qtav::MediaType::Subtitle) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (!player_ || !player_->setActiveTrack(type, selector)) {
+            return false;
+        }
+        if (type == qtav::MediaType::Subtitle) {
+            clearSubtitle();
+        }
+        return true;
+    }
+
+    std::string subtitleText() const
+    {
+        std::lock_guard<std::mutex> lock(commandMutex_);
+        if (!player_) {
+            return {};
+        }
+        const qtav::MediaInfo mediaInfo = player_->mediaInfo();
+        if (mediaInfo.activeSubtitleTrack < 0) {
+            return {};
+        }
+        const std::int64_t position =
+            std::max<std::int64_t>(0, player_->position());
+        std::lock_guard<std::mutex> subtitleLock(subtitleMutex_);
+        if (subtitleTrack_ != mediaInfo.activeSubtitleTrack
+            || position < subtitleStart_ || position > subtitleEnd_) {
+            return {};
+        }
+        return subtitleText_;
     }
 
     std::uint64_t videoSizePacked() const noexcept
@@ -626,6 +771,31 @@ public:
                 + std::to_string(interopStaleImagesDropped_.load())
                 + " pending max "
                 + std::to_string(interopMaximumPendingImages_.load());
+            const std::uint64_t externalFormat =
+                vulkanExternalFormat_.load();
+            if (externalFormat != 0) {
+                result += " · fences acquire/release/fallback "
+                    + std::to_string(
+                        interopAcquireFencesImported_.load())
+                    + "/"
+                    + std::to_string(
+                        interopReleaseFencesReturned_.load())
+                    + "/"
+                    + std::to_string(
+                        interopReleaseFenceFallbacks_.load());
+                result += " · zeroCPU map/transfer/staging/upload "
+                    + std::to_string(interopCpuMapCalls_.load()) + "/"
+                    + std::to_string(
+                        interopSoftwareTransferCalls_.load())
+                    + "/"
+                    + std::to_string(interopStagingCopies_.load()) + "/"
+                    + std::to_string(interopRendererUploads_.load());
+                result += " · Vulkan AHB/Vk/external fmt "
+                    + std::to_string(vulkanHardwareBufferFormat_.load())
+                    + "/"
+                    + std::to_string(vulkanFormat_.load()) + "/"
+                    + std::to_string(externalFormat);
+            }
         }
         const auto openGLHdrStatus =
             static_cast<qtav::MediaCodecOpenGLHdrSamplingStatus>(
@@ -1018,6 +1188,27 @@ private:
                         recordDirectOutputColorSpace(frame);
                         presentDirectSurfaceFrame(frame, generation);
                     }
+                })
+            .onSubtitleFrame(
+                [this, generation](
+                    const qtav::SubtitleFrame& frame,
+                    int track) {
+                    if (playerGeneration_.load() != generation) {
+                        return;
+                    }
+                    const std::int64_t duration =
+                        std::max<std::int64_t>(frame.duration(), 1'000);
+                    const std::int64_t end =
+                        frame.timestamp()
+                            > std::numeric_limits<std::int64_t>::max()
+                                - duration
+                        ? std::numeric_limits<std::int64_t>::max()
+                        : frame.timestamp() + duration;
+                    std::lock_guard<std::mutex> lock(subtitleMutex_);
+                    subtitleText_ = frame.text();
+                    subtitleStart_ = frame.timestamp();
+                    subtitleEnd_ = end;
+                    subtitleTrack_ = track;
                 });
     }
 
@@ -1094,8 +1285,7 @@ private:
         qtav::VideoRenderConfig renderConfig;
         renderConfig.surfaceSize = vulkanRenderer_->surfaceSize();
         renderConfig.aspectRatio = qtav::VideoAspectRatioMode::Fit;
-        renderConfig.rotation = static_cast<qtav::VideoRotation>(
-            displayRotation_);
+        renderConfig.rotation = qtav::VideoRotation::Rotate0;
         if (renderConfig.surfaceSize.width <= 0
             || renderConfig.surfaceSize.height <= 0
             || !vulkanRenderer_->open(renderConfig)) {
@@ -1304,6 +1494,16 @@ private:
         interopImagesImported_.store(0);
         interopStaleImagesDropped_.store(0);
         interopMaximumPendingImages_.store(0);
+        interopAcquireFencesImported_.store(0);
+        interopReleaseFencesReturned_.store(0);
+        interopReleaseFenceFallbacks_.store(0);
+        interopCpuMapCalls_.store(0);
+        interopSoftwareTransferCalls_.store(0);
+        interopStagingCopies_.store(0);
+        interopRendererUploads_.store(0);
+        vulkanHardwareBufferFormat_.store(0);
+        vulkanFormat_.store(0);
+        vulkanExternalFormat_.store(0);
         openGLHdrSamplingStatus_.store(static_cast<int>(
             qtav::MediaCodecOpenGLHdrSamplingStatus::Disabled));
         openGLHardwareBufferFormat_.store(0);
@@ -1357,7 +1557,11 @@ private:
         }
         qtav::MediaCodecFrame output =
             qtav::mediaCodecFrame(frame, directSurface_);
-        const bool presented = output && output.present();
+        const qtav::MediaCodecFrameDecisionResult decision = output
+            ? output.presentResult()
+            : qtav::MediaCodecFrameDecisionResult::Failed;
+        const bool presented =
+            decision == qtav::MediaCodecFrameDecisionResult::Applied;
         if (presented) {
             recordPresentation(frame.timestamp(), generation);
             const std::uint64_t presented =
@@ -1367,7 +1571,8 @@ private:
                     ANDROID_LOG_INFO,
                     "First MediaCodec frame presented to the Surface");
             }
-        } else {
+        } else if (decision
+                   != qtav::MediaCodecFrameDecisionResult::AlreadyReleased) {
             const std::string message =
                 "MediaCodec could not present a direct-Surface frame";
             if (setPipelineErrorOnce(message)) {
@@ -1379,6 +1584,7 @@ private:
     void releasePlayerAndPipeline()
     {
         playerGeneration_.fetch_add(1);
+        clearSubtitle();
         renderEnabled_.store(false);
         directEnabled_.store(false);
         deactivateRenderer();
@@ -1411,6 +1617,7 @@ private:
                 .onMediaStatus({})
                 .onEvent({})
                 .onAudioFrame({})
+                .onSubtitleFrame({})
                 .setVideoRenderAPI({})
                 .setAudioSink({})
                 .setAudioFrameConverter({});
@@ -1564,6 +1771,23 @@ private:
                     statistics.staleImagesDropped);
                 interopMaximumPendingImages_.store(
                     statistics.maximumPendingImages);
+                interopAcquireFencesImported_.store(
+                    statistics.acquireFencesImported);
+                interopReleaseFencesReturned_.store(
+                    statistics.releaseFencesReturned);
+                interopReleaseFenceFallbacks_.store(
+                    statistics.releaseFenceFallbacks);
+                interopCpuMapCalls_.store(statistics.cpuMapCalls);
+                interopSoftwareTransferCalls_.store(
+                    statistics.softwareTransferCalls);
+                interopStagingCopies_.store(statistics.stagingCopies);
+                interopRendererUploads_.store(statistics.rendererUploads);
+                vulkanHardwareBufferFormat_.store(
+                    statistics.lastHardwareBufferFormat);
+                vulkanFormat_.store(
+                    static_cast<int>(statistics.lastVulkanFormat));
+                vulkanExternalFormat_.store(
+                    statistics.lastExternalFormat);
             }
             if (openGLInterop) {
                 const auto statistics = openGLInterop->statistics();
@@ -1695,6 +1919,15 @@ private:
         }
     }
 
+    void clearSubtitle()
+    {
+        std::lock_guard<std::mutex> lock(subtitleMutex_);
+        subtitleText_.clear();
+        subtitleStart_ = 0;
+        subtitleEnd_ = 0;
+        subtitleTrack_ = -1;
+    }
+
     void setStatus(std::string status)
     {
         std::lock_guard<std::mutex> lock(statusMutex_);
@@ -1741,6 +1974,7 @@ private:
     mutable std::mutex commandMutex_;
     mutable std::mutex statusMutex_;
     mutable std::mutex outputMutex_;
+    mutable std::mutex subtitleMutex_;
     std::mutex renderMutex_;
     std::mutex directMutex_;
     std::mutex renderScheduleMutex_;
@@ -1787,6 +2021,16 @@ private:
     std::atomic<std::uint64_t> interopImagesImported_ { 0 };
     std::atomic<std::uint64_t> interopStaleImagesDropped_ { 0 };
     std::atomic<std::uint64_t> interopMaximumPendingImages_ { 0 };
+    std::atomic<std::uint64_t> interopAcquireFencesImported_ { 0 };
+    std::atomic<std::uint64_t> interopReleaseFencesReturned_ { 0 };
+    std::atomic<std::uint64_t> interopReleaseFenceFallbacks_ { 0 };
+    std::atomic<std::uint64_t> interopCpuMapCalls_ { 0 };
+    std::atomic<std::uint64_t> interopSoftwareTransferCalls_ { 0 };
+    std::atomic<std::uint64_t> interopStagingCopies_ { 0 };
+    std::atomic<std::uint64_t> interopRendererUploads_ { 0 };
+    std::atomic<std::uint32_t> vulkanHardwareBufferFormat_ { 0 };
+    std::atomic<int> vulkanFormat_ { 0 };
+    std::atomic<std::uint64_t> vulkanExternalFormat_ { 0 };
     std::atomic<int> openGLHdrSamplingStatus_ {
         static_cast<int>(
             qtav::MediaCodecOpenGLHdrSamplingStatus::Disabled)
@@ -1812,13 +2056,16 @@ private:
         presentationTimes_;
     int presentationFpsMilliHertz_ = 0;
     std::int64_t savedPosition_ = 0;
-    int displayRotation_ = 0;
     int mediaDescriptor_ = -1;
     std::string mediaLabel_;
     std::string mediaPath_;
     std::string activeMode_;
     std::string status_;
     std::string pipelineError_;
+    std::string subtitleText_;
+    std::int64_t subtitleStart_ = 0;
+    std::int64_t subtitleEnd_ = 0;
+    int subtitleTrack_ = -1;
 
     std::shared_ptr<qtav::VideoRenderAPI> renderer_;
     std::shared_ptr<qtav::AndroidVulkanVideoRenderer> vulkanRenderer_;
@@ -2026,6 +2273,70 @@ Java_org_qtav_core_player_QtAVPlayerActivity_nativeIsPlaying(
         return controller->isPlaying() ? JNI_TRUE : JNI_FALSE;
     }
     return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetTrackOptions(
+    JNIEnv* environment,
+    jobject,
+    jlong handle,
+    jint mediaType)
+{
+    std::vector<std::pair<int, std::string>> tracks;
+    if (AndroidPlayerController* controller =
+            controllerFromHandle(handle)) {
+        tracks = controller->trackOptions(
+            static_cast<qtav::MediaType>(mediaType));
+    }
+    return toJavaTrackOptions(environment, tracks);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetActiveTrack(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jint mediaType)
+{
+    if (AndroidPlayerController* controller =
+            controllerFromHandle(handle)) {
+        return controller->activeTrack(
+            static_cast<qtav::MediaType>(mediaType));
+    }
+    return -1;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_qtav_core_player_QtAVPlayerActivity_nativeSelectTrack(
+    JNIEnv*,
+    jobject,
+    jlong handle,
+    jint mediaType,
+    jint selector)
+{
+    if (AndroidPlayerController* controller =
+            controllerFromHandle(handle)) {
+        return controller->selectTrack(
+            static_cast<qtav::MediaType>(mediaType),
+            selector)
+            ? JNI_TRUE
+            : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_qtav_core_player_QtAVPlayerActivity_nativeGetSubtitleText(
+    JNIEnv* environment,
+    jobject,
+    jlong handle)
+{
+    std::string subtitle;
+    if (AndroidPlayerController* controller =
+            controllerFromHandle(handle)) {
+        subtitle = controller->subtitleText();
+    }
+    return environment->NewStringUTF(subtitle.c_str());
 }
 
 extern "C" JNIEXPORT jint JNICALL

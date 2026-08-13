@@ -668,7 +668,11 @@ The manual final-test and user-facing player is under
 the automated NativeActivity harness and provides a standard Android UI with
 an upper `SurfaceView`, current time/seek/duration controls, local document
 selection, direct FFmpeg HTTP/HTTPS URL opening, play/pause/stop, and live
-Vulkan, HDR, ZeroCopy, hardware-decode, and debug-overlay switches. The
+Vulkan, HDR, ZeroCopy, hardware-decode, and debug-overlay switches. It also
+enumerates post-load audio/subtitle tracks, switches them through
+`TrackInfo::index`, provides a subtitle-off choice, and overlays
+presentation-timed normalized subtitle text. The lightweight view overlay does
+not claim production ASS styling or bitmap-subtitle support. The
 top-left diagnostics include a rolling successful-presentation FPS alongside
 the source-rate hint and requested display refresh rate. They also show the
 actual Vulkan/EGL output color space (or the MediaCodec buffer color metadata
@@ -677,9 +681,16 @@ ratio, and the panel's desired maximum HDR content luminance. In MediaCodec
 direct-Surface mode the HDR switch changes the Android 15+
 `SurfaceView` headroom request but does not convert a PQ/HLG codec buffer to
 SDR; application-rendered paths use the switch as their `PreferHdr`/`SdrOnly`
-output policy. A full-screen button or landscape rotation overlays all
-controls on the video; five seconds without touch input hides only the
-controls, leaving the Debug window independent.
+output policy. On compact phones, the full-screen button requests
+sensor-landscape, enters immersive mode, and restores the previous orientation
+request on exit; physical landscape rotation retains the same automatic
+full-screen behavior. On Android large screens and resizable windows it does
+not lock orientation. API 30+ uses transient swipe-revealed system bars, with
+the legacy immersive-sticky path retained for API 28-29. Full screen overlays
+all controls on the video; five seconds without touch input hides only the
+controls, leaving the Debug window and active subtitle independent. API 33+
+uses the predictive-back dispatcher so Back exits full screen before it exits
+the activity.
 ZeroCopy and hardware decode occupy their own second option row so the full
 controls remain touchable on a portrait phone.
 
@@ -1348,6 +1359,11 @@ FFmpeg `AV_HWDEVICE_TYPE_OHCODEC` device for it, selects the explicit
 generation. `OHCodecFrame` is a move-only, single-decision token. `present()`
 releases immediately to the configured window, `presentAt()` uses a
 `CLOCK_MONOTONIC` nanosecond timestamp, and `drop()` releases without display.
+Their `*Result()` forms distinguish `Applied`, `AlreadyDecided`, and `Failed`.
+`AlreadyDecided` means another retained view of the same underlying output
+made the one permitted decision first; it is a stale redraw and cannot produce
+another surface buffer or frame-available callback. The Boolean forms remain
+convenient wrappers that return true only for `Applied`.
 Destroying an undecided token drops it. If an output instead reaches its final
 retained frame release without an explicit token decision, the FFmpeg overlay
 also unconditionally drops/frees it; abandonment never implies presentation.
@@ -1536,6 +1552,15 @@ ended with 1,988 opaque imports, normalization passes, releases, and frame
 callbacks, zero numeric-workaround imports,
 `lastVulkanFormat=VK_FORMAT_UNDEFINED`, and zero Player drops.
 
+The 2026-08-13 half-rate full-screen regression proved that render-target
+recreation can redraw the latest `VideoFrame` before the next 0.5x frame
+arrives. If that frame's OHCodec output was already consumed, both Vulkan and
+OpenGL ES interop now classify the repeated decision as stale instead of
+registering a producer queue entry that can never receive a callback. The
+final signed `legend.mkv` run completed three additional exit/re-enter cycles
+at 12.4 FPS with continuously increasing decoded/presented counts, zero Player
+drops, and equal release/callback counts after every cycle.
+
 The same connected harness now exercises the shared selector with real
 OHCodec frames. After eight successful opaque Vulkan imports it injects a
 bounded fatal result, retires the Vulkan consumer surface, prepares an
@@ -1586,6 +1611,13 @@ timestamp, and `drop()` releases without display. Destroying an undecided last
 frame copy lets FFmpeg drop it. Hardware-frame storage retains the decoder
 context until all copied outputs are released, including across seek, stop,
 media replacement, and asynchronous decoder reopen.
+
+The result-returning forms `presentResult()`, `presentAtResult()`, and
+`dropResult()` distinguish `Applied`, `AlreadyReleased`, and `Failed`.
+`AlreadyReleased` means another retained view already decided the shared
+output, or decoder flush retired it; no Surface buffer or frame-available
+callback will follow. The bool forms remain source compatible and return true
+only for `Applied`.
 
 `setVideoFrameScheduler()` runs on the video-decode worker once a decoded frame
 is inside its bounded lead window and supplies the target monotonic presentation
@@ -1668,6 +1700,10 @@ be acquired, serializing producer ownership transfer without waiting for the
 playback deadline or Vulkan submission. Applications should reserve their own
 bounded render slot before calling it, retain the exact `VideoFrame`, and
 render at the scheduler-provided deadline.
+If a retained old frame is offered again after presentation or surface
+invalidation, the FFmpeg output reports `AlreadyReleased`; the interop cancels
+the provisional producer association and returns `Stale` without entering the
+image wait. It never treats an absent callback as a slow producer.
 Vulkan uses the driver-reported explicit format or opaque external format. The
 renderer also applies the `AImage` crop rectangle, so codec-aligned native
 allocations may be larger than the visible decoded frame.
@@ -1685,6 +1721,11 @@ processing belongs in this normalization pass; imports that cannot preserve
 raw components must be rejected for this path. The opaque-format path performs
 no decoded-source CPU map, transfer, staging, or upload, but its intermediate
 texture means it is zero-CPU-copy rather than strict source zero-copy.
+The identity conversion retains the driver's
+`samplerYcbcrConversionComponents` mapping. Vulkan then exposes raw
+`(Cr, Y, Cb)` in sampled `(R, G, B)`, and the shared external normalizer stores
+`.gbr` as `(Y, Cb, Cr)` exactly once. Android interop must not pre-rotate that
+mapping; OHOS uses the same shared normalization contract.
 
 When an acquire sync fd is present it is imported into a temporary Vulkan
 semaphore. Submission waits on that semaphore and transfers ownership from
@@ -2830,10 +2871,21 @@ Vulkan, samples aligned native allocations using their visible crop, and
 returns one release sync fd per import. The device result requires bounded
 pending images and zero decoded-source CPU map, software transfer, staging
 copy, and renderer upload counters.
-The same path decodes the checksum-pinned FFmpeg FATE profile 8.4 sample with
-MediaCodec: all 100 decoded frames retain FFmpeg-parsed RPU metadata, 97 are
-rendered through libplacebo from raw external-format Y/Cb/Cr, and all 97
-imports return release fences with zero CPU map/transfer/staging/upload.
+The 2026-08-03 path decoded the checksum-pinned FFmpeg FATE profile 8.4 sample
+with MediaCodec: all 100 decoded frames retained FFmpeg-parsed RPU metadata,
+97 were rendered through libplacebo from raw external-format Y/Cb/Cr, and all
+97 imports returned release fences with zero CPU map/transfer/staging/upload.
+That device evidence predates the shared `.gbr` normalizer. The current
+platform-free contract regression verifies that Android and OHOS both retain
+the driver mapping and that the shared shader performs the single raw
+component rotation. On 2026-08-13 a Xiaomi 2410DPN6CC running Android 16/API
+36 and Adreno 830 reproduced the pre-repair strong purple/yellow output with
+the real Profile 5 `wednesday.mp4`, then rendered the same scene with natural
+color after the repair. The repaired Vulkan/HDR checkpoint used the opaque
+external format (`VkFormat` undefined, external format 654), delivered 582
+RPU-bearing frames and presented/imported 578, returned 578 release fences
+with zero fallbacks, kept pending depth at one, and reported zero CPU
+map/transfer/staging/upload calls.
 Independent OpenGL ES phases import 99 H.264 and 180 HEVC
 AHardwareBuffer/EGLImages through the raw-YCbCr path, return a release fence
 for every imported image, survive seek plus EGL surface recreation, and retain

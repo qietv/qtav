@@ -221,10 +221,12 @@ Patch the OHCodec surface path to expose an opaque `AVOHCodecBuffer` through
 installed `libavcodec/ohcodec_surface.h`. The public functions
 `av_ohcodec_release_buffer()` and `av_ohcodec_render_buffer_at_time()` make one
 native render/drop decision. An atomic flag guarantees that the native output
-is decided at most once. If the last frame reference is released without an
-explicit decision, the fallback unconditionally frees/drops the output rather
-than rendering it. The opaque token retains FFmpeg's decoder reference until
-the frame buffer is released.
+is decided at most once. A repeated decision through another retained frame
+view returns `AVERROR(EALREADY)` rather than reporting a second successful
+queue operation. If the last frame reference is released without an explicit
+decision, the fallback unconditionally frees/drops the output rather than
+rendering it. The opaque token retains FFmpeg's decoder reference until the
+frame buffer is released.
 
 The policy is implemented by
 [`0055-ohcodec-explicit-surface-release.patch`](ports/ffmpeg/0055-ohcodec-explicit-surface-release.patch).
@@ -246,13 +248,18 @@ The installed-package verifier requires the header and both symbols.
 The OHOS package carries a small public overlay ABI that must stay paired with
 the QtAVCore OHCodec backend. This API controls direct surface output only and
 makes no native-buffer interop or zero-copy texture claim. Android and Windows
-packages are unchanged.
+packages are unchanged. QtAVCore maps `AVERROR(EALREADY)` to a stale import;
+the interop must not install a new pending producer association because no
+second native buffer or frame-available callback will be produced.
 
 Validation requires `scripts/build-ohos.ps1`, `cmake/verify-install.cmake`,
 QtAVCore OHOS shared/static target compilation, an installed
 `QtAV::HWOHCodec` consumer, and connected-device HAP coverage that observes
 successful timed presentations and explicit drops. The 2026-08-05 Mate 60 Pro
-run completed 30 timed H.264 presentations and three explicit drops.
+run completed 30 timed H.264 presentations and three explicit drops. The
+2026-08-13 player regression additionally held `legend.mkv` at 0.5x through
+repeated full-screen swapchain recreation with balanced native release and
+callback counts.
 
 ### Retirement condition
 
@@ -535,3 +542,64 @@ Revisit the target-specific override when FFmpeg changes the semantics of
 `--enable-small`, when binary-size limits require a separate dependency
 profile, or when repeatable device measurements show that `-O2` or another
 portable optimization level provides better sustained throughput.
+
+## FD-009: Report a suppressed Android MediaCodec output release as stale
+
+- Date: 2026-08-13
+- Status: Accepted
+- Scope: Android FFmpeg MediaCodec output ownership and the installed public
+  release-result contract
+
+### Context
+
+FFmpeg 8.1.2 shares one atomic release flag across all retained
+`AVMediaCodecBuffer` views. Its MediaCodec helpers correctly invoke the native
+release only once, and also suppress a release after decoder flush changes the
+buffer serial. Both suppressed cases nevertheless returned success. A caller
+could therefore register an AImageReader timestamp association and wait for a
+frame-available callback even though no native output had been queued.
+
+This becomes reachable when Android republishes the same Surface during a
+size/fullscreen refresh. QtAVCore invalidates the old presentation epoch, then
+may redraw the retained latest frame in the new epoch. Epoch/timestamp tracking
+cannot distinguish a real new producer release from FFmpeg's successful no-op;
+the missing callback is an ownership fact, not a slow-producer timeout or an
+unknown coded-size problem.
+
+### Decision
+
+Patch both `av_mediacodec_release_buffer()` and
+`av_mediacodec_render_buffer_at_time()` so zero means the current call actually
+invoked the native output release. Return `AVERROR(EALREADY)` when another view
+already released the shared buffer or decoder flush retired it. Keep all other
+native error values unchanged.
+
+Document the result in installed `libavcodec/mediacodec.h` and require the
+contract from the Android branch of `cmake/verify-install.cmake`. QtAVCore owns
+the higher-level mapping to applied, stale, and failed; the dependency layer
+does not know about renderer epochs or presentation policy.
+
+### Rejected alternatives
+
+- Suppressing redraws by timestamp/frame identity would be an application
+  workaround and could discard a valid frame after a real generation change.
+- Waiting less or treating a timeout as success would retain the false pending
+  association and hide the ownership violation.
+- Reopening MediaCodec or probing the stream dimensions on every surface-size
+  change does not make an already-released output emit another callback.
+- Keeping the result only inside QtAVCore is impossible because the public
+  FFmpeg helper previously erased whether it performed the native release.
+
+### Consequences and validation
+
+Existing callers that check only for negative failure now observe a truthful
+stale result. QtAVCore's bool convenience functions remain source compatible
+but return true only for a real applied release; result-returning APIs preserve
+the three-way distinction.
+
+Any change to this contract must run the directly affected Android dependency
+build and `cmake/verify-install.cmake`, followed by QtAVCore Android
+shared/static builds and installed-package consumers. Connected-device
+validation must exercise a Surface/fullscreen refresh while MediaCodec
+hardware output remains active and confirm that presentation continues without
+an unbounded pending image wait.

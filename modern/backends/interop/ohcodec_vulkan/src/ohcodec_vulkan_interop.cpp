@@ -2,6 +2,8 @@
 
 #include <qtav/ohcodec_vulkan_interop.h>
 
+#include "vulkan_ycbcr_identity.h"
+
 #include <native_buffer/native_buffer.h>
 #include <native_image/native_image.h>
 #include <vulkan/vulkan_ohos.h>
@@ -1321,10 +1323,11 @@ private:
                 // externalFormat is implementation-defined, so its component
                 // mapping is implementation-defined as well. Huawei confirms
                 // that the returned mapping describes the codec buffer's raw
-                // components; changing only the model to RGB_IDENTITY exposes
-                // those Y/Cb/Cr samples without guessing a second swizzle.
-                identityInfo.components =
-                    formatProperties.samplerYcbcrConversionComponents;
+                // components. Changing only the model to RGB_IDENTITY exposes
+                // them in Vulkan's canonical (Cr, Y, Cb) order; the shared
+                // normalizer performs the only rotation into (Y, Cb, Cr).
+                identityInfo.components = detail::vulkanRawIdentityComponents(
+                    formatProperties.samplerYcbcrConversionComponents);
                 std::string identityError;
                 if (!createYcbcrResources(
                         state_->device.device,
@@ -1795,7 +1798,14 @@ public:
         }
 
         OHCodecFrame output = ohCodecFrame(frame, state_->surface);
-        const bool queued = output && output.isPending() && output.present();
+        const OHCodecFrameDecisionResult decision =
+            output && output.isPending()
+            ? output.presentResult()
+            : OHCodecFrameDecisionResult::Failed;
+        const bool queued =
+            decision == OHCodecFrameDecisionResult::Applied;
+        const bool alreadyDecided =
+            decision == OHCodecFrameDecisionResult::AlreadyDecided;
         VulkanHardwareFrameInterop::FrameAvailableCallback callback;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
@@ -1835,6 +1845,11 @@ public:
             callback();
         }
         if (!queued) {
+            if (alreadyDecided) {
+                detail =
+                    "The OHCodec output was already consumed before this redraw";
+                return VulkanHardwareImportStatus::Stale;
+            }
             detail = "Could not queue the OHCodec output into the private OH_ConsumerSurface";
             return VulkanHardwareImportStatus::Error;
         }

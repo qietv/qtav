@@ -44,6 +44,10 @@ libplacebo.
    The decoded source must remain free of CPU mapping, readback, transfer,
    staging, or upload. An on-GPU external-format normalization pass is allowed
    when it preserves raw Y, Cb, and Cr for libplacebo.
+   The Vulkan identity sampler retains the driver component mapping, producing
+   Vulkan's sampled `(Cr,Y,Cb)` convention; the shared `.gbr` normalizer is the
+   only step that reorders it to `(Y,Cb,Cr)`. Platform interop must not perform
+   the same rotation in advance.
 4. Hardware decode, ZeroCopy, Vulkan, and HDR are the Android player defaults.
    Disabling ZeroCopy while hardware decode remains enabled selects MediaCodec
    direct-Surface presentation and therefore does not use libplacebo.
@@ -240,7 +244,8 @@ ZeroCopy selection, and HDR output policy.
 
 - Date: 2026-08-03
 - Amended: 2026-08-12 to make seek-generation invalidation and late AImage
-  rejection an interop responsibility shared with the Vulkan path
+  rejection an interop responsibility shared with the Vulkan path; 2026-08-13
+  to make an already-consumed MediaCodec output an explicit stale result
 - Status: Accepted
 - Scope: Android player OpenGL ES MediaCodec/AImageReader scheduling and EGL
   release synchronization, plus Android AImageReader producer-generation
@@ -281,6 +286,17 @@ does not wake its bounded image wait; OpenGL has an interop `flush()` but no
 automatic renderer-to-interop invalidation path. Correctness must not depend on
 the Android application calling those interop methods before Player controls.
 
+A surface-size/fullscreen refresh exposed one more ownership ambiguity shared
+with the OHOS failure. Android's renderer invalidates pending presentation
+state even when `surfaceChanged` republishes the same native window. A retained
+latest `VideoFrame` can then be offered again in the new interop epoch. FFmpeg
+8.1.2 atomically suppresses the second native MediaCodec release, but returned
+success for both that duplicate and an output retired by decoder flush.
+QtAVCore therefore installed a pending timestamp association and waited for a
+frame-available callback that could never be emitted. Producer epochs can
+reject late callbacks; they cannot infer that an upstream release reported a
+false success.
+
 ### Decision
 
 1. `MediaCodecOpenGLInterop::queueFrame()` only registers the exact frame key
@@ -316,6 +332,16 @@ the Android application calling those interop methods before Player controls.
    overlapping old render crosses the Player generation boundary. It never
    waits for already-submitted GPU work; imported images keep their existing
    native-fence or timeline-based lifetime.
+9. The repository FFmpeg Android overlay returns `AVERROR(EALREADY)` when a
+   MediaCodec output was already released by another retained frame view or
+   retired by decoder flush. Zero means that the current call actually invoked
+   the native release. Installed-package verification rejects the old
+   ambiguous contract.
+10. `MediaCodecFrame` maps the boundary to `Applied`, `AlreadyReleased`, or
+    `Failed`. Both AImageReader interops cancel their provisional epoch
+    association and return stale for `AlreadyReleased`; direct-Surface output
+    also ignores it as stale. No path creates a pending producer association,
+    retries the frame, probes dimensions, or waits for a callback in that case.
 
 ### Consequences
 
@@ -339,6 +365,10 @@ the Android application calling those interop methods before Player controls.
 - This amendment specializes AD-008's generic exact-deferred-frame and
   pending-producer invalidation contract for Android AImageReader. It does not
   change direct-Surface present/drop ownership.
+- The repeat-release repair is at the shared FFmpeg/native-output ownership
+  boundary, so Vulkan, OpenGL ES, and direct-Surface paths receive the same
+  truth. It adds no redraw suppression, timeout, decoder reopen, pixel copy, or
+  media-size special case.
 
 ### Seek-generation amendment status
 

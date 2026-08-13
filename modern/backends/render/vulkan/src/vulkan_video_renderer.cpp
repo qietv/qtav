@@ -341,9 +341,14 @@ void setTargetColor(
 void applyGeometry(
     struct pl_frame& image,
     struct pl_frame& target,
-    const VideoRenderConfig& config) noexcept
+    const VideoRenderConfig& config,
+    VideoRotation presentationRotation) noexcept
 {
-    image.rotation = rotation(config.rotation);
+    const pl_rotation contentRotation = rotation(config.rotation);
+    image.rotation = static_cast<pl_rotation>(
+        (static_cast<int>(contentRotation)
+         + static_cast<int>(rotation(presentationRotation)))
+        % 4);
     const VideoViewport viewport = effectiveViewport(config);
     target.crop = {
         static_cast<float>(viewport.x),
@@ -357,14 +362,14 @@ void applyGeometry(
     if (config.aspectRatio == VideoAspectRatioMode::Fit) {
         const float sourceAspect = pl_aspect_rotate(
             pl_rect2df_aspect(&image.crop),
-            image.rotation);
+            contentRotation);
         pl_rect2df_aspect_set(&target.crop, sourceAspect, 0.0F);
         return;
     }
     const float targetAspect = pl_rect2df_aspect(&target.crop);
     const float sourceAspect = pl_aspect_rotate(
         targetAspect,
-        image.rotation);
+        contentRotation);
     pl_rect2df_aspect_set(&image.crop, sourceAspect, 0.0F);
 }
 
@@ -1881,6 +1886,7 @@ public:
     std::mutex renderMutex_;
     std::mutex logMutex_;
     VideoRenderConfig config_;
+    VideoRotation presentationRotation_ = VideoRotation::Rotate0;
     VulkanCurrentTargetCallback currentTarget_;
     std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop_;
 #if defined(QTAV_VULKAN_EXTERNAL_NORMALIZER)
@@ -1958,6 +1964,22 @@ void VulkanVideoRenderer::setEventCallback(EventCallback callback)
     impl_->eventCallback_ = std::move(callback);
 }
 
+void VulkanVideoRenderer::setPresentationRotation(VideoRotation value)
+{
+    if (!impl_) {
+        return;
+    }
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->stateMutex_);
+        changed = impl_->presentationRotation_ != value;
+        impl_->presentationRotation_ = value;
+    }
+    if (changed) {
+        impl_->notify(VideoRenderEventType::RedrawRequested, {});
+    }
+}
+
 bool VulkanVideoRenderer::open(const VideoRenderConfig& config)
 {
     if (!impl_) {
@@ -2026,12 +2048,14 @@ VideoRenderAttemptResult VulkanVideoRenderer::renderDetailed(
     }
     std::lock_guard<std::mutex> renderLock(impl_->renderMutex_);
     VideoRenderConfig config;
+    VideoRotation presentationRotation = VideoRotation::Rotate0;
     VulkanCurrentTargetCallback currentTarget;
     std::shared_ptr<VulkanHardwareFrameInterop> hardwareInterop;
     {
         std::lock_guard<std::mutex> stateLock(impl_->stateMutex_);
         if (impl_->open_) {
             config = impl_->config_;
+            presentationRotation = impl_->presentationRotation_;
             currentTarget = impl_->currentTarget_;
             hardwareInterop = impl_->hardwareInterop_;
         }
@@ -2181,7 +2205,7 @@ VideoRenderAttemptResult VulkanVideoRenderer::renderDetailed(
 
     bool rendered = error.empty();
     if (rendered) {
-        applyGeometry(image, target, config);
+        applyGeometry(image, target, config, presentationRotation);
         rendered = pl_render_image(
             impl_->renderer_,
             &image,

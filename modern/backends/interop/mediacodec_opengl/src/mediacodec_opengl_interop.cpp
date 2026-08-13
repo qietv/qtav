@@ -459,11 +459,21 @@ public:
         }
 
         MediaCodecFrame output = mediaCodecFrame(frame, state_->surface);
+        const MediaCodecFrameDecisionResult decision =
+            output && output.isPending()
+            ? output.presentResult()
+            : MediaCodecFrameDecisionResult::Failed;
         const bool released =
-            output && output.isPending() && output.present();
+            decision == MediaCodecFrameDecisionResult::Applied;
         if (!released) {
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->producerEpoch.cancel(key, queueResult.epoch);
+            if (decision
+                == MediaCodecFrameDecisionResult::AlreadyReleased) {
+                detail =
+                    "The MediaCodec output was already consumed before this redraw";
+                return OpenGLHardwareImportStatus::Stale;
+            }
             detail =
                 "Could not release the MediaCodec output into the private AImageReader";
             return OpenGLHardwareImportStatus::Error;

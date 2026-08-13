@@ -3,6 +3,7 @@
 #include <qtav/mediacodec_vulkan_interop.h>
 
 #include "mediacodec_image_epoch.h"
+#include "vulkan_ycbcr_identity.h"
 
 #include <android/hardware_buffer.h>
 #include <media/NdkImage.h>
@@ -413,28 +414,11 @@ std::shared_ptr<ConversionResources> conversionResources(
         ? VK_SAMPLER_YCBCR_RANGE_ITU_FULL
         : properties.suggestedYcbcrRange;
     if (preserveYcbcr) {
-        const auto explicitSwizzle = [](
-            VkComponentSwizzle swizzle,
-            VkComponentSwizzle identity) {
-            return swizzle == VK_COMPONENT_SWIZZLE_IDENTITY
-                ? identity
-                : swizzle;
-        };
-        // A Vulkan YCbCr model consumes (Cr, Y, Cb) as (R, G, B).
-        // Reorder the Android suggested pre-conversion swizzle so the
-        // identity model exposes (Y, Cb, Cr) to libplacebo.
-        key.components.r = explicitSwizzle(
-            properties.samplerYcbcrConversionComponents.g,
-            VK_COMPONENT_SWIZZLE_G);
-        key.components.g = explicitSwizzle(
-            properties.samplerYcbcrConversionComponents.b,
-            VK_COMPONENT_SWIZZLE_B);
-        key.components.b = explicitSwizzle(
-            properties.samplerYcbcrConversionComponents.r,
-            VK_COMPONENT_SWIZZLE_R);
-        key.components.a = explicitSwizzle(
-            properties.samplerYcbcrConversionComponents.a,
-            VK_COMPONENT_SWIZZLE_A);
+        // The driver mapping feeds Vulkan's canonical (Cr, Y, Cb) identity
+        // result. Preserve it here; the shared external normalizer performs
+        // the only .gbr conversion into libplacebo's (Y, Cb, Cr) order.
+        key.components = detail::vulkanRawIdentityComponents(
+            properties.samplerYcbcrConversionComponents);
     } else {
         key.components =
             properties.samplerYcbcrConversionComponents;
@@ -1469,11 +1453,21 @@ public:
 
         MediaCodecFrame output =
             mediaCodecFrame(frame, state_->surface);
+        const MediaCodecFrameDecisionResult decision =
+            output && output.isPending()
+            ? output.presentResult()
+            : MediaCodecFrameDecisionResult::Failed;
         const bool released =
-            output && output.isPending() && output.present();
+            decision == MediaCodecFrameDecisionResult::Applied;
         if (!released) {
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->producerEpoch.cancel(key, queueResult.epoch);
+            if (decision
+                == MediaCodecFrameDecisionResult::AlreadyReleased) {
+                detail =
+                    "The MediaCodec output was already consumed before this redraw";
+                return VulkanHardwareImportStatus::Stale;
+            }
             detail =
                 "Could not release the MediaCodec output into the private AImageReader";
             return VulkanHardwareImportStatus::Error;

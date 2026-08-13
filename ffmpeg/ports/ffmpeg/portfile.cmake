@@ -27,6 +27,7 @@ vcpkg_from_github(
         0056-ohcodec-dovi-metadata.patch
         0057-d3d11va-reuse-compatible-decoder.patch
         0058-ohcodec-vvc-decoder.patch
+        0059-mediacodec-repeat-release-status.patch
 )
 
 file(COPY
